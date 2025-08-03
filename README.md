@@ -202,6 +202,7 @@ crates/
   jjf-merge/       # the legacy file-bytes merge driver (kept as library)
   jjf/             # the `jjf` binary (clap-derive CLI over the storage layer)
 docs/
+  quickstart.md        # five-minute new-project walkthrough
   storage-format.md    # the on-disk spec
   cli-json.md          # the CLI output contract
   git-bug-cutover.md   # bridge to the archived pre-cutover planner data

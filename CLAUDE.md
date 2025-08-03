@@ -27,7 +27,9 @@ first.**
   v1 → v2 rename in `docs/storage-format.md` moved the live planner
   data from `bugs` to `issues` automatically — the storage layer
   detects v1-shape repos and migrates on first `Storage::open`.)
-- **Entry point:** the roadmap (`9566f52`). Read it first.
+- **Entry point:** the roadmap. Read it first via
+  `jjf show roadmap` (the issue's slug is `roadmap` and its
+  type is `roadmap` — both let you skip the 7-char id).
 - **CI:** `.woodpecker/blog.yaml` builds and pushes a Zola site
   image. Mirrors zfs-workspace's pattern except for the
   notify-flux hook (jjforge isn't a Flux deployment target).
@@ -44,8 +46,12 @@ new session before touching anything else; surface persistent
 memories at the same time:
 
 ```bash
-jjf show 9566f52 --include-memories
+jjf show roadmap --include-memories
 ```
+
+(The roadmap issue has slug `roadmap` and type `roadmap`;
+either resolves it. Its 7-char id is `9566f52` if you ever
+need it for archival cross-references.)
 
 The `--include-memories` flag appends a `## Persistent
 Memories` block listing every `jjf remember` entry on the
@@ -385,7 +391,7 @@ git add experiments/<topic>
 When the user asks you to "orchestrate" or "make progress" or
 "dispatch subagents," the loop is:
 
-1. **Read the roadmap first** (`jjf show 9566f52`) to orient on
+1. **Read the roadmap first** (`jjf show roadmap`) to orient on
    what's up next and what's blocking it.
 
 2. **Bugs before features.** Per Joel Spolsky's rule: fix
@@ -445,8 +451,8 @@ When the user asks you to "orchestrate" or "make progress" or
    names the closed ticket, links the commit if one landed, and
    notes what's still unfiled. **If the priority order changed
    during the round** — a sketched epic earned a promotion, a
-   closed epic falls off — update the roadmap (`9566f52`) body
-   via `jjf update 9566f52 --body-file ...`. A short comment
+   closed epic falls off — update the roadmap body
+   via `jjf update roadmap --body-file ...`. A short comment
    announcing "promoted X above Y" is fine but the truth lives
    in the body.
 
@@ -502,17 +508,17 @@ discipline" above.)
 
 ## What's next
 
-The project's running roadmap is a single ticket labeled
-`roadmap`:
+The project's running roadmap is a single ticket of type
+`roadmap` (also slug `roadmap`):
 
 ```bash
-jjf show 9566f52
+jjf show roadmap
 ```
 
 It lists the open epics in priority order, with an "above
 the line" / "below the line" cut for what's shipping now vs.
 queued. The ticket stays open for the life of the project.
-Body-edit it (`jjf update 9566f52 --body-file <path>`) when the
+Body-edit it (`jjf update roadmap --body-file <path>`) when the
 order shifts; fall back to comments for finer-grained changes.
 
 For "what exists" — every issue, by label, by status — use
@@ -528,8 +534,7 @@ Useful invocations for navigating jjforge. See
 
 ```bash
 # Roadmap — priority order, blocking judgment
-jjf show 9566f52
-jjf show roadmap                  # v2.1: by slug
+jjf show roadmap                  # by slug (also `--type roadmap`)
 
 # Epics — the six top-level milestones
 jjf ls --label epic
