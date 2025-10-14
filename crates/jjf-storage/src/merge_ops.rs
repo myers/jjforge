@@ -47,7 +47,7 @@ use crate::history::HistoryEntry;
 use crate::id::IssueId;
 use crate::jj::JjRepo;
 use crate::op::Op;
-use crate::record::{Comment, IssueRecord};
+use crate::record::{Comment, IssueRecord, IssueType};
 use crate::{issue_comments_relpath, issue_json_relpath, Error, Result};
 
 /// One issue after the op-space reducer has folded all heads' chains
@@ -251,8 +251,10 @@ fn resolve_one(repo: &JjRepo, heads: &[String], id: &IssueId) -> Result<MergedIs
             version: 2,
             id: issue_id.clone(),
             title: title.clone(),
+            slug: None,
             body: String::new(),
             status: *status,
+            type_: IssueType::Unspecified,
             labels: Vec::new(),
             dependencies: Vec::new(),
             assignee: None,
@@ -302,6 +304,12 @@ fn resolve_one(repo: &JjRepo, heads: &[String], id: &IssueId) -> Result<MergedIs
             Op::SetStatus { status, .. } => record.status = *status,
             Op::SetAssignee { assignee, .. } => {
                 record.assignee = assignee.clone();
+            }
+            Op::SetType { kind, .. } => {
+                record.type_ = *kind;
+            }
+            Op::SetSlug { slug, .. } => {
+                record.slug = slug.clone();
             }
             Op::SetBody { body_hash, .. } => {
                 latest_body_hash = Some(body_hash.clone());

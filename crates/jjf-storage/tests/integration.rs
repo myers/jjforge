@@ -9,7 +9,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use jjf_storage::{IssueDraft, IssueId, Op, Status, Storage};
+use jjf_storage::{
+    Error as StorageError, IssueDraft, IssueId, IssueType, Op,
+    SlugInvalidReason, Status, Storage, UpdateFields,
+};
 use serde::Serialize;
 
 /// Build a scratch jj repo with a seeded `issues` bookmark. Returns the
@@ -107,6 +110,7 @@ fn create_then_set_status_lands_two_commits_on_bookmark() {
         labels: vec!["bug".into(), "p1".into()],
         dependencies: vec![],
         assignee: Some("alice".into()),
+        ..Default::default()
     };
     let id = storage.create_issue(&draft).expect("create_issue");
     let id_s = id.to_string();
@@ -308,6 +312,7 @@ fn read_roundtrip_after_multiple_mutations() {
             labels: vec!["bug".into()],
             dependencies: vec![],
             assignee: None,
+            ..Default::default()
         })
         .unwrap();
 
@@ -391,6 +396,7 @@ fn read_then_serialize_byte_equals_on_disk_record() {
             labels: vec!["needs-info".into(), "bug".into()],
             dependencies: vec![],
             assignee: Some("alice".into()),
+            ..Default::default()
         })
         .unwrap();
     storage.add_label(&id, "p2").unwrap();
@@ -410,8 +416,11 @@ fn read_then_serialize_byte_equals_on_disk_record() {
         version: u32,
         id: &'a IssueId,
         title: &'a str,
+        slug: Option<&'a str>,
         body: &'a str,
         status: &'a str,
+        #[serde(rename = "type")]
+        type_: &'a str,
         labels: &'a [String],
         dependencies: &'a [IssueId],
         assignee: Option<&'a str>,
@@ -423,11 +432,13 @@ fn read_then_serialize_byte_equals_on_disk_record() {
         version: 2,
         id: &bug.id,
         title: &bug.title,
+        slug: bug.slug.as_deref(),
         body: &bug.body,
         status: match bug.status {
             Status::Open => "open",
             Status::Closed => "closed",
         },
+        type_: bug.type_.as_str(),
         labels: &bug.labels,
         dependencies: &bug.dependencies,
         assignee: bug.assignee.as_deref(),
@@ -505,6 +516,7 @@ fn read_history_returns_op_per_trailer_in_chronological_order() {
             labels: vec!["bug".into(), "p1".into()],
             dependencies: vec![],
             assignee: Some("alice".into()),
+            ..Default::default()
         })
         .unwrap();
 
@@ -694,6 +706,7 @@ fn update_lands_one_commit_with_one_trailer_per_populated_field() {
             labels: vec![],
             dependencies: vec![],
             assignee: None,
+            ..Default::default()
         })
         .unwrap();
 
@@ -709,6 +722,7 @@ fn update_lands_one_commit_with_one_trailer_per_populated_field() {
                 status: Some(Status::Closed),
                 body: Some("after body".into()),
                 assignee: None,
+                ..Default::default()
             },
         )
         .expect("update three fields");
@@ -771,6 +785,7 @@ fn update_assignee_double_option_distinguishes_set_from_unset() {
             labels: vec![],
             dependencies: vec![],
             assignee: None,
+            ..Default::default()
         })
         .unwrap();
 
@@ -814,6 +829,7 @@ fn update_with_no_fields_is_an_error() {
             labels: vec![],
             dependencies: vec![],
             assignee: None,
+            ..Default::default()
         })
         .unwrap();
 
@@ -1187,4 +1203,298 @@ fn v1_to_v2_migration_preserves_history() {
         "history must include the `set-status` op landed before the synthesized v1 rewrite. got {} entries",
         history.len()
     );
+}
+
+// ---------------------------------------------------------------------
+// v2.1 type + slug tests (issue 7100b51).
+//
+// The ticket calls out:
+//   - IssueType enum + serde roundtrip.
+//   - Slug field + validation tests covering each rejection reason.
+//   - Storage::resolve accepts id OR slug; tests cover both paths.
+//   - Slug uniqueness enforced at write; collision integration test.
+//   - Slug uniqueness scope is OPEN only — close releases, recreate
+//     succeeds.
+//   - Op::SetType and Op::SetSlug parse + replay + history-reader
+//     surface.
+//   - Storage::update lands both trailers; read_history verifies.
+// ---------------------------------------------------------------------
+
+#[test]
+fn issue_type_serde_roundtrip() {
+    // Each named variant's wire spelling is its lowercase
+    // name. Default = Unspecified.
+    for kind in [
+        IssueType::Bug,
+        IssueType::Feature,
+        IssueType::Epic,
+        IssueType::Research,
+        IssueType::Roadmap,
+        IssueType::Unspecified,
+    ] {
+        let s = serde_json::to_string(&kind).unwrap();
+        let back: IssueType = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, kind);
+    }
+    assert_eq!(IssueType::default(), IssueType::Unspecified);
+}
+
+#[test]
+fn validate_slug_accepts_canonical_shape() {
+    // The good cases. Each must pass.
+    for ok in ["abc", "agent-ready", "issue-type-and-slug-fields", "a1-2b"] {
+        assert!(
+            jjf_storage::validate_slug(ok).is_ok(),
+            "expected slug {ok:?} to validate"
+        );
+    }
+}
+
+#[test]
+fn validate_slug_rejects_each_failure_mode() {
+    use SlugInvalidReason::*;
+    // Each row pairs a bad slug with its expected rejection reason.
+    // Length checks fire before charset checks, so a too-short slug
+    // returns `TooShort` even if it ALSO contains an illegal char.
+    let cases: &[(&str, SlugInvalidReason)] = &[
+        ("ab", TooShort),
+        ("", TooShort),
+        (&"a".repeat(49), TooLong),
+        ("Abc", BadCharset),
+        ("a_b-c", BadCharset),
+        ("a/b", BadCharset),
+        ("a b", BadCharset),
+        ("-abc", LeadingHyphen),
+        ("abc-", TrailingHyphen),
+        ("a--b", ConsecutiveHyphens),
+    ];
+    for (slug, expected) in cases {
+        match jjf_storage::validate_slug(slug) {
+            Err(got) => assert_eq!(
+                got, *expected,
+                "slug {slug:?}: expected {expected:?}, got {got:?}"
+            ),
+            Ok(()) => panic!("slug {slug:?} should have been rejected with {expected:?}"),
+        }
+    }
+}
+
+#[test]
+fn create_issue_with_type_and_slug_round_trips() {
+    let repo = make_scratch_repo("create_with_type_and_slug");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "agent-ready ticket".into(),
+            type_: Some(IssueType::Feature),
+            slug: Some("agent-ready".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let issue = storage.read(&id).unwrap();
+    assert_eq!(issue.type_, IssueType::Feature);
+    assert_eq!(issue.slug.as_deref(), Some("agent-ready"));
+
+    // The create commit's trailers must include set-type AND set-slug
+    // (spec v2.1 §5.7).
+    let history = storage.read_history(&id).unwrap();
+    assert!(
+        history.iter().any(|h| matches!(&h.op, Op::SetType { kind, .. } if *kind == IssueType::Feature)),
+        "history must include set-type op: {:#?}",
+        history
+    );
+    assert!(
+        history.iter().any(|h| matches!(&h.op, Op::SetSlug { slug, .. } if slug.as_deref() == Some("agent-ready"))),
+        "history must include set-slug op: {:#?}",
+        history
+    );
+}
+
+#[test]
+fn create_issue_invalid_slug_is_rejected() {
+    let repo = make_scratch_repo("create_invalid_slug");
+    let storage = Storage::open(&repo).unwrap();
+    let err = storage
+        .create_issue(&IssueDraft {
+            title: "bad slug".into(),
+            slug: Some("Bad_Slug".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+    match err {
+        StorageError::InvalidSlug { slug, reason } => {
+            assert_eq!(slug, "Bad_Slug");
+            assert_eq!(reason, SlugInvalidReason::BadCharset);
+        }
+        other => panic!("expected InvalidSlug, got {other:?}"),
+    }
+}
+
+#[test]
+fn slug_collision_detected_among_open_issues() {
+    let repo = make_scratch_repo("slug_collision_open");
+    let storage = Storage::open(&repo).unwrap();
+    let first = storage
+        .create_issue(&IssueDraft {
+            title: "first".into(),
+            slug: Some("the-slug".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let err = storage
+        .create_issue(&IssueDraft {
+            title: "second".into(),
+            slug: Some("the-slug".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+    match err {
+        StorageError::SlugCollision { slug, conflicts_with } => {
+            assert_eq!(slug, "the-slug");
+            assert_eq!(conflicts_with, first);
+        }
+        other => panic!("expected SlugCollision, got {other:?}"),
+    }
+}
+
+#[test]
+fn slug_uniqueness_scope_is_open_only() {
+    // Closed issues release their slug. Spec v2.1 §3.1.
+    let repo = make_scratch_repo("slug_open_only");
+    let storage = Storage::open(&repo).unwrap();
+    let first = storage
+        .create_issue(&IssueDraft {
+            title: "first".into(),
+            slug: Some("the-slug".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.set_status(&first, Status::Closed).unwrap();
+    // Now the slug is free — a second open issue can take it.
+    let second = storage
+        .create_issue(&IssueDraft {
+            title: "second".into(),
+            slug: Some("the-slug".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_ne!(first, second);
+    let issue = storage.read(&second).unwrap();
+    assert_eq!(issue.slug.as_deref(), Some("the-slug"));
+}
+
+#[test]
+fn update_lands_set_type_and_set_slug_trailers_in_one_commit() {
+    let repo = make_scratch_repo("update_type_and_slug");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "baseline".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let baseline = storage.read_history(&id).unwrap().len();
+    storage
+        .update(
+            &id,
+            UpdateFields {
+                type_: Some(Some(IssueType::Bug)),
+                slug: Some(Some("baseline-slug".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let history = storage.read_history(&id).unwrap();
+    let new = &history[baseline..];
+    assert_eq!(new.len(), 2, "expected exactly two new ops, got {new:#?}");
+    // Both new entries share one commit (single multi-op update).
+    let commit = &new[0].commit;
+    assert!(new.iter().all(|e| &e.commit == commit));
+    // Field-declaration order: slug before type.
+    match &new[0].op {
+        Op::SetSlug { slug, .. } => assert_eq!(slug.as_deref(), Some("baseline-slug")),
+        other => panic!("new[0] expected SetSlug, got {other:?}"),
+    }
+    match &new[1].op {
+        Op::SetType { kind, .. } => assert_eq!(*kind, IssueType::Bug),
+        other => panic!("new[1] expected SetType, got {other:?}"),
+    }
+    let issue = storage.read(&id).unwrap();
+    assert_eq!(issue.type_, IssueType::Bug);
+    assert_eq!(issue.slug.as_deref(), Some("baseline-slug"));
+}
+
+#[test]
+fn update_unset_slug_clears_field() {
+    let repo = make_scratch_repo("update_unset_slug");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "has slug".into(),
+            slug: Some("kept".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    storage
+        .update(
+            &id,
+            UpdateFields {
+                slug: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let issue = storage.read(&id).unwrap();
+    assert_eq!(issue.slug, None);
+}
+
+#[test]
+fn resolve_accepts_id_and_slug() {
+    let repo = make_scratch_repo("resolve_id_and_slug");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "resolvable".into(),
+            slug: Some("resolvable-slug".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    // Id path.
+    assert_eq!(storage.resolve(id.as_str()).unwrap(), id);
+    // Slug path.
+    assert_eq!(storage.resolve("resolvable-slug").unwrap(), id);
+    // Unknown handle.
+    let err = storage.resolve("no-such-handle").unwrap_err();
+    match err {
+        StorageError::SlugNotFound { handle } => {
+            assert_eq!(handle, "no-such-handle");
+        }
+        other => panic!("expected SlugNotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn op_set_type_and_set_slug_round_trip_serde() {
+    let issue_id = IssueId::parse("aa6600b").unwrap();
+    let set_type = Op::SetType {
+        issue_id: issue_id.clone(),
+        kind: IssueType::Epic,
+    };
+    let set_slug = Op::SetSlug {
+        issue_id: issue_id.clone(),
+        slug: Some("epic-slug".into()),
+    };
+    for op in [&set_type, &set_slug] {
+        let s = serde_json::to_string(op).unwrap();
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(&back, op);
+    }
+    // Trailer rendering shape spot-check.
+    let block = set_type.to_trailer_block("2026-06-22T12:34:56.000000000Z");
+    assert!(block.contains("Jjf-Op: set-type"));
+    assert!(block.contains("Jjf-Type: epic"));
+    let block = set_slug.to_trailer_block("2026-06-22T12:34:56.000000000Z");
+    assert!(block.contains("Jjf-Op: set-slug"));
+    assert!(block.contains("Jjf-Slug: epic-slug"));
 }

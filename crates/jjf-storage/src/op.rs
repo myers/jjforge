@@ -23,7 +23,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::id::IssueId;
-use crate::record::Status;
+use crate::record::{IssueType, Status};
 
 /// The op vocabulary per spec §5.2.
 ///
@@ -70,6 +70,21 @@ pub enum Op {
         issue_id: IssueId,
         assignee: Option<String>,
     },
+    /// Set the coarse `IssueType` (spec v2.1). The `kind` field is
+    /// the new value; the wire spelling is the lowercase
+    /// [`IssueType::as_str`].
+    SetType {
+        issue_id: IssueId,
+        kind: IssueType,
+    },
+    /// Set the kebab-case slug (spec v2.1). `None` clears it.
+    /// Validation (charset / length / hyphen rules) happens at the
+    /// write boundary in [`crate::Storage`]; the trailer carries the
+    /// chosen value verbatim or `""` for "no slug".
+    SetSlug {
+        issue_id: IssueId,
+        slug: Option<String>,
+    },
     CommentAdd {
         issue_id: IssueId,
         comment_id: IssueId,
@@ -92,6 +107,8 @@ impl Op {
             Op::DepAdd { .. } => "dep-add",
             Op::DepRm { .. } => "dep-rm",
             Op::SetAssignee { .. } => "set-assignee",
+            Op::SetType { .. } => "set-type",
+            Op::SetSlug { .. } => "set-slug",
             Op::CommentAdd { .. } => "comment-add",
             Op::Merge { .. } => "merge",
         }
@@ -109,6 +126,8 @@ impl Op {
             | Op::DepAdd { issue_id, .. }
             | Op::DepRm { issue_id, .. }
             | Op::SetAssignee { issue_id, .. }
+            | Op::SetType { issue_id, .. }
+            | Op::SetSlug { issue_id, .. }
             | Op::CommentAdd { issue_id, .. }
             | Op::Merge { issue_id } => issue_id,
         }
@@ -170,6 +189,16 @@ impl Op {
             Op::SetAssignee { assignee, .. } => {
                 s.push_str("Jjf-Assignee: ");
                 s.push_str(assignee.as_deref().unwrap_or(""));
+                s.push('\n');
+            }
+            Op::SetType { kind, .. } => {
+                s.push_str("Jjf-Type: ");
+                s.push_str(kind.as_str());
+                s.push('\n');
+            }
+            Op::SetSlug { slug, .. } => {
+                s.push_str("Jjf-Slug: ");
+                s.push_str(slug.as_deref().unwrap_or(""));
                 s.push('\n');
             }
             Op::CommentAdd { comment_id, .. } => {

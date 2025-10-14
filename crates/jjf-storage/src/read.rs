@@ -39,7 +39,7 @@ use crate::jj::JjRepo;
 #[cfg(any(debug_assertions, test))]
 use crate::op::Op;
 #[cfg(any(debug_assertions, test))]
-use crate::record::Status;
+use crate::record::{IssueType, Status};
 use crate::record::{Comment, Issue, IssueRecord};
 #[cfg(debug_assertions)]
 use crate::trailer::parse_ops;
@@ -90,8 +90,10 @@ pub(crate) fn read(repo: &JjRepo, id: &IssueId) -> Result<Issue> {
     Ok(Issue {
         id: record.id,
         title: record.title,
+        slug: record.slug,
         body: record.body,
         status: record.status,
+        type_: record.type_,
         // Defensive re-sort — writer guarantees sorted, but the merge
         // driver may emit unioned arrays.
         labels: {
@@ -172,6 +174,11 @@ fn read_comments(repo: &JjRepo, id: &IssueId) -> Result<Vec<Comment>> {
 struct OpView {
     id: IssueId,
     title: String,
+    /// Latest slug seen in a `set-slug` op. `None` means either no
+    /// slug op was ever applied, OR the most recent slug op cleared
+    /// it (`Op::SetSlug { slug: None }`). The cross-check matches
+    /// this against the file's `slug` field directly.
+    slug: Option<String>,
     /// `Some(hash)` if a `set-body` op was applied; `None` if the issue
     /// was only ever touched by `create` (whose op chain has no body
     /// hash — the create-time body is in the JSON record). We use this
@@ -179,6 +186,10 @@ struct OpView {
     /// the check otherwise.
     body_hash: Option<String>,
     status: Status,
+    /// Latest type seen in a `set-type` op, or `Unspecified` if no
+    /// type op was applied (the v2.1-default for any chain that
+    /// predates the new field).
+    type_: IssueType,
     labels: Vec<String>,
     dependencies: Vec<IssueId>,
     assignee: Option<String>,
@@ -267,8 +278,10 @@ fn apply_op(view: &mut Option<OpView>, op: Op) {
             *view = Some(OpView {
                 id: issue_id,
                 title,
+                slug: None,
                 body_hash: None,
                 status,
+                type_: IssueType::Unspecified,
                 labels: Vec::new(),
                 dependencies: Vec::new(),
                 assignee: None,
@@ -301,6 +314,8 @@ fn apply_op(view: &mut Option<OpView>, op: Op) {
                 }
                 Op::DepRm { dep, .. } => v.dependencies.retain(|d| d != &dep),
                 Op::SetAssignee { assignee, .. } => v.assignee = assignee,
+                Op::SetType { kind, .. } => v.type_ = kind,
+                Op::SetSlug { slug, .. } => v.slug = slug,
                 Op::CommentAdd { comment_id, .. } => v.comment_ids.push(comment_id),
                 Op::Merge { .. } => {
                     // No structural change; the merge driver records
@@ -399,6 +414,26 @@ fn cross_check(record: &IssueRecord, comments: &[Comment], op_view: &OpView) {
         )
     );
 
+    assert_eq!(
+        record.type_, op_view.type_,
+        "{}",
+        mismatch(
+            "type",
+            format!("{:?}", record.type_),
+            format!("{:?}", op_view.type_)
+        )
+    );
+
+    assert_eq!(
+        record.slug, op_view.slug,
+        "{}",
+        mismatch(
+            "slug",
+            format!("{:?}", record.slug),
+            format!("{:?}", op_view.slug)
+        )
+    );
+
     // Body: only check when a `set-body` op recorded a hash. The
     // create-only path leaves the body unmolested in the file but
     // doesn't carry a hash op (spec §5.2 lists `set-body` but no
@@ -485,8 +520,10 @@ mod tests {
         let mut view = Some(OpView {
             id: id("aa6600b"),
             title: "t".into(),
+            slug: None,
             body_hash: None,
             status: Status::Open,
+            type_: IssueType::Unspecified,
             labels: Vec::new(),
             dependencies: Vec::new(),
             assignee: None,

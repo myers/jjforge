@@ -21,7 +21,7 @@
 
 use crate::id::IssueId;
 use crate::op::Op;
-use crate::record::Status;
+use crate::record::{IssueType, Status};
 
 /// A parsed op stanza plus its trailer-level metadata.
 ///
@@ -188,6 +188,23 @@ fn stanza_to_op(stanza: &[(&str, &str)], id: &IssueId) -> Option<Op> {
             Op::SetAssignee {
                 issue_id,
                 assignee: if v.is_empty() { None } else { Some(v) },
+            }
+        }
+        "set-type" => {
+            // Unknown values (a future variant we haven't taught this
+            // build about) fall through to the unknown-op-type branch
+            // below — same forward-compat tolerance spec §5.2 mandates.
+            let v = get("Jjf-Type")?;
+            Op::SetType {
+                issue_id,
+                kind: IssueType::parse_wire(&v)?,
+            }
+        }
+        "set-slug" => {
+            let v = get("Jjf-Slug").unwrap_or_default();
+            Op::SetSlug {
+                issue_id,
+                slug: if v.is_empty() { None } else { Some(v) },
             }
         }
         "comment-add" => Op::CommentAdd {

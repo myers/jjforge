@@ -41,8 +41,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use jjf_storage::{
-    ISSUES_BOOKMARK, Error as StorageError, IdError, Issue, IssueDraft, IssueId, Status,
-    Storage, UpdateFields,
+    ISSUES_BOOKMARK, Error as StorageError, IdError, Issue, IssueDraft, IssueId, IssueType,
+    SlugInvalidReason, Status, Storage, UpdateFields,
 };
 
 /// Top-level CLI shape. Subcommands live on the `Commands` enum; the
@@ -95,6 +95,32 @@ impl From<StatusArg> for Status {
     }
 }
 
+/// Clap-side mirror of [`jjf_storage::IssueType`] (less the
+/// `Unspecified` variant — the operator picks one of the named types
+/// with `--type`, and omitting the flag leaves the field at its
+/// `Unspecified` default). Same crate-isolation rationale as
+/// `StatusArg`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TypeArg {
+    Bug,
+    Feature,
+    Epic,
+    Research,
+    Roadmap,
+}
+
+impl From<TypeArg> for IssueType {
+    fn from(t: TypeArg) -> Self {
+        match t {
+            TypeArg::Bug => IssueType::Bug,
+            TypeArg::Feature => IssueType::Feature,
+            TypeArg::Epic => IssueType::Epic,
+            TypeArg::Research => IssueType::Research,
+            TypeArg::Roadmap => IssueType::Roadmap,
+        }
+    }
+}
+
 /// Every verb the epic body (`c4f7fcb`) calls out, plus `init`. Stubs
 /// exist so `--help` lists the full surface from day one; later
 /// per-verb tickets replace the stubs with real implementations.
@@ -133,6 +159,19 @@ enum Commands {
         /// (creates a record with `assignee: null`).
         #[arg(short = 'a', long)]
         assignee: Option<String>,
+
+        /// Set the coarse issue type. Optional; omit to leave the
+        /// type at `unspecified`. One of `bug`, `feature`, `epic`,
+        /// `research`, `roadmap`.
+        #[arg(long, value_enum)]
+        r#type: Option<TypeArg>,
+
+        /// Set the kebab-case slug (orientation handle). Optional;
+        /// omit to leave the field empty. Validated per spec v2.1
+        /// §3.1; collision with an existing OPEN issue's slug is a
+        /// preflight failure (exit 2).
+        #[arg(long)]
+        slug: Option<String>,
     },
 
     /// Print a single issue from the `issues` bookmark — title,
@@ -141,10 +180,11 @@ enum Commands {
     /// verbatim (no envelope — the issue IS the payload). Requires
     /// `jjf init` to have been run first.
     Show {
-        /// Full 7-char hex issue id. Prefix lookup isn't supported yet
-        /// (the storage layer is full-id-only); a bad id is a
-        /// preflight failure (exit 2), a valid id that doesn't exist
-        /// at the bookmark tip is a runtime failure (exit 1).
+        /// Issue handle (7-char hex id OR a slug). Slugs resolve
+        /// across both open and closed issues. A handle that's
+        /// neither a parseable id nor a known slug is exit 2
+        /// (`slug_not_found`); a parseable id with no matching
+        /// record on the bookmark is exit 1 (`issue_not_found`).
         id: String,
     },
 
@@ -166,6 +206,18 @@ enum Commands {
         /// must carry every listed label to match.
         #[arg(short = 'l', long = "label")]
         labels: Vec<String>,
+
+        /// Filter by issue type. Repeatable. Semantics: OR — an
+        /// issue matches if its type equals any of the listed
+        /// types. Omit the flag to include every type.
+        #[arg(long = "type", value_enum)]
+        types: Vec<TypeArg>,
+
+        /// Filter by slug substring (case-sensitive). An issue
+        /// matches if its `slug` field contains the pattern.
+        /// Issues with no slug never match.
+        #[arg(long)]
+        slug: Option<String>,
     },
 
     /// Mutate one or more scalar fields of an issue in a single commit.
@@ -188,8 +240,9 @@ enum Commands {
     /// use the standalone verbs for the single-shot ergonomic path,
     /// this verb for the multi-field case.
     Update {
-        /// Full 7-char hex issue id. Bad parse → exit 2; valid id
-        /// that doesn't exist on the bookmark → exit 1.
+        /// Issue handle (7-char hex id OR a slug). Resolved via
+        /// `Storage::resolve` — a bad id-or-slug surfaces as exit 2,
+        /// a valid one that doesn't exist on the bookmark is exit 1.
         id: String,
 
         /// Replace the title. Must be non-empty (after trim) at the
@@ -200,6 +253,22 @@ enum Commands {
         /// Replace the status. Use `open` or `closed`.
         #[arg(long, value_enum)]
         status: Option<StatusArg>,
+
+        /// Replace the issue type. One of `bug`, `feature`, `epic`,
+        /// `research`, `roadmap`.
+        #[arg(long = "type", value_enum)]
+        r#type: Option<TypeArg>,
+
+        /// Replace the slug. Validated per spec v2.1 §3.1; collision
+        /// with another open issue is exit 2. Mutually exclusive
+        /// with `--unset-slug`.
+        #[arg(long, conflicts_with = "unset_slug")]
+        slug: Option<String>,
+
+        /// Clear the slug (writes `null`). Mutually exclusive with
+        /// `--slug`.
+        #[arg(long = "unset-slug")]
+        unset_slug: bool,
 
         /// Replace the body. Source is a path, or `-` to read stdin.
         /// Mirrors the `cli-new` / `cli-comment` body-source convention;
@@ -445,6 +514,15 @@ enum CliError {
     /// A positional issue id (e.g. `jjf show <id>`) didn't parse as
     /// a valid `IssueId`. Preflight failure (exit 2) — the user typed
     /// something the storage layer can never resolve.
+    ///
+    /// **As of v2.1 (`issue-type-and-slug-fields`)** every id-taking
+    /// verb routes through `Storage::resolve`, which falls through to
+    /// a slug lookup before declaring failure — so a bad-shape input
+    /// now surfaces as `SlugNotFound` (the operator might have meant
+    /// a slug). The variant stays defined for `--dep` parsing (where
+    /// only ids are accepted) and for shape stability in the error
+    /// kind table; the positional-id path no longer constructs it.
+    #[allow(dead_code)]
     #[error("invalid issue id {value:?}: {error}")]
     BadIssueId { value: String, error: IdError },
 
@@ -604,6 +682,40 @@ enum CliError {
     #[allow(dead_code)]
     #[error("merge driver does not handle conflicted comment file for issue {issue_id} (v1 limitation)\nworking copy left with conflict markers for manual resolution")]
     CommentFileConflict { issue_id: String },
+
+    /// `jjf update --slug` / `jjf new --slug` was handed a slug that
+    /// failed validation (charset, length, hyphen rules). Preflight
+    /// failure (exit 2). The `reason` field is the typed
+    /// rejection variant; `slug` is what the operator supplied.
+    #[error("invalid slug {slug:?}: {reason}")]
+    InvalidSlug {
+        slug: String,
+        reason: SlugInvalidReason,
+    },
+
+    /// A slug write would collide with an existing open issue.
+    /// Preflight failure (exit 2). `conflicts_with` is the id of
+    /// the open issue already holding the slug.
+    ///
+    /// In practice the storage layer's `Error::SlugCollision`
+    /// surfaces this case — the CLI-side variant stays defined so
+    /// that future callers can construct it directly without going
+    /// through `Storage` (e.g. if the CLI grows pre-flight
+    /// uniqueness checks).
+    #[allow(dead_code)]
+    #[error(
+        "slug {slug:?} already in use by open issue {conflicts_with}"
+    )]
+    SlugCollision {
+        slug: String,
+        conflicts_with: String,
+    },
+
+    /// `Storage::resolve` couldn't translate the handle the operator
+    /// supplied: it wasn't a parseable 7-hex id and no open-or-closed
+    /// issue carries that slug. Preflight failure (exit 2).
+    #[error("no issue with handle {handle:?}")]
+    SlugNotFound { handle: String },
 }
 
 impl CliError {
@@ -615,6 +727,9 @@ impl CliError {
     fn exit_code(&self) -> u8 {
         match self {
             CliError::Storage(StorageError::NotAJjRepo(_)) => 2,
+            CliError::Storage(StorageError::InvalidSlug { .. }) => 2,
+            CliError::Storage(StorageError::SlugCollision { .. }) => 2,
+            CliError::Storage(StorageError::SlugNotFound { .. }) => 2,
             CliError::Cwd(_) => 2,
             CliError::BodyRead { .. } => 2,
             CliError::BadDepId { .. } => 2,
@@ -627,6 +742,9 @@ impl CliError {
             CliError::RemoteAlreadyExists(_) => 2,
             CliError::RemoteNotFound(_) => 2,
             CliError::SelfHostedWriteRefused { .. } => 2,
+            CliError::InvalidSlug { .. } => 2,
+            CliError::SlugCollision { .. } => 2,
+            CliError::SlugNotFound { .. } => 2,
             CliError::Probe(_) => 1,
             CliError::JjGitRemote(_) => 1,
             // Sync verbs: the user typed a well-formed command; the
@@ -663,6 +781,12 @@ impl CliError {
             CliError::Storage(StorageError::Io(_)) => "io_error",
             CliError::Storage(StorageError::Json(_)) => "json_error",
             CliError::Storage(StorageError::Jj(_)) => "jj_error",
+            CliError::Storage(StorageError::InvalidSlug { .. }) => "invalid_slug",
+            CliError::Storage(StorageError::SlugCollision { .. }) => "slug_collision",
+            CliError::Storage(StorageError::SlugNotFound { .. }) => "slug_not_found",
+            CliError::InvalidSlug { .. } => "invalid_slug",
+            CliError::SlugCollision { .. } => "slug_collision",
+            CliError::SlugNotFound { .. } => "slug_not_found",
             CliError::Cwd(_) => "cwd_error",
             CliError::BodyRead { .. } => "body_read_error",
             CliError::BadDepId { .. } => "bad_id",
@@ -728,6 +852,18 @@ impl CliError {
                 json!({ "issue_id": issue_id, "detail": detail })
             }
             CliError::CommentFileConflict { issue_id } => json!({ "issue_id": issue_id }),
+            CliError::Storage(StorageError::InvalidSlug { slug, reason })
+            | CliError::InvalidSlug { slug, reason } => {
+                json!({ "slug": slug, "reason": reason.as_str() })
+            }
+            CliError::Storage(StorageError::SlugCollision { slug, conflicts_with }) => {
+                json!({ "slug": slug, "conflicts_with": conflicts_with.as_str() })
+            }
+            CliError::SlugCollision { slug, conflicts_with } => {
+                json!({ "slug": slug, "conflicts_with": conflicts_with })
+            }
+            CliError::Storage(StorageError::SlugNotFound { handle })
+            | CliError::SlugNotFound { handle } => json!({ "handle": handle }),
             _ => serde_json::Value::Null,
         }
     }
@@ -802,9 +938,16 @@ fn run(cli: Cli) -> Result<(), CliError> {
             labels,
             deps,
             assignee,
-        } => run_new(cli.json, title, file, labels, deps, assignee),
+            r#type,
+            slug,
+        } => run_new(cli.json, title, file, labels, deps, assignee, r#type, slug),
         Commands::Show { id } => run_show(cli.json, id),
-        Commands::Ls { status, labels } => run_ls(cli.json, status, labels),
+        Commands::Ls {
+            status,
+            labels,
+            types,
+            slug,
+        } => run_ls(cli.json, status, labels, types, slug),
         Commands::Close { id } => run_set_status(cli.json, id, Status::Closed),
         Commands::Open { id } => run_set_status(cli.json, id, Status::Open),
         Commands::Comment { id, file, author } => run_comment(cli.json, id, file, author),
@@ -825,6 +968,9 @@ fn run(cli: Cli) -> Result<(), CliError> {
             id,
             title,
             status,
+            r#type,
+            slug,
+            unset_slug,
             body_file,
             assignee,
             unset_assignee,
@@ -833,6 +979,9 @@ fn run(cli: Cli) -> Result<(), CliError> {
             id,
             title,
             status,
+            r#type,
+            slug,
+            unset_slug,
             body_file,
             assignee,
             unset_assignee,
@@ -896,6 +1045,8 @@ fn run_new(
     labels: Vec<String>,
     deps: Vec<String>,
     assignee: Option<String>,
+    type_arg: Option<TypeArg>,
+    slug: Option<String>,
 ) -> Result<(), CliError> {
     // 1. Parse dep ids first — purely-local validation, no IO.
     let deps: Vec<IssueId> = deps
@@ -909,6 +1060,19 @@ fn run_new(
     // bytes; omitted is empty. We deliberately preserve raw bytes — no
     // trim, no newline normalization — so round-trip stays exact.
     let body = read_body(file.as_deref())?;
+
+    // 2b. Pre-validate the slug at the CLI boundary so the user gets
+    // a typed exit-2 error before any IO kicks off. Storage will
+    // re-validate; the duplicate is cheap and the early surface is
+    // the friendlier hint.
+    if let Some(slug) = &slug {
+        if let Err(reason) = jjf_storage::validate_slug(slug) {
+            return Err(CliError::InvalidSlug {
+                slug: slug.clone(),
+                reason,
+            });
+        }
+    }
 
     // 3. Resolve the cwd as an absolute path. `Storage::open` requires
     // absolute; we canonicalize so symlinks in the path don't bite us.
@@ -940,6 +1104,8 @@ fn run_new(
         labels,
         dependencies: deps,
         assignee,
+        type_: type_arg.map(IssueType::from),
+        slug,
     };
     let id = storage.create_issue(&draft)?;
 
@@ -955,6 +1121,31 @@ fn run_new(
         println!("{id}");
     }
     Ok(())
+}
+
+/// Resolve a user-supplied handle (`id`-or-`slug`) to a concrete
+/// [`IssueId`] using the open `Storage`. The CLI calls this at the
+/// boundary of every id-taking verb (`show`, `update`, `close`,
+/// `open`, `label add|rm`, `comment`).
+///
+/// Behavior:
+///
+/// - If `handle` parses as an `IssueId` (7-char lowercase hex),
+///   return it directly with no bookmark lookup.
+/// - Else, walk the bookmark and return the id whose slug matches.
+///   If no slug matches, surface as `CliError::SlugNotFound` (exit 2).
+///
+/// We deliberately don't pre-check `IssueId::parse` here: a string
+/// that's a 7-hex id but contains no slug-shaped characters will
+/// return immediately; everything else proceeds to the storage-side
+/// resolver. This keeps the CLI surface single-shape ("hand the
+/// operator's string in, get an id out") and avoids fragmenting the
+/// id-vs-slug logic across both layers.
+fn resolve_handle(storage: &Storage, handle: &str) -> Result<IssueId, CliError> {
+    storage.resolve(handle).map_err(|e| match e {
+        StorageError::SlugNotFound { handle } => CliError::SlugNotFound { handle },
+        other => CliError::Storage(other),
+    })
 }
 
 /// Read the issue body per the `-F` flag's contract.
@@ -994,25 +1185,22 @@ fn read_body(file: Option<&Path>) -> Result<String, CliError> {
 /// the user typed something well-formed, we tried to honor it, and
 /// the answer is "no such issue at the bookmark tip."
 fn run_show(json: bool, id: String) -> Result<(), CliError> {
-    // 1. Parse the id — purely-local validation, no IO. A typo here
-    // is a preflight failure (exit 2), distinct from "valid id that
-    // doesn't exist" (exit 1).
-    let issue_id =
-        IssueId::parse(&id).map_err(|error| CliError::BadIssueId { value: id, error })?;
-
-    // 2. Resolve the cwd. `Storage::open` wants an absolute path;
+    // 1. Resolve the cwd. `Storage::open` wants an absolute path;
     // canonicalize so symlinks don't bite.
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
 
-    // 3. Preflight the same checks the write path runs. `run jjf
+    // 2. Preflight the same checks the write path runs. `run jjf
     // init first` is the right error when the bookmark is missing,
     // not a raw jj-stderr.
     preflight::issues_bookmark(&cwd)?;
 
+    // 3. Open storage and resolve the handle (`id`-or-`slug`).
+    let storage = Storage::open(&cwd)?;
+    let issue_id = resolve_handle(&storage, &id)?;
+
     // 4. Hand off to storage. `IssueNotFound` flows out as a `Storage`
     // variant of `CliError`, which `exit_code` maps to 1.
-    let storage = Storage::open(&cwd)?;
     let issue = storage.read(&issue_id)?;
 
     // 5. Render.
@@ -1040,6 +1228,13 @@ fn print_issue_plain(issue: &Issue) {
     };
     println!("{}  [{}]", issue.id, status);
     println!("{}", issue.title);
+    // type + slug rendered alongside the rest of the header. type
+    // shows the lowercase wire spelling (matches CLI flag values
+    // and storage trailers); slug renders as `(none)` when null so
+    // it mirrors the other Optional fields' presentation.
+    println!("type: {}", issue.type_.as_str());
+    let slug = issue.slug.as_deref().unwrap_or("(none)");
+    println!("slug: {slug}");
     let labels = if issue.labels.is_empty() {
         "(none)".to_owned()
     } else {
@@ -1104,23 +1299,21 @@ fn print_issue_plain(issue: &Issue) {
 /// storage. A well-formed id that doesn't exist on the bookmark
 /// surfaces as `IssueNotFound` and exits 1.
 fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError> {
-    // 1. Parse the id. Same exit-2 rule as `show`.
-    let issue_id =
-        IssueId::parse(&id).map_err(|error| CliError::BadIssueId { value: id, error })?;
-
-    // 2. Resolve + canonicalize cwd.
+    // 1. Resolve + canonicalize cwd.
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
 
-    // 3. Preflight: refuse to run from the jjforge source repo
+    // 2. Preflight: refuse to run from the jjforge source repo
     // (colocate drift guard). See `preflight::refuse_self_hosted_write`.
     preflight::refuse_self_hosted_write(&cwd, json)?;
 
-    // 4. Preflight: jj repo + `issues` bookmark present.
+    // 3. Preflight: jj repo + `issues` bookmark present.
     preflight::issues_bookmark(&cwd)?;
 
-    // 5. Hand off to storage.
+    // 4. Open storage, resolve the handle (`id`-or-`slug`), then
+    // hand off the mutation.
     let storage = Storage::open(&cwd)?;
+    let issue_id = resolve_handle(&storage, &id)?;
     storage.set_status(&issue_id, status)?;
 
     // 5. Render. The plain-text shape (`closed <id>` / `opened <id>`)
@@ -1169,11 +1362,7 @@ fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError
 /// absent), then hand off to storage. A well-formed id that doesn't
 /// exist on the bookmark surfaces as `IssueNotFound` and exits 1.
 fn run_label(json: bool, id: String, label: String, op: LabelOp) -> Result<(), CliError> {
-    // 1. Parse the id. Same exit-2 rule as `show` / `close`.
-    let issue_id =
-        IssueId::parse(&id).map_err(|error| CliError::BadIssueId { value: id, error })?;
-
-    // 2. Reject empty labels at the CLI layer — storage doesn't
+    // 1. Reject empty labels at the CLI layer — storage doesn't
     // validate. We trim before the check because a whitespace-only
     // label is almost certainly the same shell-quoting mistake an
     // empty one would be.
@@ -1181,20 +1370,20 @@ fn run_label(json: bool, id: String, label: String, op: LabelOp) -> Result<(), C
         return Err(CliError::EmptyLabel);
     }
 
-    // 3. Resolve + canonicalize cwd.
+    // 2. Resolve + canonicalize cwd.
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
 
-    // 4. Preflight: refuse to run from the jjforge source repo
+    // 3. Preflight: refuse to run from the jjforge source repo
     // (colocate drift guard). See `preflight::refuse_self_hosted_write`.
     preflight::refuse_self_hosted_write(&cwd, json)?;
 
-    // 5. Preflight: jj repo + `issues` bookmark present.
+    // 4. Preflight: jj repo + `issues` bookmark present.
     preflight::issues_bookmark(&cwd)?;
 
-    // 6. Hand off to storage. The two mutators have the same signature
-    // (`&IssueId, &str -> Result<()>`); branch on the action enum.
+    // 5. Open storage, resolve handle (`id`-or-`slug`), then hand off.
     let storage = Storage::open(&cwd)?;
+    let issue_id = resolve_handle(&storage, &id)?;
     match op {
         LabelOp::Add => storage.add_label(&issue_id, &label)?,
         LabelOp::Rm => storage.remove_label(&issue_id, &label)?,
@@ -1403,22 +1592,26 @@ fn run_update(
     id: String,
     title: Option<String>,
     status: Option<StatusArg>,
+    type_arg: Option<TypeArg>,
+    slug: Option<String>,
+    unset_slug: bool,
     body_file: Option<PathBuf>,
     assignee: Option<String>,
     unset_assignee: bool,
 ) -> Result<(), CliError> {
-    // 1. Parse the id. Same exit-2 rule as `show` / `close` / `label`.
-    let issue_id =
-        IssueId::parse(&id).map_err(|error| CliError::BadIssueId { value: id, error })?;
-
-    // 2. Build the `UpdateFields` bundle from the flag matrix. The
+    // 1. Build the `UpdateFields` bundle from the flag matrix. The
     // body-file read is done UP FRONT (before the at-least-one check,
     // and before the bookmark probe) so a bogus `--body-file` path
     // surfaces as a typed `BodyRead` error rather than getting masked
     // by a subsequent failure. `--assignee X` => `Some(Some(X))`;
     // `--unset-assignee` => `Some(None)`; neither => `None` (leave
     // alone) — the storage-side `UpdateFields::assignee` is double-
-    // wrapped exactly to express this three-way distinction.
+    // wrapped exactly to express this three-way distinction. The
+    // same shape applies to `--slug` / `--unset-slug` and to
+    // `--type` (which has no unset variant; setting it to a value
+    // is the only path, since omitting it leaves the field alone
+    // and a `--type unspecified` request collapses to a `Some(None)`
+    // wrapper that storage maps back to the default).
     let body = match body_file.as_deref() {
         Some(path) => Some(read_body(Some(path))?),
         None => None,
@@ -1428,14 +1621,32 @@ fn run_update(
     } else {
         assignee.map(Some)
     };
+    let slug_field: Option<Option<String>> = if unset_slug {
+        Some(None)
+    } else {
+        slug.map(Some)
+    };
+    // Pre-validate the slug at the CLI boundary so the operator
+    // sees the typed exit-2 error before any IO. Storage will
+    // re-validate.
+    if let Some(Some(slug)) = &slug_field {
+        if let Err(reason) = jjf_storage::validate_slug(slug) {
+            return Err(CliError::InvalidSlug {
+                slug: slug.clone(),
+                reason,
+            });
+        }
+    }
     let fields = UpdateFields {
         title,
+        slug: slug_field,
         status: status.map(Status::from),
+        type_: type_arg.map(|t| Some(IssueType::from(t))),
         body,
         assignee: assignee_field,
     };
 
-    // 3. At-least-one-flag rule. Clap can't enforce this (every flag
+    // 2. At-least-one-flag rule. Clap can't enforce this (every flag
     // is `Option<_>` / `bool`), so we surface a typed exit-2 hint
     // pointing at the available flags. The storage layer would also
     // reject this with `Error::Invalid`, but the CLI message names
@@ -1445,20 +1656,22 @@ fn run_update(
         return Err(CliError::NoUpdateFields);
     }
 
-    // 4. Resolve + canonicalize cwd.
+    // 3. Resolve + canonicalize cwd.
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
 
-    // 5. Preflight: refuse to run from the jjforge source repo
+    // 4. Preflight: refuse to run from the jjforge source repo
     // (colocate drift guard). See `preflight::refuse_self_hosted_write`.
     preflight::refuse_self_hosted_write(&cwd, json)?;
 
-    // 6. Preflight: jj repo + `issues` bookmark present.
+    // 5. Preflight: jj repo + `issues` bookmark present.
     preflight::issues_bookmark(&cwd)?;
 
-    // 7. Hand off to storage. One call lands one commit with N
+    // 6. Open storage, resolve handle (`id`-or-`slug`), then hand off
+    // the multi-field update. One call lands one commit with N
     // trailers.
     let storage = Storage::open(&cwd)?;
+    let issue_id = resolve_handle(&storage, &id)?;
     storage.update(&issue_id, fields.clone())?;
 
     // 7. Render. The list of field names mirrors the populated fields
@@ -1489,8 +1702,14 @@ fn changed_field_names(fields: &UpdateFields) -> Vec<&'static str> {
     if fields.title.is_some() {
         out.push("title");
     }
+    if fields.slug.is_some() {
+        out.push("slug");
+    }
     if fields.status.is_some() {
         out.push("status");
+    }
+    if fields.type_.is_some() {
+        out.push("type");
     }
     if fields.body.is_some() {
         out.push("body");
@@ -1521,11 +1740,7 @@ fn run_comment(
     file: PathBuf,
     author: Option<String>,
 ) -> Result<(), CliError> {
-    // 1. Parse the id. Bad shape → exit 2.
-    let issue_id =
-        IssueId::parse(&id).map_err(|error| CliError::BadIssueId { value: id, error })?;
-
-    // 2. Read the body. `-F -` is stdin; `-F <path>` is the file.
+    // 1. Read the body. `-F -` is stdin; `-F <path>` is the file.
     // Reuse the same helper `run_new` uses so the contract stays
     // consistent across verbs.
     let body = read_body(Some(file.as_path()))?;
@@ -1533,30 +1748,32 @@ fn run_comment(
         return Err(CliError::EmptyCommentBody);
     }
 
-    // 3. Resolve + canonicalize cwd.
+    // 2. Resolve + canonicalize cwd.
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
 
-    // 4. Preflight: refuse to run from the jjforge source repo
+    // 3. Preflight: refuse to run from the jjforge source repo
     // (colocate drift guard). See `preflight::refuse_self_hosted_write`.
     preflight::refuse_self_hosted_write(&cwd, json)?;
 
-    // 5. Preflight: jj repo + `issues` bookmark present. We run this
+    // 4. Preflight: jj repo + `issues` bookmark present. We run this
     // BEFORE author resolution so a non-jj cwd surfaces the typed
     // "not a jj repo" error rather than the (correct but less useful)
     // "no comment author available" — the user almost always wants to
     // hear about the repo problem first.
     preflight::issues_bookmark(&cwd)?;
 
-    // 6. Resolve the author. CLI override wins; otherwise we synthesize
+    // 5. Resolve the author. CLI override wins; otherwise we synthesize
     // `Name <email>` from jj's user config. If neither path yields a
     // non-empty string we bail with a typed hint rather than letting
     // the storage layer surface a generic `Invalid` error.
     let author = resolve_author(author)?;
 
-    // 6. Hand off to storage. `add_comment` returns the freshly-minted
-    // comment id (a 7-hex `IssueId`) for the JSON envelope.
+    // 6. Open storage, resolve handle (`id`-or-`slug`), then hand off.
+    // `add_comment` returns the freshly-minted comment id (a 7-hex
+    // `IssueId`) for the JSON envelope.
     let storage = Storage::open(&cwd)?;
+    let issue_id = resolve_handle(&storage, &id)?;
     let comment_id = storage.add_comment(&issue_id, &body, &author)?;
 
     // 7. Render.
@@ -1649,6 +1866,8 @@ fn run_ls(
     json: bool,
     status: StatusFilter,
     labels: Vec<String>,
+    types: Vec<TypeArg>,
+    slug: Option<String>,
 ) -> Result<(), CliError> {
     // Preflight: cwd is a jj repo AND `issues` bookmark exists. Same
     // order as `run_show` — typed `run jjf init first` message rather
@@ -1659,6 +1878,8 @@ fn run_ls(
 
     let storage = Storage::open(&cwd)?;
     let ids = storage.list_ids()?;
+    let wanted_types: Vec<IssueType> =
+        types.into_iter().map(IssueType::from).collect();
 
     // Read every issue, filter. v1 is read-all; see the doc-comment.
     let mut issues: Vec<Issue> = Vec::with_capacity(ids.len());
@@ -1668,6 +1889,12 @@ fn run_ls(
             continue;
         }
         if !labels_match(&issue, &labels) {
+            continue;
+        }
+        if !types_match(&issue, &wanted_types) {
+            continue;
+        }
+        if !slug_matches(&issue, slug.as_deref()) {
             continue;
         }
         issues.push(issue);
@@ -1726,6 +1953,28 @@ fn status_matches(issue: &Issue, filter: StatusFilter) -> bool {
 /// filter requires the issue to carry EVERY listed label (intersection).
 fn labels_match(issue: &Issue, wanted: &[String]) -> bool {
     wanted.iter().all(|w| issue.labels.iter().any(|l| l == w))
+}
+
+/// `--type` predicate. Empty filter matches every issue. A non-empty
+/// filter requires the issue's type to equal AT LEAST ONE listed
+/// type (union). Mirrors the OR-semantics behavior the ticket calls
+/// out, distinct from `--label`'s AND.
+fn types_match(issue: &Issue, wanted: &[IssueType]) -> bool {
+    wanted.is_empty() || wanted.iter().any(|t| *t == issue.type_)
+}
+
+/// `--slug` predicate. `None` filter matches every issue. A non-`None`
+/// filter requires the issue's `slug` to contain the pattern as a
+/// substring (case-sensitive — slugs are already lowercase). Issues
+/// without a slug never match.
+fn slug_matches(issue: &Issue, pattern: Option<&str>) -> bool {
+    match pattern {
+        None => true,
+        Some(p) => issue
+            .slug
+            .as_deref()
+            .is_some_and(|s| s.contains(p)),
+    }
 }
 
 /// `jjf push <remote>` — shell out to `jj git push --bookmark issues

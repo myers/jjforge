@@ -76,7 +76,7 @@ pub use id::{IdError, IssueId};
 pub use jj::JjError;
 pub use merge_ops::{MergeReport, MergedIssue};
 pub use op::Op;
-pub use record::{Comment, Issue, IssueDraft, IssueRecord, Status};
+pub use record::{Comment, Issue, IssueDraft, IssueRecord, IssueType, Status};
 
 /// Field-update bundle for [`Storage::update`].
 ///
@@ -98,7 +98,9 @@ pub use record::{Comment, Issue, IssueDraft, IssueRecord, Status};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UpdateFields {
     pub title: Option<String>,
+    pub slug: Option<Option<String>>,
     pub status: Option<Status>,
+    pub type_: Option<Option<IssueType>>,
     pub body: Option<String>,
     pub assignee: Option<Option<String>>,
 }
@@ -108,7 +110,9 @@ impl UpdateFields {
     /// Cheap helper so the CLI doesn't have to repeat the pattern.
     pub fn is_empty(&self) -> bool {
         self.title.is_none()
+            && self.slug.is_none()
             && self.status.is_none()
+            && self.type_.is_none()
             && self.body.is_none()
             && self.assignee.is_none()
     }
@@ -137,6 +141,137 @@ pub enum Error {
     /// string-matching stderr.
     #[error("not a jj repo: {0}")]
     NotAJjRepo(PathBuf),
+
+    /// A slug failed the v2.1 validation rules (charset, length,
+    /// hyphen placement). Surfaced from `Storage::create_issue` /
+    /// `Storage::update` whenever a non-`None` slug doesn't pass
+    /// `validate_slug`.
+    #[error("invalid slug {slug:?}: {reason}")]
+    InvalidSlug {
+        slug: String,
+        reason: SlugInvalidReason,
+    },
+
+    /// Two open issues can't share a slug. Surfaced from
+    /// `Storage::create_issue` / `Storage::update` when an attempted
+    /// slug write collides with an existing OPEN issue's slug.
+    /// `conflicts_with` carries the id of the issue already holding
+    /// the slug so the operator can disambiguate. Closed issues
+    /// release their slug; reusing a slug from a closed issue is
+    /// allowed.
+    #[error(
+        "slug {slug:?} already in use by open issue {conflicts_with}"
+    )]
+    SlugCollision {
+        slug: String,
+        conflicts_with: IssueId,
+    },
+
+    /// `Storage::resolve` was handed a string that isn't a valid id
+    /// and doesn't match any open issue's slug. The handle is
+    /// preserved so the CLI's `slug_not_found` error envelope can
+    /// surface the operator-supplied value.
+    #[error("no issue with handle {handle:?}")]
+    SlugNotFound { handle: String },
+}
+
+/// Why a slug failed validation. Each variant maps to one of the
+/// rules in `Storage::validate_slug`; the CLI's JSON error envelope
+/// surfaces the variant name (lowercase snake_case) in
+/// `details.reason` so scripts can branch without parsing the
+/// human message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlugInvalidReason {
+    /// Slug contained characters outside `[a-z0-9-]`.
+    BadCharset,
+    /// Slug was shorter than 3 characters.
+    TooShort,
+    /// Slug was longer than 48 characters.
+    TooLong,
+    /// Slug began with `-`.
+    LeadingHyphen,
+    /// Slug ended with `-`.
+    TrailingHyphen,
+    /// Slug contained `--` (two consecutive hyphens).
+    ConsecutiveHyphens,
+}
+
+impl SlugInvalidReason {
+    /// Stable lowercase snake_case name. Used by the CLI to surface
+    /// the rejection reason in the JSON error envelope.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SlugInvalidReason::BadCharset => "bad_charset",
+            SlugInvalidReason::TooShort => "too_short",
+            SlugInvalidReason::TooLong => "too_long",
+            SlugInvalidReason::LeadingHyphen => "leading_hyphen",
+            SlugInvalidReason::TrailingHyphen => "trailing_hyphen",
+            SlugInvalidReason::ConsecutiveHyphens => "consecutive_hyphens",
+        }
+    }
+}
+
+impl std::fmt::Display for SlugInvalidReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let msg = match self {
+            SlugInvalidReason::BadCharset => {
+                "slug must match [a-z0-9-]+ (no uppercase, no other punctuation)"
+            }
+            SlugInvalidReason::TooShort => "slug must be at least 3 characters",
+            SlugInvalidReason::TooLong => "slug must be at most 48 characters",
+            SlugInvalidReason::LeadingHyphen => "slug must not start with `-`",
+            SlugInvalidReason::TrailingHyphen => "slug must not end with `-`",
+            SlugInvalidReason::ConsecutiveHyphens => {
+                "slug must not contain `--` (consecutive hyphens)"
+            }
+        };
+        f.write_str(msg)
+    }
+}
+
+/// Minimum slug length (inclusive). Spec v2.1 §3.1.
+pub const SLUG_MIN_LEN: usize = 3;
+
+/// Maximum slug length (inclusive). Spec v2.1 §3.1.
+pub const SLUG_MAX_LEN: usize = 48;
+
+/// Validate a slug per spec v2.1 §3.1 rules:
+///
+/// - Charset: `[a-z0-9-]+`.
+/// - Length: `[SLUG_MIN_LEN, SLUG_MAX_LEN]`.
+/// - No leading hyphen.
+/// - No trailing hyphen.
+/// - No two consecutive hyphens.
+///
+/// Returns `Ok(())` if every rule passes; otherwise
+/// `Err(SlugInvalidReason)` for the first rule that fails. Order
+/// of checks: length-too-short (so empty strings get the right
+/// reason rather than the catchall length one), then charset, then
+/// hyphen placement, then length-too-long.
+///
+/// Exposed publicly so the CLI can pre-validate before calling
+/// `Storage::update` — letting the CLI surface a typed exit-2
+/// error rather than the (correct but generic) storage-side bounce.
+pub fn validate_slug(slug: &str) -> std::result::Result<(), SlugInvalidReason> {
+    if slug.len() < SLUG_MIN_LEN {
+        return Err(SlugInvalidReason::TooShort);
+    }
+    if slug.len() > SLUG_MAX_LEN {
+        return Err(SlugInvalidReason::TooLong);
+    }
+    if !slug.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-')) {
+        return Err(SlugInvalidReason::BadCharset);
+    }
+    if slug.starts_with('-') {
+        return Err(SlugInvalidReason::LeadingHyphen);
+    }
+    if slug.ends_with('-') {
+        return Err(SlugInvalidReason::TrailingHyphen);
+    }
+    if slug.contains("--") {
+        return Err(SlugInvalidReason::ConsecutiveHyphens);
+    }
+    Ok(())
 }
 
 /// Convenience alias.
@@ -412,9 +547,39 @@ impl Storage {
     /// Create a new issue from a draft. Returns the freshly-minted
     /// issue ID. Lands one commit on the `issues` bookmark with op
     /// vocabulary `create`.
+    ///
+    /// Validates `draft.slug` per spec v2.1 §3.1 if present
+    /// (`Error::InvalidSlug`); rejects a slug already in use by an
+    /// open issue (`Error::SlugCollision`). Closed issues release
+    /// their slug — reusing a closed issue's slug is allowed.
     pub fn create_issue(&self, draft: &IssueDraft) -> Result<IssueId> {
         if draft.title.trim().is_empty() {
             return Err(Error::Invalid("issue title must not be empty".into()));
+        }
+
+        // Pre-validate the slug, if any, BEFORE the (cheap) id reroll
+        // and the (expensive) uniqueness probe. The first check is
+        // purely local; the second is a list-and-read across every
+        // open issue. The order keeps the cheap rejection cheap.
+        if let Some(slug) = &draft.slug {
+            if let Err(reason) = validate_slug(slug) {
+                return Err(Error::InvalidSlug {
+                    slug: slug.clone(),
+                    reason,
+                });
+            }
+            // Uniqueness across OPEN issues. Spec v2.1: slug
+            // collisions are forbidden among open issues; closed
+            // issues release their slug. The probe reads every open
+            // issue; for v2.1 N is small (the live planner has 10
+            // issues) so a read-all is fine. If N gets meaningfully
+            // bigger a slug-index (separate ticket) is the follow-up.
+            if let Some(conflict) = self.find_open_slug_collision(slug, None)? {
+                return Err(Error::SlugCollision {
+                    slug: slug.clone(),
+                    conflicts_with: conflict,
+                });
+            }
         }
 
         // Reroll on collision. The space is 2^28 ≈ 268M and a repo
@@ -430,12 +595,15 @@ impl Storage {
         };
 
         let now = now_rfc3339()?;
+        let type_ = draft.type_.unwrap_or_default();
         let record = IssueRecord {
             version: 2,
             id: id.clone(),
             title: draft.title.clone(),
+            slug: draft.slug.clone(),
             body: draft.body.clone(),
             status: Status::Open,
+            type_,
             labels: sorted_dedup(&draft.labels),
             dependencies: sorted_dedup_ids(&draft.dependencies),
             assignee: draft.assignee.clone(),
@@ -445,11 +613,16 @@ impl Storage {
 
         // The `create` op trailer (spec §5.2) carries only title +
         // status. Anything else the draft seeds — body, labels,
-        // dependencies, assignee — is recorded as additional ops in
-        // the same commit (spec §5.5 allows multi-op commits). Without
-        // this, the audit chain (and the read-path op-replay) would
-        // miss seed-time fields entirely, and the v1-contract
-        // cross-check would fire on every non-trivial create.
+        // dependencies, assignee, type, slug — is recorded as
+        // additional ops in the same commit (spec §5.5 allows
+        // multi-op commits). Without this, the audit chain (and the
+        // read-path op-replay) would miss seed-time fields entirely,
+        // and the v1-contract cross-check would fire on every
+        // non-trivial create.
+        //
+        // Op order in the create-time multi-op stanza follows the
+        // record's field-declaration order (spec §3.3): slug,
+        // body, type, labels, dependencies, assignee.
         let summary = format!("jjf: issue {} - create", id);
         let mut ops: Vec<Op> = Vec::new();
         ops.push(Op::Create {
@@ -457,10 +630,22 @@ impl Storage {
             title: record.title.clone(),
             status: Status::Open,
         });
+        if let Some(slug) = &record.slug {
+            ops.push(Op::SetSlug {
+                issue_id: id.clone(),
+                slug: Some(slug.clone()),
+            });
+        }
         if !record.body.is_empty() {
             ops.push(Op::SetBody {
                 issue_id: id.clone(),
                 body_hash: sha256_hex(record.body.as_bytes()),
+            });
+        }
+        if record.type_ != IssueType::Unspecified {
+            ops.push(Op::SetType {
+                issue_id: id.clone(),
+                kind: record.type_,
             });
         }
         for label in &record.labels {
@@ -580,6 +765,33 @@ impl Storage {
                 return Err(Error::Invalid("title must not be empty".into()));
             }
         }
+        // Pre-validate the slug, if any, BEFORE the storage-side
+        // mutate dance. We validate the syntactic shape here and the
+        // uniqueness probe runs INSIDE `mutate` (after we've read the
+        // current record), so we know whether the issue is open and
+        // can scope the collision check accordingly.
+        if let Some(Some(slug)) = &fields.slug {
+            if let Err(reason) = validate_slug(slug) {
+                return Err(Error::InvalidSlug {
+                    slug: slug.clone(),
+                    reason,
+                });
+            }
+        }
+        // Slug uniqueness probe: a non-`None` slug write must not
+        // collide with any OTHER open issue's slug. We probe before
+        // entering `mutate` so a collision error fires before any
+        // commit machinery spins up.
+        if let Some(Some(new_slug)) = &fields.slug {
+            if let Some(conflict) =
+                self.find_open_slug_collision(new_slug, Some(id))?
+            {
+                return Err(Error::SlugCollision {
+                    slug: new_slug.clone(),
+                    conflicts_with: conflict,
+                });
+            }
+        }
         let summary = format!("jjf: issue {} - update", id);
         self.mutate(id, &summary, |rec| {
             let mut ops: Vec<Op> = Vec::new();
@@ -590,11 +802,26 @@ impl Storage {
                     title: title.clone(),
                 });
             }
+            if let Some(slug) = &fields.slug {
+                rec.slug = slug.clone();
+                ops.push(Op::SetSlug {
+                    issue_id: rec.id.clone(),
+                    slug: slug.clone(),
+                });
+            }
             if let Some(status) = fields.status {
                 rec.status = status;
                 ops.push(Op::SetStatus {
                     issue_id: rec.id.clone(),
                     status,
+                });
+            }
+            if let Some(type_outer) = fields.type_ {
+                let new_type = type_outer.unwrap_or_default();
+                rec.type_ = new_type;
+                ops.push(Op::SetType {
+                    issue_id: rec.id.clone(),
+                    kind: new_type,
                 });
             }
             if let Some(body) = &fields.body {
@@ -724,6 +951,73 @@ impl Storage {
     /// op-replay view in debug builds — see `read.rs` for the rules.
     pub fn read(&self, id: &IssueId) -> Result<Issue> {
         read::read(&self.repo, id)
+    }
+
+    /// Resolve a user-supplied handle to a concrete `IssueId`.
+    ///
+    /// - If `handle` parses as an `IssueId` (7 lowercase-hex), return
+    ///   that id directly. No bookmark lookup — the id is the
+    ///   authoritative shape; checking existence is the caller's
+    ///   job via `Storage::read`.
+    /// - Otherwise, walk every issue on the bookmark and return the
+    ///   id whose slug matches `handle` exactly. The lookup is
+    ///   exact-match, case-sensitive (slugs are kebab-case
+    ///   lowercase per validation).
+    /// - If no issue's slug matches, return [`Error::SlugNotFound`].
+    ///
+    /// Implementation is read-all-then-match: O(N) over every
+    /// `issues/<id>.json` at the bookmark tip. For v2.1's small N
+    /// this is fine; if it ever proves slow, a slug → id index is
+    /// the follow-up. The match scans both open AND closed issues
+    /// (so the operator can `jjf show <slug>` against a closed
+    /// orientation handle — uniqueness is enforced only across
+    /// OPEN issues at write time).
+    pub fn resolve(&self, handle: &str) -> Result<IssueId> {
+        // Fast path: handle IS an id. We deliberately don't probe
+        // the bookmark here — callers that need the existence check
+        // get it from the subsequent `read` / mutator call.
+        if let Ok(id) = IssueId::parse(handle) {
+            return Ok(id);
+        }
+        // Slow path: scan every issue's slug.
+        for id in self.list_ids()? {
+            let rec = self.read_record_from_bookmark(&id)?;
+            if rec.slug.as_deref() == Some(handle) {
+                return Ok(id);
+            }
+        }
+        Err(Error::SlugNotFound {
+            handle: handle.to_owned(),
+        })
+    }
+
+    /// Probe for a slug collision among OPEN issues. Returns
+    /// `Some(id)` for the offending open issue if any other open
+    /// issue carries this exact slug, `None` if the slug is free.
+    /// `self_id` (if provided) is excluded from the probe — used by
+    /// the update path so re-setting an issue's existing slug
+    /// doesn't self-conflict.
+    ///
+    /// Closed issues do NOT participate: spec v2.1 says closed
+    /// issues release their slug.
+    fn find_open_slug_collision(
+        &self,
+        slug: &str,
+        self_id: Option<&IssueId>,
+    ) -> Result<Option<IssueId>> {
+        for id in self.list_ids()? {
+            if Some(&id) == self_id {
+                continue;
+            }
+            let rec = self.read_record_from_bookmark(&id)?;
+            if rec.status != Status::Open {
+                continue;
+            }
+            if rec.slug.as_deref() == Some(slug) {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
     }
 
     /// Enumerate every issue id present at the `issues` bookmark tip.
@@ -1516,8 +1810,10 @@ mod tests {
             version: 2,
             id: IssueId::parse("aa6600b").unwrap(),
             title: "segfault on empty input".into(),
+            slug: Some("segfault-on-empty-input".into()),
             body: "Running `./app` with no arguments crashes.".into(),
             status: Status::Open,
+            type_: IssueType::Bug,
             labels: vec!["bug".into(), "p1".into()],
             dependencies: vec![],
             assignee: Some("alice".into()),
@@ -1527,11 +1823,15 @@ mod tests {
         let s = serde_json::to_string_pretty(&rec).unwrap();
         let back: IssueRecord = serde_json::from_str(&s).unwrap();
         assert_eq!(back, rec);
-        // Field-ordering check: version must come before id, etc.
+        // Field-ordering check: spec §3.1 / v2.1 — fields appear in
+        // schema order so jj's textual auto-merger has stable diffs.
         let v_idx = s.find("\"version\"").unwrap();
         let id_idx = s.find("\"id\"").unwrap();
         let title_idx = s.find("\"title\"").unwrap();
+        let slug_idx = s.find("\"slug\"").unwrap();
+        let body_idx = s.find("\"body\"").unwrap();
         let status_idx = s.find("\"status\"").unwrap();
+        let type_idx = s.find("\"type\"").unwrap();
         let labels_idx = s.find("\"labels\"").unwrap();
         let deps_idx = s.find("\"dependencies\"").unwrap();
         let assignee_idx = s.find("\"assignee\"").unwrap();
@@ -1539,8 +1839,11 @@ mod tests {
         let updated_idx = s.find("\"updated_at\"").unwrap();
         assert!(v_idx < id_idx);
         assert!(id_idx < title_idx);
-        assert!(title_idx < status_idx);
-        assert!(status_idx < labels_idx);
+        assert!(title_idx < slug_idx);
+        assert!(slug_idx < body_idx);
+        assert!(body_idx < status_idx);
+        assert!(status_idx < type_idx);
+        assert!(type_idx < labels_idx);
         assert!(labels_idx < deps_idx);
         assert!(deps_idx < assignee_idx);
         assert!(assignee_idx < created_idx);
