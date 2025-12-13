@@ -64,6 +64,7 @@ fn make_jj_repo(name: &str) -> PathBuf {
 fn make_initialized_repo(name: &str) -> PathBuf {
     let repo = make_jj_repo(name);
     let out = Command::new(JJF_BIN)
+        .env("JJF_ALLOW_SELF_HOST", "1")
         .arg("init")
         .current_dir(&repo)
         .output()
@@ -79,6 +80,7 @@ fn make_initialized_repo(name: &str) -> PathBuf {
 
 fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
     Command::new(JJF_BIN)
+        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(args)
         .current_dir(cwd)
         .output()
@@ -87,6 +89,7 @@ fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
 
 fn run_jjf_with_stdin(cwd: &Path, args: &[&str], stdin_bytes: &[u8]) -> Output {
     let mut child = Command::new(JJF_BIN)
+        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -526,6 +529,7 @@ fn label_rm_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
 fn label_help_documents_subcommands() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = Command::new(JJF_BIN)
+        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(["label", "--help"])
         .current_dir(cwd)
         .output()
@@ -540,6 +544,7 @@ fn label_help_documents_subcommands() {
 fn label_add_help_documents_positionals_and_json() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = Command::new(JJF_BIN)
+        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(["label", "add", "--help"])
         .current_dir(cwd)
         .output()
@@ -555,6 +560,7 @@ fn label_add_help_documents_positionals_and_json() {
 fn label_rm_help_documents_positionals_and_json() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = Command::new(JJF_BIN)
+        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(["label", "rm", "--help"])
         .current_dir(cwd)
         .output()

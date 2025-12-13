@@ -369,19 +369,49 @@ Code and experiments do not.
 ### Operating in a colocated jj+git repo
 
 This repo is colocated (`jj git init --colocate` was run during
-the cutover). `jjf` operations move the jj working copy onto
-the `bugs` bookmark and back — between dispatches it's normal
-for `@` to drift off `main`. After running `jjf <verb>`, if you
-need to write code or docs, run:
+the cutover). The colocate setup creates a footgun: the storage
+layer's 4-CLI write dance moves the jj working copy onto an
+empty descendant of the `bugs` bookmark, which in a colocated
+repo also drives **git** HEAD onto `refs/jj/root` — a phantom
+empty root commit. Recovery is destructive
+(`git symbolic-ref HEAD refs/heads/main && git reset --hard main`)
+and the symptoms (whole tree shows as deleted, `git commit` lands
+on a phantom root) cost two recovery rounds before the guard
+landed.
+
+**The guard.** Per issue `08cf14b`, every mutating `jjf` verb
+(`init`, `new`, `update`, `comment`, `close`, `open`, `label`,
+`push`, `pull`) refuses to run from inside the source repo —
+detected by the presence of both `crates/jjf/Cargo.toml` and
+`docs/storage-format.md` at some ancestor of cwd. The refusal
+is a typed preflight error (`self_hosted_write_refused`, exit 2).
+Read verbs (`show`, `ls`, `remote ls`) pass through unguarded.
+
+**Canonical operator pattern: sibling working dir.** Clone the
+repo into a second location (e.g. `~/p/jjforge-data`), `cd`
+there, and run mutating `jjf` verbs against that sibling. The
+`bugs` bookmark refs live in the underlying git database and
+travel between siblings via `jjf push` / `jjf pull` (or via a
+shared remote). This keeps the source tree's HEAD on `main`
+where the rust workspace expects it.
+
+**Bypass (orchestrator authorized).** When the orchestrator
+*genuinely* needs to write from inside the source repo (e.g. to
+file a status comment on a roadmap ticket as part of a dispatch
+cycle), set `JJF_ALLOW_SELF_HOST=1` in the environment. The
+bypass emits a stderr line announcing itself (text mode only;
+silent under `--json`), and the drift WILL happen — so after the
+mutating verb completes, restore git HEAD:
 
 ```bash
-jj edit main
+git symbolic-ref HEAD refs/heads/main
+git reset --hard main
 ```
 
-to put `@` back on `main` before editing. Otherwise the working
-tree may reflect the empty `bugs` bookmark instead of the
-project tree, and any files you wrote during the drift won't
-end up on `main`.
+Note: `jj edit main` rebases the descendant chain and re-SHAs
+the commits we just landed; **do not** use it as the recovery
+step on the orchestrator's own commits. The git-symbolic-ref +
+reset path is the correct recovery.
 
 ### Dispatch prompt template
 

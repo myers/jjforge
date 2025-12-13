@@ -55,6 +55,7 @@ fn make_jj_repo(name: &str) -> PathBuf {
 /// Run `jjf <args...>` in `cwd`, capture exit/stdout/stderr.
 fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
     Command::new(JJF_BIN)
+        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(args)
         .current_dir(cwd)
         .output()
@@ -247,6 +248,7 @@ fn help_lists_every_epic_verb() {
     // keeps the test reproducible.
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = Command::new(JJF_BIN)
+        .env("JJF_ALLOW_SELF_HOST", "1")
         .arg("--help")
         .current_dir(cwd)
         .output()

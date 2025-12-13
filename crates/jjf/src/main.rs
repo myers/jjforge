@@ -554,6 +554,24 @@ enum CliError {
     #[error("jj git fetch failed: {0}")]
     JjGitFetch(String),
 
+    /// Refused to run a mutating verb from inside the jjforge source
+    /// repo. The colocated jj+git layout means the storage layer's
+    /// 4-CLI write dance moves git HEAD off `main` and onto a phantom
+    /// `refs/jj/root`, leaving the working tree apparently empty
+    /// against the new HEAD — destructive to recover from. Preflight
+    /// failure (exit 2) per the standard exit-code convention; the
+    /// operator can opt in via `JJF_ALLOW_SELF_HOST=1` if they
+    /// genuinely need to write from inside (e.g. orchestration
+    /// loops). See `crates/jjf/src/preflight.rs` for the marker-set
+    /// detection rationale.
+    #[error(
+        "refusing to write from inside the jjforge source repo at {path}; this would drift git HEAD onto refs/jj/root.\nhint: cd to a sibling working dir (e.g. ~/p/jjforge-data) and retry, or set JJF_ALLOW_SELF_HOST=1 to override"
+    )]
+    SelfHostedWriteRefused {
+        path: PathBuf,
+        markers: Vec<String>,
+    },
+
     /// Legacy v1 file-bytes merge driver failure: the bug record's
     /// body field had free-text conflicts the LWW/union policy
     /// couldn't dispatch. Runtime (exit 1). **As of the
@@ -603,6 +621,7 @@ impl CliError {
             CliError::NoUpdateFields => 2,
             CliError::RemoteAlreadyExists(_) => 2,
             CliError::RemoteNotFound(_) => 2,
+            CliError::SelfHostedWriteRefused { .. } => 2,
             CliError::Probe(_) => 1,
             CliError::JjGitRemote(_) => 1,
             // Sync verbs: the user typed a well-formed command; the
@@ -650,6 +669,7 @@ impl CliError {
             CliError::NoUpdateFields => "no_update_fields",
             CliError::RemoteAlreadyExists(_) => "remote_already_exists",
             CliError::RemoteNotFound(_) => "remote_not_found",
+            CliError::SelfHostedWriteRefused { .. } => "self_hosted_write_refused",
             CliError::JjGitRemote(_) => "jj_git_remote_error",
             CliError::Probe(_) => "probe_error",
             CliError::PushNetworkFailure { .. } => "push_network_failure",
@@ -690,6 +710,10 @@ impl CliError {
             }
             CliError::RemoteAlreadyExists(name) => json!({ "name": name }),
             CliError::RemoteNotFound(name) => json!({ "name": name }),
+            CliError::SelfHostedWriteRefused { path, markers } => json!({
+                "path": path.display().to_string(),
+                "markers": markers,
+            }),
             CliError::PushNetworkFailure { remote, .. }
             | CliError::PushAuthFailure { remote, .. }
             | CliError::PushRejected { remote, .. }
@@ -826,6 +850,13 @@ enum LabelOp {
 /// ticket-spec `{"ok": true, "bookmark": "bugs"}`.
 fn run_init(json: bool) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    // Refuse to run from inside the jjforge source repo (colocate
+    // drift guard — see preflight::refuse_self_hosted_write). Init is
+    // a mutating verb: it runs the 4-CLI seed dance, which flips git
+    // HEAD onto refs/jj/root in a colocated repo. `JJF_ALLOW_SELF_HOST=1`
+    // bypasses with a loud stderr line.
+    let cwd_canon = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    preflight::refuse_self_hosted_write(&cwd_canon, json)?;
     Storage::init(&cwd)?;
     if json {
         // We hand-build this object rather than using `serde_json::json!`
@@ -879,7 +910,16 @@ fn run_new(
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
 
-    // 4. Preflight: we're inside a jj repo AND the `bugs` bookmark
+    // 4. Preflight: refuse to run from inside the jjforge source repo
+    // (colocate drift guard — see `preflight::refuse_self_hosted_write`).
+    // Runs FIRST among the preflights so an operator inside the source
+    // tree gets the actionable "use a sibling working dir" message
+    // rather than a generic `MissingBugsBookmark` (when they haven't
+    // run `jjf init` in that scratch dir yet, which is the common case
+    // since `jjf init` is also guarded).
+    preflight::refuse_self_hosted_write(&cwd, json)?;
+
+    // 5. Preflight: we're inside a jj repo AND the `bugs` bookmark
     // exists. The storage layer doesn't distinguish missing-bookmark
     // today (see follow-ups in the cli-new/cli-show closing comments);
     // doing the probe here keeps the user-facing error precise without
@@ -887,7 +927,7 @@ fn run_new(
     // so the read verbs share the same code.
     preflight::bugs_bookmark(&cwd)?;
 
-    // 5. Hand the draft to storage.
+    // 6. Hand the draft to storage.
     let storage = Storage::open(&cwd)?;
     let draft = BugDraft {
         title,
@@ -1066,10 +1106,14 @@ fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
 
-    // 3. Preflight: jj repo + `bugs` bookmark present.
+    // 3. Preflight: refuse to run from the jjforge source repo
+    // (colocate drift guard). See `preflight::refuse_self_hosted_write`.
+    preflight::refuse_self_hosted_write(&cwd, json)?;
+
+    // 4. Preflight: jj repo + `bugs` bookmark present.
     preflight::bugs_bookmark(&cwd)?;
 
-    // 4. Hand off to storage.
+    // 5. Hand off to storage.
     let storage = Storage::open(&cwd)?;
     storage.set_status(&bug_id, status)?;
 
@@ -1135,10 +1179,14 @@ fn run_label(json: bool, id: String, label: String, op: LabelOp) -> Result<(), C
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
 
-    // 4. Preflight: jj repo + `bugs` bookmark present.
+    // 4. Preflight: refuse to run from the jjforge source repo
+    // (colocate drift guard). See `preflight::refuse_self_hosted_write`.
+    preflight::refuse_self_hosted_write(&cwd, json)?;
+
+    // 5. Preflight: jj repo + `bugs` bookmark present.
     preflight::bugs_bookmark(&cwd)?;
 
-    // 5. Hand off to storage. The two mutators have the same signature
+    // 6. Hand off to storage. The two mutators have the same signature
     // (`&BugId, &str -> Result<()>`); branch on the action enum.
     let storage = Storage::open(&cwd)?;
     match op {
@@ -1395,10 +1443,14 @@ fn run_update(
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
 
-    // 5. Preflight: jj repo + `bugs` bookmark present.
+    // 5. Preflight: refuse to run from the jjforge source repo
+    // (colocate drift guard). See `preflight::refuse_self_hosted_write`.
+    preflight::refuse_self_hosted_write(&cwd, json)?;
+
+    // 6. Preflight: jj repo + `bugs` bookmark present.
     preflight::bugs_bookmark(&cwd)?;
 
-    // 6. Hand off to storage. One call lands one commit with N
+    // 7. Hand off to storage. One call lands one commit with N
     // trailers.
     let storage = Storage::open(&cwd)?;
     storage.update(&bug_id, fields.clone())?;
@@ -1479,14 +1531,18 @@ fn run_comment(
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
 
-    // 4. Preflight: jj repo + `bugs` bookmark present. We run this
+    // 4. Preflight: refuse to run from the jjforge source repo
+    // (colocate drift guard). See `preflight::refuse_self_hosted_write`.
+    preflight::refuse_self_hosted_write(&cwd, json)?;
+
+    // 5. Preflight: jj repo + `bugs` bookmark present. We run this
     // BEFORE author resolution so a non-jj cwd surfaces the typed
     // "not a jj repo" error rather than the (correct but less useful)
     // "no comment author available" — the user almost always wants to
     // hear about the repo problem first.
     preflight::bugs_bookmark(&cwd)?;
 
-    // 5. Resolve the author. CLI override wins; otherwise we synthesize
+    // 6. Resolve the author. CLI override wins; otherwise we synthesize
     // `Name <email>` from jj's user config. If neither path yields a
     // non-empty string we bail with a typed hint rather than letting
     // the storage layer surface a generic `Invalid` error.
@@ -1687,6 +1743,12 @@ fn labels_match(bug: &Bug, wanted: &[String]) -> bool {
 fn run_push(json: bool, remote: String) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    // Refuse to run from the jjforge source repo (colocate drift guard).
+    // Push doesn't directly drive the 4-CLI dance, but it's grouped
+    // with the other mutating verbs for consistency and because a
+    // future jj release could move `@` during push (jj has changed
+    // working-copy-touching semantics across versions before).
+    preflight::refuse_self_hosted_write(&cwd, json)?;
     preflight::bugs_bookmark(&cwd)?;
 
     let out = std::process::Command::new("jj")
@@ -1793,6 +1855,11 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
     // an awkward `jjf init` on a clone that already has the bookmark
     // server-side. `push`, by contrast, requires the local bookmark
     // (there's nothing to push without it).
+    //
+    // Refuse to run from the jjforge source repo (colocate drift guard).
+    // Pull can land a merge commit via the 4-CLI dance on divergence;
+    // that path absolutely drifts `@` in a colocated repo.
+    preflight::refuse_self_hosted_write(&cwd, json)?;
     preflight::jj_repo(&cwd)?;
 
     // 1. Fetch. Map known failures the same way push does.

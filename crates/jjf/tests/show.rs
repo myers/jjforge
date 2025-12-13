@@ -57,6 +57,7 @@ fn make_jj_repo(name: &str) -> PathBuf {
 fn make_initialized_repo(name: &str) -> PathBuf {
     let repo = make_jj_repo(name);
     let out = Command::new(JJF_BIN)
+        .env("JJF_ALLOW_SELF_HOST", "1")
         .arg("init")
         .current_dir(&repo)
         .output()
@@ -73,6 +74,7 @@ fn make_initialized_repo(name: &str) -> PathBuf {
 /// Run `jjf <args...>` in `cwd` with no stdin, capture exit/stdout/stderr.
 fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
     Command::new(JJF_BIN)
+        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(args)
         .current_dir(cwd)
         .output()
@@ -82,6 +84,7 @@ fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
 /// Run `jjf <args...>` in `cwd`, piping `stdin_bytes` into stdin.
 fn run_jjf_with_stdin(cwd: &Path, args: &[&str], stdin_bytes: &[u8]) -> Output {
     let mut child = Command::new(JJF_BIN)
+        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -381,6 +384,7 @@ fn show_help_documents_positional_and_json_flag() {
     // Keeps the public surface stable against accidental renames.
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = Command::new(JJF_BIN)
+        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(["show", "--help"])
         .current_dir(cwd)
         .output()

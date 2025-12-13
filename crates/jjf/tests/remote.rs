@@ -56,6 +56,7 @@ fn make_jj_repo(name: &str) -> PathBuf {
 
 fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
     Command::new(JJF_BIN)
+        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(args)
         .current_dir(cwd)
         .output()
@@ -352,6 +353,7 @@ fn remote_verbs_do_not_require_bugs_bookmark() {
 fn remote_help_documents_subcommands() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = Command::new(JJF_BIN)
+        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(["remote", "--help"])
         .current_dir(cwd)
         .output()
@@ -367,6 +369,7 @@ fn remote_help_documents_subcommands() {
 fn remote_add_help_documents_positionals() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = Command::new(JJF_BIN)
+        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(["remote", "add", "--help"])
         .current_dir(cwd)
         .output()
