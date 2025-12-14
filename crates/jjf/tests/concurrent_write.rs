@@ -57,6 +57,30 @@ fn make_jj_repo(name: &str) -> PathBuf {
         .current_dir(&dir)
         .output()
         .expect("spawn jj config set email");
+    // J2: also set repo-local git config — the actor chain now reads
+    // `git config user.name` instead of `jj config get user.name`.
+    // Without this the tests fall through to the dev's ~/.gitconfig and
+    // fail in bare CI where no global git identity is configured.
+    let out = Command::new("git")
+        .args(["config", "user.name", "Test User"])
+        .current_dir(&dir)
+        .output()
+        .expect("spawn git config user.name");
+    assert!(
+        out.status.success(),
+        "git config user.name failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(&dir)
+        .output()
+        .expect("spawn git config user.email");
+    assert!(
+        out.status.success(),
+        "git config user.email failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     dir
 }
 

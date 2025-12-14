@@ -227,7 +227,7 @@ fn claim_actor_flag_overrides_env_and_config() {
     assert_eq!(
         assignee.as_deref(),
         Some("flag-bob"),
-        "--actor flag must win over JJF_ACTOR env and jj config"
+        "--actor flag must win over JJF_ACTOR env and git config"
     );
 }
 
@@ -250,7 +250,7 @@ fn claim_env_used_when_flag_absent() {
     assert_eq!(
         assignee.as_deref(),
         Some("env-alice"),
-        "JJF_ACTOR env must beat jj config when flag is absent"
+        "JJF_ACTOR env must beat git config when flag is absent"
     );
 }
 
@@ -273,7 +273,7 @@ fn claim_config_used_when_flag_and_env_absent() {
     assert_eq!(
         assignee.as_deref(),
         Some("config-user"),
-        "jj config user.name must win when no flag/env override"
+        "git config user.name must win when no flag/env override"
     );
 }
 
@@ -602,10 +602,13 @@ fn claim_uses_git_config_user_name() {
     // --claim with no JJF_ACTOR / --actor: must fall back to git config user.name.
     // Pre-J2 this would fail (jj config has no user.name → NoCurrentUser).
     // Post-J2 this must succeed (git config has "Git Person").
+    // GIT_CONFIG_GLOBAL=/dev/null proves resolution comes from the repo-local
+    // git config specifically, not the dev's ~/.gitconfig — mirrors the
+    // isolation used by claim_all_slots_empty_errors_no_current_user.
     let out = run_jjf_with_env(
         &root,
         &["update", &id, "--claim", "--json"],
-        &[("JJF_ACTOR", None)],
+        &[("JJF_ACTOR", None), ("GIT_CONFIG_GLOBAL", Some("/dev/null"))],
     );
     assert!(
         out.status.success(),
