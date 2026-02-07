@@ -499,6 +499,15 @@ $ jjf new --json -t "agent-ready" --type feature --slug agent-ready
 {"ok":true,"id":"a3f9c01"}
 ```
 
+Seed-time metadata (`--meta key=value`, repeatable). Each pair is
+validated then emitted as a `set-metadata` op on the create commit.
+Bare-key form (`--meta key`) exits 2 with `metadata_filter_malformed`.
+
+```sh
+$ jjf new --json -t "import task" --meta gc.owner=haiku-3 --meta gc.phase=import
+{"ok":true,"id":"a3f9c01"}
+```
+
 Error path — invalid slug (`bad_charset` is one of `bad_charset` /
 `too_short` / `too_long` / `leading_hyphen` / `trailing_hyphen` /
 `consecutive_hyphens`):
@@ -546,6 +555,7 @@ $ jjf show --json a3f9c01
   "status": "open",
   "type": "feature",
   "labels": [],
+  "metadata": {},
   "dependencies": [],
   "assignee": null,
   "comments": [],
@@ -595,7 +605,7 @@ $ jjf ls --json
 Empty result is `[]`, not silence — scripts piping to `jq length`
 get a useful value either way.
 
-Type and slug filters:
+Type, slug, and metadata filters:
 
 - `--type <kind>` — repeatable, OR-semantics across the listed
   types. An issue matches if its `type` field equals any listed
@@ -605,6 +615,10 @@ Type and slug filters:
 - `--parent <H>` — Filter to issues with a `parent-child` dep
   edge to `<H>`. `<H>` is an id or slug. Unknown → exit 2
   (`slug_not_found`).
+- `--meta <key>=<value>` — repeatable, AND-semantics. An issue
+  matches only if its `metadata` map contains every listed
+  `key=value` pair exactly. Bare-key form (`--meta key`) is
+  rejected at preflight: exit 2, `metadata_filter_malformed`.
 
 ```sh
 $ jjf ls --json --type bug --type feature
@@ -612,6 +626,9 @@ $ jjf ls --json --type bug --type feature
 
 $ jjf ls --json --slug agent
 [ ... open issues whose slug contains "agent" ... ]
+
+$ jjf ls --json --meta gc.owner=haiku-3 --meta gc.phase=import
+[ ... open issues where metadata["gc.owner"]=="haiku-3" AND metadata["gc.phase"]=="import" ... ]
 ```
 
 Error path — running outside a jj repo:
@@ -651,6 +668,9 @@ Filters:
 - `--parent <H>` — Filter to issues with a `parent-child` dep
   edge to `<H>`. `<H>` is an id or slug. Unknown → exit 2
   (`slug_not_found`).
+- `--meta <key>=<value>` — repeatable, AND-semantics. Mirrors
+  `jjf ls --meta`. Bare-key form rejected at preflight: exit 2,
+  `metadata_filter_malformed`.
 - `--limit <N>` — truncate to the first N entries AFTER the
   priority sort. Omit for unlimited.
 - `--include-claimed` — also include `in-progress` issues in
@@ -719,11 +739,12 @@ $ jjf search --json "segfault"
 }
 ```
 
-`matched_field` is one of `"title"`, `"body"`, `"comments"`. When
-an issue hits in multiple fields, the most-specific one wins:
-title > body > comments. `score` is the total hit count across
-every searched field (title + body + every comment body, when
-included).
+`matched_field` is one of `"title"`, `"body"`, `"comments"`,
+`"metadata"`. When an issue hits in multiple fields, the
+most-specific one wins: title > body > comments > metadata.
+`score` is the total hit count across every searched field
+(title + body + every comment body + metadata values, when
+their respective include flags are active).
 
 Flags:
 
@@ -740,6 +761,9 @@ Flags:
   (`slug_not_found`).
 - `--include-comments` — also search comment bodies. Off by
   default so the cheap "what mentions X" case stays unambiguous.
+- `--include-metadata` — also search metadata keys and values.
+  Off by default. Matches on the concatenated `"key=value"` form
+  of each entry.
 - `--limit <N>` — cap the result list after the sort. Default
   20. Pass `--limit 0` for unlimited.
 - `--snippet-context <N>` — half-width of the snippet window,
@@ -816,6 +840,7 @@ Flag matrix:
 | `--status <S>` | `open` | Mirrors `ls`'s default. `all` includes closed/abandoned. |
 | `--label <L>` | — | Repeatable, AND across labels. |
 | `--type <T>` | — | Repeatable, OR across types. |
+| `--meta <K>=<V>` | — | Repeatable, AND across key=value pairs. Bare-key rejected: exit 2, `metadata_filter_malformed`. |
 | `--limit <N>` | `0` | `0` == unlimited; mirrors `search`. |
 | `--json` | off | Bare array (NOT envelope); mirrors `ls`. |
 
@@ -973,6 +998,47 @@ Error path — empty label:
 ```sh
 $ jjf label add --json a3f9c01 ""
 {"ok":false,"error":{"kind":"empty_label","message":"label must not be empty"}}
+```
+
+### `metadata set` / `metadata unset`
+
+Mutating verbs — key/value metadata attached to an issue.
+`metadata set` creates or overwrites one key; `metadata unset`
+removes it (no-op if the key doesn't exist).
+
+```sh
+$ jjf metadata set --json a3f9c01 gc.owner haiku-3
+{"ok":true,"id":"a3f9c01","key":"gc.owner","value":"haiku-3","action":"set"}
+
+$ jjf metadata unset --json a3f9c01 gc.owner
+{"ok":true,"id":"a3f9c01","key":"gc.owner","action":"unset"}
+```
+
+`set` envelope fields: `id`, `key`, `value`, `action: "set"`.
+`unset` envelope fields: `id`, `key`, `action: "unset"` — no
+`value` field.
+
+Error path — invalid key (empty, contains `=` or newline, or
+exceeds 128 bytes):
+
+```sh
+$ jjf metadata set --json a3f9c01 "bad=key" val
+{"ok":false,"error":{"kind":"invalid_metadata_key","message":"metadata key must not contain '='","details":{"key":"bad=key"}}}
+```
+
+Error path — invalid value (contains a newline, or exceeds
+4096 bytes):
+
+```sh
+$ jjf metadata set --json a3f9c01 gc.note $'line1\nline2'
+{"ok":false,"error":{"kind":"invalid_metadata_value","message":"metadata value must not contain newlines","details":{"key":"gc.note"}}}
+```
+
+Error path — nonexistent id:
+
+```sh
+$ jjf metadata set --json deadbee gc.owner haiku-3
+{"ok":false,"error":{"kind":"issue_not_found","message":"issue not found in working copy: deadbee","details":{"id":"deadbee"}}}
 ```
 
 ### `remote add`

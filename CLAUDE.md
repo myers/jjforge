@@ -626,6 +626,27 @@ host repo, including jjforge's own source tree. Mutating verbs
 repo without drift; no env-var opt-in, no sibling working dir,
 no HEAD recovery dance.
 
+### Additive field policy
+
+A new field that's empty-by-default and read-tolerant via
+`#[serde(default)]` does NOT bump the record version. Every
+additive field shipped to date follows this rule:
+
+- `priority` (v2.8, additive tolerated)
+- `slug` (v2.1, additive tolerated)
+- `type` (v2.1, additive tolerated)
+- `metadata` (2026-06-29, additive tolerated)
+
+Reserve version bumps for breaking changes — removed fields,
+semantic changes to existing fields, ref-namespace moves. The
+asymmetric-read-tolerance trade-off (older binaries silently
+drop the new field on write-back, losing the data) is the
+explicit cost.
+
+If a peer agent or operator ships a breaking change, that
+DOES bump the version, AND it ships with a migration recipe
+(per any migration documentation).
+
 ### Referring to issues: prefer slugs
 
 When you name an issue in user-facing text — dispatch announcements,

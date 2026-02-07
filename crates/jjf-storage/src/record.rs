@@ -458,6 +458,7 @@ pub struct IssueRecord {
     /// per key. serde-default so pre-metadata records read as an empty
     /// map. Emitted after `labels` (BTreeMap → sorted keys in JSON).
     #[serde(default)]
+    // TODO(41c2e4a): when docs/storage-format.md is revived, add this field to §3.
     pub metadata: std::collections::BTreeMap<String, String>,
     /// Typed dependency edges (spec v2.4). Each edge carries a target
     /// id and a [`DepKind`]. Backward-compat: a v1 record (no kind
