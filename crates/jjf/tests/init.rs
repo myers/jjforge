@@ -18,24 +18,16 @@ use std::process::Command;
 mod common;
 use common::*;
 
-/// Convenience: list the `issues` bookmark via jj, return true if it
-/// exists. We re-implement the storage crate's probe here rather than
-/// import it, so the test exercises observable repo state rather
-/// than the very function we're indirectly testing.
+/// Convenience: check whether the v2 `issues` git branch exists.
+/// Used to assert that v3 `jjf init` does NOT create the old v2
+/// bookmark. Implemented via pure git (no jj — J7).
 fn bugs_bookmark_present(repo: &Path) -> bool {
-    let out = Command::new("jj")
-        .args(["bookmark", "list", "-T", "name ++ \"\\n\"", "issues"])
+    let out = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", "refs/heads/issues"])
         .current_dir(repo)
         .output()
-        .expect("spawn jj");
-    assert!(
-        out.status.success(),
-        "jj bookmark list failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .any(|l| l.trim() == "issues")
+        .expect("spawn git rev-parse");
+    out.status.success()
 }
 
 /// Convenience: does `refs/jjf/meta/format-version` resolve? Used by

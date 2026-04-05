@@ -39,14 +39,35 @@ pub(crate) fn scratch_non_git(name: &str) -> PathBuf {
 
 pub(crate) fn make_jj_repo(name: &str) -> PathBuf {
     let dir = scratch(name);
-    let out = Command::new("jj")
-        .args(["git", "init"])
+    let out = Command::new("git")
+        .arg("init")
         .current_dir(&dir)
         .output()
-        .expect("spawn jj");
+        .expect("spawn git init");
     assert!(
         out.status.success(),
-        "jj git init failed: {}",
+        "git init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Set repo-local identity so verbs that commit have an author.
+    let out = Command::new("git")
+        .args(["config", "user.name", "Test User"])
+        .current_dir(&dir)
+        .output()
+        .expect("spawn git config user.name");
+    assert!(
+        out.status.success(),
+        "git config user.name failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(&dir)
+        .output()
+        .expect("spawn git config user.email");
+    assert!(
+        out.status.success(),
+        "git config user.email failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     dir

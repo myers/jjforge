@@ -21,15 +21,14 @@ use jjf_storage::{
     DepKind, IssueDraft, Status, Storage, UpdateFields,
 };
 
-/// Build a v3-shape scratch repo: a jj+git colocated repo with the
+/// Build a v3-shape scratch repo: a plain git repo with the
 /// `refs/jjf/meta/format-version` sentinel ref planted. `Storage::open`
-/// will detect V3 mode and route every write through the git-only
-/// path.
+/// will detect V3 mode and route every write through the git-only path.
 ///
-/// We plant the sentinel by hand here (one `git commit-tree` + one
-/// `git update-ref`) because ticket `add0646` — the init rewrite —
-/// hasn't landed yet. This emulates what the v2→v3 migrator (ticket
-/// `c14e1c1`) will eventually do for production repos.
+/// J7: switched from `jj git init --colocate` to `git init` — the
+/// shipped binary no longer calls jj, and the tests should not either.
+/// The `Storage::init` call plants the sentinel; we call it via the API
+/// so Storage is the actor (rather than hand-planting the sentinel).
 fn make_v3_scratch_repo(name: &str) -> PathBuf {
     let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -40,66 +39,20 @@ fn make_v3_scratch_repo(name: &str) -> PathBuf {
     }
     fs::create_dir_all(&scratch).unwrap();
     let abs = fs::canonicalize(&scratch).unwrap();
-    // jj git init --colocate gives us BOTH `.git/` and `.jj/`, with
-    // jj's working copy state and git's object database backing the
-    // same repo. This is the production shape jjforge runs against.
-    sh("jj", &["git", "init", "--colocate"], &abs);
-    // Configure git identity locally — `commit-tree` needs an
-    // author. The default `user.name` / `user.email` come from
-    // `~/.gitconfig` in CI; we set them explicitly here so the
-    // test is hermetic.
-    sh(
-        "git",
-        &["config", "user.email", "test@jjforge.invalid"],
-        &abs,
-    );
+    // Plain git init — no jj required (J7).
+    sh("git", &["init"], &abs);
+    // Configure git identity locally — `commit-tree` needs an author.
+    // Set explicitly here so the test is hermetic in CI.
+    sh("git", &["config", "user.email", "test@jjforge.invalid"], &abs);
     sh("git", &["config", "user.name", "jjforge test"], &abs);
 
-    // Plant the v3 sentinel ref. The bytes don't matter to the
-    // detection logic — only the ref's presence — but we emit the
-    // self-describing `version: 3` blob so the ref is informative.
-    plant_v3_sentinel(&abs);
+    // Plant the v3 sentinel ref via Storage::init (the canonical path).
+    Storage::init(&abs).expect("Storage::init must plant the v3 sentinel");
     abs
 }
 
-/// Plant `refs/jjf/meta/format-version` pointing at a parentless
-/// commit whose tree carries a single `version` blob with the bytes
-/// `version: 3\n`.
-fn plant_v3_sentinel(repo: &Path) {
-    // 1. Hash the blob.
-    let blob_oid = git_capture_with_stdin(
-        &["hash-object", "-w", "--stdin"],
-        b"version: 3\n",
-        repo,
-    );
-    let blob_oid = blob_oid.trim();
-    // 2. Build a tree carrying the blob as `version`.
-    let mktree_input = format!("100644 blob {blob_oid}\tversion\n");
-    let tree_oid = git_capture_with_stdin(
-        &["mktree"],
-        mktree_input.as_bytes(),
-        repo,
-    );
-    let tree_oid = tree_oid.trim();
-    // 3. Commit-tree, parentless.
-    let commit_oid = git_capture_with_stdin(
-        &["commit-tree", tree_oid, "-F", "-"],
-        b"jjf: storage format v3 sentinel\n",
-        repo,
-    );
-    let commit_oid = commit_oid.trim();
-    // 4. Plant the ref.
-    sh(
-        "git",
-        &[
-            "update-ref",
-            "refs/jjf/meta/format-version",
-            commit_oid,
-            "0000000000000000000000000000000000000000",
-        ],
-        repo,
-    );
-}
+// J7: plant_v3_sentinel removed — make_v3_scratch_repo now calls
+// Storage::init, which is the canonical sentinel-planting path.
 
 fn sh(prog: &str, args: &[&str], cwd: &Path) {
     let out = Command::new(prog).args(args).current_dir(cwd).output().unwrap();
@@ -126,37 +79,8 @@ fn git_capture(args: &[&str], cwd: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-fn git_capture_with_stdin(args: &[&str], stdin: &[u8], cwd: &Path) -> String {
-    use std::io::Write;
-    use std::process::Stdio;
-    let mut child = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(stdin)
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "`git {}` failed in {}:\nstdout: {}\nstderr: {}",
-        args.join(" "),
-        cwd.display(),
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
 /// `git rev-parse HEAD`, tolerating the "unborn HEAD" state (a
-/// fresh colocated init has HEAD pointing at `refs/heads/main` but
+/// fresh plain git init has HEAD pointing at `refs/heads/main` but
 /// that ref doesn't exist yet — there's no commit). Returns an
 /// empty string in the unborn case. The v3 contract is that
 /// mutations never move HEAD; comparing the value before/after
@@ -182,21 +106,8 @@ fn git_head_symbolic(repo: &Path) -> String {
         .to_owned()
 }
 
-/// jj's notion of `@` (the working-copy change_id). The v3 contract
-/// says the working copy is never touched by writes.
-fn jj_at_change_id(repo: &Path) -> String {
-    let out = Command::new("jj")
-        .args(["log", "-r", "@", "--no-graph", "-T", "change_id.short()"])
-        .current_dir(repo)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "jj log -r @ failed:\nstderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
-}
+// J7: jj_at_change_id removed — plain git repos have no jj working-copy
+// change concept. The git HEAD invariant is sufficient.
 
 /// Resolve a ref to its oid (or empty string if missing).
 fn git_show_ref(repo: &Path, ref_name: &str) -> String {
@@ -237,7 +148,6 @@ fn v3_repo_open_detects_v3_mode_and_writes_via_git_only() {
     let repo = make_v3_scratch_repo("v3_open_then_create_issue");
     let head_before = git_head(&repo);
     let head_sym_before = git_head_symbolic(&repo);
-    let at_before = jj_at_change_id(&repo);
 
     let storage = Storage::open(&repo).expect("Storage::open on v3 repo");
     let id = storage
@@ -283,12 +193,6 @@ fn v3_repo_open_detects_v3_mode_and_writes_via_git_only() {
         head_sym_before,
         "v3 write must not retarget HEAD (drift fingerprint: refs/jj/root)"
     );
-    // jj's @ is also unchanged — the working copy isn't touched.
-    assert_eq!(
-        jj_at_change_id(&repo),
-        at_before,
-        "v3 write must not move the jj working-copy change"
-    );
 }
 
 #[test]
@@ -305,7 +209,6 @@ fn v3_mutate_preserves_head_and_chains_commits() {
     let ref_name = format!("refs/jjf/issues/{id}");
     let after_create = git_show_ref(&repo, &ref_name);
     let head_before = git_head(&repo);
-    let at_before = jj_at_change_id(&repo);
 
     // A scalar mutation lands a new commit on the per-issue ref,
     // with the create commit as parent.
@@ -326,9 +229,8 @@ fn v3_mutate_preserves_head_and_chains_commits() {
         parent_of_status, after_create,
         "v3 mutate must chain: new commit's parent == previous tip"
     );
-    // git HEAD and jj `@` are both pinned through the mutation.
+    // git HEAD is pinned through the mutation.
     assert_eq!(git_head(&repo), head_before);
-    assert_eq!(jj_at_change_id(&repo), at_before);
 
     // The new tip's `issue.json` reflects the set_status mutation.
     let issue_blob = git_blob_at(&repo, &ref_name, "issue.json")
@@ -352,7 +254,6 @@ fn v3_add_comment_writes_comments_jsonl_in_tree() {
     let ref_name = format!("refs/jjf/issues/{id}");
 
     let head_before = git_head(&repo);
-    let at_before = jj_at_change_id(&repo);
 
     let _c1 = storage
         .add_comment(&id, "first comment", "alice")
@@ -374,9 +275,8 @@ fn v3_add_comment_writes_comments_jsonl_in_tree() {
     let line_count = comments_blob.lines().filter(|l| !l.is_empty()).count();
     assert_eq!(line_count, 2, "expected two comment lines in jsonl");
 
-    // HEAD / @ stable through both add_comment calls.
+    // HEAD stable through both add_comment calls.
     assert_eq!(git_head(&repo), head_before);
-    assert_eq!(jj_at_change_id(&repo), at_before);
 }
 
 #[test]
@@ -422,7 +322,6 @@ fn v3_set_and_unset_memory_chain_on_per_memory_ref() {
     let storage = Storage::open(&repo).unwrap();
 
     let head_before = git_head(&repo);
-    let at_before = jj_at_change_id(&repo);
 
     storage.set_memory("dolt-phantoms", "Three places").unwrap();
     let mem_ref = "refs/jjf/memories/dolt-phantoms";
@@ -444,7 +343,6 @@ fn v3_set_and_unset_memory_chain_on_per_memory_ref() {
     );
 
     assert_eq!(git_head(&repo), head_before);
-    assert_eq!(jj_at_change_id(&repo), at_before);
 }
 
 #[test]
@@ -574,20 +472,19 @@ fn v3_concurrent_create_loses_to_cas_failure() {
 // names the kind and any failure points at exactly which kind drifted.
 // ---------------------------------------------------------------------
 
-/// Snapshot of the three identifiers that pin HEAD/working-copy for the
-/// v3 invariant.
+/// Snapshot of the git HEAD identifiers that pin the v3 no-drift invariant.
+/// J7: removed `at_change_id` (jj working-copy concept; plain git repos
+/// have no @). git HEAD is the authoritative drift signal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HeadSnapshot {
     head_oid: String,
     head_sym: String,
-    at_change_id: String,
 }
 
 fn snapshot_head(repo: &Path) -> HeadSnapshot {
     HeadSnapshot {
         head_oid: git_head(repo),
         head_sym: git_head_symbolic(repo),
-        at_change_id: jj_at_change_id(repo),
     }
 }
 
@@ -604,10 +501,6 @@ fn assert_no_drift<F: FnOnce()>(repo: &Path, kind: &str, mutation: F) {
     assert_eq!(
         before.head_sym, after.head_sym,
         "{kind}: git HEAD symbolic target drifted (fingerprint of the v2 dance: refs/jj/root)"
-    );
-    assert_eq!(
-        before.at_change_id, after.at_change_id,
-        "{kind}: jj `@` change id drifted (working copy moved)"
     );
 }
 
@@ -734,10 +627,6 @@ where
     assert_eq!(
         before.head_sym, after.head_sym,
         "{kind}: git HEAD symbolic target drifted"
-    );
-    assert_eq!(
-        before.at_change_id, after.at_change_id,
-        "{kind}: jj `@` change id drifted"
     );
     r
 }

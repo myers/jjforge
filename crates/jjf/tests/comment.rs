@@ -27,42 +27,20 @@ use common::{run_jjf, run_jjf_with_stdin, scratch, scratch_non_git, JJF_BIN};
 
 fn make_jj_repo(name: &str) -> PathBuf {
     let dir = scratch(name);
-    let out = Command::new("jj")
-        .args(["git", "init"])
+    let out = Command::new("git")
+        .arg("init")
         .current_dir(&dir)
         .output()
-        .expect("spawn jj");
+        .expect("spawn git init");
     assert!(
         out.status.success(),
-        "jj git init failed: {}",
+        "git init failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // Make sure the scratch repo has a stable user identity so the
-    // default-author path in `jjf comment` has something to find.
-    // We do this here (rather than relying on the test runner's
-    // environment) so the tests are hermetic.
-    let out = Command::new("jj")
-        .args(["config", "set", "--repo", "user.name", "Test User"])
-        .current_dir(&dir)
-        .output()
-        .expect("spawn jj config set name");
-    assert!(
-        out.status.success(),
-        "jj config set user.name failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let out = Command::new("jj")
-        .args(["config", "set", "--repo", "user.email", "test@example.com"])
-        .current_dir(&dir)
-        .output()
-        .expect("spawn jj config set email");
-    assert!(
-        out.status.success(),
-        "jj config set user.email failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // J2: also set git config so the binary reads identity from git
-    // (the author-resolution chain now calls `git config user.name`).
+    // Set a stable repo-local identity so the default-author path in
+    // `jjf comment` has something to find (the actor chain reads
+    // `git config user.name`; without this, tests fall through to the
+    // dev's ~/.gitconfig, breaking hermetic CI).
     let out = Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(&dir)

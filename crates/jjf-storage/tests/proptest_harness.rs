@@ -69,11 +69,12 @@ use proptest::prelude::*;
 /// names are cheaper than a uuid dep.
 static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Fresh empty jj repo, with `Storage::init` already called to plant
-/// the v3 sentinel. v3-init is two CLI shell-outs total (`jj git init`
-/// + `git update-ref`), an order of magnitude cheaper than the v2
-/// bootstrap-then-migrate path used by `search.rs` / `stale.rs` — and
-/// proptest cases pay this cost N times, so the difference matters.
+/// Fresh empty plain git repo (J7: switched from `jj git init`), with
+/// `Storage::init` already called to plant the v3 sentinel. Setup is
+/// three git CLI calls (`git init` + two `git config`), an order of
+/// magnitude cheaper than the v2 bootstrap-then-migrate path used by
+/// `search.rs` / `stale.rs` — and proptest cases pay this cost N times,
+/// so the difference matters.
 fn fresh_scratch_repo(prefix: &str) -> PathBuf {
     let n = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
@@ -87,7 +88,10 @@ fn fresh_scratch_repo(prefix: &str) -> PathBuf {
     }
     fs::create_dir_all(&scratch).unwrap();
     let abs = fs::canonicalize(&scratch).unwrap();
-    sh("jj", &["git", "init"], &abs);
+    // J7: plain git init — no jj required.
+    sh("git", &["init"], &abs);
+    sh("git", &["config", "user.name", "jjforge test"], &abs);
+    sh("git", &["config", "user.email", "test@jjforge.invalid"], &abs);
     // v3 init contract: zero jj calls, zero bookmarks. The sentinel
     // ref under `refs/jjf/meta/format-version` is the entire setup.
     Storage::init(&abs).unwrap();

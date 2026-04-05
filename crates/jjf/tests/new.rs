@@ -170,9 +170,8 @@ fn new_with_bogus_dep_id_exits_two_and_does_not_write() {
     let repo = make_initialized_repo("new_bad_dep");
 
     // -l a -l b are valid; the bogus dep id is the failure point. We
-    // assert exit 2 and that NO bug was created (the bookmark stays
-    // exactly where init left it).
-    let bookmark_before = bookmark_tip_commit(&repo);
+    // assert exit 2 and that NO issue ref was created.
+    let refs_before = issue_ref_count(&repo);
 
     let out = run_jjf_with_stdin(
         &repo,
@@ -208,10 +207,10 @@ fn new_with_bogus_dep_id_exits_two_and_does_not_write() {
         "stderr should echo the bad value, got: {stderr}"
     );
 
-    let bookmark_after = bookmark_tip_commit(&repo);
+    let refs_after = issue_ref_count(&repo);
     assert_eq!(
-        bookmark_before, bookmark_after,
-        "preflight failure must NOT advance the `issues` bookmark"
+        refs_before, refs_after,
+        "preflight failure must NOT create a new refs/jjf/issues/ ref"
     );
 }
 
@@ -596,19 +595,22 @@ fn new_meta_duplicate_key_last_wins() {
 
 // --- helpers -------------------------------------------------------
 
-/// Capture the commit id of the `issues` bookmark tip. Used by tests
-/// that assert preflight failures don't advance the bookmark.
-fn bookmark_tip_commit(repo: &Path) -> String {
-    let out = Command::new("jj")
-        .arg("--repository")
-        .arg(repo)
-        .args(["log", "-r", "bookmarks(issues)", "-T", "commit_id ++ \"\\n\"", "--no-graph"])
+/// Count the `refs/jjf/issues/*` refs in the repo. Used by tests that
+/// assert preflight failures don't create a new issue ref.
+/// Replaces the v2 `jj log bookmarks(issues)` tip-capture (J7: no jj).
+fn issue_ref_count(repo: &Path) -> usize {
+    let out = Command::new("git")
+        .args(["for-each-ref", "--format=%(refname)", "refs/jjf/issues/"])
+        .current_dir(repo)
         .output()
-        .expect("spawn jj log");
+        .expect("spawn git for-each-ref");
     assert!(
         out.status.success(),
-        "jj log failed: {}",
+        "git for-each-ref failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count()
 }

@@ -46,7 +46,11 @@ fn make_empty_jj_repo(name: &str) -> PathBuf {
     }
     fs::create_dir_all(&scratch).unwrap();
     let abs = fs::canonicalize(&scratch).unwrap();
-    sh("jj", &["git", "init"], &abs);
+    // J7: plain git init — no jj required.
+    sh("git", &["init"], &abs);
+    // Set a local identity so mutations that commit have an author.
+    sh("git", &["config", "user.name", "jjforge test"], &abs);
+    sh("git", &["config", "user.email", "test@jjforge.invalid"], &abs);
     abs
 }
 
@@ -164,16 +168,16 @@ fn git_symbolic_ref_head(repo: &Path) -> String {
 }
 
 
-fn jj_capture(args: &[&str], cwd: &Path) -> String {
-    let out = Command::new("jj").args(args).current_dir(cwd).output().unwrap();
-    assert!(
-        out.status.success(),
-        "`jj {}` failed in {}:\nstderr: {}",
-        args.join(" "),
-        cwd.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
+/// Check whether a git branch (refs/heads/<name>) exists in the repo.
+/// Used to assert that v3 storage never creates the old v2 `issues` bookmark.
+/// J7: replaces jj_capture bookmark-list checks; no jj required.
+fn git_branch_exists(repo: &Path, branch: &str) -> bool {
+    let out = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    out.status.success()
 }
 
 #[test]
@@ -229,21 +233,12 @@ fn create_then_set_status_lands_two_commits_on_bookmark() {
     );
 
     // Snapshot HEAD before set_status — v3 mutations MUST leave HEAD
-    // untouched (the original test asserted "@ off the bookmark";
-    // v3 inverts that to "HEAD does not drift").
-    //
-    // Use `symbolic-ref HEAD` rather than `rev-parse HEAD` because a
-    // jj-only repo (no `--colocate`) has no checked-out branch — HEAD
-    // is a symbolic ref pointing at `refs/heads/main` which itself has
-    // no oid until something is committed via git. The drift fingerprint
-    // we care about is HEAD's symbolic target getting re-pointed (e.g.
-    // to `refs/jj/root`), not the oid value. The companion v3 write-path
-    // tests (`v3_write_path.rs::git_head_symbolic`) use the same probe.
+    // untouched. Use `symbolic-ref HEAD` because a fresh plain git repo
+    // has no checked-out branch yet; HEAD is a symbolic ref pointing at
+    // `refs/heads/main` (or `refs/heads/master`) which itself has no oid
+    // until something is committed via git. The drift fingerprint we care
+    // about is HEAD's symbolic target getting re-pointed, not the oid value.
     let head_sym_before_set = git_symbolic_ref_head(&repo);
-    let at_before_set = jj_capture(
-        &["log", "--no-graph", "-r", "@", "-T", "change_id"],
-        &repo,
-    );
 
     // set_status to closed.
     storage.set_status(&id, Status::Closed).expect("set_status");
@@ -316,20 +311,11 @@ fn create_then_set_status_lands_two_commits_on_bookmark() {
         tip_msg
     );
 
-    // V3 invariant: git HEAD does not drift across a mutation. jj's
-    // working-copy change id is also pinned.
+    // V3 invariant: git HEAD does not drift across a mutation.
     let head_sym_after_set = git_symbolic_ref_head(&repo);
-    let at_after_set = jj_capture(
-        &["log", "--no-graph", "-r", "@", "-T", "change_id"],
-        &repo,
-    );
     assert_eq!(
         head_sym_before_set, head_sym_after_set,
         "git HEAD symbolic target must not move across a v3 mutation"
-    );
-    assert_eq!(
-        at_before_set, at_after_set,
-        "jj @ must not move across a v3 mutation"
     );
 }
 
@@ -1031,13 +1017,12 @@ fn list_jjf_refs(repo: &Path) -> Vec<String> {
 fn init_on_fresh_repo_plants_v3_sentinel_only() {
     let repo = make_empty_jj_repo("init_fresh");
 
-    // Pre-condition: no `issues` bookmark, no `refs/jjf/*`, capture
-    // git HEAD for the invariance check below.
-    let pre_bookmarks =
-        jj_capture(&["bookmark", "list", "-T", "name ++ \"\\n\""], &repo);
+    // Pre-condition: no `issues` branch, no `refs/jjf/*`, capture
+    // git HEAD for the invariance check below. Use git to check
+    // branch existence (J7: no jj).
     assert!(
-        !pre_bookmarks.lines().any(|l| l.trim() == "issues"),
-        "pre-condition: issues bookmark should not exist yet, got: {pre_bookmarks}"
+        !git_branch_exists(&repo, "issues"),
+        "pre-condition: issues branch should not exist yet"
     );
     assert!(
         list_jjf_refs(&repo).is_empty(),
@@ -1056,12 +1041,10 @@ fn init_on_fresh_repo_plants_v3_sentinel_only() {
         "init must plant exactly the sentinel ref, got: {post_refs:?}"
     );
 
-    // Post-condition 2: no issues bookmark.
-    let post_bookmarks =
-        jj_capture(&["bookmark", "list", "-T", "name ++ \"\\n\""], &repo);
+    // Post-condition 2: no issues branch created.
     assert!(
-        !post_bookmarks.lines().any(|l| l.trim() == "issues"),
-        "post-condition: issues bookmark must NOT exist, got: {post_bookmarks}"
+        !git_branch_exists(&repo, "issues"),
+        "post-condition: issues branch must NOT exist after v3 init"
     );
 
     // Post-condition 3: git HEAD is unchanged. The whole point of the
@@ -1071,38 +1054,11 @@ fn init_on_fresh_repo_plants_v3_sentinel_only() {
         pre_head, post_head,
         "git HEAD must not move across init: pre={pre_head:?} post={post_head:?}"
     );
-
-    // Post-condition 4: jj working-copy @ stays put — the v3 init
-    // writes via git only and never calls `jj new` / `jj describe`,
-    // so the commit at @ must be the same one a freshly-init'd jj
-    // repo carries. (We can't assert "no commits under @ besides
-    // root" because `jj git init` itself materializes one
-    // working-copy commit.) See
-    // `init_on_fresh_repo_does_not_advance_jj_working_copy` for the
-    // before/after @ comparison.
 }
 
-#[test]
-fn init_on_fresh_repo_does_not_advance_jj_working_copy() {
-    let repo = make_empty_jj_repo("init_fresh_wc");
-
-    let pre_at = jj_capture(
-        &["log", "--no-graph", "-r", "@", "-T", "commit_id ++ \"\\n\""],
-        &repo,
-    );
-
-    Storage::init(&repo).expect("Storage::init on fresh repo");
-
-    let post_at = jj_capture(
-        &["log", "--no-graph", "-r", "@", "-T", "commit_id ++ \"\\n\""],
-        &repo,
-    );
-    assert_eq!(
-        pre_at.trim(),
-        post_at.trim(),
-        "init must NOT advance the jj working copy (pre={pre_at:?} post={post_at:?})"
-    );
-}
+// J7: init_on_fresh_repo_does_not_advance_jj_working_copy removed — the
+// jj working-copy @ concept doesn't apply to plain git repos. The
+// git HEAD invariant is covered by init_on_fresh_repo_plants_v3_sentinel_only.
 
 #[test]
 fn init_is_idempotent_on_v3_repo() {
@@ -1181,12 +1137,10 @@ fn init_then_create_issue_round_trips_on_v3_repo() {
         "create_issue must plant the per-issue ref {issue_ref}"
     );
 
-    // No v2 issues bookmark was created.
-    let post_bookmarks =
-        jj_capture(&["bookmark", "list", "-T", "name ++ \"\\n\""], &repo);
+    // No v2 issues branch was created (J7: check via git, no jj).
     assert!(
-        !post_bookmarks.lines().any(|l| l.trim() == "issues"),
-        "v3 create must not create the v2 issues bookmark, got: {post_bookmarks}"
+        !git_branch_exists(&repo, "issues"),
+        "v3 create must not create the v2 issues branch"
     );
 }
 

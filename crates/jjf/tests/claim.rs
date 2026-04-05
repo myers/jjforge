@@ -29,40 +29,18 @@ use common::{run_jjf, run_jjf_with_stdin, scratch, JJF_BIN};
 
 fn make_jj_repo_with_user(name: &str, user: &str) -> PathBuf {
     let dir = scratch(name);
-    let out = Command::new("jj")
-        .args(["git", "init"])
+    let out = Command::new("git")
+        .arg("init")
         .current_dir(&dir)
         .output()
-        .expect("spawn jj");
+        .expect("spawn git init");
     assert!(
         out.status.success(),
-        "jj git init failed: {}",
+        "git init failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // Pin user.name so the `--claim` resolver has an identity.
-    let out = Command::new("jj")
-        .args(["config", "set", "--repo", "user.name", user])
-        .current_dir(&dir)
-        .output()
-        .expect("spawn jj config set name");
-    assert!(
-        out.status.success(),
-        "jj config set user.name failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let out = Command::new("jj")
-        .args(["config", "set", "--repo", "user.email", "test@example.com"])
-        .current_dir(&dir)
-        .output()
-        .expect("spawn jj config set email");
-    assert!(
-        out.status.success(),
-        "jj config set user.email failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // J2: also set git config so the binary reads identity from git
-    // (the actor chain now calls `git config user.name` instead of
-    // `jj config get user.name`).
+    // Pin user.name so the `--claim` resolver has an identity. The actor
+    // chain reads `git config user.name` (jj config calls removed in J7).
     let out = Command::new("git")
         .args(["config", "user.name", user])
         .current_dir(&dir)
@@ -233,14 +211,9 @@ fn update_claim_different_user_errors_already_claimed() {
     let out = run_jjf(&repo, &["update", &id, "--claim"]);
     assert!(out.status.success(), "alice's claim must succeed");
 
-    // Flip user.name to bob in both jj config and git config (J2: the
-    // binary now reads from git config, so both must be updated).
-    let out = Command::new("jj")
-        .args(["config", "set", "--repo", "user.name", "bob"])
-        .current_dir(&repo)
-        .output()
-        .unwrap();
-    assert!(out.status.success());
+    // Flip user.name to bob in git config (the binary reads from git
+    // config, so only git config needs to be updated; jj config calls
+    // removed in J7).
     let out = Command::new("git")
         .args(["config", "user.name", "bob"])
         .current_dir(&repo)

@@ -29,10 +29,12 @@ use jjf_storage::{
 
 // ---- fixture --------------------------------------------------------
 
-/// Build a v3-shape scratch repo: a jj+git colocated repo with the
+/// Build a v3-shape scratch repo: a plain git repo with the
 /// `refs/jjf/meta/format-version` sentinel ref planted. `Storage::open`
-/// will detect V3 mode and route every read through the git-only
-/// path.
+/// will detect V3 mode and route every read through the git-only path.
+///
+/// J7: switched from `jj git init --colocate` to `git init` — the
+/// shipped binary no longer calls jj, and the tests should not either.
 fn make_v3_scratch_repo(name: &str) -> PathBuf {
     let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -43,48 +45,17 @@ fn make_v3_scratch_repo(name: &str) -> PathBuf {
     }
     fs::create_dir_all(&scratch).unwrap();
     let abs = fs::canonicalize(&scratch).unwrap();
-    sh("jj", &["git", "init", "--colocate"], &abs);
-    sh(
-        "git",
-        &["config", "user.email", "test@jjforge.invalid"],
-        &abs,
-    );
+    // Plain git init — no jj required (J7).
+    sh("git", &["init"], &abs);
+    sh("git", &["config", "user.email", "test@jjforge.invalid"], &abs);
     sh("git", &["config", "user.name", "jjforge test"], &abs);
-    plant_v3_sentinel(&abs);
+    // Plant the v3 sentinel via Storage::init (the canonical path).
+    Storage::init(&abs).expect("Storage::init must plant the v3 sentinel");
     abs
 }
 
-fn plant_v3_sentinel(repo: &Path) {
-    let blob_oid = git_capture_with_stdin(
-        &["hash-object", "-w", "--stdin"],
-        b"version: 3\n",
-        repo,
-    );
-    let blob_oid = blob_oid.trim();
-    let mktree_input = format!("100644 blob {blob_oid}\tversion\n");
-    let tree_oid = git_capture_with_stdin(
-        &["mktree"],
-        mktree_input.as_bytes(),
-        repo,
-    );
-    let tree_oid = tree_oid.trim();
-    let commit_oid = git_capture_with_stdin(
-        &["commit-tree", tree_oid, "-F", "-"],
-        b"jjf: storage format v3 sentinel\n",
-        repo,
-    );
-    let commit_oid = commit_oid.trim();
-    sh(
-        "git",
-        &[
-            "update-ref",
-            "refs/jjf/meta/format-version",
-            commit_oid,
-            "0000000000000000000000000000000000000000",
-        ],
-        repo,
-    );
-}
+// J7: plant_v3_sentinel removed — make_v3_scratch_repo now calls
+// Storage::init, which is the canonical sentinel-planting path.
 
 fn sh(prog: &str, args: &[&str], cwd: &Path) {
     let out = Command::new(prog).args(args).current_dir(cwd).output().unwrap();
@@ -733,7 +704,8 @@ fn open_refuses_legacy_repo_without_v3_sentinel() {
     }
     fs::create_dir_all(&scratch).unwrap();
     let repo = fs::canonicalize(&scratch).unwrap();
-    sh("jj", &["git", "init", "--colocate"], &repo);
+    // J7: plain git init — no jj required.
+    sh("git", &["init"], &repo);
     sh("git", &["config", "user.email", "test@jjforge.invalid"], &repo);
     sh("git", &["config", "user.name", "jjforge test"], &repo);
     // Deliberately do NOT plant the v3 sentinel — this is a legacy

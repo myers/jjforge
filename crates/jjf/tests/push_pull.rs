@@ -48,10 +48,11 @@ fn must_succeed(out: &Output, what: &str) {
 }
 
 /// Stand up a bare git repo at `<root>/remote.git` and (optionally)
-/// one jj clone per name in `clones`. Returns the root.
+/// one plain git clone per name in `clones`. Returns the root.
 ///
-/// jj 0.40's `jj git clone` requires the source URL be reachable; we
-/// pass an absolute filesystem path so this works fully offline.
+/// Uses `git clone` (no jj — J7). The clones are plain git repos
+/// with `origin` already pointing at the bare remote, which is all
+/// `jjf push`/`jjf pull` needs.
 fn setup(name: &str, clones: &[&str]) -> PathBuf {
     let root = scratch(name);
     let remote = root.join("remote.git");
@@ -63,28 +64,27 @@ fn setup(name: &str, clones: &[&str]) -> PathBuf {
     must_succeed(&init, "git init --bare");
     for clone in clones {
         let dest = root.join(clone);
-        let clone_out = Command::new("jj")
-            .arg("git")
+        let clone_out = Command::new("git")
             .arg("clone")
             .arg(remote.to_str().unwrap())
             .arg(&dest)
             .output()
-            .expect("jj git clone");
-        must_succeed(&clone_out, &format!("jj git clone {clone}"));
-        // Configure a per-clone identity so commits don't all collide
-        // on the default `Tester <t@t.com>` author.
-        let cfg_name = Command::new("jj")
-            .args(["config", "set", "--repo", "user.name", clone])
+            .expect("git clone");
+        must_succeed(&clone_out, &format!("git clone {clone}"));
+        // Configure a per-clone identity so the actor chain has an identity
+        // and commits don't all collide on a shared author.
+        let cfg_name = Command::new("git")
+            .args(["config", "user.name", clone])
             .current_dir(&dest)
             .output()
-            .expect("jj config user.name");
-        must_succeed(&cfg_name, "jj config user.name");
-        let cfg_mail = Command::new("jj")
-            .args(["config", "set", "--repo", "user.email", &format!("{clone}@example.com")])
+            .expect("git config user.name");
+        must_succeed(&cfg_name, "git config user.name");
+        let cfg_mail = Command::new("git")
+            .args(["config", "user.email", &format!("{clone}@example.com")])
             .current_dir(&dest)
             .output()
-            .expect("jj config user.email");
-        must_succeed(&cfg_mail, "jj config user.email");
+            .expect("git config user.email");
+        must_succeed(&cfg_mail, "git config user.email");
     }
     root
 }

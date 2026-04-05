@@ -33,7 +33,10 @@ fn make_empty_jj_repo(name: &str) -> PathBuf {
     }
     fs::create_dir_all(&scratch).unwrap();
     let abs = fs::canonicalize(&scratch).unwrap();
-    sh("jj", &["git", "init"], &abs);
+    // J7: plain git init — no jj required.
+    sh("git", &["init"], &abs);
+    sh("git", &["config", "user.name", "jjforge test"], &abs);
+    sh("git", &["config", "user.email", "test@jjforge.invalid"], &abs);
     abs
 }
 

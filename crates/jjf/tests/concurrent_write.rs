@@ -37,30 +37,19 @@ use common::{run_jjf, run_jjf_with_stdin, scratch, JJF_BIN};
 
 fn make_jj_repo(name: &str) -> PathBuf {
     let dir = scratch(name);
-    let out = Command::new("jj")
-        .args(["git", "init"])
+    let out = Command::new("git")
+        .arg("init")
         .current_dir(&dir)
         .output()
-        .expect("spawn jj");
+        .expect("spawn git init");
     assert!(
         out.status.success(),
-        "jj git init failed: {}",
+        "git init failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let _ = Command::new("jj")
-        .args(["config", "set", "--repo", "user.name", "Test User"])
-        .current_dir(&dir)
-        .output()
-        .expect("spawn jj config set name");
-    let _ = Command::new("jj")
-        .args(["config", "set", "--repo", "user.email", "test@example.com"])
-        .current_dir(&dir)
-        .output()
-        .expect("spawn jj config set email");
-    // J2: also set repo-local git config — the actor chain now reads
-    // `git config user.name` instead of `jj config get user.name`.
-    // Without this the tests fall through to the dev's ~/.gitconfig and
-    // fail in bare CI where no global git identity is configured.
+    // Set repo-local git identity — the actor chain reads
+    // `git config user.name` so tests don't fall through to the
+    // dev's ~/.gitconfig (or fail in bare CI with no global identity).
     let out = Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(&dir)

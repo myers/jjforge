@@ -15,12 +15,12 @@ use common::{scratch, run_jjf, JJF_BIN};
 /// `issues` bookmark exists).
 fn make_initialized(name: &str) -> PathBuf {
     let dir = scratch(name);
-    let out = Command::new("jj")
-        .args(["git", "init"])
+    let out = Command::new("git")
+        .arg("init")
         .current_dir(&dir)
         .output()
-        .expect("spawn jj git init");
-    assert!(out.status.success(), "jj git init failed");
+        .expect("spawn git init");
+    assert!(out.status.success(), "git init failed: {}", String::from_utf8_lossy(&out.stderr));
     let init = Command::new(JJF_BIN)
         .arg("init")
         .current_dir(&dir)

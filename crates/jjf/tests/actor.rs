@@ -34,41 +34,19 @@ use common::{scratch, JJF_BIN};
 /// (for the "no current user" / chain-runs-dry tests).
 fn make_jj_repo_with_user(name: &str, user: Option<&str>) -> PathBuf {
     let dir = scratch(name);
-    let out = Command::new("jj")
-        .args(["git", "init"])
+    let out = Command::new("git")
+        .arg("init")
         .current_dir(&dir)
         .output()
-        .expect("spawn jj");
+        .expect("spawn git init");
     assert!(
         out.status.success(),
-        "jj git init failed: {}",
+        "git init failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     if let Some(user) = user {
-        let out = Command::new("jj")
-            .args(["config", "set", "--repo", "user.name", user])
-            .current_dir(&dir)
-            .output()
-            .expect("spawn jj config set name");
-        assert!(
-            out.status.success(),
-            "jj config set user.name failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let out = Command::new("jj")
-            .args(["config", "set", "--repo", "user.email", "test@example.com"])
-            .current_dir(&dir)
-            .output()
-            .expect("spawn jj config set email");
-        assert!(
-            out.status.success(),
-            "jj config set user.email failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        // J2: also set git config so the binary reads identity from git
-        // (the actor chain now calls `git config user.name` instead of
-        // `jj config get user.name`). Setting both keeps jj-init working
-        // and makes git the authoritative source of truth post-J2.
+        // Set repo-local git identity — the actor chain reads
+        // `git config user.name` (post-J2; jj config calls removed in J7).
         let out = Command::new("git")
             .args(["config", "user.name", user])
             .current_dir(&dir)
