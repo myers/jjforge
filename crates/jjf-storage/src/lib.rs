@@ -161,6 +161,20 @@ pub enum Error {
         reason: SlugInvalidReason,
     },
 
+    /// A title contained a control character that would corrupt
+    /// downstream surfaces (`jjf ls` text rows, JSON envelopes, the
+    /// trailer payload), or was empty after trim. Surfaced from
+    /// `Storage::create_issue`, `Storage::set_title`, and
+    /// `Storage::update` whenever a candidate title doesn't pass
+    /// `validate_title`. The `title` field carries the rejected
+    /// value verbatim so a CLI error envelope can echo it back to
+    /// the operator. v2.x (`qa-title-validation`).
+    #[error("invalid title: {reason}")]
+    InvalidTitle {
+        title: String,
+        reason: TitleInvalidReason,
+    },
+
     /// Two open issues can't share a slug. Surfaced from
     /// `Storage::create_issue` / `Storage::update` when an attempted
     /// slug write collides with an existing OPEN issue's slug.
@@ -399,6 +413,119 @@ impl std::fmt::Display for SlugInvalidReason {
         };
         f.write_str(msg)
     }
+}
+
+/// Why a title failed validation. Each variant maps to one of the
+/// rules in [`validate_title`]; the CLI's JSON error envelope
+/// surfaces the variant name (lowercase snake_case) in
+/// `details.reason` so scripts can branch without parsing the
+/// human message.
+///
+/// Added in `qa-title-validation` (QA red-team 2026-06-23). The
+/// goal is to reject — at the CLI/storage boundary — any title
+/// that would corrupt downstream surfaces. Two of the rejections
+/// are immediate data-loss / corruption defects: an embedded
+/// `\0` is silently truncated by the JSON-as-C-string round-trip
+/// somewhere in the write path; an embedded `\n` (or `\r`) breaks
+/// the tab-separated `jjf ls` / `jjf ready` text row format. Tabs
+/// (`\t`) ALSO break that text row format (the row separator IS a
+/// tab), so we reject them under [`TitleInvalidReason::ControlChar`]
+/// for consistency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleInvalidReason {
+    /// Title was empty or whitespace-only after trim.
+    Empty,
+    /// Title contained `\n` (line feed) or `\r` (carriage return).
+    /// The tab-separated `jjf ls` row format has no escape rule, so a
+    /// newline splits one row across multiple lines and breaks
+    /// downstream pipelines.
+    Newline,
+    /// Title contained a `\0` (null byte). Hits a silent-truncation
+    /// path on the write side — the on-disk title would be the
+    /// substring up to (but not including) the null. Reject at the
+    /// boundary to prevent data loss.
+    NullByte,
+    /// Title contained any other control character (per
+    /// `char::is_control`) that isn't already covered by
+    /// [`TitleInvalidReason::Newline`] or
+    /// [`TitleInvalidReason::NullByte`]. Tabs (`\t`, U+0009) land
+    /// here because they break the `jjf ls` row format too. The
+    /// `codepoint` field carries the offending Unicode scalar so
+    /// the operator can tell which control char tripped the
+    /// rejection.
+    ControlChar { codepoint: u32 },
+}
+
+impl TitleInvalidReason {
+    /// Stable lowercase snake_case name. Used by the CLI to surface
+    /// the rejection reason in the JSON error envelope. The
+    /// `ControlChar` variant exposes its codepoint via the
+    /// `codepoint` key alongside `reason` in the envelope; the
+    /// `as_str` mapping is just the variant tag.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TitleInvalidReason::Empty => "empty",
+            TitleInvalidReason::Newline => "newline",
+            TitleInvalidReason::NullByte => "null_byte",
+            TitleInvalidReason::ControlChar { .. } => "control_char",
+        }
+    }
+}
+
+impl std::fmt::Display for TitleInvalidReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TitleInvalidReason::Empty => f.write_str("title must not be empty"),
+            TitleInvalidReason::Newline => {
+                f.write_str("title must not contain newline (\\n) or carriage return (\\r)")
+            }
+            TitleInvalidReason::NullByte => {
+                f.write_str("title must not contain a null byte (\\0)")
+            }
+            TitleInvalidReason::ControlChar { codepoint } => {
+                write!(f, "title must not contain control character U+{:04X}", codepoint)
+            }
+        }
+    }
+}
+
+/// Validate a title per the rules pinned in `qa-title-validation`:
+///
+/// - Must be non-empty after `trim` (the existing "empty title"
+///   rule, now folded into a typed reason).
+/// - Must not contain `\n` (U+000A) or `\r` (U+000D) — these break
+///   the tab-separated `jjf ls` / `jjf ready` text row format.
+/// - Must not contain `\0` (U+0000) — embedded nulls hit a silent
+///   truncation path between argv parsing and on-disk storage.
+/// - Must not contain any other control character per
+///   `char::is_control` (tabs included — `\t` is the row separator
+///   in `jjf ls` text output, so it breaks parsing too).
+///
+/// Returns `Ok(())` if every rule passes; otherwise the first
+/// failing rule's typed reason. The check order is: empty, then
+/// scan characters left-to-right reporting the first control
+/// character.
+///
+/// Exposed publicly so the CLI can pre-validate before calling
+/// `Storage::create_issue` / `Storage::update` and surface a typed
+/// `invalid_title` exit-2 error before any IO kicks off.
+pub fn validate_title(title: &str) -> std::result::Result<(), TitleInvalidReason> {
+    if title.trim().is_empty() {
+        return Err(TitleInvalidReason::Empty);
+    }
+    for c in title.chars() {
+        match c {
+            '\n' | '\r' => return Err(TitleInvalidReason::Newline),
+            '\0' => return Err(TitleInvalidReason::NullByte),
+            c if c.is_control() => {
+                return Err(TitleInvalidReason::ControlChar {
+                    codepoint: c as u32,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Minimum slug length (inclusive). Spec v2.1 §3.1.
@@ -836,8 +963,11 @@ impl Storage {
     /// open issue (`Error::SlugCollision`). Closed issues release
     /// their slug — reusing a closed issue's slug is allowed.
     pub fn create_issue(&self, draft: &IssueDraft) -> Result<IssueId> {
-        if draft.title.trim().is_empty() {
-            return Err(Error::Invalid("issue title must not be empty".into()));
+        if let Err(reason) = validate_title(&draft.title) {
+            return Err(Error::InvalidTitle {
+                title: draft.title.clone(),
+                reason,
+            });
         }
 
         // Pre-validate the slug, if any, BEFORE the (cheap) id reroll
@@ -964,8 +1094,11 @@ impl Storage {
 
     /// Replace the title.
     pub fn set_title(&self, id: &IssueId, title: &str) -> Result<()> {
-        if title.trim().is_empty() {
-            return Err(Error::Invalid("title must not be empty".into()));
+        if let Err(reason) = validate_title(title) {
+            return Err(Error::InvalidTitle {
+                title: title.to_owned(),
+                reason,
+            });
         }
         let title = title.to_owned();
         self.mutate(id, &format!("jjf: issue {} - set-title", id), |rec| {
@@ -1037,8 +1170,9 @@ impl Storage {
     /// the storage-side guard means programmatic callers can't trip the
     /// spec by accident either.
     ///
-    /// Title validation matches `set_title` (non-empty after trim);
-    /// other fields accept any string.
+    /// Title validation matches `set_title` (delegated to
+    /// `validate_title`: non-empty after trim AND no control
+    /// characters); other fields accept any string.
     pub fn update(&self, id: &IssueId, fields: UpdateFields) -> Result<()> {
         if fields.is_empty() {
             return Err(Error::Invalid(
@@ -1046,8 +1180,11 @@ impl Storage {
             ));
         }
         if let Some(title) = &fields.title {
-            if title.trim().is_empty() {
-                return Err(Error::Invalid("title must not be empty".into()));
+            if let Err(reason) = validate_title(title) {
+                return Err(Error::InvalidTitle {
+                    title: title.clone(),
+                    reason,
+                });
             }
         }
         // Pre-validate the slug, if any, BEFORE the storage-side

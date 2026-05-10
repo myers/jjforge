@@ -455,6 +455,7 @@ from plain-text mode (see the top comment in `main.rs`: `0` success,
 | `unmergeable`                | 1    | `Unmergeable`                 | `issue_id`, `detail`     |
 | `comment_file_conflict`      | 1    | `CommentFileConflict`         | `issue_id`               |
 | `invalid_slug`               | 2    | `Storage::InvalidSlug` / `InvalidSlug` | `slug`, `reason`        |
+| `invalid_title`              | 2    | `Storage::InvalidTitle` / `InvalidTitle` | `title`, `reason`, `codepoint`* |
 | `slug_collision`             | 2    | `Storage::SlugCollision` / `SlugCollision` | `slug`, `conflicts_with` |
 | `slug_not_found`             | 2    | `Storage::SlugNotFound` / `SlugNotFound` | `handle`                 |
 | `invalid_input`              | 1    | `Storage::Invalid`            | —                        |
@@ -469,6 +470,46 @@ from plain-text mode (see the top comment in `main.rs`: `0` success,
 Adding a new variant to `CliError`? Pick a stable kind, add it to
 the `kind()` match in `main.rs`, add a row above, and add a
 test in the relevant `tests/<verb>.rs` file that pins it.
+
+\* The `invalid_title` envelope carries a `codepoint` key in
+`details` ONLY when `reason` is `control_char`; for `empty`,
+`newline`, and `null_byte` the field is omitted.
+
+### Note on `invalid_title`
+
+Emitted by `jjf new -t` and `jjf update --title` when the supplied
+title contains a control character that would corrupt downstream
+surfaces, or is empty after trim. Preflight failure (exit 2).
+Added in `qa-title-validation` (issue `e4e483b`) after a QA
+red-team round found embedded `\0` was silently truncated before
+storage (data loss) and embedded `\n` corrupted `jjf ls` text
+rows (the tab-separated row format has no escape rule).
+
+`details.reason` is one of:
+
+- `empty` — title was empty or whitespace-only after trim.
+- `newline` — title contained `\n` (U+000A) or `\r` (U+000D).
+- `null_byte` — title contained `\0` (U+0000).
+- `control_char` — title contained any other control character
+  per `char::is_control` (tabs included — `\t` breaks the
+  `jjf ls` row format too). `details.codepoint` carries the
+  offending Unicode scalar as an unsigned integer.
+
+```sh
+$ jjf new --json -t $'foo\nbar'
+{"ok":false,"error":{"kind":"invalid_title","message":"...","details":{"title":"foo\nbar","reason":"newline"}}}
+
+$ jjf new --json -t $'a\tb'
+{"ok":false,"error":{"kind":"invalid_title","message":"...","details":{"title":"a\tb","reason":"control_char","codepoint":9}}}
+```
+
+The `null_byte` reason is reachable only via programmatic
+callers of `Storage::create_issue` / `Storage::update` (e.g. a
+Python or MCP client constructing the call directly). POSIX
+argv is a NUL-terminated C string array, so a shell-typed
+`jjf new -t $'a\x00b'` actually loses the bytes after the
+null in the shell's argv expansion before `jjf` sees them —
+the storage-side guard catches it for every other entry point.
 
 ### Note on `self_hosted_write_refused`
 
@@ -543,6 +584,16 @@ Error path — slug collision with an open issue:
 ```sh
 $ jjf new --json -t x --slug taken
 {"ok":false,"error":{"kind":"slug_collision","message":"...","details":{"slug":"taken","conflicts_with":"a3f9c01"}}}
+```
+
+Error path — invalid title (embedded newline corrupts `jjf ls`
+text rows; embedded null byte was silently truncated before
+`qa-title-validation`). `reason` is one of `empty` / `newline` /
+`null_byte` / `control_char`:
+
+```sh
+$ jjf new --json -t $'foo\nbar'
+{"ok":false,"error":{"kind":"invalid_title","message":"...","details":{"title":"foo\nbar","reason":"newline"}}}
 ```
 
 Error path — `issues` bookmark missing (didn't run `jjf init` first):

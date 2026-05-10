@@ -43,7 +43,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use jjf_storage::{
     ISSUES_BOOKMARK, DepEdge, DepKind, DepTreeNode, Error as StorageError, IdError, Issue,
     IssueDraft, IssueId, IssueType, Memory, ReadyFilter, SlugInvalidReason, Status, Storage,
-    UpdateFields,
+    TitleInvalidReason, UpdateFields,
 };
 
 /// Top-level CLI shape. Subcommands live on the `Commands` enum; the
@@ -1045,6 +1045,18 @@ enum CliError {
         reason: SlugInvalidReason,
     },
 
+    /// `jjf new -t` / `jjf update --title` was handed a title that
+    /// failed validation (empty, embedded newline, embedded null
+    /// byte, other control character). Preflight failure (exit 2).
+    /// The `reason` field is the typed rejection variant; `title`
+    /// is what the operator supplied. Added in
+    /// `qa-title-validation` (issue `e4e483b`).
+    #[error("invalid title: {reason}")]
+    InvalidTitle {
+        title: String,
+        reason: TitleInvalidReason,
+    },
+
     /// A slug write would collide with an existing open issue.
     /// Preflight failure (exit 2). `conflicts_with` is the id of
     /// the open issue already holding the slug.
@@ -1129,6 +1141,7 @@ impl CliError {
         match self {
             CliError::Storage(StorageError::NotAJjRepo(_)) => 2,
             CliError::Storage(StorageError::InvalidSlug { .. }) => 2,
+            CliError::Storage(StorageError::InvalidTitle { .. }) => 2,
             CliError::Storage(StorageError::SlugCollision { .. }) => 2,
             CliError::Storage(StorageError::SlugNotFound { .. }) => 2,
             CliError::Storage(StorageError::AlreadyClaimed { .. }) => 2,
@@ -1146,6 +1159,7 @@ impl CliError {
             CliError::RemoteNotFound(_) => 2,
             CliError::SelfHostedWriteRefused { .. } => 2,
             CliError::InvalidSlug { .. } => 2,
+            CliError::InvalidTitle { .. } => 2,
             CliError::SlugCollision { .. } => 2,
             CliError::SlugNotFound { .. } => 2,
             CliError::MissingMemoryValue => 2,
@@ -1191,10 +1205,12 @@ impl CliError {
             CliError::Storage(StorageError::Json(_)) => "json_error",
             CliError::Storage(StorageError::Jj(_)) => "jj_error",
             CliError::Storage(StorageError::InvalidSlug { .. }) => "invalid_slug",
+            CliError::Storage(StorageError::InvalidTitle { .. }) => "invalid_title",
             CliError::Storage(StorageError::SlugCollision { .. }) => "slug_collision",
             CliError::Storage(StorageError::SlugNotFound { .. }) => "slug_not_found",
             CliError::Storage(StorageError::AlreadyClaimed { .. }) => "already_claimed",
             CliError::InvalidSlug { .. } => "invalid_slug",
+            CliError::InvalidTitle { .. } => "invalid_title",
             CliError::SlugCollision { .. } => "slug_collision",
             CliError::SlugNotFound { .. } => "slug_not_found",
             CliError::MissingMemoryValue => "missing_memory_value",
@@ -1277,6 +1293,27 @@ impl CliError {
             CliError::Storage(StorageError::InvalidSlug { slug, reason })
             | CliError::InvalidSlug { slug, reason } => {
                 json!({ "slug": slug, "reason": reason.as_str() })
+            }
+            CliError::Storage(StorageError::InvalidTitle { title, reason })
+            | CliError::InvalidTitle { title, reason } => {
+                // `ControlChar` carries the offending codepoint; the
+                // other reasons don't have additional structure. Expose
+                // `codepoint` as a top-level key in `details` rather
+                // than a nested object so the JSON envelope stays flat
+                // (matches the slug envelope's pattern).
+                let mut obj = serde_json::Map::new();
+                obj.insert("title".into(), serde_json::Value::String(title.clone()));
+                obj.insert(
+                    "reason".into(),
+                    serde_json::Value::String(reason.as_str().into()),
+                );
+                if let TitleInvalidReason::ControlChar { codepoint } = reason {
+                    obj.insert(
+                        "codepoint".into(),
+                        serde_json::Value::Number((*codepoint).into()),
+                    );
+                }
+                serde_json::Value::Object(obj)
             }
             CliError::Storage(StorageError::SlugCollision { slug, conflicts_with }) => {
                 json!({ "slug": slug, "conflicts_with": conflicts_with.as_str() })
@@ -1536,6 +1573,18 @@ fn run_new(
     // bytes; omitted is empty. We deliberately preserve raw bytes — no
     // trim, no newline normalization — so round-trip stays exact.
     let body = read_body(file.as_deref())?;
+
+    // 2a. Pre-validate the title at the CLI boundary so the user
+    // gets a typed exit-2 error before any IO kicks off. Storage
+    // will re-validate. See `qa-title-validation` (issue
+    // `e4e483b`): embedded `\n` corrupts `jjf ls` rows; embedded
+    // `\0` was silently truncated before this guard landed.
+    if let Err(reason) = jjf_storage::validate_title(&title) {
+        return Err(CliError::InvalidTitle {
+            title: title.clone(),
+            reason,
+        });
+    }
 
     // 2b. Pre-validate the slug at the CLI boundary so the user gets
     // a typed exit-2 error before any IO kicks off. Storage will
@@ -2535,6 +2584,18 @@ fn run_update(
     } else {
         slug.map(Some)
     };
+    // Pre-validate the title at the CLI boundary so the operator
+    // sees the typed exit-2 error before any IO. Storage will
+    // re-validate. `qa-title-validation` (issue `e4e483b`).
+    if let Some(title) = &title {
+        if let Err(reason) = jjf_storage::validate_title(title) {
+            return Err(CliError::InvalidTitle {
+                title: title.clone(),
+                reason,
+            });
+        }
+    }
+
     // Pre-validate the slug at the CLI boundary so the operator
     // sees the typed exit-2 error before any IO. Storage will
     // re-validate.

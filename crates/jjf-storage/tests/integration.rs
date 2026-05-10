@@ -11,7 +11,7 @@ use std::process::Command;
 
 use jjf_storage::{
     DepEdge, DepKind, Error as StorageError, IssueDraft, IssueId, IssueType, Op, ReadyFilter,
-    SlugInvalidReason, Status, Storage, UpdateFields,
+    SlugInvalidReason, Status, Storage, TitleInvalidReason, UpdateFields,
 };
 use serde::Serialize;
 
@@ -2984,4 +2984,180 @@ fn cache_hit_avoids_rebuild_n_issues() {
         second_dur < first_dur,
         "cache hit ({second_dur:?}) should be faster than rebuild ({first_dur:?})"
     );
+}
+
+// --- qa-title-validation (issue e4e483b) ---------------------------------
+//
+// `validate_title` rejects four classes of input at the storage
+// boundary: empty, embedded newline, embedded null byte, and any
+// other control character (tabs included). `Storage::create_issue`,
+// `Storage::set_title`, and `Storage::update` all delegate to it
+// and surface the typed `InvalidTitle` error.
+
+#[test]
+fn create_issue_rejects_empty_title_with_typed_reason() {
+    let repo = make_scratch_repo("create_title_empty");
+    let storage = Storage::open(&repo).unwrap();
+    let err = storage
+        .create_issue(&IssueDraft {
+            title: "   ".into(),
+            ..Default::default()
+        })
+        .unwrap_err();
+    match err {
+        StorageError::InvalidTitle { title, reason } => {
+            assert_eq!(title, "   ");
+            assert_eq!(reason, TitleInvalidReason::Empty);
+        }
+        other => panic!("expected InvalidTitle, got {other:?}"),
+    }
+}
+
+#[test]
+fn create_issue_rejects_embedded_newline_in_title() {
+    let repo = make_scratch_repo("create_title_newline");
+    let storage = Storage::open(&repo).unwrap();
+    let err = storage
+        .create_issue(&IssueDraft {
+            title: "foo\nbar".into(),
+            ..Default::default()
+        })
+        .unwrap_err();
+    match err {
+        StorageError::InvalidTitle { title, reason } => {
+            assert_eq!(title, "foo\nbar");
+            assert_eq!(reason, TitleInvalidReason::Newline);
+        }
+        other => panic!("expected InvalidTitle/Newline, got {other:?}"),
+    }
+}
+
+#[test]
+fn create_issue_rejects_carriage_return_in_title() {
+    let repo = make_scratch_repo("create_title_cr");
+    let storage = Storage::open(&repo).unwrap();
+    let err = storage
+        .create_issue(&IssueDraft {
+            title: "foo\rbar".into(),
+            ..Default::default()
+        })
+        .unwrap_err();
+    match err {
+        StorageError::InvalidTitle { reason, .. } => {
+            assert_eq!(reason, TitleInvalidReason::Newline);
+        }
+        other => panic!("expected InvalidTitle/Newline (CR), got {other:?}"),
+    }
+}
+
+#[test]
+fn create_issue_rejects_embedded_null_byte_in_title() {
+    let repo = make_scratch_repo("create_title_null");
+    let storage = Storage::open(&repo).unwrap();
+    let err = storage
+        .create_issue(&IssueDraft {
+            title: "a\0b".into(),
+            ..Default::default()
+        })
+        .unwrap_err();
+    match err {
+        StorageError::InvalidTitle { title, reason } => {
+            assert_eq!(title, "a\0b");
+            assert_eq!(reason, TitleInvalidReason::NullByte);
+        }
+        other => panic!("expected InvalidTitle/NullByte, got {other:?}"),
+    }
+}
+
+#[test]
+fn create_issue_rejects_tab_in_title_as_control_char() {
+    let repo = make_scratch_repo("create_title_tab");
+    let storage = Storage::open(&repo).unwrap();
+    let err = storage
+        .create_issue(&IssueDraft {
+            title: "a\tb".into(),
+            ..Default::default()
+        })
+        .unwrap_err();
+    match err {
+        StorageError::InvalidTitle { reason, .. } => match reason {
+            TitleInvalidReason::ControlChar { codepoint } => {
+                assert_eq!(codepoint, 0x09, "tab should be U+0009");
+            }
+            other => panic!("expected ControlChar(0x09), got {other:?}"),
+        },
+        other => panic!("expected InvalidTitle/ControlChar, got {other:?}"),
+    }
+}
+
+#[test]
+fn set_title_rejects_newline_with_typed_reason() {
+    let repo = make_scratch_repo("set_title_newline");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "baseline".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let err = storage.set_title(&id, "foo\nbar").unwrap_err();
+    match err {
+        StorageError::InvalidTitle { reason, .. } => {
+            assert_eq!(reason, TitleInvalidReason::Newline);
+        }
+        other => panic!("expected InvalidTitle/Newline, got {other:?}"),
+    }
+}
+
+#[test]
+fn update_with_invalid_title_is_rejected_before_commit() {
+    let repo = make_scratch_repo("update_title_invalid");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "baseline".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let history_before = storage.read_history(&id).unwrap().len();
+    let err = storage
+        .update(
+            &id,
+            UpdateFields {
+                title: Some("a\0b".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    match err {
+        StorageError::InvalidTitle { reason, .. } => {
+            assert_eq!(reason, TitleInvalidReason::NullByte);
+        }
+        other => panic!("expected InvalidTitle/NullByte, got {other:?}"),
+    }
+    let history_after = storage.read_history(&id).unwrap().len();
+    assert_eq!(
+        history_before, history_after,
+        "rejected update must not land a commit"
+    );
+}
+
+#[test]
+fn validate_title_accepts_unicode_and_punctuation() {
+    // Sanity: legitimate prose titles (asterinas migration use case)
+    // must NOT be rejected by the new validator. Quotes, parens,
+    // dashes, slashes, em-dash, non-ASCII letters all OK.
+    let ok_titles = [
+        "Fix the bug in the foo subsystem",
+        "host-asterinas-migrate: import the upstream tree",
+        "Why doesn't \"qux\" work? (it should)",
+        "rust/no_std — drop the alloc crate",
+        "Émilie hits the same panic",
+    ];
+    for t in &ok_titles {
+        assert!(
+            jjf_storage::validate_title(t).is_ok(),
+            "validator wrongly rejected {t:?}"
+        );
+    }
 }
