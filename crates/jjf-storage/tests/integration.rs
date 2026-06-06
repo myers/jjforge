@@ -527,6 +527,7 @@ fn read_then_serialize_byte_equals_on_disk_record() {
         type_: &'a str,
         priority: Option<u8>,
         labels: &'a [String],
+        metadata: &'a std::collections::BTreeMap<String, String>,
         dependencies: &'a [DepEdge],
         assignee: Option<&'a str>,
         created_at: &'a str,
@@ -544,6 +545,7 @@ fn read_then_serialize_byte_equals_on_disk_record() {
         type_: bug.type_.as_str(),
         priority: bug.priority,
         labels: &bug.labels,
+        metadata: &bug.metadata,
         dependencies: &bug.dependencies,
         assignee: bug.assignee.as_deref(),
         created_at: &bug.created_at,
@@ -591,6 +593,47 @@ fn read_after_add_then_remove_label_observes_neither() {
 
     let bug = storage.read(&id).unwrap();
     assert_eq!(bug.labels, vec!["permanent".to_string()]);
+}
+
+#[test]
+fn metadata_set_show_unset_and_lww_round_trip() {
+    // Mirror of the label lifecycle test, for the string→string
+    // metadata map. Exercises set (round-trip through op/trailer/merge),
+    // last-write-wins per key, and unset removal — and (in debug builds)
+    // the read-path cross-check that the file record and op-replay view
+    // agree on the projected metadata map.
+    use std::collections::BTreeMap;
+
+    let repo = make_scratch_repo("metadata_lifecycle");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "metadata lifecycle".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    // 1. Set two keys; both round-trip through show.
+    storage.set_metadata(&id, "gc.routed_to", "worker-1").unwrap();
+    storage.set_metadata(&id, "gc.kind", "workflow").unwrap();
+
+    let issue = storage.read(&id).unwrap();
+    let mut expected = BTreeMap::new();
+    expected.insert("gc.kind".to_string(), "workflow".to_string());
+    expected.insert("gc.routed_to".to_string(), "worker-1".to_string());
+    assert_eq!(issue.metadata, expected);
+
+    // 2. Last-write-wins per key: overwrite gc.kind.
+    storage.set_metadata(&id, "gc.kind", "probe").unwrap();
+    let issue = storage.read(&id).unwrap();
+    assert_eq!(issue.metadata.get("gc.kind"), Some(&"probe".to_string()));
+
+    // 3. Unset one key removes only it.
+    storage.unset_metadata(&id, "gc.kind").unwrap();
+    let issue = storage.read(&id).unwrap();
+    let mut expected = BTreeMap::new();
+    expected.insert("gc.routed_to".to_string(), "worker-1".to_string());
+    assert_eq!(issue.metadata, expected);
 }
 
 // ---------------------------------------------------------------------

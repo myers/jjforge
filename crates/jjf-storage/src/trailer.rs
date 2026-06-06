@@ -178,6 +178,15 @@ fn stanza_to_op(stanza: &[(&str, &str)], id: &IssueId) -> Option<Op> {
             issue_id,
             label: get("Jjf-Label")?,
         },
+        "set-metadata" => Op::SetMetadata {
+            issue_id,
+            key: get("Jjf-Metadata-Key")?,
+            value: get("Jjf-Metadata-Value")?,
+        },
+        "unset-metadata" => Op::UnsetMetadata {
+            issue_id,
+            key: get("Jjf-Metadata-Key")?,
+        },
         "dep-add" => {
             // v2.4: optional `Jjf-Dep-Kind:`. v1 stanzas without the
             // line read as `kind: Blocks` for back-compat. Unknown

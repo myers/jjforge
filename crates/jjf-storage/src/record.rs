@@ -452,6 +452,13 @@ pub struct IssueRecord {
     #[serde(default)]
     pub priority: Option<u8>,
     pub labels: Vec<String>,
+    /// Arbitrary string→string metadata map (e.g. `gc.*` orchestration
+    /// keys used by external work-source consumers). Mirrors `labels`
+    /// but key/value; set via `set-metadata` ops with last-write-wins
+    /// per key. serde-default so pre-metadata records read as an empty
+    /// map. Emitted after `labels` (BTreeMap → sorted keys in JSON).
+    #[serde(default)]
+    pub metadata: std::collections::BTreeMap<String, String>,
     /// Typed dependency edges (spec v2.4). Each edge carries a target
     /// id and a [`DepKind`]. Backward-compat: a v1 record (no kind
     /// tag, bare `[<id>, ...]` array) reads as a list of
@@ -561,6 +568,11 @@ pub struct Issue {
     #[serde(default)]
     pub priority: Option<u8>,
     pub labels: Vec<String>,
+    /// Arbitrary string→string metadata map. Mirrors
+    /// [`IssueRecord::metadata`]; emitted after `labels` on
+    /// `jjf show --json`. Empty map when the issue has no metadata.
+    #[serde(default)]
+    pub metadata: std::collections::BTreeMap<String, String>,
     /// Typed dependency edges. Same shape as
     /// [`IssueRecord::dependencies`] but emitted directly on
     /// `jjf show --json` (this projection IS the JSON envelope).

@@ -2021,6 +2021,7 @@ impl Storage {
             type_,
             priority: draft.priority,
             labels: sorted_dedup(&draft.labels),
+            metadata: std::collections::BTreeMap::new(),
             dependencies: sorted_dedup_edges(&draft.dependencies),
             assignee: draft.assignee.clone(),
             created_at: now.clone(),
@@ -2729,6 +2730,51 @@ impl Storage {
             MutateOutcome::Write(vec![Op::LabelRm {
                 issue_id: rec.id.clone(),
                 label: label.clone(),
+            }])
+        })
+        .map(|_| ())
+    }
+
+    /// Set a metadata key to a value. Last-write-wins per key; an
+    /// existing key is overwritten. Mirrors [`Storage::add_label`].
+    pub fn set_metadata(&self, id: &IssueId, key: &str, value: &str) -> Result<()> {
+        if validate_no_newlines(key).is_err() {
+            return Err(Error::Invalid(
+                "metadata key must not contain newlines".into(),
+            ));
+        }
+        if validate_no_newlines(value).is_err() {
+            return Err(Error::Invalid(
+                "metadata value must not contain newlines".into(),
+            ));
+        }
+        let key = key.to_owned();
+        let value = value.to_owned();
+        self.mutate(id, &format!("jjf: issue {} - set-metadata", id), |rec| {
+            rec.metadata.insert(key.clone(), value.clone());
+            MutateOutcome::Write(vec![Op::SetMetadata {
+                issue_id: rec.id.clone(),
+                key: key.clone(),
+                value: value.clone(),
+            }])
+        })
+        .map(|_| ())
+    }
+
+    /// Remove a metadata key. No-op if not present (mirrors
+    /// [`Storage::remove_label`]).
+    pub fn unset_metadata(&self, id: &IssueId, key: &str) -> Result<()> {
+        if validate_no_newlines(key).is_err() {
+            return Err(Error::Invalid(
+                "metadata key must not contain newlines".into(),
+            ));
+        }
+        let key = key.to_owned();
+        self.mutate(id, &format!("jjf: issue {} - unset-metadata", id), |rec| {
+            rec.metadata.remove(&key);
+            MutateOutcome::Write(vec![Op::UnsetMetadata {
+                issue_id: rec.id.clone(),
+                key: key.clone(),
             }])
         })
         .map(|_| ())
@@ -4938,6 +4984,7 @@ mod tests {
             type_: IssueType::Bug,
             priority: Some(1),
             labels: vec!["bug".into(), "p1".into()],
+            metadata: std::collections::BTreeMap::new(),
             dependencies: vec![],
             assignee: Some("alice".into()),
             created_at: "2026-06-21T12:00:00Z".into(),
@@ -5206,6 +5253,7 @@ Jjf-Label: fixed
             type_: IssueType::Feature,
             priority: None,
             labels: vec![],
+            metadata: std::collections::BTreeMap::new(),
             dependencies: vec![
                 DepEdge {
                     target: IssueId::parse("abc1234").unwrap(),
@@ -5332,6 +5380,7 @@ Jjf-Label: fixed
             priority: None,
             labels: vec![],
             dependencies: deps,
+            metadata: std::collections::BTreeMap::new(),
             assignee: None,
             comments: vec![],
             created_at: "2026-06-22T12:00:00Z".into(),

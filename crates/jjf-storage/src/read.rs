@@ -130,6 +130,7 @@ pub(crate) fn read(
             v.dedup();
             v
         },
+        metadata: record.metadata,
         assignee: record.assignee,
         comments,
         created_at: record.created_at,
@@ -225,6 +226,10 @@ struct OpView {
     /// file's `priority` field directly.
     priority: Option<u8>,
     labels: Vec<String>,
+    /// Metadata map projected from `set-metadata` / `unset-metadata`
+    /// ops (last-write-wins per key). Cross-check compares this against
+    /// the file's `metadata` field directly.
+    metadata: std::collections::BTreeMap<String, String>,
     /// Typed dependency edges. v2.4 — same shape as
     /// [`IssueRecord::dependencies`]; the read path cross-check
     /// compares the file's edge list (sorted by `(target, kind)`)
@@ -323,6 +328,7 @@ fn apply_op(view: &mut Option<OpView>, op: Op) {
                 type_: IssueType::Unspecified,
                 priority: None,
                 labels: Vec::new(),
+                metadata: std::collections::BTreeMap::new(),
                 dependencies: Vec::new(),
                 assignee: None,
                 comment_ids: Vec::new(),
@@ -345,6 +351,12 @@ fn apply_op(view: &mut Option<OpView>, op: Op) {
                     }
                 }
                 Op::LabelRm { label, .. } => v.labels.retain(|l| l != &label),
+                Op::SetMetadata { key, value, .. } => {
+                    v.metadata.insert(key, value);
+                }
+                Op::UnsetMetadata { key, .. } => {
+                    v.metadata.remove(&key);
+                }
                 Op::DepAdd { dep, kind, .. } => {
                     let edge = DepEdge { target: dep, kind };
                     if !v.dependencies.iter().any(|d| d == &edge) {
@@ -427,6 +439,19 @@ fn cross_check(record: &IssueRecord, comments: &[Comment], op_view: &OpView) {
             "labels",
             format!("{:?}", file_labels),
             format!("{:?}", op_labels)
+        )
+    );
+
+    // Metadata: file and ops should match as maps (BTreeMap compares
+    // key/value sets directly; both project last-write-wins per key).
+    assert_eq!(
+        record.metadata,
+        op_view.metadata,
+        "{}",
+        mismatch(
+            "metadata",
+            format!("{:?}", record.metadata),
+            format!("{:?}", op_view.metadata)
         )
     );
 
@@ -588,6 +613,7 @@ mod tests {
             type_: IssueType::Unspecified,
             priority: None,
             labels: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
             dependencies: Vec::new(),
             assignee: None,
             comment_ids: Vec::new(),

@@ -58,6 +58,30 @@ pub enum Op {
         issue_id: IssueId,
         label: String,
     },
+    /// Set a metadata key to a value (spec metadata facility). The
+    /// per-key model is last-write-wins, mirroring scalar ops; the
+    /// `BTreeMap<String,String>` is composed from the op chain the
+    /// same way labels are composed from add/remove ops. The wire
+    /// stanza is:
+    ///
+    /// ```text
+    /// Jjf-Op: set-metadata
+    /// Jjf-Issue: <id>
+    /// Jjf-Metadata-Key: <key>
+    /// Jjf-Metadata-Value: <value>
+    /// ```
+    SetMetadata {
+        issue_id: IssueId,
+        key: String,
+        value: String,
+    },
+    /// Remove a metadata key. Symmetric to [`Op::SetMetadata`] — only
+    /// the key is carried; the merge model records the key's final
+    /// state as "absent".
+    UnsetMetadata {
+        issue_id: IssueId,
+        key: String,
+    },
     /// Add a typed dependency edge. v2.4 (`agent-dep-types`) extended
     /// the v1 `dep-add` op with a `kind` field. The wire stanza is:
     ///
@@ -145,6 +169,8 @@ impl Op {
             Op::SetBody { .. } => "set-body",
             Op::LabelAdd { .. } => "label-add",
             Op::LabelRm { .. } => "label-rm",
+            Op::SetMetadata { .. } => "set-metadata",
+            Op::UnsetMetadata { .. } => "unset-metadata",
             Op::DepAdd { .. } => "dep-add",
             Op::DepRm { .. } => "dep-rm",
             Op::SetAssignee { .. } => "set-assignee",
@@ -166,6 +192,8 @@ impl Op {
             | Op::SetBody { issue_id, .. }
             | Op::LabelAdd { issue_id, .. }
             | Op::LabelRm { issue_id, .. }
+            | Op::SetMetadata { issue_id, .. }
+            | Op::UnsetMetadata { issue_id, .. }
             | Op::DepAdd { issue_id, .. }
             | Op::DepRm { issue_id, .. }
             | Op::SetAssignee { issue_id, .. }
@@ -249,6 +277,31 @@ impl Op {
                 );
                 s.push_str("Jjf-Label: ");
                 s.push_str(label);
+                s.push('\n');
+            }
+            Op::SetMetadata { key, value, .. } => {
+                debug_assert!(
+                    !key.contains('\n') && !key.contains('\r'),
+                    "metadata key contained a newline: {key:?}"
+                );
+                debug_assert!(
+                    !value.contains('\n') && !value.contains('\r'),
+                    "metadata value contained a newline: {value:?}"
+                );
+                s.push_str("Jjf-Metadata-Key: ");
+                s.push_str(key);
+                s.push('\n');
+                s.push_str("Jjf-Metadata-Value: ");
+                s.push_str(value);
+                s.push('\n');
+            }
+            Op::UnsetMetadata { key, .. } => {
+                debug_assert!(
+                    !key.contains('\n') && !key.contains('\r'),
+                    "metadata key contained a newline: {key:?}"
+                );
+                s.push_str("Jjf-Metadata-Key: ");
+                s.push_str(key);
                 s.push('\n');
             }
             Op::DepAdd { dep, kind, .. } | Op::DepRm { dep, kind, .. } => {

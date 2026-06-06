@@ -294,6 +294,7 @@ pub(crate) fn reduce_to_merged(
             type_: IssueType::Unspecified,
             priority: None,
             labels: Vec::new(),
+            metadata: BTreeMap::new(),
             dependencies: Vec::new(),
             assignee: None,
             // Seed both timestamps from the create op's stamp; the
@@ -320,6 +321,11 @@ pub(crate) fn reduce_to_merged(
     // under this same key without special-casing.
     let mut label_state: BTreeMap<String, bool> = BTreeMap::new();
     let mut dep_state: BTreeMap<(IssueId, DepKind), bool> = BTreeMap::new();
+    // Per-key metadata last-write tracker. `SetMetadata` writes
+    // `Some(value)`, `UnsetMetadata` writes `None`; final pass keeps
+    // the keys whose final value is `Some`. Same causal algorithm as
+    // labels; the value (not just presence) is carried.
+    let mut metadata_state: BTreeMap<String, Option<String>> = BTreeMap::new();
 
     // Track the latest SetBody op's hash so we can look up the
     // matching head's body bytes once the reduce is done.
@@ -374,6 +380,12 @@ pub(crate) fn reduce_to_merged(
             Op::LabelRm { label, .. } => {
                 label_state.insert(label.clone(), false);
             }
+            Op::SetMetadata { key, value, .. } => {
+                metadata_state.insert(key.clone(), Some(value.clone()));
+            }
+            Op::UnsetMetadata { key, .. } => {
+                metadata_state.insert(key.clone(), None);
+            }
             Op::DepAdd { dep, kind, .. } => {
                 dep_state.insert((dep.clone(), *kind), true);
             }
@@ -396,6 +408,13 @@ pub(crate) fn reduce_to_merged(
         .collect();
     labels.sort();
     record.labels = labels;
+
+    // Project final metadata state — keep only keys whose final write
+    // was a `Some`. `BTreeMap::collect` yields sorted keys.
+    record.metadata = metadata_state
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|val| (k, val)))
+        .collect();
 
     let mut deps: Vec<DepEdge> = dep_state
         .into_iter()
@@ -1177,6 +1196,7 @@ mod tests {
                 type_: IssueType::Unspecified,
                 priority: None,
                 labels: Vec::new(),
+                metadata: BTreeMap::new(),
                 dependencies: Vec::new(),
                 assignee: None,
                 created_at: "2026-06-22T12:00:00Z".into(),
@@ -1209,6 +1229,7 @@ mod tests {
                 type_: IssueType::Unspecified,
                 priority: None,
                 labels: Vec::new(),
+                metadata: BTreeMap::new(),
                 dependencies: Vec::new(),
                 assignee: None,
                 created_at: "2026-06-22T12:00:00Z".into(),
@@ -1257,6 +1278,7 @@ mod tests {
                 type_: IssueType::Unspecified,
                 priority: None,
                 labels: Vec::new(),
+                metadata: BTreeMap::new(),
                 dependencies: Vec::new(),
                 assignee: None,
                 created_at: "2026-06-22T12:00:00Z".into(),
@@ -1310,6 +1332,7 @@ mod tests {
                 type_: IssueType::Unspecified,
                 priority: None,
                 labels: Vec::new(),
+                metadata: BTreeMap::new(),
                 dependencies: Vec::new(),
                 assignee: None,
                 created_at: "2026-06-22T12:00:00Z".into(),
@@ -1357,6 +1380,7 @@ mod tests {
                 type_: IssueType::Unspecified,
                 priority: None,
                 labels: Vec::new(),
+                metadata: BTreeMap::new(),
                 dependencies: Vec::new(),
                 assignee: None,
                 created_at: "2026-06-22T12:00:00Z".into(),

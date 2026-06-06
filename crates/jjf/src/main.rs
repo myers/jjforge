@@ -308,6 +308,13 @@ enum Commands {
         #[arg(short = 'l', long = "label")]
         labels: Vec<String>,
 
+        /// Filter by metadata key=value. Repeatable. Semantics:
+        /// AND — an issue must carry every listed key with the exact
+        /// value to match. Format is `key=value`; the first `=`
+        /// splits key from value (values may contain `=`).
+        #[arg(long = "meta")]
+        meta: Vec<String>,
+
         /// Filter by issue type. Repeatable. Semantics: OR — an
         /// issue matches if its type equals any of the listed
         /// types. Omit the flag to include every type.
@@ -706,6 +713,15 @@ enum Commands {
         action: LabelAction,
     },
 
+    /// Manage per-issue string→string metadata (last-write-wins per
+    /// key). Mirrors `label` but stores a key/value map instead of a
+    /// set. Emitted on `jjf show --json` / `jjf ls --json` as a
+    /// `"metadata"` object.
+    Metadata {
+        #[command(subcommand)]
+        action: MetadataAction,
+    },
+
     /// Manage typed dependency edges between issues (v2.4
     /// `agent-dep-types`). Four edge kinds with distinct semantics:
     ///
@@ -1018,6 +1034,42 @@ enum LabelAction {
     },
 }
 
+/// Inner enum for `jjf metadata <action>`. Same shape rationale as
+/// `LabelAction` (one help page per subcommand). `set` writes a
+/// key/value (overwriting any prior value — last-write-wins per key);
+/// `unset` removes a key.
+#[derive(Debug, Subcommand)]
+enum MetadataAction {
+    /// Set a metadata key to a value. Overwrites any existing value
+    /// for the key (last-write-wins). A fresh `set-metadata` op lands
+    /// either way.
+    Set {
+        /// Full 7-char hex issue id (or slug). Bad parse → exit 2;
+        /// valid id that doesn't exist → exit 1.
+        id: String,
+
+        /// Metadata key. Must be non-empty; an empty string is a
+        /// preflight failure (exit 2) at the CLI layer.
+        key: String,
+
+        /// Metadata value. May be empty; must not contain newlines
+        /// (the storage layer rejects newlines in key or value).
+        value: String,
+    },
+
+    /// Remove a metadata key. No-op at the record level if the key
+    /// isn't present, but a fresh `unset-metadata` op lands either way.
+    Unset {
+        /// Full 7-char hex issue id (or slug). Bad parse → exit 2;
+        /// valid id that doesn't exist → exit 1.
+        id: String,
+
+        /// Metadata key to remove. Must be non-empty (same rule as
+        /// `set`).
+        key: String,
+    },
+}
+
 /// Inner enum for `jjf dep <action>` — v2.4 (`agent-dep-types`).
 /// Same shape rationale as `LabelAction` (one help page per
 /// subcommand, clean clap-derive output). The three verbs are
@@ -1185,6 +1237,13 @@ enum CliError {
     /// `$L` unset) rather than intent.
     #[error("label must not be empty")]
     EmptyLabel,
+
+    /// The user passed an empty key for `jjf metadata set|unset <id>
+    /// <key> …`. Same rationale as `EmptyLabel`: the storage layer
+    /// doesn't validate emptiness, and an empty key is almost
+    /// certainly a shell-quoting mistake. Preflight failure (exit 2).
+    #[error("metadata key must not be empty")]
+    EmptyMetadataKey,
 
     /// `jjf comment` couldn't resolve a comment author. Either jj's
     /// `user.name` isn't configured AND no `--author` override was
@@ -1537,6 +1596,7 @@ impl CliError {
             CliError::MissingIssuesBookmark(_) => 2,
             CliError::EmptyCommentBody => 2,
             CliError::EmptyLabel => 2,
+            CliError::EmptyMetadataKey => 2,
             CliError::MissingAuthor => 2,
             CliError::NoUpdateFields => 2,
             CliError::RemoteAlreadyExists(_) => 2,
@@ -1627,6 +1687,7 @@ impl CliError {
             CliError::MissingIssuesBookmark(_) => "missing_issues_bookmark",
             CliError::EmptyCommentBody => "empty_body",
             CliError::EmptyLabel => "empty_label",
+            CliError::EmptyMetadataKey => "empty_metadata_key",
             CliError::MissingAuthor => "missing_author",
             CliError::NoUpdateFields => "no_update_fields",
             CliError::RemoteAlreadyExists(_) => "remote_already_exists",
@@ -1894,11 +1955,12 @@ fn run(cli: Cli) -> Result<(), CliError> {
         Commands::Ls {
             status,
             labels,
+            meta,
             types,
             slug,
             priorities,
             parent,
-        } => run_ls(cli.json, status, labels, types, slug, priorities, parent),
+        } => run_ls(cli.json, status, labels, meta, types, slug, priorities, parent),
         Commands::Ready {
             labels,
             types,
@@ -1931,6 +1993,14 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 run_label(cli.json, id, label, LabelOp::Add)
             }
             LabelAction::Rm { id, label } => run_label(cli.json, id, label, LabelOp::Rm),
+        },
+        Commands::Metadata { action } => match action {
+            MetadataAction::Set { id, key, value } => {
+                run_metadata(cli.json, id, key, Some(value), MetadataOp::Set)
+            }
+            MetadataAction::Unset { id, key } => {
+                run_metadata(cli.json, id, key, None, MetadataOp::Unset)
+            }
         },
         Commands::Dep { action } => match action {
             DepAction::Add { child, parent, kind } => {
@@ -2018,6 +2088,15 @@ fn run(cli: Cli) -> Result<(), CliError> {
 enum LabelOp {
     Add,
     Rm,
+}
+
+/// Which storage mutator `run_metadata` should call. Mirrors
+/// [`LabelOp`]; lets the helper render the right past-tense verb
+/// (`set` / `unset`) without re-matching on `MetadataAction`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataOp {
+    Set,
+    Unset,
 }
 
 /// Which storage mutator `run_dep` should call. Same shape rationale
@@ -2899,6 +2978,69 @@ fn run_label(json: bool, id: String, label: String, op: LabelOp) -> Result<(), C
     Ok(())
 }
 
+/// `jjf metadata set|unset <id> <key> [<value>]` — wrap
+/// `Storage::set_metadata` / `Storage::unset_metadata`. Mirrors
+/// [`run_label`]: reject an empty key at the CLI layer (exit 2),
+/// canonicalize cwd, probe for the `issues` bookmark, resolve the
+/// handle (id-or-slug), then hand off to storage. The `value` is
+/// `Some` for `set` and `None` for `unset`.
+fn run_metadata(
+    json: bool,
+    id: String,
+    key: String,
+    value: Option<String>,
+    op: MetadataOp,
+) -> Result<(), CliError> {
+    // 1. Reject empty keys at the CLI layer — storage doesn't validate
+    // emptiness. Trim before the check (whitespace-only key is the
+    // same shell-quoting mistake an empty one would be).
+    if key.trim().is_empty() {
+        return Err(CliError::EmptyMetadataKey);
+    }
+
+    // 2. Resolve + canonicalize cwd.
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+
+    // 3. Preflight: jj repo + `issues` bookmark present.
+    preflight::issues_bookmark(&cwd)?;
+
+    // 4. Open storage, resolve handle (`id`-or-`slug`), then hand off.
+    let storage = Storage::open(&cwd)?;
+    let issue_id = resolve_handle(&storage, &id)?;
+    match op {
+        MetadataOp::Set => {
+            let v = value.as_deref().unwrap_or("");
+            storage.set_metadata(&issue_id, &key, v)?
+        }
+        MetadataOp::Unset => storage.unset_metadata(&issue_id, &key)?,
+    }
+
+    // 5. Render. Same `{"ok":true,…}` envelope shape as `run_label`.
+    let action_word = match op {
+        MetadataOp::Set => "set",
+        MetadataOp::Unset => "unset",
+    };
+    if json {
+        let mut out = serde_json::json!({
+            "ok": true,
+            "id": issue_id.as_str(),
+            "key": &key,
+            "action": action_word,
+        });
+        if let Some(v) = &value {
+            out["value"] = serde_json::Value::String(v.clone());
+        }
+        println!("{out}");
+    } else {
+        match &value {
+            Some(v) => println!("metadata {action_word}: {key}={v} -> {issue_id}"),
+            None => println!("metadata {action_word}: {key} -> {issue_id}"),
+        }
+    }
+    Ok(())
+}
+
 /// `jjf dep add|rm <child> <parent> [--kind <kind>]` — wrap
 /// `Storage::add_dep_edge` / `Storage::remove_dep_edge`. v2.4
 /// (`agent-dep-types`). Preflight mirrors `run_label`: refuse to run
@@ -3738,6 +3880,7 @@ fn run_ls(
     json: bool,
     status: StatusFilter,
     labels: Vec<String>,
+    meta: Vec<String>,
     types: Vec<TypeArg>,
     slug: Option<String>,
     priorities: Vec<u8>,
@@ -3777,6 +3920,9 @@ fn run_ls(
             continue;
         }
         if !labels_match(&issue, &labels) {
+            continue;
+        }
+        if !metadata_matches(&issue, &meta) {
             continue;
         }
         if !types_match(&issue, &wanted_types) {
@@ -4282,6 +4428,22 @@ fn status_matches(issue: &Issue, filter: StatusFilter) -> bool {
 /// filter requires the issue to carry EVERY listed label (intersection).
 fn labels_match(issue: &Issue, wanted: &[String]) -> bool {
     wanted.iter().all(|w| issue.labels.iter().any(|l| l == w))
+}
+
+/// `--meta` predicate. Empty filter matches every issue. A non-empty
+/// filter requires the issue's metadata map to carry EVERY listed
+/// `key=value` pair exactly (AND semantics, mirroring `--label`). Each
+/// filter token is split on the first `=`; a token with no `=` never
+/// matches (treated as `key` with empty value, which only matches an
+/// explicitly-empty value). Values may contain `=`.
+fn metadata_matches(issue: &Issue, wanted: &[String]) -> bool {
+    wanted.iter().all(|w| {
+        let (key, value) = match w.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (w.as_str(), ""),
+        };
+        issue.metadata.get(key).map(|v| v == value).unwrap_or(false)
+    })
 }
 
 /// `--type` predicate. Empty filter matches every issue. A non-empty
