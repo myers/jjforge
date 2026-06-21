@@ -1,0 +1,242 @@
+
+===== SHAPE A: bookmark-branch (dedicated 'bugs' bookmark) =====
+
+===== (1) set up bare git remote, seed with empty main =====
+Initialized empty Git repository in /Users/myers/p/jjforge/experiments/storage-shape/.scratch/shape-a/remote.git/
+Initialized empty Git repository in /Users/myers/p/jjforge/experiments/storage-shape/.scratch/shape-a/seed/.git/
+[main (root-commit) 5ff0250] seed
+To /Users/myers/p/jjforge/experiments/storage-shape/.scratch/shape-a/remote.git
+ * [new branch]      main -> main
+branch 'main' set up to track 'origin/main'.
+
+===== (2) jj git clone twice (alice, bob) =====
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Fetching into new repo in "/Users/myers/p/jjforge/experiments/storage-shape/.scratch/shape-a/alice"
+bookmark: main@origin [new] tracked
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Setting the revset alias `trunk()` to `main@origin`
+Working copy  (@) now at: kzusuyls 1afeb8ac (empty) (no description set)
+Parent commit (@-)      : qyqvsysy 5ff02504 main | (empty) seed
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Hint: Running `git clean -xdf` will remove `.jj/`!
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Fetching into new repo in "/Users/myers/p/jjforge/experiments/storage-shape/.scratch/shape-a/bob"
+bookmark: main@origin [new] tracked
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Setting the revset alias `trunk()` to `main@origin`
+Working copy  (@) now at: pryqqmzp bfd8263e (empty) (no description set)
+Parent commit (@-)      : qyqvsysy 5ff02504 main | (empty) seed
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Hint: Running `git clean -xdf` will remove `.jj/`!
+Warning: This setting will only impact future commits.
+The author of the working copy will stay " <>".
+To change the working copy author, use "jj metaedit --update-author"
+Warning: This setting will only impact future commits.
+The author of the working copy will stay " <>".
+To change the working copy author, use "jj metaedit --update-author"
+Warning: This setting will only impact future commits.
+The author of the working copy will stay " <>".
+To change the working copy author, use "jj metaedit --update-author"
+Warning: This setting will only impact future commits.
+The author of the working copy will stay " <>".
+To change the working copy author, use "jj metaedit --update-author"
+
+===== (3) alice: create bug aa6600b on a fresh 'bugs' bookmark; push =====
+Working copy  (@) now at: tqtqmkvq 40818db9 (empty) jjf: bug aa6600b - create
+Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+Working copy changes:
+A bugs/aa6600b.json
+Working copy  (@) : tqtqmkvq a42fe1a4 jjf: bug aa6600b - create
+Parent commit (@-): zzzzzzzz 00000000 (empty) (no description set)
+alice change at @ = tqtqmkvqzsuoykmmpztumpxvlwylkzon
+Created 1 bookmarks pointing to tqtqmkvq a42fe1a4 bugs | jjf: bug aa6600b - create
+Working copy  (@) now at: zxrvqylx e7d5fae7 (empty) (no description set)
+Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+Added 0 files, modified 0 files, removed 1 files
+Warning: --allow-new is deprecated, track bookmarks manually or configure remotes.<name>.auto-track-bookmarks instead.
+Changes to push to origin:
+  Add bookmark bugs to a42fe1a4cbcd
+alice's bookmarks after push:
+bugs: tqtqmkvq a42fe1a4 jjf: bug aa6600b - create
+  @git: tqtqmkvq a42fe1a4 jjf: bug aa6600b - create
+  @origin: tqtqmkvq a42fe1a4 jjf: bug aa6600b - create
+main: qyqvsysy 5ff02504 (empty) seed
+  @git: qyqvsysy 5ff02504 (empty) seed
+  @origin: qyqvsysy 5ff02504 (empty) seed
+
+===== (4) bob: fetch and inspect =====
+bookmark: bugs@origin [new] untracked
+bob's bookmarks (should show bugs@origin):
+bugs@origin: tqtqmkvq a42fe1a4 jjf: bug aa6600b - create
+main: qyqvsysy 5ff02504 (empty) seed
+  @git: qyqvsysy 5ff02504 (empty) seed
+  @origin: qyqvsysy 5ff02504 (empty) seed
+bob's log of bugs@origin:
+tqtqmkvqzsuo jjf: bug aa6600b - create
+bob's per-file history at root:bugs/aa6600b.json:
+tqtqmkvqzsuo jjf: bug aa6600b - create
+
+===== (5a) alice: retitle, push =====
+Working copy  (@) now at: wsyovzlp 7fb9291e (empty) jjf: bug aa6600b - set-title
+Parent commit (@-)      : tqtqmkvq a42fe1a4 bugs | jjf: bug aa6600b - create
+Added 1 files, modified 0 files, removed 0 files
+Moved 1 bookmarks to wsyovzlp e9981737 bugs* | jjf: bug aa6600b - set-title
+Working copy  (@) now at: xmyyunzk 1f34be8f (empty) (no description set)
+Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+Added 0 files, modified 0 files, removed 1 files
+Changes to push to origin:
+  Move forward bookmark bugs from a42fe1a4cbcd to e99817378bc5
+alice pushed concurrent change wsyovzlpturukqsxuxprzkvsrusukxzp
+
+===== (5b) bob: independently retitle the same bug to a different value =====
+Warning: <bookmark>@<remote> syntax is deprecated, use `<bookmark> --remote=<remote>` instead.
+Started tracking 1 remote bookmarks.
+bugs: tqtqmkvq a42fe1a4 jjf: bug aa6600b - create
+  @git: tqtqmkvq a42fe1a4 jjf: bug aa6600b - create
+  @origin: tqtqmkvq a42fe1a4 jjf: bug aa6600b - create
+main: qyqvsysy 5ff02504 (empty) seed
+  @git: qyqvsysy 5ff02504 (empty) seed
+  @origin: qyqvsysy 5ff02504 (empty) seed
+Working copy  (@) now at: sownuxll a65bfdb7 (empty) jjf: bug aa6600b - set-title
+Parent commit (@-)      : tqtqmkvq a42fe1a4 bugs | jjf: bug aa6600b - create
+Added 1 files, modified 0 files, removed 0 files
+Moved 1 bookmarks to sownuxll 5f8288b1 bugs* | jjf: bug aa6600b - set-title
+Working copy  (@) now at: knssuylp 659fbed0 (empty) (no description set)
+Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+Added 0 files, modified 0 files, removed 1 files
+bob created concurrent change sownuxllolklkxzyxmtqlympnlxvmsmr
+
+===== (5c) bob fetches alice's push; bookmarks diverge =====
+bookmark: bugs@origin [updated] tracked
+bob's bookmarks (should show divergence: bugs vs bugs@origin):
+bugs (conflicted):
+  - tqtqmkvq a42fe1a4 jjf: bug aa6600b - create
+  + sownuxll 5f8288b1 jjf: bug aa6600b - set-title
+  + wsyovzlp e9981737 jjf: bug aa6600b - set-title
+  @git (behind by 1 commits): sownuxll 5f8288b1 jjf: bug aa6600b - set-title
+  @origin (behind by 1 commits): wsyovzlp e9981737 jjf: bug aa6600b - set-title
+main: qyqvsysy 5ff02504 (empty) seed
+  @git: qyqvsysy 5ff02504 (empty) seed
+  @origin: qyqvsysy 5ff02504 (empty) seed
+Hint: Some bookmarks have conflicts. Use `jj bookmark set <name> -r <rev>` to resolve.
+
+===== (5d) bob tries to push: refused (bookmark conflicted) =====
+Error: Bookmark bugs is conflicted
+Hint: Run `jj bookmark list` to inspect, and use `jj bookmark set` to fix it up.
+(push refused as expected)
+
+===== (5e) bob creates a merge commit by selecting both heads via bookmarks() revset =====
+Working copy  (@) now at: mzlzqkqx 6912900e (conflict) (empty) jjf: bug aa6600b - merge concurrent titles
+Parent commit (@-)      : wsyovzlp e9981737 bugs?? bugs@origin | jjf: bug aa6600b - set-title
+Parent commit (@-)      : sownuxll 5f8288b1 bugs?? bugs@git | jjf: bug aa6600b - set-title
+Added 1 files, modified 0 files, removed 0 files
+Warning: There are unresolved conflicts at these paths:
+bugs/aa6600b.json    2-sided conflict
+@ after merge attempt:
+The working copy has no changes.
+Working copy  (@) : mzlzqkqx 6912900e (conflict) (empty) jjf: bug aa6600b - merge concurrent titles
+Parent commit (@-): wsyovzlp e9981737 bugs?? bugs@origin | jjf: bug aa6600b - set-title
+Parent commit (@-): sownuxll 5f8288b1 bugs?? bugs@git | jjf: bug aa6600b - set-title
+Warning: There are unresolved conflicts at these paths:
+bugs/aa6600b.json    2-sided conflict
+Warning: These bookmarks have conflicts:
+  bugs
+Hint: Use `jj bookmark list` to see details. Use `jj bookmark set <name> -r <rev>` to resolve.
+working copy file content (should show jj conflict markers):
+<<<<<<< conflict 1 of 1
++++++++ wsyovzlp e9981737 "jjf: bug aa6600b - set-title"
+{"title":"alice's title","status":"open","comments":[]}
+%%%%%%% diff from: tqtqmkvq a42fe1a4 "jjf: bug aa6600b - create"
+\\\\\\\        to: sownuxll 5f8288b1 "jjf: bug aa6600b - set-title"
+-{"title":"first bug","status":"open","comments":[]}
++{"title":"bob's title","status":"open","comments":[]}
+>>>>>>> conflict 1 of 1 ends
+is @ marked as conflict?
+mzlzqkqxppml conflict=YES
+
+===== (5f) bob resolves manually (picks alice's title) and pushes =====
+Working copy changes:
+M bugs/aa6600b.json
+Working copy  (@) : mzlzqkqx 13a67643 jjf: bug aa6600b - merge concurrent titles
+Parent commit (@-): wsyovzlp e9981737 bugs?? bugs@origin | jjf: bug aa6600b - set-title
+Parent commit (@-): sownuxll 5f8288b1 bugs?? bugs@git | jjf: bug aa6600b - set-title
+Warning: These bookmarks have conflicts:
+  bugs
+Hint: Use `jj bookmark list` to see details. Use `jj bookmark set <name> -r <rev>` to resolve.
+Moved 1 bookmarks to mzlzqkqx 13a67643 bugs* | jjf: bug aa6600b - merge concurrent titles
+Working copy  (@) now at: vlklytyo 98b94ef9 (empty) (no description set)
+Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+Added 0 files, modified 0 files, removed 1 files
+Changes to push to origin:
+  Move forward bookmark bugs from e99817378bc5 to 13a676435a1f
+
+===== (6) op history for the file: stock jj log <path> =====
+bookmark: bugs@origin [updated] tracked
+alice's view of bugs file history after fetching bob's merge:
+mzlzqkqxppml jjf: bug aa6600b - merge concurrent titles
+sownuxllolkl jjf: bug aa6600b - set-title
+wsyovzlpturu jjf: bug aa6600b - set-title
+tqtqmkvqzsuo jjf: bug aa6600b - create
+
+===== (7) mutating from a different bookmark: how awkward? =====
+alice's @ before mutation:
+xmyyunzkwomp 
+running the 4-CLI dance: new bugs -> write -> bookmark set -> new root()
+Working copy  (@) now at: yyvonruo 32f8502f (empty) jjf: bug bb7700c - create
+Parent commit (@-)      : mzlzqkqx 13a67643 bugs | jjf: bug aa6600b - merge concurrent titles
+Added 1 files, modified 0 files, removed 0 files
+Moved 1 bookmarks to yyvonruo 6ecafe67 bugs* | jjf: bug bb7700c - create
+Working copy  (@) now at: rwplnskn 03379b1c (empty) (no description set)
+Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+Added 0 files, modified 0 files, removed 2 files
+alice's @ after mutation:
+rwplnsknzrvp empty=YES
+Changes to push to origin:
+  Move forward bookmark bugs from 13a676435a1f to 6ecafe672f32
+
+===== (8) a different awkwardness: mutating while alice has WIP on @ =====
+alice has uncommitted WIP on @ (a file unrelated to bugs):
+Working copy changes:
+A wip.txt
+Working copy  (@) : rwplnskn 6e1eed22 (no description set)
+Parent commit (@-): zzzzzzzz 00000000 (empty) (no description set)
+now run the new bugs dance — does WIP survive?
+Working copy  (@) now at: tltuuppk 97bd7e41 (empty) jjf: bug dd9900e - create
+Parent commit (@-)      : yyvonruo 6ecafe67 bugs | jjf: bug bb7700c - create
+Added 2 files, modified 0 files, removed 1 files
+Moved 1 bookmarks to tltuuppk 95178928 bugs* | jjf: bug dd9900e - create
+Working copy  (@) now at: kstqzrkl bc9a38b1 (empty) (no description set)
+Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+Added 0 files, modified 0 files, removed 3 files
+alice's full log now (looking for the wip change):
+kstqzrklnwuy files=0 
+tltuuppkqklp files=n jjf: bug dd9900e - create
+rwplnsknzrvp files=n 
+yyvonruoosqn files=n jjf: bug bb7700c - create
+mzlzqkqxppml files=n jjf: bug aa6600b - merge concurrent titles
+sownuxllolkl files=n jjf: bug aa6600b - set-title
+wsyovzlpturu files=n jjf: bug aa6600b - set-title
+tqtqmkvqzsuo files=n jjf: bug aa6600b - create
+qyqvsysyrnus files=0 seed
+is wip.txt still findable under the prior change_id rwplnsknzrvpuvslvuntnlwywkqpnlqo?
+A wip.txt
+
+===== DONE shape A =====

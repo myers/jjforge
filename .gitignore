@@ -1,0 +1,6 @@
+# Per-experiment scratch directories. Test harnesses build bare git
+# remotes and jj clones under these; they should never be tracked.
+experiments/**/.scratch/
+
+# Cargo build dirs in experiments.
+experiments/**/target/

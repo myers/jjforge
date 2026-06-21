@@ -1,0 +1,130 @@
+
+===== SHAPE B: side-channel jj op type (feasibility probe) =====
+
+===== (0) sanity: does jj have a public way to record a custom op type? =====
+subcommands of 'jj op' (looking for create/insert/extend):
+  Commands:
+    abandon    Abandon operation history
+    diff       Compare changes to the repository between two operations
+    integrate  Make an operation part of the operation log
+    log        Show the operation log
+    restore    Create a new operation that restores the repo to an earlier state
+    revert     Create a new operation that reverts an earlier operation
+    show       Show changes to the repository in an operation
+  
+  Options:
+(Note: 'integrate' is a recovery tool for orphaned ops, not a
+ way to write custom op metadata. There is no 'jj op create',
+ no 'jj op annotate', no plugin API.)
+
+===== (1) bare remote, jj git clone twice =====
+Initialized empty Git repository in /Users/myers/p/jjforge/experiments/storage-shape/.scratch/shape-b/remote.git/
+Initialized empty Git repository in /Users/myers/p/jjforge/experiments/storage-shape/.scratch/shape-b/seed/.git/
+[main (root-commit) 9addd1f] seed
+To /Users/myers/p/jjforge/experiments/storage-shape/.scratch/shape-b/remote.git
+ * [new branch]      main -> main
+branch 'main' set up to track 'origin/main'.
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Fetching into new repo in "/Users/myers/p/jjforge/experiments/storage-shape/.scratch/shape-b/alice"
+bookmark: main@origin [new] tracked
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Setting the revset alias `trunk()` to `main@origin`
+Working copy  (@) now at: uzuxszmy f52f6814 (empty) (no description set)
+Parent commit (@-)      : rvrsstys 9addd1fd main | (empty) seed
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Hint: Running `git clean -xdf` will remove `.jj/`!
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Fetching into new repo in "/Users/myers/p/jjforge/experiments/storage-shape/.scratch/shape-b/bob"
+bookmark: main@origin [new] tracked
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Setting the revset alias `trunk()` to `main@origin`
+Working copy  (@) now at: puxzxlly 96ac37dd (empty) (no description set)
+Parent commit (@-)      : rvrsstys 9addd1fd main | (empty) seed
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Hint: Running `git clean -xdf` will remove `.jj/`!
+Warning: This setting will only impact future commits.
+The author of the working copy will stay " <>".
+To change the working copy author, use "jj metaedit --update-author"
+Warning: This setting will only impact future commits.
+The author of the working copy will stay " <>".
+To change the working copy author, use "jj metaedit --update-author"
+Warning: This setting will only impact future commits.
+The author of the working copy will stay " <>".
+To change the working copy author, use "jj metaedit --update-author"
+Warning: This setting will only impact future commits.
+The author of the working copy will stay " <>".
+To change the working copy author, use "jj metaedit --update-author"
+
+===== (2) alice does several mutations: 5 distinct jj transactions =====
+Working copy  (@) now at: zvpnynox 968ae541 (empty) create bug aa6600b
+Parent commit (@-)      : rvrsstys 9addd1fd main | (empty) seed
+Working copy  (@) now at: zvpnynox 8262ac6b create bug aa6600b - now with title
+Parent commit (@-)      : rvrsstys 9addd1fd main | (empty) seed
+Created 1 bookmarks pointing to zvpnynox 8262ac6b bugs | create bug aa6600b - now with title
+Working copy  (@) now at: onzolwlt 86e1d2c3 (empty) create bug bb7700c
+Parent commit (@-)      : rvrsstys 9addd1fd main | (empty) seed
+Added 0 files, modified 0 files, removed 1 files
+/Users/myers/p/jjforge/experiments/storage-shape/test-shape-b-side-channel.sh: line 69: /Users/myers/p/jjforge/experiments/storage-shape/.scratch/shape-b/alice/bugs/bb7700c.json: No such file or directory
+
+===== (3) count ops in alice's op log =====
+alice ops: 10
+first 5 alice op descriptions:
+1ada10e43a42  new empty commit
+35c26a892287  create bookmark bugs pointing to commit 8262ac6b657486ce3f9194b9e69f8fd13efb039d
+ed5c8c60ba4d  describe commit 152444c5d8f50148de33f5c668729471a98ce244
+7de42cb4a0d0  snapshot working copy
+c1ca1a89f433  new empty commit
+
+===== (4) push, fetch, count ops in bob =====
+Bookmark main@origin already matches main
+Changes to push to origin:
+  Add bookmark bugs to 8262ac6b6574
+bookmark: bugs@origin [new] untracked
+bob ops: 6
+first 5 bob op descriptions:
+c867222c91ad  fetch from git remote(s) origin
+ef62ad7675c8  check out git remote's branch: main
+a0244721c58b  fetch from git remote into empty repo
+1fc8fc925049  add git remote origin
+b11c76d7b67f  add workspace 'default'
+
+===== (5) verdict: are alice's transaction ops in bob's op log? =====
+Compare counts: alice=10, bob=6
+If bob_ops << alice_ops, the op log is local-only — confirming
+a60bb95's finding that 'jj op log is not the audit surface.'
+If we attached side-channel data to jj ops in alice's clone,
+none of it would reach bob via jj fetch.
+
+===== (6) what about jj op log content? still local-flavored? =====
+alice's full op log:
+e14e7b55a477  push bookmark bugs to git remote origin  tags=args: jj git push --bookmark bugs --allow-new --bookmark main
+1ada10e43a42  new empty commit  tags=args: jj new main -m 'create bug bb7700c'
+35c26a892287  create bookmark bugs pointing to commit 8262ac6b657486ce3f9194b9e69f8fd13efb039d  tags=args: jj bookmark create bugs -r @
+ed5c8c60ba4d  describe commit 152444c5d8f50148de33f5c668729471a98ce244  tags=args: jj describe -m 'create bug aa6600b - now with title'
+7de42cb4a0d0  snapshot working copy  tags=args: jj describe -m 'create bug aa6600b - now with title'
+c1ca1a89f433  new empty commit  tags=args: jj new main -m 'create bug aa6600b'
+105d6232df89  check out git remote's branch: main  tags=args: jj git clone /Users/myers/p/jjforge/experiments/storage-shape/.scratch/shape-b/remote.git alice
+41610119e2af  fetch from git remote into empty repo  tags=args: jj git clone /Users/myers/p/jjforge/experiments/storage-shape/.scratch/shape-b/remote.git alice
+84d18f57dbcf  add git remote origin  tags=args: jj git clone /Users/myers/p/jjforge/experiments/storage-shape/.scratch/shape-b/remote.git alice
+1ab4cdfef8e7  add workspace 'default'  tags=
+000000000000    tags=
+
+===== DONE shape B (feasibility probe) =====
