@@ -331,10 +331,23 @@ prompt; let the skill carry it.
 
 ## What's next
 
-Read the meta-epic `04e1dac` and pick the next concrete piece
-of work. The MVP path is `mvp-storage` → `mvp-cli` → `mvp-sync`
-(`e2e473b` is the named "do this now" ticket under `mvp-sync`).
+The project's running roadmap is a single ticket labeled
+`roadmap`:
 
-Don't expand scope into the speculative epics
-(`multi-client`, `project-agent-orchestration`) until the MVP
-epics ship. Their sketches are intentionally rough.
+```bash
+git-bug bug --label roadmap
+```
+
+It lists the open epics in the order they should be tackled.
+The order shifts as the project learns; the ticket itself
+stays open for the life of the project. The latest comment
+is the truth (git-bug has no edit-body command; the roadmap
+gets updated by appending a new ordering as a comment).
+
+For the broader index — every issue, open and closed, by
+label — read the meta-epic `04e1dac`. The roadmap tells you
+*what to work on next*; the meta-epic tells you *what
+exists*.
+
+Don't expand scope into epics below the roadmap's "above the
+line" cut until the roadmap explicitly pulls them up.

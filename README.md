@@ -56,7 +56,8 @@ Quick reference:
 
 ```
 git-bug bug                            # list everything
-git-bug bug --label meta-epic          # the plan's entry point
+git-bug bug --label roadmap            # the priority order — read this first
+git-bug bug --label meta-epic          # the index of every issue
 git-bug bug --label epic               # the six epics
 git-bug bug --label epic:mvp-storage   # one epic + its related issues
 git-bug bug --label research           # historical research record
@@ -67,7 +68,9 @@ git-bug bug comment new <id> -F -      # comment, body on stdin
 
 Label scheme:
 
-- `meta-epic` — the entry-point issue.
+- `roadmap` — the project's running priority list (one ticket, never
+  closes; latest comment is the truth).
+- `meta-epic` — the index of every issue, by label.
 - `epic` — the six top-level epic issues.
 - `epic:<slug>` — every issue belonging to an epic (the epic itself
   plus its research and child tickets).
