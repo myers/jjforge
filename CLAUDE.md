@@ -269,8 +269,11 @@ When the user asks you to "orchestrate" or "make progress" or
 6. **Post a status comment to each affected epic** when a child
    ticket closes. The comment goes on the epic issue (e.g.
    `72638a0`), names the closed ticket, links the commit if one
-   landed, and notes what's still unfiled. This is how the
-   meta-epic's index stays usable.
+   landed, and notes what's still unfiled. **When the orchestration
+   round ends, also post a status comment to the meta-epic
+   `04e1dac`** linking any newly-filed or newly-closed tickets —
+   epic-level comments aren't enough; the meta-epic is the index
+   readers (and future orchestrators) hit first.
 
 7. **Surface follow-ups to the user.** Stop and report when:
    the subagent budget is exhausted, a finding contradicts an
