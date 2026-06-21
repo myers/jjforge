@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# jjf — the jjforge CLI.
+#
+# Today: this is a thin shim around git-bug, so we plan jjforge in
+# git-bug while we build it. The verb shape we use here is what
+# the real `jjf` will offer eventually.
+#
+# Tomorrow: this script gets replaced by a real Rust binary at
+# target/release/jjf. The wrapper layer in this script will move
+# inside the binary, or vanish entirely.
+#
+# Usage examples (today, via git-bug under the hood):
+#   jjf ls                       # list issues
+#   jjf show <id>                # show one
+#   jjf new "<title>" -F body.md # create from file
+#   jjf comment <id> -F note.md  # add a comment
+#   jjf close <id>               # close it
+#
+# Run with no args: prints help.
+
+set -euo pipefail
+
+if [[ $# -eq 0 ]]; then
+    cat <<USAGE
+jjf — jjforge CLI (currently a git-bug shim; real binary forthcoming)
+
+Verbs:
+  jjf ls                       List issues
+  jjf show <id>                Show one issue
+  jjf new -t "<title>" -F -    Create an issue (-F - reads from stdin)
+  jjf comment <id> -F -        Add a comment (-F - reads from stdin)
+  jjf close <id>               Close an issue
+  jjf open <id>                Reopen an issue
+  jjf label add <id> <label>   Add a label
+  jjf label rm <id> <label>    Remove a label
+
+Plus anything else git-bug supports — pass directly to git-bug:
+  jjf bug ...
+  jjf push
+  jjf pull
+USAGE
+    exit 0
+fi
+
+cmd="$1"
+shift
+
+case "$cmd" in
+    ls)        exec git-bug bug "$@" ;;
+    show)      exec git-bug bug show "$@" ;;
+    new)       exec git-bug bug new --non-interactive "$@" ;;
+    comment)   exec git-bug bug comment new --non-interactive "$@" ;;
+    close)     exec git-bug bug status close "$@" ;;
+    open)      exec git-bug bug status open "$@" ;;
+    label)
+        sub="$1"; shift
+        case "$sub" in
+            add) exec git-bug bug label new "$@" ;;
+            rm)  exec git-bug bug label rm "$@" ;;
+            *)   echo "jjf label: unknown subcommand '$sub'" >&2; exit 2 ;;
+        esac
+        ;;
+    *)         exec git-bug "$cmd" "$@" ;;
+esac
