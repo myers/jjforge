@@ -3,6 +3,10 @@
 experiments/**/.scratch/
 experiments/**/.scratch-followup/
 
+# Per-crate scratch directories. Same role as above, but for
+# `crates/<x>/tests/.scratch/` integration tests.
+crates/**/tests/.scratch/
+
 # Cargo build dirs in experiments.
 experiments/**/target/
 

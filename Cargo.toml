@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/jjf-merge",
+    "crates/jjf-storage",
 ]
 # experiments/jj-shellout-hello has its own lockfile and intentionally
 # stays a standalone crate (it ships as a tiny example, separate from
