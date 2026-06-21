@@ -1,0 +1,296 @@
+
+===== A. far-apart edits — does line distance avoid a conflict? =====
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Fetching into new repo in "/Users/myers/p/jjforge/experiments/distributed-edit/.scratch-followup/A/alice"
+bookmark: main@origin [new] tracked
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Setting the revset alias `trunk()` to `main@origin`
+Working copy  (@) now at: ysmvtzvu 543044c2 (empty) (no description set)
+Parent commit (@-)      : nkmnryoy 79fc2bcd main | (empty) seed
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Hint: Running `git clean -xdf` will remove `.jj/`!
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Fetching into new repo in "/Users/myers/p/jjforge/experiments/distributed-edit/.scratch-followup/A/bob"
+bookmark: main@origin [new] tracked
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Setting the revset alias `trunk()` to `main@origin`
+Working copy  (@) now at: xzstzytq ff81997b (empty) (no description set)
+Parent commit (@-)      : nkmnryoy 79fc2bcd main | (empty) seed
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Hint: Running `git clean -xdf` will remove `.jj/`!
+Warning: This setting will only impact future commits.
+The author of the working copy will stay " <>".
+To change the working copy author, use "jj metaedit --update-author"
+Warning: This setting will only impact future commits.
+The author of the working copy will stay " <>".
+To change the working copy author, use "jj metaedit --update-author"
+Warning: This setting will only impact future commits.
+The author of the working copy will stay " <>".
+To change the working copy author, use "jj metaedit --update-author"
+Warning: This setting will only impact future commits.
+The author of the working copy will stay " <>".
+To change the working copy author, use "jj metaedit --update-author"
+Working copy  (@) now at: otqtolur 4573c907 (empty) jjf: seed bugs bookmark
+Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+Created 1 bookmarks pointing to otqtolur bd5c088d bugs | jjf: seed bugs bookmark
+Working copy  (@) now at: zzzkwqto 1d8d0935 (empty) (no description set)
+Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+Added 0 files, modified 0 files, removed 1 files
+Warning: --allow-new is deprecated, track bookmarks manually or configure remotes.<name>.auto-track-bookmarks instead.
+Changes to push to origin:
+  Add bookmark bugs to bd5c088d2f01
+bookmark: bugs@origin [new] untracked
+
+--- A.create (alice) ---
+Working copy  (@) now at: ymmtqwlm f1fa6dcc (empty) jjf: bug aa01 - create
+Parent commit (@-)      : otqtolur bd5c088d bugs | jjf: seed bugs bookmark
+Added 1 files, modified 0 files, removed 0 files
+Moved 1 bookmarks to ymmtqwlm 55367a60 bugs* | jjf: bug aa01 - create
+Working copy  (@) now at: xpolxrlm cf2de3a8 (empty) (no description set)
+Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+Added 0 files, modified 0 files, removed 2 files
+Changes to push to origin:
+  Move forward bookmark bugs from bd5c088d2f01 to 55367a604dab
+bookmark: bugs@origin [updated] tracked
+
+--- A.alice edits title only ---
+Working copy  (@) now at: rqmtnvsn ba45910e (empty) jjf: bug aa01 - set-title
+Parent commit (@-)      : ymmtqwlm 55367a60 bugs | jjf: bug aa01 - create
+Added 2 files, modified 0 files, removed 0 files
+Moved 1 bookmarks to rqmtnvsn 0841fdf8 bugs* | jjf: bug aa01 - set-title
+Working copy  (@) now at: xskpyppl 3e0ff35c (empty) (no description set)
+Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+Added 0 files, modified 0 files, removed 2 files
+Changes to push to origin:
+  Move forward bookmark bugs from 55367a604dab to 0841fdf8ff65
+
+--- A.bob edits status only ---
+Working copy  (@) now at: nsvpwspz cdbd2788 (empty) jjf: bug aa01 - set-status
+Parent commit (@-)      : ymmtqwlm 55367a60 bugs | jjf: bug aa01 - create
+Added 2 files, modified 0 files, removed 0 files
+Moved 1 bookmarks to nsvpwspz e3f54408 bugs* | jjf: bug aa01 - set-status
+Working copy  (@) now at: nyoxzoys 4d6bba4f (empty) (no description set)
+Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+Added 0 files, modified 0 files, removed 2 files
+
+--- A.bob fetches and merges ---
+bookmark: bugs@origin [updated] tracked
+Working copy  (@) now at: txpousrx e9d00fd4 (empty) jjf: bug aa01 - auto-merge far-apart
+Parent commit (@-)      : rqmtnvsn 0841fdf8 bugs?? bugs@origin | jjf: bug aa01 - set-title
+Parent commit (@-)      : nsvpwspz e3f54408 bugs?? bugs@git | jjf: bug aa01 - set-status
+Added 2 files, modified 0 files, removed 0 files
+@ conflict?:
+txpousrxrvov conflict=no
+file content:
+title: alice changed title
+---
+(metadata block)
+labels:
+priority:
+assignee:
+---
+status: closed
+---
+comments:
+
+===== B. conflict markers + resolution affordances =====
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Fetching into new repo in "/Users/myers/p/jjforge/experiments/distributed-edit/.scratch-followup/B/alice"
+bookmark: main@origin [new] tracked
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Setting the revset alias `trunk()` to `main@origin`
+Working copy  (@) now at: upqmsrpr eab44c79 (empty) (no description set)
+Parent commit (@-)      : swntzmnw 03028e5e main | (empty) seed
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Hint: Running `git clean -xdf` will remove `.jj/`!
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Fetching into new repo in "/Users/myers/p/jjforge/experiments/distributed-edit/.scratch-followup/B/bob"
+bookmark: main@origin [new] tracked
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Setting the revset alias `trunk()` to `main@origin`
+Working copy  (@) now at: lwlxqmvm 7172ad5d (empty) (no description set)
+Parent commit (@-)      : swntzmnw 03028e5e main | (empty) seed
+Warning: Name and email not configured. Until configured, your commits will be created with the empty identity, and can't be pushed to remotes.
+Hint: To configure, run:
+  jj config set --user user.name "Some One"
+  jj config set --user user.email "someone@example.com"
+Hint: Running `git clean -xdf` will remove `.jj/`!
+Warning: This setting will only impact future commits.
+The author of the working copy will stay " <>".
+To change the working copy author, use "jj metaedit --update-author"
+Warning: This setting will only impact future commits.
+The author of the working copy will stay " <>".
+To change the working copy author, use "jj metaedit --update-author"
+Warning: This setting will only impact future commits.
+The author of the working copy will stay " <>".
+To change the working copy author, use "jj metaedit --update-author"
+Warning: This setting will only impact future commits.
+The author of the working copy will stay " <>".
+To change the working copy author, use "jj metaedit --update-author"
+Working copy  (@) now at: vnomyvlk 87cffad0 (empty) jjf: seed bugs bookmark
+Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+Created 1 bookmarks pointing to vnomyvlk 601a3267 bugs | jjf: seed bugs bookmark
+Working copy  (@) now at: svzwovxq 5d3f824b (empty) (no description set)
+Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+Added 0 files, modified 0 files, removed 1 files
+Warning: --allow-new is deprecated, track bookmarks manually or configure remotes.<name>.auto-track-bookmarks instead.
+Changes to push to origin:
+  Add bookmark bugs to 601a3267f3a3
+bookmark: bugs@origin [new] untracked
+
+--- B.create ---
+Working copy  (@) now at: ltxqzulz 9a33bb3d (empty) jjf: bug bb02 - create
+Parent commit (@-)      : vnomyvlk 601a3267 bugs | jjf: seed bugs bookmark
+Added 1 files, modified 0 files, removed 0 files
+Moved 1 bookmarks to ltxqzulz d66ba4d3 bugs* | jjf: bug bb02 - create
+Working copy  (@) now at: nrsvnrnm c71ca212 (empty) (no description set)
+Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+Added 0 files, modified 0 files, removed 2 files
+Changes to push to origin:
+  Move forward bookmark bugs from 601a3267f3a3 to d66ba4d3f31f
+bookmark: bugs@origin [updated] tracked
+
+--- B.alice retitles ---
+Working copy  (@) now at: rwyxzusv 2645f8d9 (empty) jjf: bug bb02 - set-title alice
+Parent commit (@-)      : ltxqzulz d66ba4d3 bugs | jjf: bug bb02 - create
+Added 2 files, modified 0 files, removed 0 files
+Moved 1 bookmarks to rwyxzusv d38c05c6 bugs* | jjf: bug bb02 - set-title alice
+Working copy  (@) now at: qsoqmuru e63cc867 (empty) (no description set)
+Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+Added 0 files, modified 0 files, removed 2 files
+Changes to push to origin:
+  Move forward bookmark bugs from d66ba4d3f31f to d38c05c655fe
+
+--- B.bob retitles ---
+Working copy  (@) now at: rtlvvpks be278502 (empty) jjf: bug bb02 - set-title bob
+Parent commit (@-)      : ltxqzulz d66ba4d3 bugs | jjf: bug bb02 - create
+Added 2 files, modified 0 files, removed 0 files
+Moved 1 bookmarks to rtlvvpks 27c53447 bugs* | jjf: bug bb02 - set-title bob
+Working copy  (@) now at: uqumpzps 41cd2ab4 (empty) (no description set)
+Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
+Added 0 files, modified 0 files, removed 2 files
+
+--- B.bob fetches and merges (will conflict) ---
+bookmark: bugs@origin [updated] tracked
+Working copy  (@) now at: nkpppwlt 03519aed (conflict) (empty) jjf: bug bb02 - merge
+Parent commit (@-)      : rwyxzusv d38c05c6 bugs?? bugs@origin | jjf: bug bb02 - set-title alice
+Parent commit (@-)      : rtlvvpks 27c53447 bugs?? bugs@git | jjf: bug bb02 - set-title bob
+Added 2 files, modified 0 files, removed 0 files
+Warning: There are unresolved conflicts at these paths:
+bugs/bb02.json    2-sided conflict
+
+--- B.what does jj report about the conflict? ---
+--- jj status ---
+The working copy has no changes.
+Working copy  (@) : nkpppwlt 03519aed (conflict) (empty) jjf: bug bb02 - merge
+Parent commit (@-): rwyxzusv d38c05c6 bugs?? bugs@origin | jjf: bug bb02 - set-title alice
+Parent commit (@-): rtlvvpks 27c53447 bugs?? bugs@git | jjf: bug bb02 - set-title bob
+Warning: There are unresolved conflicts at these paths:
+bugs/bb02.json    2-sided conflict
+Warning: These bookmarks have conflicts:
+  bugs
+Hint: Use `jj bookmark list` to see details. Use `jj bookmark set <name> -r <rev>` to resolve.
+--- jj resolve --list ---
+bugs/bb02.json    2-sided conflict
+
+--- B.what does the file look like as written? ---
+<<<<<<< conflict 1 of 1
++++++++ rwyxzusv d38c05c6 "jjf: bug bb02 - set-title alice"
+{"title":"alice title","status":"open","comments":[]}
+%%%%%%% diff from: ltxqzulz d66ba4d3 "jjf: bug bb02 - create"
+\\\\\\\        to: rtlvvpks 27c53447 "jjf: bug bb02 - set-title bob"
+-{"title":"first","status":"open","comments":[]}
++{"title":"bob title","status":"open","comments":[]}
+>>>>>>> conflict 1 of 1 ends
+
+--- B.can we get the three sides programmatically? ---
+--- jj file show -r @ <FILE> (working-copy materialized) ---
+<<<<<<< conflict 1 of 1
++++++++ rwyxzusv d38c05c6 "jjf: bug bb02 - set-title alice"
+{"title":"alice title","status":"open","comments":[]}
+%%%%%%% diff from: ltxqzulz d66ba4d3 "jjf: bug bb02 - create"
+\\\\\\\        to: rtlvvpks 27c53447 "jjf: bug bb02 - set-title bob"
+-{"title":"first","status":"open","comments":[]}
++{"title":"bob title","status":"open","comments":[]}
+>>>>>>> conflict 1 of 1 ends
+
+--- the two parent revs of @ ---
+rwyxzusvkups jjf: bug bb02 - set-title alice
+rtlvvpksntkr jjf: bug bb02 - set-title bob
+--- alice's version (first parent file) ---
+Error: Revset `parents(@) ~ ancestors(@-, 1)` didn't resolve to any revisions
+--- attempt: jj file show -r @- (both parents) ---
+Error: Revset `@-` resolved to more than one revision
+Hint: The revset `@-` resolved to these revisions:
+  rwyxzusv d38c05c6 bugs?? bugs@origin | jjf: bug bb02 - set-title alice
+  rtlvvpks 27c53447 bugs?? bugs@git | jjf: bug bb02 - set-title bob
+
+--- B.attempt agent-style resolution: read the conflict, pick a side, write it back ---
+--- raw bytes (repr) ---
+'<<<<<<< conflict 1 of 1\n+++++++ rwyxzusv d38c05c6 "jjf: bug bb02 - set-title alice"\n{"title":"alice title","status":"open","comments":[]}\n%%%%%%% diff from: ltxqzulz d66ba4d3 "jjf: bug bb02 - create"\n\\\\\\\\\\\\\\        to: rtlvvpks 27c53447 "jjf: bug bb02 - set-title bob"\n-{"title":"first","status":"open","comments":[]}\n+{"title":"bob title","status":"open","comments":[]}\n>>>>>>> conflict 1 of 1 ends\n'
+--- conflict block ---
++++++++ rwyxzusv d38c05c6 "jjf: bug bb02 - set-title alice"
+{"title":"alice title","status":"open","comments":[]}
+%%%%%%% diff from: ltxqzulz d66ba4d3 "jjf: bug bb02 - create"
+\\\\\\\        to: rtlvvpks 27c53447 "jjf: bug bb02 - set-title bob"
+-{"title":"first","status":"open","comments":[]}
++{"title":"bob title","status":"open","comments":[]}
+
+--- parsed parts ---
+part[0]: '+++++++ rwyxzusv d38c05c6 "jjf: bug bb02 - set-title alice"\n{"title":"alice title","status":"open","comments":[]}\n'
+part[1]: '-{"title":"first","status":"open","comments":[]}\n+{"title":"bob title","status":"open","comments":[]}\n'
+--- side A reconstructed ---
+{"title":"alice title","status":"open","comments":[]}
+
+--- side B reconstructed from diff ---
+{"title":"bob title","status":"open","comments":[]}
+--- agent decision: last-write-wins per field; pick side B (bob) for title ---
+chosen line: '{"title":"bob title","status":"open","comments":[]}'
+
+--- B.resolve the conflict by writing the chosen content ---
+--- after write ---
+Working copy changes:
+M bugs/bb02.json
+Working copy  (@) : nkpppwlt 00c6754c jjf: bug bb02 - merge
+Parent commit (@-): rwyxzusv d38c05c6 bugs?? bugs@origin | jjf: bug bb02 - set-title alice
+Parent commit (@-): rtlvvpks 27c53447 bugs?? bugs@git | jjf: bug bb02 - set-title bob
+Warning: These bookmarks have conflicts:
+  bugs
+Hint: Use `jj bookmark list` to see details. Use `jj bookmark set <name> -r <rev>` to resolve.
+--- jj log @ now ---
+nkpppwltsqst conflict=no
+
+===== DONE =====
