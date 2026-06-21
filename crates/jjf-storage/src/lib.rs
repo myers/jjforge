@@ -38,14 +38,17 @@
 
 #![forbid(unsafe_code)]
 
+mod history;
 mod id;
 mod jj;
 mod op;
 mod read;
 mod record;
+mod trailer;
 
 use std::path::{Path, PathBuf};
 
+pub use history::HistoryEntry;
 pub use id::BugId;
 pub use jj::JjError;
 pub use op::Op;
@@ -353,6 +356,21 @@ impl Storage {
     /// op-replay view in debug builds — see `read.rs` for the rules.
     pub fn read(&self, id: &BugId) -> Result<Bug> {
         read::read(&self.repo, id)
+    }
+
+    /// Read the full op-by-op timeline for a bug, oldest first.
+    ///
+    /// Returns one [`HistoryEntry`] per `Jjf-Op:` stanza on the bug's
+    /// commit chain. A commit with multiple ops (the create-time
+    /// multi-op stanza of spec §5.7, or any other multi-op commit)
+    /// emits one entry per op, all sharing `commit` / `author` /
+    /// `timestamp`. Comment ops appear in the stream alongside scalar
+    /// mutations — they're commits like any other.
+    ///
+    /// Errors with `BugNotFound` if no commit on the `bugs` bookmark
+    /// touches this bug's files.
+    pub fn read_history(&self, id: &BugId) -> Result<Vec<HistoryEntry>> {
+        history::read_history(&self.repo, id)
     }
 
     // ---- internals ---------------------------------------------------

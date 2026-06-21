@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use jjf_storage::{BugDraft, BugId, Status, Storage};
+use jjf_storage::{BugDraft, BugId, Op, Status, Storage};
 use serde::Serialize;
 
 /// Build a scratch jj repo with a seeded `bugs` bookmark. Returns the
@@ -461,4 +461,194 @@ fn read_after_add_then_remove_label_observes_neither() {
 
     let bug = storage.read(&id).unwrap();
     assert_eq!(bug.labels, vec!["permanent".to_string()]);
+}
+
+// ---------------------------------------------------------------------
+// History-path tests (issue 2f7e085).
+//
+// `Storage::read_history` returns one `HistoryEntry` per `Jjf-Op:`
+// trailer on the chain, oldest first. The acceptance criterion:
+// 4-5 distinct mutations including a multi-op create and a
+// comment-add, with the returned op stream matching what was written
+// in order.
+// ---------------------------------------------------------------------
+
+#[test]
+fn read_history_returns_op_per_trailer_in_chronological_order() {
+    let repo = make_scratch_repo("read_history");
+    let storage = Storage::open(&repo).unwrap();
+
+    // Mutation 1: multi-op create. The writer emits `create` + (per
+    // spec §5.7, in this order) `set-body`, `label-add` × N (sorted),
+    // `dep-add` × N (sorted), `set-assignee`. With body + 2 labels +
+    // assignee that's 5 ops in one commit.
+    let id = storage
+        .create_bug(&BugDraft {
+            title: "first title".into(),
+            body: "initial body".into(),
+            labels: vec!["bug".into(), "p1".into()],
+            dependencies: vec![],
+            assignee: Some("alice".into()),
+        })
+        .unwrap();
+
+    // Mutation 2: set-title (single-op commit).
+    storage.set_title(&id, "second title").unwrap();
+
+    // Mutation 3: set-status to closed (single-op commit).
+    storage.set_status(&id, Status::Closed).unwrap();
+
+    // Mutation 4: add-comment — comments are ops too, in the same
+    // stream as scalar changes.
+    storage
+        .add_comment(&id, "a thought", "alice <a@x>")
+        .unwrap();
+
+    // Mutation 5: label-rm (proves rm-shaped ops are visible too).
+    storage.remove_label(&id, "bug").unwrap();
+
+    let history = storage.read_history(&id).expect("read_history");
+
+    // 5 ops from mutation 1 + 1 + 1 + 1 + 1 + 1 = 9 entries.
+    assert_eq!(
+        history.len(),
+        9,
+        "expected 9 history entries, got {}: {:#?}",
+        history.len(),
+        history,
+    );
+
+    // Per-op assertions, oldest first.
+    // ---- create commit (multi-op stanza per spec §5.7) ----
+    match &history[0].op {
+        Op::Create { bug_id, title, status } => {
+            assert_eq!(bug_id, &id);
+            assert_eq!(title, "first title");
+            assert_eq!(*status, Status::Open);
+        }
+        other => panic!("history[0] expected Create, got {:?}", other),
+    }
+    match &history[1].op {
+        Op::SetBody { bug_id, body_hash } => {
+            assert_eq!(bug_id, &id);
+            assert_eq!(body_hash.len(), 64, "sha-256 hex is 64 chars");
+        }
+        other => panic!("history[1] expected SetBody, got {:?}", other),
+    }
+    match &history[2].op {
+        Op::LabelAdd { bug_id, label } => {
+            assert_eq!(bug_id, &id);
+            assert_eq!(label, "bug"); // labels sorted alphabetically
+        }
+        other => panic!("history[2] expected LabelAdd(bug), got {:?}", other),
+    }
+    match &history[3].op {
+        Op::LabelAdd { bug_id, label } => {
+            assert_eq!(bug_id, &id);
+            assert_eq!(label, "p1");
+        }
+        other => panic!("history[3] expected LabelAdd(p1), got {:?}", other),
+    }
+    match &history[4].op {
+        Op::SetAssignee { bug_id, assignee } => {
+            assert_eq!(bug_id, &id);
+            assert_eq!(assignee.as_deref(), Some("alice"));
+        }
+        other => panic!("history[4] expected SetAssignee, got {:?}", other),
+    }
+
+    // All 5 ops above share the same commit (the multi-op create),
+    // which is the whole point of spec §5.5/§5.7.
+    let create_commit = &history[0].commit;
+    for i in 1..5 {
+        assert_eq!(
+            &history[i].commit, create_commit,
+            "history[{}] should share the create commit but differs: {} vs {}",
+            i, history[i].commit, create_commit,
+        );
+        assert_eq!(&history[i].timestamp, &history[0].timestamp);
+        assert_eq!(&history[i].author, &history[0].author);
+    }
+
+    // ---- set-title commit ----
+    match &history[5].op {
+        Op::SetTitle { bug_id, title } => {
+            assert_eq!(bug_id, &id);
+            assert_eq!(title, "second title");
+        }
+        other => panic!("history[5] expected SetTitle, got {:?}", other),
+    }
+    assert_ne!(
+        &history[5].commit, create_commit,
+        "set-title must land on its own commit"
+    );
+
+    // ---- set-status commit ----
+    match &history[6].op {
+        Op::SetStatus { bug_id, status } => {
+            assert_eq!(bug_id, &id);
+            assert_eq!(*status, Status::Closed);
+        }
+        other => panic!("history[6] expected SetStatus, got {:?}", other),
+    }
+
+    // ---- comment-add commit ----
+    match &history[7].op {
+        Op::CommentAdd { bug_id, comment_id } => {
+            assert_eq!(bug_id, &id);
+            // Comment id should match the one in the comments file.
+            let bug = storage.read(&id).unwrap();
+            assert_eq!(bug.comments.len(), 1);
+            assert_eq!(comment_id, &bug.comments[0].id);
+        }
+        other => panic!("history[7] expected CommentAdd, got {:?}", other),
+    }
+
+    // ---- label-rm commit ----
+    match &history[8].op {
+        Op::LabelRm { bug_id, label } => {
+            assert_eq!(bug_id, &id);
+            assert_eq!(label, "bug");
+        }
+        other => panic!("history[8] expected LabelRm, got {:?}", other),
+    }
+
+    // Timestamps strictly non-decreasing across commits (a commit
+    // can't have an earlier author timestamp than its parent).
+    for i in 1..history.len() {
+        assert!(
+            history[i].timestamp >= history[i - 1].timestamp,
+            "history timestamps must be non-decreasing: history[{}]={} < history[{}]={}",
+            i, history[i].timestamp,
+            i - 1, history[i - 1].timestamp,
+        );
+    }
+
+    // Every entry has a non-empty commit id (jj's commit_id is always
+    // a 40-char hex sha-1) and a well-formed timestamp.
+    for (i, entry) in history.iter().enumerate() {
+        assert_eq!(
+            entry.commit.len(),
+            40,
+            "history[{}] commit id should be 40 hex chars, got {:?}",
+            i, entry.commit,
+        );
+        assert_eq!(
+            entry.timestamp.len(),
+            "2026-06-21T12:00:00Z".len(),
+            "history[{}] timestamp should be RFC3339 Z-form, got {:?}",
+            i, entry.timestamp,
+        );
+    }
+}
+
+#[test]
+fn read_history_missing_bug_returns_bug_not_found() {
+    let repo = make_scratch_repo("read_history_missing");
+    let storage = Storage::open(&repo).unwrap();
+    let missing = BugId::parse("deadbee").unwrap();
+    match storage.read_history(&missing) {
+        Err(jjf_storage::Error::BugNotFound(got)) => assert_eq!(got, missing),
+        other => panic!("expected BugNotFound, got {:?}", other),
+    }
 }

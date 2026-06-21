@@ -40,6 +40,8 @@ use crate::op::Op;
 #[cfg(any(debug_assertions, test))]
 use crate::record::Status;
 use crate::record::{Bug, BugRecord, Comment};
+#[cfg(debug_assertions)]
+use crate::trailer::parse_ops;
 use crate::{bug_comments_relpath, bug_json_relpath, Error, Result, BUGS_BOOKMARK_REVSET};
 
 /// Read a single bug from the `bugs` bookmark tip.
@@ -138,10 +140,11 @@ fn read_comments(repo: &JjRepo, id: &BugId) -> Result<Vec<Comment>> {
 
 // ---- op-replay view ---------------------------------------------------
 //
-// Used today only by the debug-assertions cross-check. The upcoming
-// `storage-read-history` ticket will lift these gates when it exposes
-// the full audit chain — at that point `parse_ops`, `apply_op`, and
-// `OpView` graduate to crate-public helpers.
+// Used only by the debug-assertions cross-check. The trailer-parsing
+// machinery this folds over lives in `trailer.rs` and is shared with
+// the history path; `OpView` is specifically the structural snapshot
+// the cross-check needs, distinct from the per-op timeline that
+// `history.rs` exposes.
 #[cfg(any(debug_assertions, test))]
 /// The structural projection an op-replay can recover. No timestamps
 /// because trailers don't carry them; the body string isn't carried in
@@ -219,170 +222,6 @@ fn replay_ops(repo: &JjRepo, id: &BugId) -> Result<OpView> {
             id
         ))
     })
-}
-
-/// Parse all `Jjf-Op:` stanzas from a commit description, returning
-/// only those whose `Jjf-Bug:` matches `id`. Unknown op types are
-/// preserved as `None` so the caller can skip them without breaking
-/// (spec §5.2: "Unknown trailers and unknown op-types must be
-/// tolerated by readers").
-#[cfg(any(debug_assertions, test))]
-fn parse_ops(desc: &str, id: &BugId) -> Vec<Op> {
-    // Find the trailer block: the last paragraph of trailer lines at
-    // the end of the description. We don't need to be too clever — we
-    // just iterate every `Jjf-Op:` we see and pair it with subsequent
-    // `Jjf-...:` lines until the next `Jjf-Op:` or end.
-    let lines: Vec<&str> = desc.lines().collect();
-    let mut stanzas: Vec<Vec<(&str, &str)>> = Vec::new();
-    let mut current: Option<Vec<(&str, &str)>> = None;
-    for line in lines {
-        if let Some((k, v)) = split_trailer(line) {
-            if k == "Jjf-Op" {
-                if let Some(prev) = current.take() {
-                    stanzas.push(prev);
-                }
-                current = Some(vec![(k, v)]);
-            } else if k.starts_with("Jjf-") {
-                if let Some(cur) = current.as_mut() {
-                    cur.push((k, v));
-                }
-                // Else: stray Jjf-* trailer before any Jjf-Op — ignored.
-            } else if let Some(cur) = current.as_mut() {
-                // Non-Jjf trailer (e.g. Signed-off-by). Stop the
-                // current stanza — trailer blocks per RFC are
-                // contiguous, but mixing is unusual; safest to close.
-                stanzas.push(std::mem::take(cur));
-                current = None;
-            }
-        } else if line.trim().is_empty() {
-            // Blank line: not by itself enough to break a stanza — git
-            // trailers are contiguous, so a blank line ends them. Close.
-            if let Some(prev) = current.take() {
-                stanzas.push(prev);
-            }
-        } else if current.is_some() {
-            // Non-trailer line in the middle of a stanza: close the
-            // stanza (it was probably the body, not a real trailer).
-            if let Some(prev) = current.take() {
-                stanzas.push(prev);
-            }
-        }
-    }
-    if let Some(last) = current.take() {
-        stanzas.push(last);
-    }
-
-    let mut out = Vec::new();
-    for stanza in stanzas {
-        if let Some(op) = stanza_to_op(&stanza, id) {
-            out.push(op);
-        }
-    }
-    out
-}
-
-/// Convert one parsed trailer stanza (starting with `Jjf-Op`) into a
-/// typed op for the requested bug, or `None` if it's missing required
-/// fields, references a different bug, or has an unknown op-type.
-#[cfg(any(debug_assertions, test))]
-fn stanza_to_op(stanza: &[(&str, &str)], id: &BugId) -> Option<Op> {
-    if stanza.is_empty() || stanza[0].0 != "Jjf-Op" {
-        return None;
-    }
-    let op_type = stanza[0].1;
-    let payload = &stanza[1..];
-
-    let get = |k: &str| -> Option<String> {
-        payload
-            .iter()
-            .find(|(kk, _)| *kk == k)
-            .map(|(_, v)| (*v).to_owned())
-    };
-
-    let bug_id_str = get("Jjf-Bug")?;
-    if bug_id_str != id.as_str() {
-        // Op for a different bug — drop.
-        return None;
-    }
-    let bug_id = BugId::parse(&bug_id_str).ok()?;
-
-    let op = match op_type {
-        "create" => Op::Create {
-            bug_id,
-            title: get("Jjf-Title")?,
-            status: parse_status(&get("Jjf-Status")?)?,
-        },
-        "set-title" => Op::SetTitle {
-            bug_id,
-            title: get("Jjf-Title")?,
-        },
-        "set-status" => Op::SetStatus {
-            bug_id,
-            status: parse_status(&get("Jjf-Status")?)?,
-        },
-        "set-body" => Op::SetBody {
-            bug_id,
-            body_hash: get("Jjf-Body-Hash")?,
-        },
-        "label-add" => Op::LabelAdd {
-            bug_id,
-            label: get("Jjf-Label")?,
-        },
-        "label-rm" => Op::LabelRm {
-            bug_id,
-            label: get("Jjf-Label")?,
-        },
-        "dep-add" => Op::DepAdd {
-            bug_id,
-            dep: BugId::parse(&get("Jjf-Dep")?).ok()?,
-        },
-        "dep-rm" => Op::DepRm {
-            bug_id,
-            dep: BugId::parse(&get("Jjf-Dep")?).ok()?,
-        },
-        "set-assignee" => {
-            let v = get("Jjf-Assignee").unwrap_or_default();
-            Op::SetAssignee {
-                bug_id,
-                assignee: if v.is_empty() { None } else { Some(v) },
-            }
-        }
-        "comment-add" => Op::CommentAdd {
-            bug_id,
-            comment_id: BugId::parse(&get("Jjf-Comment-Id")?).ok()?,
-        },
-        "merge" => Op::Merge { bug_id },
-        // Unknown op-type: spec §5.2 says tolerate. Skip silently for
-        // the read path; an audit-trail view would surface it.
-        _ => return None,
-    };
-    Some(op)
-}
-
-#[cfg(any(debug_assertions, test))]
-fn parse_status(s: &str) -> Option<Status> {
-    match s {
-        "open" => Some(Status::Open),
-        "closed" => Some(Status::Closed),
-        _ => None,
-    }
-}
-
-/// Parse one trailer line. Returns `(key, value)` if it looks like
-/// `Key: value`, else `None`. Trailers can have leading whitespace
-/// in folded forms; we don't handle continuation lines because the
-/// writer never emits them.
-#[cfg(any(debug_assertions, test))]
-fn split_trailer(line: &str) -> Option<(&str, &str)> {
-    let trimmed = line.trim_end();
-    let colon = trimmed.find(':')?;
-    let key = &trimmed[..colon];
-    // A real trailer key is a single token with no spaces.
-    if key.is_empty() || key.contains(' ') {
-        return None;
-    }
-    let value = trimmed[colon + 1..].trim_start();
-    Some((key, value))
 }
 
 #[cfg(any(debug_assertions, test))]
@@ -572,110 +411,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    // Trailer-parser unit tests (single-op, multi-op, unknown-op,
+    // cross-bug) live in `trailer.rs` next to the parser. The tests
+    // below cover the cross-check's own structural fold — `apply_op` /
+    // `OpView` — which is specific to this module.
     use super::*;
 
     fn id(s: &str) -> BugId {
         BugId::parse(s).unwrap()
-    }
-
-    #[test]
-    fn parses_single_op_create_trailer() {
-        let desc = "\
-jjf: bug aa6600b - create
-
-Jjf-Op: create
-Jjf-Bug: aa6600b
-Jjf-Title: segfault on empty input
-Jjf-Status: open
-";
-        let ops = parse_ops(desc, &id("aa6600b"));
-        assert_eq!(
-            ops,
-            vec![Op::Create {
-                bug_id: id("aa6600b"),
-                title: "segfault on empty input".into(),
-                status: Status::Open,
-            }]
-        );
-    }
-
-    #[test]
-    fn parses_multi_op_stanza_in_order() {
-        // Spec §5.5 example.
-        let desc = "\
-jjf: bug aa6600b - close + label
-
-Closing as fixed in #42.
-
-Jjf-Op: set-status
-Jjf-Bug: aa6600b
-Jjf-Status: closed
-Jjf-Op: label-add
-Jjf-Bug: aa6600b
-Jjf-Label: fixed
-";
-        let ops = parse_ops(desc, &id("aa6600b"));
-        assert_eq!(
-            ops,
-            vec![
-                Op::SetStatus {
-                    bug_id: id("aa6600b"),
-                    status: Status::Closed,
-                },
-                Op::LabelAdd {
-                    bug_id: id("aa6600b"),
-                    label: "fixed".into(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn ignores_unknown_op_types_per_spec() {
-        // Unknown op-types must be tolerated, not panicked-on
-        // (spec §5.2).
-        let desc = "\
-jjf: bug aa6600b - speculative
-
-Jjf-Op: not-yet-invented
-Jjf-Bug: aa6600b
-Jjf-Foo: bar
-Jjf-Op: set-status
-Jjf-Bug: aa6600b
-Jjf-Status: closed
-";
-        let ops = parse_ops(desc, &id("aa6600b"));
-        assert_eq!(
-            ops,
-            vec![Op::SetStatus {
-                bug_id: id("aa6600b"),
-                status: Status::Closed,
-            }]
-        );
-    }
-
-    #[test]
-    fn ignores_ops_for_other_bugs() {
-        // Multi-bug commits aren't a v1 pattern but the spec doesn't
-        // forbid them; readers must filter by Jjf-Bug.
-        let desc = "\
-jjf: cross-bug
-
-Jjf-Op: set-status
-Jjf-Bug: bbbbbbb
-Jjf-Status: closed
-Jjf-Op: set-status
-Jjf-Bug: aa6600b
-Jjf-Status: closed
-";
-        let ops = parse_ops(desc, &id("aa6600b"));
-        assert_eq!(
-            ops,
-            vec![Op::SetStatus {
-                bug_id: id("aa6600b"),
-                status: Status::Closed,
-            }]
-        );
     }
 
     #[test]
