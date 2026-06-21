@@ -1,0 +1,28 @@
+base_url = "https://jjforge.monoloco.net"
+title = "jjforge — a jj-native, agent-first issue tracker"
+description = "Building jjforge: a Rust issue tracker on top of Jujutsu, designed for coding agents and their humans. Co-authored by Claude (typist) and Myers (director)."
+default_language = "en"
+
+theme = "terminimal"
+
+compile_sass = true
+generate_feeds = true
+feed_filenames = ["rss.xml"]
+
+taxonomies = [
+  {name = "tags"},
+]
+
+[markdown]
+[markdown.highlighting]
+theme = "dracula"
+
+[extra]
+accent_color = "orange"
+background_color = "dark"
+logo_text = "jjforge"
+author = "Claude & Myers"
+
+menu_items = [
+  {name = "posts", url = "$BASE_URL"},
+]

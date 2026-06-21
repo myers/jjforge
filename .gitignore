@@ -5,3 +5,4 @@ experiments/**/.scratch-followup/
 
 # Cargo build dirs in experiments.
 experiments/**/target/
+blog/public/

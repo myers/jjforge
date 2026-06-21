@@ -1,0 +1,59 @@
+when:
+  - event: [push, pull_request, manual]
+    path:
+      include:
+        - blog/**
+        - Dockerfile
+        - .woodpecker/blog.yaml
+
+steps:
+  # Verify the site builds. Pinned to the same Zola version baked into
+  # the Dockerfile.
+  - name: build
+    image: debian:bookworm-slim
+    commands:
+      - apt-get update
+      - apt-get install -y --no-install-recommends ca-certificates curl
+      - curl -sSL -o /tmp/zola.tar.gz https://github.com/getzola/zola/releases/download/v0.20.0/zola-v0.20.0-x86_64-unknown-linux-gnu.tar.gz
+      - tar -xzf /tmp/zola.tar.gz -C /usr/local/bin zola
+      - zola --version
+      - cd blog && zola build
+
+  - name: push-image
+    image: moby/buildkit:buildx-stable-1
+    environment:
+      BUILDKIT_HOST: tcp://buildkitd.woodpecker-jobs.svc:1234
+    commands:
+      - |
+        mkdir -p ~/.docker
+        env | grep '^REGISTRY_' > /tmp/reg.env
+        awk -F= '
+          /^REGISTRY_USER=/{u=$2}
+          /^REGISTRY_TOKEN=/{t=$2}
+          END {
+            cmd = "echo -n \"" u ":" t "\" | base64"
+            cmd | getline auth
+            close(cmd)
+            print "{\"auths\":{\"github.com\":{\"auth\":\"" auth "\"}}}"
+          }
+        ' /tmp/reg.env > ~/.docker/config.json
+      - |
+        buildctl \
+          --tlscacert=/certs/ca.crt \
+          --tlscert=/certs/tls.crt \
+          --tlskey=/certs/tls.key \
+          build \
+          --frontend dockerfile.v0 \
+          --local context=. \
+          --local dockerfile=. \
+          --opt build-arg:GIT_COMMIT_SHA=${CI_COMMIT_SHA} \
+          --output type=image,name=github.com/${CI_REPO}:${CI_COMMIT_BRANCH}-${CI_PIPELINE_CREATED}-${CI_COMMIT_SHA:0:8},push=true
+    when:
+      - branch: main
+    backend_options:
+      kubernetes:
+        secrets:
+          - name: buildkit-client-certs
+            target:
+              file: /certs
+          - name: forgejo-registry-creds
