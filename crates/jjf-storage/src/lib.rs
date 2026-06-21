@@ -24,11 +24,16 @@
 //!
 //! # Out of scope
 //!
-//! - Read path (`storage-read-single`, `storage-read-history`).
-//! - `jjf init` / bookmark bootstrap (`storage-bootstrap`).
 //! - The merge driver (`jjf-merge`).
 //! - The `jjf` binary (mvp-cli).
 //! - The `comments.jsonl` merge policy.
+//!
+//! # In scope (now landed)
+//!
+//! - Write path: [`Storage::create_bug`], the mutators, [`Storage::add_comment`].
+//! - Read path: [`Storage::read`], [`Storage::read_history`].
+//! - Bookmark bootstrap: [`Storage::init`] (idempotent; the `mvp-cli`
+//!   `jjf init` verb is a thin wrapper).
 //!
 //! # Verdict pins
 //!
@@ -71,6 +76,12 @@ pub enum Error {
     Invalid(String),
     #[error("clock: {0}")]
     Clock(String),
+    /// The repo root passed to `Storage::init` / `Storage::open` does not
+    /// hold a jj repo. Distinct from `Jj` so callers can tell "not a
+    /// repo at all" from "jj broke for some other reason" without
+    /// string-matching stderr.
+    #[error("not a jj repo: {0}")]
+    NotAJjRepo(PathBuf),
 }
 
 /// Convenience alias.
@@ -85,8 +96,16 @@ pub const BUGS_BOOKMARK: &str = "bugs";
 /// name so a stray collision with another revset never bites.
 pub const BUGS_BOOKMARK_REVSET: &str = "bookmarks(bugs)";
 
-/// A handle to a repo whose `bugs` bookmark already exists (bootstrap
-/// is a different ticket — `storage-bootstrap`).
+/// Description on the empty seed commit that anchors the `bugs`
+/// bookmark in a fresh repo. Spec §1.1 pins the exact text: no
+/// `Jjf-Op:` trailer (the seed predates any op chain), human-readable,
+/// stable across versions.
+pub const BUGS_SEED_DESCRIPTION: &str = "jjf: seed bugs bookmark";
+
+/// A handle to a repo whose `bugs` bookmark exists. Use
+/// [`Storage::init`] to create the bookmark (idempotent) in a fresh
+/// repo, or [`Storage::open`] when you know the bookmark is already
+/// in place.
 #[derive(Debug, Clone)]
 pub struct Storage {
     repo: JjRepo,
@@ -96,7 +115,7 @@ impl Storage {
     /// Open a storage handle at the given repo root. The path must be
     /// absolute; we don't resolve `~` or relative paths — that's the
     /// caller's job (mvp-cli, tests). The `bugs` bookmark must already
-    /// exist.
+    /// exist; call [`Storage::init`] first if you're not sure.
     pub fn open(repo_root: impl Into<PathBuf>) -> Result<Self> {
         let root = repo_root.into();
         if !root.is_absolute() {
@@ -108,6 +127,73 @@ impl Storage {
         Ok(Self {
             repo: JjRepo::open(root),
         })
+    }
+
+    /// Open or create a storage handle, bootstrapping the `bugs`
+    /// bookmark per spec §1.1 if absent. Idempotent: calling twice
+    /// against the same repo is a no-op the second time.
+    ///
+    /// Three distinct outcomes:
+    ///
+    /// - `repo_root` is not a jj repo at all → [`Error::NotAJjRepo`].
+    /// - `repo_root` is a jj repo and `bugs` is missing → create an
+    ///   empty seed commit (description: [`BUGS_SEED_DESCRIPTION`]),
+    ///   point the `bugs` bookmark at it, step `@` off the bookmark
+    ///   (so the first subsequent mutation's `jj new bookmarks(bugs)`
+    ///   doesn't snapshot stale working-copy state). Return Storage.
+    /// - `repo_root` is a jj repo and `bugs` already exists → return
+    ///   Storage with no repo-side changes.
+    ///
+    /// The `mvp-cli` `jjf init` verb is a thin wrapper over this.
+    pub fn init(repo_root: impl Into<PathBuf>) -> Result<Self> {
+        let root = repo_root.into();
+        if !root.is_absolute() {
+            return Err(Error::Invalid(format!(
+                "Storage::init requires an absolute path, got {}",
+                root.display()
+            )));
+        }
+        let repo = JjRepo::open(root.clone());
+
+        // Probe: are we inside a jj repo at all? `jj workspace root`
+        // is cheap and its failure mode is unambiguous (stderr starts
+        // with `Error: There is no jj repo in`). We translate that one
+        // specific failure into `NotAJjRepo`; anything else bubbles
+        // up as a typed `Jj` error.
+        if let Err(e) = repo.run(&["workspace", "root"]) {
+            if let JjError::Cli { stderr, .. } = &e {
+                if stderr.contains("no jj repo") {
+                    return Err(Error::NotAJjRepo(root));
+                }
+            }
+            return Err(Error::Jj(e));
+        }
+
+        // Probe: does the `bugs` bookmark already exist? `jj bookmark
+        // list -T 'name ++ "\n"' bugs` prints just `bugs\n` to stdout
+        // when present and an empty stdout (with a stderr warning)
+        // when absent. Exit status is 0 either way, so we key off
+        // stdout content.
+        let stdout = repo.run(&[
+            "bookmark",
+            "list",
+            "-T",
+            "name ++ \"\\n\"",
+            BUGS_BOOKMARK,
+        ])?;
+        if stdout.lines().any(|line| line.trim() == BUGS_BOOKMARK) {
+            // Already initialized; nothing to do.
+            return Ok(Self { repo });
+        }
+
+        // Bootstrap. Three jj calls: branch a fresh empty change off
+        // root() with the seed description, point the bookmark at it,
+        // then step @ off the bookmark.
+        repo.run(&["new", "root()", "-m", BUGS_SEED_DESCRIPTION])?;
+        repo.run(&["bookmark", "create", BUGS_BOOKMARK, "-r", "@"])?;
+        repo.run(&["new", "root()"])?;
+
+        Ok(Self { repo })
     }
 
     /// The repo root this storage handle is rooted at.

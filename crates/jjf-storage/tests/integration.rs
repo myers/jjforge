@@ -14,7 +14,23 @@ use serde::Serialize;
 
 /// Build a scratch jj repo with a seeded `bugs` bookmark. Returns the
 /// absolute path to the repo root.
+///
+/// Bootstrap is delegated to `Storage::init` — that's the function
+/// under test for the `storage-bootstrap` ticket, and using it here
+/// means every other integration test exercises it incidentally.
 fn make_scratch_repo(name: &str) -> PathBuf {
+    let abs = make_empty_jj_repo(name);
+    // `init` is idempotent and produces the seed commit + `bugs`
+    // bookmark in one call; the storage crate's first `jj new
+    // bookmarks(bugs)` then branches from that seed cleanly.
+    Storage::init(&abs).expect("Storage::init on fresh repo");
+    abs
+}
+
+/// Build a scratch directory that's a jj repo but has no `bugs`
+/// bookmark yet. Returns the absolute path. Use this when a test
+/// wants to drive `Storage::init` itself.
+fn make_empty_jj_repo(name: &str) -> PathBuf {
     let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join(".scratch")
@@ -24,22 +40,22 @@ fn make_scratch_repo(name: &str) -> PathBuf {
     }
     fs::create_dir_all(&scratch).unwrap();
     let abs = fs::canonicalize(&scratch).unwrap();
-
     sh("jj", &["git", "init"], &abs);
-
-    // Seed: an empty commit with description `jjf: seed bugs bookmark`
-    // per spec §1.1, then point the bookmark at it, then step @ off it
-    // so the storage crate's first `jj new bookmarks(bugs)` is a clean
-    // branch from the seed (not from a working copy holding stale data).
-    sh(
-        "jj",
-        &["new", "root()", "-m", "jjf: seed bugs bookmark"],
-        &abs,
-    );
-    sh("jj", &["bookmark", "create", "bugs", "-r", "@"], &abs);
-    sh("jj", &["new", "root()"], &abs);
-
     abs
+}
+
+/// Build a scratch directory that's NOT a jj repo. Used by the
+/// `Storage::init` typed-error test.
+fn make_non_jj_dir(name: &str) -> PathBuf {
+    let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join(".scratch")
+        .join(name);
+    if scratch.exists() {
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+    fs::create_dir_all(&scratch).unwrap();
+    fs::canonicalize(&scratch).unwrap()
 }
 
 fn sh(prog: &str, args: &[&str], cwd: &Path) {
@@ -651,4 +667,199 @@ fn read_history_missing_bug_returns_bug_not_found() {
         Err(jjf_storage::Error::BugNotFound(got)) => assert_eq!(got, missing),
         other => panic!("expected BugNotFound, got {:?}", other),
     }
+}
+
+// ---------------------------------------------------------------------
+// Bootstrap-path tests (issue 8b12f9d).
+//
+// `Storage::init` bootstraps the `bugs` bookmark idempotently. Spec
+// §1.1 pins the seed-commit description; the three distinct failure
+// shapes (not-a-jj-repo, bookmark-missing, bookmark-present) all need
+// coverage.
+// ---------------------------------------------------------------------
+
+#[test]
+fn init_on_fresh_jj_repo_creates_bookmark_with_seed_commit() {
+    let repo = make_empty_jj_repo("init_fresh");
+
+    // Pre-condition: no `bugs` bookmark.
+    let pre = jj_capture(&["bookmark", "list", "-T", "name ++ \"\\n\""], &repo);
+    assert!(
+        !pre.lines().any(|l| l.trim() == "bugs"),
+        "pre-condition: bookmark should not exist yet, got: {pre}"
+    );
+
+    Storage::init(&repo).expect("Storage::init on fresh repo");
+
+    // Post-condition: bookmark exists, points at one commit whose
+    // description matches the spec.
+    let post = jj_capture(&["bookmark", "list", "-T", "name ++ \"\\n\""], &repo);
+    assert!(
+        post.lines().any(|l| l.trim() == "bugs"),
+        "post-condition: bookmark should exist, got: {post}"
+    );
+
+    let seed_desc = jj_capture(
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            "bookmarks(bugs)",
+            "-T",
+            "description.first_line() ++ \"\\n\"",
+        ],
+        &repo,
+    );
+    assert_eq!(
+        seed_desc.trim(),
+        "jjf: seed bugs bookmark",
+        "seed commit description must match spec §1.1, got: {seed_desc:?}"
+    );
+
+    // The bookmark should resolve to exactly one commit (no chain
+    // yet beyond the seed) when scoped to non-root().
+    let count = jj_capture(
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            "bookmarks(bugs) ~ root()",
+            "-T",
+            "\"x\"",
+        ],
+        &repo,
+    );
+    assert_eq!(
+        count, "x",
+        "exactly one non-root commit on the bookmark expected, got: {count:?}"
+    );
+
+    // Step 3 of bootstrap (`jj new root()`) leaves @ off the bookmark,
+    // matching the invariant the writer dance relies on.
+    let at_bookmarks = jj_capture(
+        &["log", "--no-graph", "-r", "@", "-T", "bookmarks ++ \"\\n\""],
+        &repo,
+    );
+    assert!(
+        !at_bookmarks.contains("bugs"),
+        "@ should not be on the bugs bookmark after init, got: {at_bookmarks:?}"
+    );
+}
+
+#[test]
+fn init_is_idempotent_when_called_twice() {
+    let repo = make_empty_jj_repo("init_twice");
+
+    Storage::init(&repo).expect("first init");
+
+    // Capture the bookmark's commit id after the first init so we can
+    // assert the second init didn't move it.
+    let first_tip = jj_capture(
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            "bookmarks(bugs)",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+        &repo,
+    );
+    assert!(
+        !first_tip.trim().is_empty(),
+        "first init should have created a bookmark, got: {first_tip:?}"
+    );
+
+    Storage::init(&repo).expect("second init must be a no-op success");
+
+    let second_tip = jj_capture(
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            "bookmarks(bugs)",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+        &repo,
+    );
+    assert_eq!(
+        first_tip, second_tip,
+        "second init must not move the bookmark: first={first_tip:?}, second={second_tip:?}"
+    );
+
+    // And exactly one commit (the seed) is reachable from the bookmark
+    // — the second init must not have produced another seed.
+    let non_root_count = jj_capture(
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            "ancestors(bookmarks(bugs)) ~ root()",
+            "-T",
+            "\"x\\n\"",
+        ],
+        &repo,
+    );
+    assert_eq!(
+        non_root_count.lines().count(),
+        1,
+        "exactly one non-root commit reachable from bookmark expected, got: {non_root_count:?}"
+    );
+}
+
+#[test]
+fn init_outside_any_jj_repo_returns_typed_error() {
+    let bare = make_non_jj_dir("init_no_repo");
+    match Storage::init(&bare) {
+        Err(jjf_storage::Error::NotAJjRepo(got)) => assert_eq!(got, bare),
+        other => panic!("expected NotAJjRepo, got {:?}", other),
+    }
+}
+
+#[test]
+fn init_then_create_bug_lands_on_top_of_seed() {
+    // End-to-end: init bootstraps, then create_bug uses the bookmark
+    // just like every other test does. Confirms the seed commit is a
+    // viable parent for the first mutation.
+    let repo = make_empty_jj_repo("init_then_create");
+    let storage = Storage::init(&repo).unwrap();
+
+    let id = storage
+        .create_bug(&BugDraft {
+            title: "first ever bug".into(),
+            ..Default::default()
+        })
+        .expect("create_bug on freshly-init'd repo");
+
+    let bug = storage.read(&id).expect("read after create");
+    assert_eq!(bug.title, "first ever bug");
+
+    // The bookmark should now point at the create commit (not the
+    // seed); the seed is one parent back.
+    let chain = jj_capture(
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            "ancestors(bookmarks(bugs)) ~ root()",
+            "-T",
+            "description.first_line() ++ \"\\n\"",
+        ],
+        &repo,
+    );
+    let descs: Vec<&str> = chain.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        descs.len(),
+        2,
+        "expected seed + 1 mutation on the chain, got: {chain:?}"
+    );
+    assert!(
+        descs[0].contains(&format!("bug {}", id)),
+        "newest commit should be the create, got: {chain:?}"
+    );
+    assert_eq!(
+        descs[1], "jjf: seed bugs bookmark",
+        "oldest commit should be the seed, got: {chain:?}"
+    );
 }
