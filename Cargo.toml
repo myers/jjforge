@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/jjf-merge",
+]
+# experiments/jj-shellout-hello has its own lockfile and intentionally
+# stays a standalone crate (it ships as a tiny example, separate from
+# the real jjforge tree). Exclude it from the workspace so its lockfile
+# is not clobbered.
+exclude = [
+    "experiments/jj-shellout-hello",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"

@@ -5,4 +5,9 @@ experiments/**/.scratch-followup/
 
 # Cargo build dirs in experiments.
 experiments/**/target/
+
+# Workspace-level Cargo build dir (root Cargo.toml lives here per
+# crates/jjf-merge — see issue e2e473b).
+/target/
+
 blog/public/

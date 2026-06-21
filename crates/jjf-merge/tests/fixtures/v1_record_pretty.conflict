@@ -1,0 +1,34 @@
+<<<<<<< conflict 1 of 1
++++++++ aaaaaaaa 11111111 "jjf: bug aa6600b - alice edits"
+{
+  "version": 1,
+  "id": "aa6600b",
+  "title": "alice title",
+  "body": "Running `./app` with no arguments crashes.",
+  "status": "open",
+  "labels": ["bug", "p1"],
+  "dependencies": [],
+  "assignee": "alice",
+  "created_at": "2026-06-21T12:00:00Z",
+  "updated_at": "2026-06-21T14:00:00Z"
+}
+%%%%%%% diff from: bbbbbbbb 22222222 "create"
+\\\\\\\        to: cccccccc 33333333 "jjf: bug aa6600b - bob edits"
+ {
+   "version": 1,
+   "id": "aa6600b",
+-  "title": "shared",
++  "title": "bob title",
+   "body": "Running `./app` with no arguments crashes.",
+-  "status": "open",
++  "status": "closed",
+-  "labels": ["bug"],
++  "labels": ["bug", "regression"],
+   "dependencies": [],
+-  "assignee": "alice",
++  "assignee": "bob",
+   "created_at": "2026-06-21T12:00:00Z",
+-  "updated_at": "2026-06-21T13:00:00Z"
++  "updated_at": "2026-06-21T15:00:00Z"
+ }
+>>>>>>> conflict 1 of 1 ends

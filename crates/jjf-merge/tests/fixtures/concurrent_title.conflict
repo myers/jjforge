@@ -1,0 +1,8 @@
+<<<<<<< conflict 1 of 1
++++++++ rwyxzusv d38c05c6 "jjf: bug bb02 - set-title alice"
+{"title":"alice title","status":"open","comments":[]}
+%%%%%%% diff from: ltxqzulz d66ba4d3 "jjf: bug bb02 - create"
+\\\\\\\        to: rtlvvpks 27c53447 "jjf: bug bb02 - set-title bob"
+-{"title":"first","status":"open","comments":[]}
++{"title":"bob title","status":"open","comments":[]}
+>>>>>>> conflict 1 of 1 ends
