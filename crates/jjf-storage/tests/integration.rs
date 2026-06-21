@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use jjf_storage::{BugDraft, BugId, Status, Storage};
+use serde::Serialize;
 
 /// Build a scratch jj repo with a seeded `bugs` bookmark. Returns the
 /// absolute path to the repo root.
@@ -263,4 +264,201 @@ fn add_comment_lands_jsonl_line_and_trailer() {
         log.contains(&format!("Jjf-Comment-Id: {}", v["id"].as_str().unwrap())),
         "trailer comment id mismatch:\n{log}"
     );
+}
+
+// ---------------------------------------------------------------------
+// Read-path tests (issue b650d74).
+//
+// The acceptance criteria call for:
+//   1. A seeded repo with several mutations, read-back, all-field
+//      assertion.
+//   2. A round-trip property test: write produces files + trailers;
+//      read produces a struct; serializing the struct back byte-equals
+//      the file on disk.
+//
+// Both are exercised below.
+// ---------------------------------------------------------------------
+
+#[test]
+fn read_roundtrip_after_multiple_mutations() {
+    let repo = make_scratch_repo("read_roundtrip");
+    let storage = Storage::open(&repo).unwrap();
+
+    // 1. Create.
+    let id = storage
+        .create_bug(&BugDraft {
+            title: "initial title".into(),
+            body: "first body".into(),
+            labels: vec!["bug".into()],
+            dependencies: vec![],
+            assignee: None,
+        })
+        .unwrap();
+
+    // 2. set-status, set-title, two comments, label-add (the recipe
+    // from the ticket's acceptance criteria).
+    storage.set_status(&id, Status::Closed).unwrap();
+    storage.set_title(&id, "final title").unwrap();
+    storage
+        .add_comment(&id, "first comment", "alice <a@x>")
+        .unwrap();
+    storage
+        .add_comment(&id, "second comment", "bob <b@x>")
+        .unwrap();
+    storage.add_label(&id, "p1").unwrap();
+
+    // 3. Read back and assert every field is what we expect.
+    let bug = storage.read(&id).expect("read after mutations");
+
+    assert_eq!(bug.id, id);
+    assert_eq!(bug.title, "final title");
+    assert_eq!(bug.body, "first body");
+    assert_eq!(bug.status, Status::Closed);
+    // Labels are sorted alphabetically per spec §3.1.
+    assert_eq!(bug.labels, vec!["bug".to_string(), "p1".to_string()]);
+    assert_eq!(bug.dependencies, Vec::<BugId>::new());
+    assert_eq!(bug.assignee, None);
+
+    // Two comments, chronological. The first add gets created_at
+    // strictly <= the second's because the storage layer stamps both
+    // from the same monotonic clock-source.
+    assert_eq!(bug.comments.len(), 2);
+    assert_eq!(bug.comments[0].body, "first comment");
+    assert_eq!(bug.comments[0].author, "alice <a@x>");
+    assert_eq!(bug.comments[1].body, "second comment");
+    assert_eq!(bug.comments[1].author, "bob <b@x>");
+    assert!(
+        bug.comments[0].created_at <= bug.comments[1].created_at,
+        "comments must be chronological: {:?} then {:?}",
+        bug.comments[0].created_at,
+        bug.comments[1].created_at,
+    );
+
+    // Timestamps are well-formed RFC 3339 strings and updated_at >=
+    // created_at.
+    assert_eq!(bug.created_at.len(), "2026-06-21T12:00:00Z".len());
+    assert_eq!(bug.updated_at.len(), "2026-06-21T12:00:00Z".len());
+    assert!(
+        bug.updated_at >= bug.created_at,
+        "updated_at must be >= created_at: created={}, updated={}",
+        bug.created_at,
+        bug.updated_at
+    );
+}
+
+#[test]
+fn read_missing_bug_returns_bug_not_found() {
+    let repo = make_scratch_repo("read_missing");
+    let storage = Storage::open(&repo).unwrap();
+    let missing = BugId::parse("deadbee").unwrap();
+    match storage.read(&missing) {
+        Err(jjf_storage::Error::BugNotFound(got)) => assert_eq!(got, missing),
+        other => panic!("expected BugNotFound, got {:?}", other),
+    }
+}
+
+#[test]
+fn read_then_serialize_byte_equals_on_disk_record() {
+    // The v1 storage contract: the file on disk IS the read-path
+    // result, byte-for-byte (after applying the writer's pretty-print
+    // + field-ordering rules). This test holds the writer to that
+    // contract by reading the on-disk bytes, reading the parsed Bug,
+    // converting the Bug back into the canonical record shape, and
+    // asserting the two byte buffers match.
+    let repo = make_scratch_repo("read_byte_equal");
+    let storage = Storage::open(&repo).unwrap();
+
+    let id = storage
+        .create_bug(&BugDraft {
+            title: "round-trip me".into(),
+            body: "body line 1\nbody line 2".into(),
+            labels: vec!["needs-info".into(), "bug".into()],
+            dependencies: vec![],
+            assignee: Some("alice".into()),
+        })
+        .unwrap();
+    storage.add_label(&id, "p2").unwrap();
+    storage.add_comment(&id, "hi", "alice <a@x>").unwrap();
+
+    let id_s = id.to_string();
+    let on_disk = read_at_bookmark(&repo, &format!("bugs/{}.json", id_s));
+
+    // Re-serialize the Bug back through the same writer convention
+    // (pretty-printed, 2-space indent, trailing newline) and the
+    // bytes must match. The shape used here mirrors the writer's
+    // private `BugRecord` exactly — that's the contract.
+    let bug = storage.read(&id).expect("read");
+
+    #[derive(Serialize)]
+    struct CanonicalRecord<'a> {
+        version: u32,
+        id: &'a BugId,
+        title: &'a str,
+        body: &'a str,
+        status: &'a str,
+        labels: &'a [String],
+        dependencies: &'a [BugId],
+        assignee: Option<&'a str>,
+        created_at: &'a str,
+        updated_at: &'a str,
+    }
+
+    let canonical = CanonicalRecord {
+        version: 1,
+        id: &bug.id,
+        title: &bug.title,
+        body: &bug.body,
+        status: match bug.status {
+            Status::Open => "open",
+            Status::Closed => "closed",
+        },
+        labels: &bug.labels,
+        dependencies: &bug.dependencies,
+        assignee: bug.assignee.as_deref(),
+        created_at: &bug.created_at,
+        updated_at: &bug.updated_at,
+    };
+    let mut reserialized = serde_json::to_string_pretty(&canonical).unwrap();
+    reserialized.push('\n');
+
+    assert_eq!(
+        reserialized, on_disk,
+        "round-trip byte-equality failed.\nfile on disk:\n{on_disk}\nreserialized:\n{reserialized}"
+    );
+
+    // Same byte-equality contract for the comments file: each line is
+    // a Comment serialized as compact JSON, terminated by `\n`.
+    let on_disk_comments =
+        read_at_bookmark(&repo, &format!("bugs/{}.comments.jsonl", id_s));
+    let mut reserialized_comments = String::new();
+    for c in &bug.comments {
+        reserialized_comments.push_str(&serde_json::to_string(c).unwrap());
+        reserialized_comments.push('\n');
+    }
+    assert_eq!(
+        reserialized_comments, on_disk_comments,
+        "comments-file round-trip byte-equality failed.\nfile on disk:\n{on_disk_comments}\nreserialized:\n{reserialized_comments}"
+    );
+}
+
+#[test]
+fn read_after_add_then_remove_label_observes_neither() {
+    // Exercises the op-replay path through label-rm: the file ends up
+    // without the label, and the op chain (label-add then label-rm)
+    // also ends up without it. The debug-build cross-check would fire
+    // here if the two views ever disagreed.
+    let repo = make_scratch_repo("read_label_lifecycle");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_bug(&BugDraft {
+            title: "label lifecycle".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.add_label(&id, "ephemeral").unwrap();
+    storage.add_label(&id, "permanent").unwrap();
+    storage.remove_label(&id, "ephemeral").unwrap();
+
+    let bug = storage.read(&id).unwrap();
+    assert_eq!(bug.labels, vec!["permanent".to_string()]);
 }

@@ -41,6 +41,7 @@
 mod id;
 mod jj;
 mod op;
+mod read;
 mod record;
 
 use std::path::{Path, PathBuf};
@@ -48,7 +49,7 @@ use std::path::{Path, PathBuf};
 pub use id::BugId;
 pub use jj::JjError;
 pub use op::Op;
-pub use record::{BugDraft, BugRecord, Comment, Status};
+pub use record::{Bug, BugDraft, BugRecord, Comment, Status};
 
 use jj::JjRepo;
 
@@ -145,13 +146,45 @@ impl Storage {
             updated_at: now,
         };
 
+        // The `create` op trailer (spec §5.2) carries only title +
+        // status. Anything else the draft seeds — body, labels,
+        // dependencies, assignee — is recorded as additional ops in
+        // the same commit (spec §5.5 allows multi-op commits). Without
+        // this, the audit chain (and the read-path op-replay) would
+        // miss seed-time fields entirely, and the v1-contract
+        // cross-check would fire on every non-trivial create.
         let summary = format!("jjf: bug {} - create", id);
-        let op = Op::Create {
+        let mut ops: Vec<Op> = Vec::new();
+        ops.push(Op::Create {
             bug_id: id.clone(),
             title: record.title.clone(),
             status: Status::Open,
-        };
-        self.commit_record_change(&summary, &[op], |wc_root| {
+        });
+        if !record.body.is_empty() {
+            ops.push(Op::SetBody {
+                bug_id: id.clone(),
+                body_hash: sha256_hex(record.body.as_bytes()),
+            });
+        }
+        for label in &record.labels {
+            ops.push(Op::LabelAdd {
+                bug_id: id.clone(),
+                label: label.clone(),
+            });
+        }
+        for dep in &record.dependencies {
+            ops.push(Op::DepAdd {
+                bug_id: id.clone(),
+                dep: dep.clone(),
+            });
+        }
+        if let Some(assignee) = &record.assignee {
+            ops.push(Op::SetAssignee {
+                bug_id: id.clone(),
+                assignee: Some(assignee.clone()),
+            });
+        }
+        self.commit_record_change(&summary, &ops, |wc_root| {
             write_record_json(&wc_root.join(bug_json_relpath(&id)), &record)?;
             // Comments file: create empty so readers don't trip on
             // ENOENT for new bugs. Spec §4 allows empty == no comments.
@@ -309,6 +342,17 @@ impl Storage {
             },
         )?;
         Ok(())
+    }
+
+    /// Read a single bug back from the `bugs` bookmark tip. Returns
+    /// the latest scalar field values plus the full chronological
+    /// comment thread. Errors with `BugNotFound` if `bugs/<id>.json`
+    /// is absent at the bookmark.
+    ///
+    /// Implementation cross-checks the file-read view against an
+    /// op-replay view in debug builds — see `read.rs` for the rules.
+    pub fn read(&self, id: &BugId) -> Result<Bug> {
+        read::read(&self.repo, id)
     }
 
     // ---- internals ---------------------------------------------------
@@ -515,6 +559,13 @@ fn sorted_dedup_ids(xs: &[BugId]) -> Vec<BugId> {
     v.sort();
     v.dedup();
     v
+}
+
+/// Crate-internal alias so `read.rs` can reuse the same hash function
+/// without duplicating the inline implementation.
+#[cfg(debug_assertions)]
+pub(crate) fn sha256_hex_for_read(bytes: &[u8]) -> String {
+    sha256_hex(bytes)
 }
 
 /// Hex sha-256 for `set-body` trailers (`Jjf-Body-Hash` per spec §5.2).

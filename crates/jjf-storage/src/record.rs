@@ -65,3 +65,29 @@ pub struct Comment {
     pub created_at: String,
     pub body: String,
 }
+
+/// The read-side view of a bug: the latest scalar state plus the full
+/// chronological comment thread. Returned by `Storage::read`.
+///
+/// This is a flattened projection of the on-disk pair
+/// (`bugs/<id>.json` + `bugs/<id>.comments.jsonl`) that callers (the
+/// upcoming `jjf` CLI, the merge driver once it consumes records) can
+/// use without knowing about the underlying file layout.
+///
+/// Fields mirror `BugRecord` plus a `comments` vector. `labels` and
+/// `dependencies` are sorted (the writer guarantees that already, but
+/// the read path re-sorts defensively); `comments` are sorted by
+/// `created_at` ascending (chronological).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bug {
+    pub id: BugId,
+    pub title: String,
+    pub body: String,
+    pub status: Status,
+    pub labels: Vec<String>,
+    pub dependencies: Vec<BugId>,
+    pub assignee: Option<String>,
+    pub comments: Vec<Comment>,
+    pub created_at: String,
+    pub updated_at: String,
+}

@@ -290,7 +290,9 @@ Applied in order: status → closed, then label `fixed` added.
 
 ```sh
 jj log --no-graph \
+   -r 'ancestors(bookmarks(bugs))' \
    'root:bugs/aa6600b.json' \
+   'root:bugs/aa6600b.comments.jsonl' \
    -T 'change_id.short() ++ "\t" ++ json(description) ++ "\n"'
 ```
 
@@ -299,6 +301,34 @@ parses the `Jjf-Op:` trailers out of each description to build
 the typed audit view (git-bug-equivalent `CreateOp` /
 `SetTitleOp` / ... chain). The audit IS the commit chain — no
 side jsonl.
+
+**Filter on both files**, not just the JSON record. If two
+mutations land within the same second, the JSON record's
+`updated_at` is byte-identical between commits and jj's
+snapshotter records no change to that file — a JSON-only filter
+silently drops the second commit. The comments-jsonl path picks
+those up because every comment-add appends a new line.
+
+**Anchor the revset to `ancestors(bookmarks(bugs))`.** Without
+the explicit revset, `jj log` defaults to a working-copy
+revision that doesn't include the bookmark's history once the
+4-CLI dance has stepped `@` off the bookmark.
+
+### 5.7 Create-time fields and op chains
+
+The `create` op trailer carries only `Jjf-Title` and
+`Jjf-Status`. Any other seed fields on a freshly-created bug
+(`body`, `labels`, `dependencies`, `assignee`) must be recorded
+as **additional ops in the same commit** — the multi-op pattern
+of §5.5. Without this, a reader that re-derives state from the
+op chain would miss those fields entirely; the v1-contract
+correctness gate (file-read vs. op-replay equality) would fire
+on every non-trivial create.
+
+The writer emits them in this order, after the `Jjf-Op: create`
+stanza: `set-body`, `label-add` (one per label, sorted),
+`dep-add` (one per dependency, sorted), `set-assignee` (if
+present).
 
 ---
 
