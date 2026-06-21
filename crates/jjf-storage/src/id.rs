@@ -131,16 +131,19 @@ mod tests {
 
     #[test]
     fn random_ids_are_distinct_within_process() {
+        // 1k samples in a 268M space: birthday-paradox p(collision)
+        // ≈ 1 - exp(-1000^2 / (2 * 2^28)) ≈ 0.19%. Low enough to assert
+        // no collision on a single run without flake. (10k was 17% —
+        // that's the flake we caught after the subagent shipped.)
+        // The real defense against collisions is the re-roll-on-write
+        // loop in the spec; this test just sanity-checks the RNG isn't
+        // pathologically biased.
         let mut seen = HashSet::new();
-        for _ in 0..10_000 {
+        for _ in 0..1_000 {
             let id = BugId::random();
-            // 10k samples in a 268M space ≈ birthday-paradox p(collision) <1e-2.
-            // We assert the *unlikely* event doesn't happen on this run; if
-            // it does, the test is flaky by design and the spec re-roll loop
-            // catches it in practice.
             assert!(
                 seen.insert(id.0.clone()),
-                "id collision in 10k samples: {}",
+                "id collision in 1k samples: {}",
                 id.0
             );
         }
