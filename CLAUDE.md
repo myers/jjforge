@@ -266,7 +266,21 @@ When the user asks you to "orchestrate" or "make progress" or
    messages double as a worklog. Use the explicit-filename
    discipline from the Commits section.
 
-6. **Post a status comment to each affected epic** when a child
+6. **Run the workspace tests between dispatches.** After
+   committing one subagent's work and before dispatching the
+   next:
+
+   ```bash
+   cargo nextest run --workspace
+   # fall back to `cargo test --workspace` if nextest isn't installed
+   ```
+
+   If anything is red — including tests written by an earlier
+   round that this round broke — fix or roll back before
+   dispatching the next subagent. Don't paper over a regression
+   by dispatching more work on top of it.
+
+7. **Post a status comment to each affected epic** when a child
    ticket closes. The comment goes on the epic issue (e.g.
    `72638a0`), names the closed ticket, links the commit if one
    landed, and notes what's still unfiled. **When the orchestration
@@ -275,7 +289,7 @@ When the user asks you to "orchestrate" or "make progress" or
    epic-level comments aren't enough; the meta-epic is the index
    readers (and future orchestrators) hit first.
 
-7. **Surface follow-ups to the user.** Stop and report when:
+8. **Surface follow-ups to the user.** Stop and report when:
    the subagent budget is exhausted, a finding contradicts an
    epic's sketched approach, scope is creeping into a different
    epic, or the next move requires a design call only the user

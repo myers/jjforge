@@ -20,6 +20,32 @@ Inspirations and what we take from each:
   incidents, closure ties to a physical artifact, "no parser depends on the
   format."
 
+## First-time setup
+
+Stable Rust toolchain (1.75+ should be fine; project is currently
+on whatever rustup gives you).
+
+Install once:
+
+```bash
+# git-bug — the interim issue tracker (we'll replace it with jjf)
+brew install git-bug
+
+# jj — Jujutsu, the substrate we shell out to from jjf
+brew install jj   # or: cargo install --git https://github.com/jj-vcs/jj.git --locked --bin jj
+
+# nextest — preferred test runner; isolates test processes, which matters for
+# the integration tests that spawn real `jj` subprocesses
+cargo install cargo-nextest --locked
+```
+
+Run the workspace tests:
+
+```bash
+cargo nextest run --workspace
+# fall back to `cargo test --workspace` if nextest isn't available
+```
+
 ## Planning lives in git-bug
 
 Plans, decisions, and work items live in `git-bug` issues in this repo,
