@@ -21,7 +21,8 @@ first.**
   live in the issues, not in markdown files. The blog
   (`blog/content/posts/`) captures milestones for the public
   record.
-- **Entry point:** the meta-epic `04e1dac`. Read it first.
+- **Entry point:** the roadmap (`git-bug bug --label roadmap`).
+  Read it first.
 - **CI:** `.woodpecker/blog.yaml` builds and pushes a Zola site
   image. Mirrors zfs-workspace's pattern except for the
   notify-flux hook (jjforge isn't a Flux deployment target).
@@ -34,28 +35,20 @@ as data, not as something to fix in the planner.
 
 ### Entry point and discovery
 
-The meta-epic at `04e1dac` is the orientation document. Start
-there in any new session before touching anything else:
+The roadmap is the orientation document. Start there in any
+new session before touching anything else:
 
 ```bash
-git-bug bug show 04e1dac
+git-bug bug --label roadmap
 ```
 
-To navigate from there:
-
-```bash
-git-bug bug                                # everything, oldest first
-git-bug bug --label meta-epic              # just the entry point
-git-bug bug --label epic                   # the six top-level epics
-git-bug bug --label epic:mvp-storage       # one epic + its related issues
-git-bug bug --label research               # historical research
-git-bug bug --status open                  # filter by status
-git-bug bug show <prefix>                  # one issue, 7-char prefix is enough
-```
+To navigate from there, see the Queries section at the bottom
+of this file.
 
 ### Label scheme
 
-- **`meta-epic`** — the entry-point issue (one only).
+- **`roadmap`** — the running plan (one ticket, never closes;
+  latest comment is the truth).
 - **`epic`** — the six top-level epic issues. Each carries the
   goal, the sketched approach, the tickets we expect to file
   under it, and its dependency graph.
@@ -143,11 +136,11 @@ comment. Implications:
 - If you need to revise an epic's plan after filing it, post a
   follow-up comment. The original goal statement stays put.
   This is one of the things jjforge should improve on.
-- For the meta-epic specifically: the body is the placeholder
-  goal sentence; the populated epic index lives as comment #1.
-  Both are visible in `bug show`, but the chronology can
-  confuse a reader. State the comment-#1 location explicitly
-  when pointing someone at the meta-epic.
+- The **roadmap** ticket (`--label roadmap`) is the live
+  example of this. Its body has the original framing; the
+  *latest* comment carries the current priority order.
+  Readers should know to scroll to the bottom of `bug show`
+  output for the truth.
 
 ### Issue-id length
 
@@ -238,7 +231,8 @@ git add experiments/<topic>
 When the user asks you to "orchestrate" or "make progress" or
 "dispatch subagents," the loop is:
 
-1. **Read the meta-epic `04e1dac` first** to orient.
+1. **Read the roadmap first** (`git-bug bug --label roadmap`)
+   to orient on what's up next and what's blocking it.
 
 2. **Find the next concrete ticket.** Either there's a named
    "do this now" ticket (today: `e2e473b`, the merge driver) or
@@ -283,11 +277,11 @@ When the user asks you to "orchestrate" or "make progress" or
 7. **Post a status comment to each affected epic** when a child
    ticket closes. The comment goes on the epic issue (e.g.
    `72638a0`), names the closed ticket, links the commit if one
-   landed, and notes what's still unfiled. **When the orchestration
-   round ends, also post a status comment to the meta-epic
-   `04e1dac`** linking any newly-filed or newly-closed tickets —
-   epic-level comments aren't enough; the meta-epic is the index
-   readers (and future orchestrators) hit first.
+   landed, and notes what's still unfiled. **If the priority
+   order changed during the round** — a sketched epic earned a
+   promotion, a closed epic falls off — post the new ordering
+   as a comment on the roadmap (`6a65c0d`). Don't restate
+   queryable state in the comment; just the priority delta.
 
 8. **Surface follow-ups to the user.** Stop and report when:
    the subagent budget is exhausted, a finding contradicts an
@@ -338,16 +332,47 @@ The project's running roadmap is a single ticket labeled
 git-bug bug --label roadmap
 ```
 
-It lists the open epics in the order they should be tackled.
-The order shifts as the project learns; the ticket itself
-stays open for the life of the project. The latest comment
-is the truth (git-bug has no edit-body command; the roadmap
-gets updated by appending a new ordering as a comment).
+It lists the open epics in priority order, with an "above
+the line" / "below the line" cut for what's shipping now vs.
+queued. The ticket stays open for the life of the project;
+the latest comment is the truth (git-bug has no edit-body
+command).
 
-For the broader index — every issue, open and closed, by
-label — read the meta-epic `04e1dac`. The roadmap tells you
-*what to work on next*; the meta-epic tells you *what
-exists*.
+For "what exists" — every issue, by label, by status — use
+the queries below, not a maintained index.
 
 Don't expand scope into epics below the roadmap's "above the
 line" cut until the roadmap explicitly pulls them up.
+
+## Queries
+
+git-bug has a query language for filtering. The useful
+filters for navigating jjforge:
+
+```bash
+# Roadmap — priority order, blocking judgment
+git-bug bug --label roadmap
+
+# Epics — the six top-level milestones
+git-bug bug --label epic
+
+# Work under one epic — open tickets only
+git-bug bug --label epic:mvp-storage --status open
+
+# Everything ever attached to an epic — open and closed
+git-bug bug --label epic:mvp-sync
+
+# Historical research record
+git-bug bug --label research
+
+# Recently closed (handy for orchestration retro)
+git-bug bug --status closed --by edit -d desc
+
+# Search bodies and comments
+git-bug bug "merge driver"
+```
+
+If a useful filter isn't here, add it. If git-bug can't
+express it, that's a feature request for `jjf` (a real
+`blocks` / `blocked-by` relation, for example, is exactly
+why we're building this).

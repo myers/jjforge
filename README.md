@@ -2,7 +2,8 @@
 
 A jj-native, agent-first issue tracker. CLI: `jjf`.
 
-**Status:** scoping. See the meta-epic `04e1dac` for the plan.
+**Status:** scoping. See the roadmap (`git-bug bug --label roadmap`)
+for the plan.
 
 Inspirations and what we take from each:
 
@@ -49,15 +50,17 @@ cargo nextest run --workspace
 ## Planning lives in git-bug
 
 Plans, decisions, and work items live in `git-bug` issues in this repo,
-not in markdown files. The meta-epic `04e1dac` is the entry point;
-read it first.
+not in markdown files. The roadmap is the entry point; read it first:
+
+```bash
+git-bug bug --label roadmap
+```
 
 Quick reference:
 
 ```
 git-bug bug                            # list everything
 git-bug bug --label roadmap            # the priority order — read this first
-git-bug bug --label meta-epic          # the index of every issue
 git-bug bug --label epic               # the six epics
 git-bug bug --label epic:mvp-storage   # one epic + its related issues
 git-bug bug --label research           # historical research record
@@ -70,7 +73,6 @@ Label scheme:
 
 - `roadmap` — the project's running priority list (one ticket, never
   closes; latest comment is the truth).
-- `meta-epic` — the index of every issue, by label.
 - `epic` — the six top-level epic issues.
 - `epic:<slug>` — every issue belonging to an epic (the epic itself
   plus its research and child tickets).
