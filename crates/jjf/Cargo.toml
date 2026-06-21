@@ -1,0 +1,17 @@
+[package]
+name = "jjf"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The jjforge CLI binary — clap-derive subcommand harness over `jjf-storage`."
+
+[[bin]]
+name = "jjf"
+path = "src/main.rs"
+
+[dependencies]
+jjf-storage = { path = "../jjf-storage" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+clap = { version = "4", features = ["derive"] }
