@@ -233,12 +233,90 @@ git add experiments/<topic>
   unless you're told otherwise.
 - Don't push to remote (none configured).
 
+## Orchestrating work
+
+When the user asks you to "orchestrate" or "make progress" or
+"dispatch subagents," the loop is:
+
+1. **Read the meta-epic `04e1dac` first** to orient.
+
+2. **Find the next concrete ticket.** Either there's a named
+   "do this now" ticket (today: `e2e473b`, the merge driver) or
+   there isn't. If there is one, work backward: are its
+   prerequisites filed and viable, or do they need detailing
+   first?
+
+3. **File any missing prerequisite tickets yourself before
+   dispatching subagents.** The orchestrator owns the ticket
+   graph. Subagents own the work inside one ticket. A subagent
+   asked to "build X and file the ticket for it" will either
+   skip the ticket or write it badly. Pre-file with a sketched
+   body; let the subagent close it.
+
+4. **Dispatch serially, not in parallel.** Subagents writing to
+   `refs/bugs/*` race each other — git-bug's underlying refs
+   aren't atomic across processes. The earlier session learned
+   this the hard way. Parallel is fine ONLY when the subagents
+   have disjoint write targets (different bug ids, different
+   files in `experiments/<topic>/`). When in doubt, serial.
+
+5. **Commit between dispatches.** Each subagent's experiments,
+   docs, or other artifacts get committed before the next is
+   dispatched. The next agent reads a clean tree; commit
+   messages double as a worklog. Use the explicit-filename
+   discipline from the Commits section.
+
+6. **Post a status comment to each affected epic** when a child
+   ticket closes. The comment goes on the epic issue (e.g.
+   `72638a0`), names the closed ticket, links the commit if one
+   landed, and notes what's still unfiled. This is how the
+   meta-epic's index stays usable.
+
+7. **Surface follow-ups to the user.** Stop and report when:
+   the subagent budget is exhausted, a finding contradicts an
+   epic's sketched approach, scope is creeping into a different
+   epic, or the next move requires a design call only the user
+   can make.
+
+### Where to work
+
+The orchestrator runs in whichever directory it was invoked.
+**Commits land there.** If you were invoked in
+`~/p/jjforge`, commits go to `~/p/jjforge`. If you were invoked
+in a worktree at `~/p/jjforge-test-orchestration/`, scratch
+work and commits stay in the worktree. Do NOT chdir to
+`~/p/jjforge` to commit if you were invoked elsewhere — that
+contaminates the real working tree with experimental state.
+
+`git-bug` data lives in `refs/bugs/*` and is shared across
+worktrees automatically; bug edits travel between them. Code
+and experiments do not.
+
+### Dispatch prompt template
+
+When dispatching a subagent on an issue, include:
+
+- The issue id and the command to view it
+  (`cd ~/p/jjforge && git-bug bug show <id>`).
+- A one-sentence summary of why this work is happening now
+  (which epic, what's blocked on it).
+- Pointers to prior-subagent findings as paths or issue ids
+  (`see ~/p/jjforge/experiments/.../README.md` or
+  `the closing comment on <prior-id> records the verdict`).
+- The housekeeping note about stripping nested `.git/`/`.jj/`
+  from experiment dirs.
+- An explicit "report back under 200 words" cap.
+
+The `subagent-working-a-git-bug-issue` skill auto-loads from
+keywords ("git-bug", "issue") and enforces the four-section
+closing-comment recipe. Don't re-explain that in the dispatch
+prompt; let the skill carry it.
+
 ## What's next
 
 Read the meta-epic `04e1dac` and pick the next concrete piece
 of work. The MVP path is `mvp-storage` → `mvp-cli` → `mvp-sync`
-(`e2e473b` is the first ticket under `mvp-sync` and the only
-"do this now" concrete ticket currently filed).
+(`e2e473b` is the named "do this now" ticket under `mvp-sync`).
 
 Don't expand scope into the speculative epics
 (`multi-client`, `project-agent-orchestration`) until the MVP
