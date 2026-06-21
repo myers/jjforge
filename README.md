@@ -2,7 +2,7 @@
 
 A jj-native, agent-first issue tracker. CLI: `jjf`.
 
-**Status:** scoping. This README will grow as decisions land.
+**Status:** scoping. See the meta-epic `04e1dac` for the plan.
 
 Inspirations and what we take from each:
 
@@ -20,24 +20,39 @@ Inspirations and what we take from each:
   incidents, closure ties to a physical artifact, "no parser depends on the
   format."
 
-## Planning
+## Planning lives in git-bug
 
-Planning happens in `git-bug` issues in this repo, not in markdown files. Use
-`git-bug` to list, show, and update issues:
+Plans, decisions, and work items live in `git-bug` issues in this repo,
+not in markdown files. The meta-epic `04e1dac` is the entry point;
+read it first.
+
+Quick reference:
 
 ```
-git-bug bug                  # list
-git-bug bug show <prefix>    # one
-git-bug bug add ...          # new
-git-bug bug comment <id> ... # discuss
+git-bug bug                            # list everything
+git-bug bug --label meta-epic          # the plan's entry point
+git-bug bug --label epic               # the six epics
+git-bug bug --label epic:mvp-storage   # one epic + its related issues
+git-bug bug --label research           # historical research record
+git-bug bug show <id>                  # one issue
+git-bug bug new -t "<title>" -F -      # new, body on stdin
+git-bug bug comment new <id> -F -      # comment, body on stdin
 ```
 
-The first issues are the operational unknowns we need to research before we
-can credibly write a v1 of the tool itself. See those for the current shape of
-the work.
+Label scheme:
+
+- `meta-epic` — the entry-point issue.
+- `epic` — the six top-level epic issues.
+- `epic:<slug>` — every issue belonging to an epic (the epic itself
+  plus its research and child tickets).
+- `research` — historical research issues.
 
 ## Why git-bug for planning
 
-This is deliberate eat-our-own-dogfood: we will use git-bug to plan a
-jj-native tracker. If the experience is rough, we'll have learned exactly
-where the friction is, which is the input we need.
+We're using git-bug to plan its jj-native successor. If the
+experience is rough, that's exactly the input we need: the friction
+shows up in detail, and jjforge can specifically improve on it.
+
+The CLI shim at `bin/jjf` already wraps git-bug, so the verb shape
+of the eventual Rust binary stays consistent through the planning
+phase.
