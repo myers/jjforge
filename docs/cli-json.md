@@ -1,5 +1,33 @@
 # `jjf --json` output contract
 
+## v2 → v2.1 changelog
+
+Backwards-compatible additions, landed in
+`issue-type-and-slug-fields`:
+
+- **`Issue` payload gains `type` and `slug`** — `show --json`,
+  `ls --json`, and the per-issue arrays embed the new fields
+  verbatim. `type` is the lowercase wire spelling (`bug` |
+  `feature` | `epic` | `research` | `roadmap` | `unspecified`);
+  `slug` is a string or `null`.
+- **`jjf new --json` accepts `--type` and `--slug` flags**; the
+  envelope shape is unchanged (`{"ok":true,"id":"..."}`).
+- **`jjf update --json` accepts `--type`, `--slug`,
+  `--unset-slug`**. The `fields` array surfaces the populated
+  field names — values include `"slug"` and `"type"` alongside
+  the existing `"title"`/`"status"`/`"body"`/`"assignee"`.
+- **`jjf ls --json` accepts `--type` (repeatable, OR-semantics)
+  and `--slug` (substring match)** as filter flags.
+- **Every id-taking verb (`show`, `update`, `close`, `open`,
+  `comment`, `label add|rm`) accepts a slug in place of the
+  7-hex id.** Resolution happens at the CLI boundary; verbs
+  surface `slug_not_found` (exit 2) when the handle doesn't
+  match an id or a known slug.
+- **Three new error kinds** — `invalid_slug` (with
+  `details.slug` + `details.reason`), `slug_collision` (with
+  `details.slug` + `details.conflicts_with`), `slug_not_found`
+  (with `details.handle`).
+
 This document is the canonical reference for what `jjf <verb> --json`
 emits. The contract here is what scripts, the `mvp-sync` orchestrator,
 and the `agent-ergonomics` MCP server are entitled to rely on. Changes
@@ -139,6 +167,9 @@ from plain-text mode (see the top comment in `main.rs`: `0` success,
 | `jj_git_fetch_error`         | 1    | `JjGitFetch`                  | —                        |
 | `unmergeable`                | 1    | `Unmergeable`                 | `issue_id`, `detail`     |
 | `comment_file_conflict`      | 1    | `CommentFileConflict`         | `issue_id`               |
+| `invalid_slug`               | 2    | `Storage::InvalidSlug` / `InvalidSlug` | `slug`, `reason`        |
+| `slug_collision`             | 2    | `Storage::SlugCollision` / `SlugCollision` | `slug`, `conflicts_with` |
+| `slug_not_found`             | 2    | `Storage::SlugNotFound` / `SlugNotFound` | `handle`                 |
 | `invalid_input`              | 1    | `Storage::Invalid`            | —                        |
 | `clock_error`                | 1    | `Storage::Clock`              | —                        |
 | `io_error`                   | 1    | `Storage::Io`                 | —                        |
@@ -201,6 +232,29 @@ $ echo "body" | jjf new --json -t "fix the thing" -F -
 {"ok":true,"id":"a3f9c01"}
 ```
 
+Optional flags for v2.1 fields:
+
+```sh
+$ jjf new --json -t "agent-ready" --type feature --slug agent-ready
+{"ok":true,"id":"a3f9c01"}
+```
+
+Error path — invalid slug (`bad_charset` is one of `bad_charset` /
+`too_short` / `too_long` / `leading_hyphen` / `trailing_hyphen` /
+`consecutive_hyphens`):
+
+```sh
+$ jjf new --json -t x --slug Bad_Slug
+{"ok":false,"error":{"kind":"invalid_slug","message":"...","details":{"slug":"Bad_Slug","reason":"bad_charset"}}}
+```
+
+Error path — slug collision with an open issue:
+
+```sh
+$ jjf new --json -t x --slug taken
+{"ok":false,"error":{"kind":"slug_collision","message":"...","details":{"slug":"taken","conflicts_with":"a3f9c01"}}}
+```
+
 Error path — `issues` bookmark missing (didn't run `jjf init` first):
 
 ```sh
@@ -217,15 +271,32 @@ $ jjf show --json a3f9c01
 {
   "id": "a3f9c01",
   "title": "fix the thing",
-  "status": "open",
-  "labels": [],
-  "assignee": null,
-  "dependencies": [],
+  "slug": "agent-ready",
   "body": "body\n",
+  "status": "open",
+  "type": "feature",
+  "labels": [],
+  "dependencies": [],
+  "assignee": null,
   "comments": [],
   "created_at": "2026-06-21T22:00:00Z",
   "updated_at": "2026-06-21T22:00:00Z"
 }
+```
+
+`show` also accepts a slug in place of the id:
+
+```sh
+$ jjf show --json agent-ready
+{ ... same payload ... }
+```
+
+A handle that's neither a parseable id nor a known slug surfaces
+the `slug_not_found` envelope:
+
+```sh
+$ jjf show --json nope
+{"ok":false,"error":{"kind":"slug_not_found","message":"no issue with handle \"nope\"","details":{"handle":"nope"}}}
 ```
 
 Error path — nonexistent id:
@@ -254,6 +325,22 @@ $ jjf ls --json
 Empty result is `[]`, not silence — scripts piping to `jq length`
 get a useful value either way.
 
+v2.1 filters:
+
+- `--type <kind>` — repeatable, OR-semantics across the listed
+  types. An issue matches if its `type` field equals any listed
+  type.
+- `--slug <pattern>` — case-sensitive substring match against
+  the `slug` field. Issues without a slug never match.
+
+```sh
+$ jjf ls --json --type bug --type feature
+[ ... open issues whose type is bug OR feature ... ]
+
+$ jjf ls --json --slug agent
+[ ... open issues whose slug contains "agent" ... ]
+```
+
 Error path — running outside a jj repo:
 
 ```sh
@@ -269,9 +356,28 @@ $ jjf update --json a3f9c01 --title "renamed" --status closed
 ```
 
 The `fields` array lists the populated fields in field-declaration
-order (`title`, `status`, `body`, `assignee`) — the same order the
-storage layer lands the corresponding trailers on the resulting
-commit.
+order — the same order the storage layer lands the corresponding
+trailers on the resulting commit. The full ordering (v2.1):
+
+1. `title`
+2. `slug`
+3. `status`
+4. `type`
+5. `body`
+6. `assignee`
+
+`update` accepts a slug in place of the id (`jjf update
+agent-ready --title ...` works the same as the 7-hex variant).
+`--slug new-handle` and `--unset-slug` are mutually exclusive
+(clap enforces).
+
+```sh
+$ jjf update --json a3f9c01 --type bug --slug fix-the-thing
+{"ok":true,"id":"a3f9c01","fields":["slug","type"]}
+
+$ jjf update --json a3f9c01 --unset-slug
+{"ok":true,"id":"a3f9c01","fields":["slug"]}
+```
 
 Error path — nonexistent id:
 

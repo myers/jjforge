@@ -65,8 +65,16 @@ of this file.
 Use `-F -` to read the body from stdin (the recommended pattern
 — no interactive flow, no editor invocation, scripts cleanly).
 Pass labels with `-l` (repeatable). Optional flags: `-d <id>`
-(repeatable, dependencies), `-a <name>` (assignee). Use
+(repeatable, dependencies), `-a <name>` (assignee), `--type
+<kind>` (one of `bug` / `feature` / `epic` / `research` /
+`roadmap` — v2.1), `--slug <kebab>` (kebab-case orientation
+handle — v2.1, validated, unique across open issues). Use
 `--json` for the machine-readable envelope.
+
+**Recommended:** set `--type` and `--slug` on every new ticket.
+The slug lets you say `jjf show agent-ready` instead of `jjf
+show 69d5e1b`, and the type drives `jjf ls --type bug` /
+`jjf ready`'s priority sort.
 
 ```bash
 cat <<'EOF' | jjf new --json -t "Real title goes here" -F - -l epic -l epic:mvp-cli
@@ -485,9 +493,17 @@ Useful invocations for navigating jjforge. See
 ```bash
 # Roadmap — priority order, blocking judgment
 jjf show 9566f52
+jjf show roadmap                  # v2.1: by slug
 
 # Epics — the six top-level milestones
 jjf ls --label epic
+
+# All tickets of a given type (v2.1)
+jjf ls --type bug
+jjf ls --type epic --type feature # OR-semantics across types
+
+# Slug substring lookup (v2.1)
+jjf ls --slug agent
 
 # Work under one epic — open tickets only
 jjf ls --label epic:mvp-storage --status open

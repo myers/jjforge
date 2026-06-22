@@ -1,6 +1,6 @@
-# jjforge on-disk storage format — v2
+# jjforge on-disk storage format — v2.1
 
-Status: v2, current. This is the contract every other crate
+Status: v2.1, current. This is the contract every other crate
 implements against. Verdicts pinned by:
 
 - `dcd4b57` — Shape A (dedicated bookmark for issue data).
@@ -8,6 +8,36 @@ implements against. Verdicts pinned by:
   audit surface.
 - `2130de1` — shell out to the `jj` CLI; do not link `jj-lib`.
 - `72638a0` — the `mvp-storage` epic.
+
+## v2 → v2.1 changelog
+
+Backwards-compatible field additions, landed in
+`issue-type-and-slug-fields`. v2 readers tolerate v2.1 records
+(the trailer parser ignores unknown ops per §5.2; the record
+parser tolerates extra fields because serde-derive does); v2.1
+readers tolerate v2 records via serde-default on the two new
+fields. No bookmark rename, no path change, no migration commit.
+
+- **New record field `type`** (string enum, default
+  `"unspecified"`) — placed between `status` and `labels` in the
+  on-disk record. Values: `bug`, `feature`, `epic`, `research`,
+  `roadmap`, `unspecified`. Future-extensible (parsers tolerate
+  unknown strings via the standard serde failure path; add the
+  variant when the older reader meets newer data).
+- **New record field `slug`** (string or null, default `null`)
+  — placed between `title` and `body` in the on-disk record.
+  Kebab-case orientation handle. Validation: `[a-z0-9-]+`, length
+  3–48, no leading/trailing/consecutive hyphens. **Uniqueness
+  enforced across OPEN issues at write time**; closing an issue
+  releases its slug.
+- **New op `set-type`** — payload field `Jjf-Type`. Carries one
+  of the wire-spelling values above.
+- **New op `set-slug`** — payload field `Jjf-Slug`. Empty value
+  clears the slug.
+- **Create-time emission (§5.7)** — non-default `type` and
+  `slug` values emit `set-type` / `set-slug` stanzas in the
+  multi-op create commit. Emission order matches record field
+  order: slug, body, type, labels, dependencies, assignee.
 
 ## v1 → v2 changelog
 
@@ -137,11 +167,13 @@ separate lines).
 
 | Field          | Type                  | Req? | Notes                                                          |
 | -------------- | --------------------- | ---- | -------------------------------------------------------------- |
-| `version`      | integer               | yes  | Schema version. v2 = `2`. Older records may carry `1`.         |
+| `version`      | integer               | yes  | Schema version. v2.1 = `2` (same wire value as v2).            |
 | `id`           | string (7-hex)        | yes  | Must equal the filename stem.                                  |
 | `title`        | string                | yes  | Single-line. Must not be empty.                                |
+| `slug`         | string \| null        | yes  | v2.1 — kebab-case orientation handle. Default `null`. See §3.4. |
 | `body`         | string                | yes  | Opening description. May be empty.                             |
 | `status`       | string enum           | yes  | `open` or `closed`. Extensible by adding values in later vN.   |
+| `type`         | string enum           | yes  | v2.1 — `bug` \| `feature` \| `epic` \| `research` \| `roadmap` \| `unspecified`. Default `unspecified`. |
 | `labels`       | array of string       | yes  | Sorted alphabetically. Empty array if none.                    |
 | `dependencies` | array of string       | yes  | Issue IDs this depends on. Sorted. Empty array if none.        |
 | `assignee`     | string \| null        | yes  | Free-text identifier. `null` if unassigned.                    |
@@ -170,8 +202,10 @@ Adds over git-bug:
   "version": 2,
   "id": "aa6600b",
   "title": "segfault on empty input",
+  "slug": "segfault-on-empty-input",
   "body": "Running `./app` with no arguments crashes.",
   "status": "open",
+  "type": "bug",
   "labels": ["bug", "p1"],
   "dependencies": [],
   "assignee": "alice",
@@ -190,6 +224,30 @@ Writers **must** emit fields in the order above. This is not for
 parsers (any JSON parser ignores order) — it's for jj's textual
 auto-merger and human review of diffs. Stable ordering avoids
 spurious conflicts when two clones touch different fields.
+
+### 3.4 Slug validation (v2.1)
+
+A non-null `slug` field must satisfy:
+
+- Charset: `[a-z0-9-]+` (lowercase ASCII alphanumerics and
+  hyphen only).
+- Length: 3 ≤ N ≤ 48 characters.
+- No leading `-`.
+- No trailing `-`.
+- No two consecutive hyphens (`--`).
+
+Slug uniqueness is enforced **across OPEN issues at write time**.
+Closing an issue releases its slug — a subsequent `jjf new` /
+`jjf update --slug` may take it. (Rationale: orientation handles
+are for the live workspace; archived issues don't need to hold
+the keyword space hostage.) Writers SHOULD pre-validate before
+constructing a commit; storage MUST validate and reject on the
+write boundary.
+
+Operators look up issues by id OR slug — `jjf show
+agent-ready` resolves the open issue whose slug is
+`agent-ready`. The id-or-slug resolver scans every issue
+(open and closed); only the uniqueness rule is open-only.
 
 ---
 
@@ -310,6 +368,8 @@ trap that §5.6's filter-on-both-files workaround papers over.
 | `dep-add`    | `Jjf-Dep` (target issue-id)                               |                                                      |
 | `dep-rm`     | `Jjf-Dep`                                                 |                                                      |
 | `set-assignee` | `Jjf-Assignee` (string or empty for unassign)           |                                                      |
+| `set-type`   | `Jjf-Type` (one of `bug` / `feature` / `epic` / `research` / `roadmap` / `unspecified`) | v2.1.                              |
+| `set-slug`   | `Jjf-Slug` (validated kebab-case per §3.4; empty clears) | v2.1.                                                |
 | `comment-add` | `Jjf-Comment-Id` (the new comment's 7-hex id)            | The comment body lives in `<id>.comments.jsonl`.     |
 | `merge`      | (no extra payload fields)                                 | Used by the merge driver in `e2e473b`.               |
 
@@ -450,9 +510,12 @@ correctness gate (file-read vs. op-replay equality) would fire
 on every non-trivial create.
 
 The writer emits them in this order, after the `Jjf-Op: create`
-stanza: `set-body`, `label-add` (one per label, sorted),
-`dep-add` (one per dependency, sorted), `set-assignee` (if
-present).
+stanza: `set-slug` (if non-null), `set-body`, `set-type` (if
+non-default), `label-add` (one per label, sorted), `dep-add` (one
+per dependency, sorted), `set-assignee` (if present). Order
+follows the record's field-declaration order (§3.1) so the
+op-replay view's structural fold matches the file-read view
+exactly.
 
 ---
 

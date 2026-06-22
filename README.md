@@ -43,12 +43,16 @@ terminology — same word everyone else uses; we don't call them
 "bugs" because most of what we track is roadmap and epic work,
 not defects). One issue per work item: roadmap, epic, story,
 research note, defect, whatever. Each issue has an id, title,
-status (open / closed), body, labels, dependencies, assignee,
-and an append-only comment thread.
+an optional slug (kebab-case orientation handle), a coarse
+type (`bug` / `feature` / `epic` / `research` / `roadmap` /
+`unspecified`), status (open / closed), body, labels,
+dependencies, assignee, and an append-only comment thread.
 
 As of `199ed91` (v1 → v2 storage spec) the Rust types, wire
 trailers, bookmark, and on-disk paths all say "issue" too —
-the type-level rename catches the code up to the prose.
+the type-level rename catches the code up to the prose. The
+v2.1 update (`issue-type-and-slug-fields`) added the `type`
+and `slug` fields on top of v2 without breaking the wire shape.
 
 ## First-time setup
 
@@ -92,12 +96,20 @@ Create, list, read:
 ```bash
 jjf new -t "the title" -F body.md -l epic            # body from file
 echo "the body" | jjf new -t "the title" -F -        # body from stdin
+jjf new --type feature --slug agent-ready -t "..."    # v2.1 — typed + slugged
 jjf ls                                                # open issues
 jjf ls --status all                                   # everything
 jjf ls --label epic                                   # filter by label
-jjf show <id>                                         # one issue
+jjf ls --type bug                                     # filter by type
+jjf ls --slug agent                                   # substring-match slug
+jjf show <id>                                         # one issue by id
+jjf show agent-ready                                  # one issue by slug
 jjf show <id> --json                                  # machine-readable
 ```
+
+Every id-taking verb (`show`, `update`, `close`, `open`,
+`comment`, `label add|rm`) accepts a slug in place of the 7-hex
+id.
 
 Mutate:
 
