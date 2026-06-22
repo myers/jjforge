@@ -198,9 +198,56 @@ enum Commands {
         id: String,
     },
 
-    /// Add or remove labels. Not yet implemented (ticket:
-    /// `cli-label`).
-    Label,
+    /// Add or remove a single label on a bug. Lands a fresh
+    /// `label-add` or `label-rm` op on a new commit on the `bugs`
+    /// bookmark.
+    ///
+    /// Per the spec (§5.2) and matching `close`/`open`'s twin-mutator
+    /// shape: the call is NOT idempotent — re-adding an already-present
+    /// label, or removing one that isn't there, still writes a fresh
+    /// trailer so the audit log records the intent. The in-memory
+    /// label set is dedup'd, so `show` reports a clean list either way.
+    ///
+    /// v1 is single-label-per-call. Bulk (`label add <id> a b c`) is
+    /// out of scope; repeat the command in a loop for now.
+    Label {
+        #[command(subcommand)]
+        action: LabelAction,
+    },
+}
+
+/// Inner enum for `jjf label <action>`. Separating the action from the
+/// outer verb keeps the clap-derive `--help` clean (one help page per
+/// add/rm rather than two flag combinations on one verb) and gives
+/// `cli-update`'s scalar fan-out a pattern to copy if it wants nested
+/// subcommands instead of flags.
+#[derive(Debug, Subcommand)]
+enum LabelAction {
+    /// Add a label to a bug. Idempotent at the record level (the label
+    /// set dedupes) but NOT at the commit level — a fresh `label-add`
+    /// op lands either way per spec §5.2.
+    Add {
+        /// Full 7-char hex bug id. Bad parse → exit 2; valid id that
+        /// doesn't exist on the bookmark → exit 1.
+        id: String,
+
+        /// Label to add. Must be non-empty; an empty string is a
+        /// preflight failure (exit 2) at the CLI layer because the
+        /// storage layer doesn't validate it.
+        label: String,
+    },
+
+    /// Remove a label from a bug. No-op at the record level if the
+    /// label isn't present, but a fresh `label-rm` op lands either way
+    /// per spec §5.2.
+    Rm {
+        /// Full 7-char hex bug id. Bad parse → exit 2; valid id that
+        /// doesn't exist on the bookmark → exit 1.
+        id: String,
+
+        /// Label to remove. Must be non-empty (same rule as `add`).
+        label: String,
+    },
 }
 
 /// What the binary can fail with. Kept narrow so `main` can fan a
@@ -263,6 +310,15 @@ enum CliError {
     #[error("comment body is empty; pipe non-empty content via -F - or pass -F <path>")]
     EmptyCommentBody,
 
+    /// The user passed an empty string for `jjf label add|rm <id>
+    /// <label>`. The storage layer doesn't validate this — it would
+    /// happily land a `label-add`/`label-rm` op with `label=""` — so
+    /// we reject at the CLI layer (exit 2). An empty label is almost
+    /// certainly a shell-quoting mistake (`jjf label add $ID $L` with
+    /// `$L` unset) rather than intent.
+    #[error("label must not be empty")]
+    EmptyLabel,
+
     /// `jjf comment` couldn't resolve a comment author. Either jj's
     /// `user.name` isn't configured AND no `--author` override was
     /// supplied, or the override itself is empty/whitespace. Preflight
@@ -289,6 +345,7 @@ impl CliError {
             CliError::BadBugId { .. } => 2,
             CliError::MissingBugsBookmark(_) => 2,
             CliError::EmptyCommentBody => 2,
+            CliError::EmptyLabel => 2,
             CliError::MissingAuthor => 2,
             CliError::Probe(_) => 1,
             // `BugNotFound` is the user typing a valid id that just
@@ -325,14 +382,30 @@ fn run(cli: Cli) -> Result<(), CliError> {
         Commands::Close { id } => run_set_status(cli.json, id, Status::Closed),
         Commands::Open { id } => run_set_status(cli.json, id, Status::Open),
         Commands::Comment { id, file, author } => run_comment(cli.json, id, file, author),
+        Commands::Label { action } => match action {
+            LabelAction::Add { id, label } => {
+                run_label(cli.json, id, label, LabelOp::Add)
+            }
+            LabelAction::Rm { id, label } => run_label(cli.json, id, label, LabelOp::Rm),
+        },
         // Stubs. We deliberately return a generic runtime error
         // (exit 1) rather than a clap-level error (exit 2): the
         // command parsed fine, we just haven't implemented its
         // body. When the per-verb ticket lands, this arm goes away.
-        Commands::Update | Commands::Label => Err(CliError::Storage(
-            StorageError::Invalid("not yet implemented".into()),
-        )),
+        Commands::Update => Err(CliError::Storage(StorageError::Invalid(
+            "not yet implemented".into(),
+        ))),
     }
+}
+
+/// Which storage mutator `run_label` should call. Kept as a tiny enum
+/// (rather than passing a function pointer or matching on
+/// `LabelAction` twice) so the helper can render the right past-tense
+/// verb (`added` / `removed`) without re-matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabelOp {
+    Add,
+    Rm,
 }
 
 /// `jjf init` — wrap `Storage::init` against the cwd. Idempotent;
@@ -612,6 +685,73 @@ fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError
             Status::Closed => "closed",
         };
         println!("{verb} {bug_id}");
+    }
+    Ok(())
+}
+
+/// `jjf label add|rm <id> <label>` — flip one label on a bug via the
+/// storage write path. Both arms differ only in which `Storage`
+/// mutator they call (`add_label` vs `remove_label`) and which
+/// past-tense verb they render, so they share one helper.
+///
+/// Per spec §5.2 (and matching `set-status`'s shape): the call is NOT
+/// idempotent at the commit level — re-adding an already-present
+/// label, or removing a label that isn't there, still lands a fresh
+/// `label-add`/`label-rm` trailer. The in-memory label set is dedup'd
+/// by the storage layer so `show` reports a clean list either way.
+///
+/// Preflight order mirrors `run_set_status`: parse the id (exit 2),
+/// reject an empty label (exit 2), canonicalize cwd, probe for the jj
+/// repo + `bugs` bookmark (exit 2 with `run jjf init first` if
+/// absent), then hand off to storage. A well-formed id that doesn't
+/// exist on the bookmark surfaces as `BugNotFound` and exits 1.
+fn run_label(json: bool, id: String, label: String, op: LabelOp) -> Result<(), CliError> {
+    // 1. Parse the id. Same exit-2 rule as `show` / `close`.
+    let bug_id =
+        BugId::parse(&id).map_err(|error| CliError::BadBugId { value: id, error })?;
+
+    // 2. Reject empty labels at the CLI layer — storage doesn't
+    // validate. We trim before the check because a whitespace-only
+    // label is almost certainly the same shell-quoting mistake an
+    // empty one would be.
+    if label.trim().is_empty() {
+        return Err(CliError::EmptyLabel);
+    }
+
+    // 3. Resolve + canonicalize cwd.
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+
+    // 4. Preflight: jj repo + `bugs` bookmark present.
+    preflight::bugs_bookmark(&cwd)?;
+
+    // 5. Hand off to storage. The two mutators have the same signature
+    // (`&BugId, &str -> Result<()>`); branch on the action enum.
+    let storage = Storage::open(&cwd)?;
+    match op {
+        LabelOp::Add => storage.add_label(&bug_id, &label)?,
+        LabelOp::Rm => storage.remove_label(&bug_id, &label)?,
+    }
+
+    // 6. Render. Plain-text shape is `label added: <label> -> <id>` /
+    // `label removed: <label> -> <id>` per the ticket — verb-first and
+    // past-tense matches `closed <id>` / `opened <id>`. The arrow
+    // visually separates the two values so a reader can scan
+    // `<label>` and `<id>` without parsing word position.
+    let action_word = match op {
+        LabelOp::Add => "added",
+        LabelOp::Rm => "removed",
+    };
+    if json {
+        let out = serde_json::json!({
+            "ok": true,
+            "id": bug_id.as_str(),
+            "label": &label,
+            "action": action_word,
+        });
+        println!("{out}");
+    } else {
+        println!("label {action_word}: {label} -> {bug_id}");
     }
     Ok(())
 }
