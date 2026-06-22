@@ -670,6 +670,165 @@ fn read_history_missing_bug_returns_bug_not_found() {
 }
 
 // ---------------------------------------------------------------------
+// Storage::update tests (issue fdd0c7f).
+//
+// The whole point of the typed update API is multi-op-per-commit: a
+// caller bundles N field changes; the storage layer lands ONE commit
+// carrying N `Jjf-Op:` trailers. The read-back record reflects every
+// change, and `read_history` exposes the trailers as N entries that
+// share a single `commit` id.
+// ---------------------------------------------------------------------
+
+#[test]
+fn update_lands_one_commit_with_one_trailer_per_populated_field() {
+    use jjf_storage::UpdateFields;
+
+    let repo = make_scratch_repo("update_multi_op");
+    let storage = Storage::open(&repo).unwrap();
+
+    // Seed a bug.
+    let id = storage
+        .create_bug(&BugDraft {
+            title: "before".into(),
+            body: "before body".into(),
+            labels: vec![],
+            dependencies: vec![],
+            assignee: None,
+        })
+        .unwrap();
+
+    // Baseline op count, so we can assert the delta below.
+    let baseline = storage.read_history(&id).expect("read_history baseline").len();
+
+    // Populate three fields. The fourth (assignee) is None — left alone.
+    storage
+        .update(
+            &id,
+            UpdateFields {
+                title: Some("after".into()),
+                status: Some(Status::Closed),
+                body: Some("after body".into()),
+                assignee: None,
+            },
+        )
+        .expect("update three fields");
+
+    // Three populated fields => three NEW history entries, all on the
+    // SAME commit (one commit, three trailers). This is the load-bearing
+    // assertion the ticket calls out.
+    let history = storage.read_history(&id).expect("read_history after");
+    let new = &history[baseline..];
+    assert_eq!(
+        new.len(),
+        3,
+        "expected three new ops (title/status/body), got {}: {:#?}",
+        new.len(),
+        new,
+    );
+    let commit = &new[0].commit;
+    assert!(
+        new.iter().all(|e| &e.commit == commit),
+        "all new ops must share one commit, got: {:#?}",
+        new,
+    );
+
+    // Op order follows UpdateFields field-declaration order
+    // (title, status, body, assignee). Spec §5.7 convention.
+    match &new[0].op {
+        Op::SetTitle { title, .. } => assert_eq!(title, "after"),
+        other => panic!("new[0] expected SetTitle, got {:?}", other),
+    }
+    match &new[1].op {
+        Op::SetStatus { status, .. } => assert_eq!(*status, Status::Closed),
+        other => panic!("new[1] expected SetStatus, got {:?}", other),
+    }
+    match &new[2].op {
+        Op::SetBody { body_hash, .. } => {
+            assert_eq!(body_hash.len(), 64, "sha-256 hex is 64 chars");
+        }
+        other => panic!("new[2] expected SetBody, got {:?}", other),
+    }
+
+    // Record-level read agrees with what we wrote.
+    let bug = storage.read(&id).unwrap();
+    assert_eq!(bug.title, "after");
+    assert_eq!(bug.status, Status::Closed);
+    assert_eq!(bug.body, "after body");
+    // assignee was None in the update bundle => unchanged.
+    assert_eq!(bug.assignee, None);
+}
+
+#[test]
+fn update_assignee_double_option_distinguishes_set_from_unset() {
+    use jjf_storage::UpdateFields;
+
+    let repo = make_scratch_repo("update_assignee_double_option");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_bug(&BugDraft {
+            title: "assign me".into(),
+            body: String::new(),
+            labels: vec![],
+            dependencies: vec![],
+            assignee: None,
+        })
+        .unwrap();
+
+    // Some(Some("alice")) sets the assignee.
+    storage
+        .update(
+            &id,
+            UpdateFields {
+                assignee: Some(Some("alice".into())),
+                ..UpdateFields::default()
+            },
+        )
+        .expect("update assignee set");
+    let bug = storage.read(&id).unwrap();
+    assert_eq!(bug.assignee.as_deref(), Some("alice"));
+
+    // Some(None) clears the assignee.
+    storage
+        .update(
+            &id,
+            UpdateFields {
+                assignee: Some(None),
+                ..UpdateFields::default()
+            },
+        )
+        .expect("update assignee unset");
+    let bug = storage.read(&id).unwrap();
+    assert_eq!(bug.assignee, None);
+}
+
+#[test]
+fn update_with_no_fields_is_an_error() {
+    use jjf_storage::UpdateFields;
+
+    let repo = make_scratch_repo("update_no_fields");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_bug(&BugDraft {
+            title: "noop".into(),
+            body: String::new(),
+            labels: vec![],
+            dependencies: vec![],
+            assignee: None,
+        })
+        .unwrap();
+
+    match storage.update(&id, UpdateFields::default()) {
+        Err(jjf_storage::Error::Invalid(msg)) => {
+            assert!(
+                msg.contains("no fields"),
+                "Invalid message should mention `no fields`, got: {msg}"
+            );
+        }
+        other => panic!("expected Invalid, got {:?}", other),
+    }
+}
+
+// ---------------------------------------------------------------------
 // Bootstrap-path tests (issue 8b12f9d).
 //
 // `Storage::init` bootstraps the `bugs` bookmark idempotently. Spec

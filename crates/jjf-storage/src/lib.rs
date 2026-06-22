@@ -59,6 +59,42 @@ pub use jj::JjError;
 pub use op::Op;
 pub use record::{Bug, BugDraft, BugRecord, Comment, Status};
 
+/// Field-update bundle for [`Storage::update`].
+///
+/// Each `Option` field is "do not touch" when `None`. A populated
+/// variant means the corresponding scalar should be replaced with the
+/// supplied value. The `assignee` field is double-wrapped on purpose:
+/// `None` leaves the assignee alone, `Some(None)` clears it (writes
+/// `null`), `Some(Some(name))` sets it to `name`. The two distinct
+/// "set" intents (assign vs. unset) preserve the existing
+/// `set_assignee(Option<&str>)` semantics without sacrificing the
+/// "leave alone" outcome.
+///
+/// All populated fields land as ops in a single commit, per spec §5.5
+/// (multi-op-per-commit). An `UpdateFields` with every field `None`
+/// is a programming error and surfaces as
+/// [`Error::Invalid`] — callers (notably the `jjf update` CLI) should
+/// reject the empty-bundle case at their own layer with a more
+/// targeted message before reaching here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateFields {
+    pub title: Option<String>,
+    pub status: Option<Status>,
+    pub body: Option<String>,
+    pub assignee: Option<Option<String>>,
+}
+
+impl UpdateFields {
+    /// `true` iff every field is `None` — i.e. there's nothing to do.
+    /// Cheap helper so the CLI doesn't have to repeat the pattern.
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.status.is_none()
+            && self.body.is_none()
+            && self.assignee.is_none()
+    }
+}
+
 use jj::JjRepo;
 
 /// What went wrong on the write path.
@@ -332,6 +368,78 @@ impl Storage {
                 bug_id: rec.id.clone(),
                 assignee: assignee.clone(),
             }])
+        })
+    }
+
+    /// Update one or more scalar fields in a single commit.
+    ///
+    /// Bundles every populated field of [`UpdateFields`] into one call
+    /// to [`Storage::mutate`], which produces ONE new commit on the
+    /// `bugs` bookmark carrying N `Jjf-Op:` trailers (spec §5.5).
+    /// This is the operator-facing "change title + status + body in one
+    /// go" path that the per-field scalar mutators
+    /// (`set_title` / `set_status` / `set_body` / `set_assignee`) can't
+    /// express without fragmenting into N separate commits.
+    ///
+    /// Op order in the resulting commit follows the field-declaration
+    /// order of `UpdateFields` (title, status, body, assignee). This
+    /// matches the spec §5.7 convention used by `create_bug` — readers
+    /// that op-replay see fields applied in the same order the on-disk
+    /// record's schema declares them.
+    ///
+    /// Empty bundles (every field `None`) are rejected with
+    /// [`Error::Invalid`]: the call would land an empty commit with no
+    /// trailers, which would violate spec §5.4 (every jjforge commit
+    /// carries at least one `Jjf-Op:` stanza). The CLI layer also
+    /// rejects this case earlier with a more user-friendly hint, but
+    /// the storage-side guard means programmatic callers can't trip the
+    /// spec by accident either.
+    ///
+    /// Title validation matches `set_title` (non-empty after trim);
+    /// other fields accept any string.
+    pub fn update(&self, id: &BugId, fields: UpdateFields) -> Result<()> {
+        if fields.is_empty() {
+            return Err(Error::Invalid(
+                "update called with no fields set".into(),
+            ));
+        }
+        if let Some(title) = &fields.title {
+            if title.trim().is_empty() {
+                return Err(Error::Invalid("title must not be empty".into()));
+            }
+        }
+        let summary = format!("jjf: bug {} - update", id);
+        self.mutate(id, &summary, |rec| {
+            let mut ops: Vec<Op> = Vec::new();
+            if let Some(title) = &fields.title {
+                rec.title = title.clone();
+                ops.push(Op::SetTitle {
+                    bug_id: rec.id.clone(),
+                    title: title.clone(),
+                });
+            }
+            if let Some(status) = fields.status {
+                rec.status = status;
+                ops.push(Op::SetStatus {
+                    bug_id: rec.id.clone(),
+                    status,
+                });
+            }
+            if let Some(body) = &fields.body {
+                rec.body = body.clone();
+                ops.push(Op::SetBody {
+                    bug_id: rec.id.clone(),
+                    body_hash: sha256_hex(body.as_bytes()),
+                });
+            }
+            if let Some(assignee) = &fields.assignee {
+                rec.assignee = assignee.clone();
+                ops.push(Op::SetAssignee {
+                    bug_id: rec.id.clone(),
+                    assignee: assignee.clone(),
+                });
+            }
+            Ok(ops)
         })
     }
 

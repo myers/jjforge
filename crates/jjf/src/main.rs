@@ -42,6 +42,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use jjf_storage::{
     BUGS_BOOKMARK, Bug, BugDraft, BugId, Error as StorageError, IdError, Status, Storage,
+    UpdateFields,
 };
 
 /// Top-level CLI shape. Subcommands live on the `Commands` enum; the
@@ -72,6 +73,26 @@ enum StatusFilter {
     Open,
     Closed,
     All,
+}
+
+/// Clap-side mirror of [`jjf_storage::Status`] used for the `--status`
+/// flag on `jjf update`. We declare it here (rather than deriving
+/// `ValueEnum` directly on `Status` in the storage crate) so the
+/// storage crate doesn't pick up a `clap` dependency just for a
+/// derive — the binary is the only `ValueEnum` site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum StatusArg {
+    Open,
+    Closed,
+}
+
+impl From<StatusArg> for Status {
+    fn from(s: StatusArg) -> Self {
+        match s {
+            StatusArg::Open => Status::Open,
+            StatusArg::Closed => Status::Closed,
+        }
+    }
 }
 
 /// Every verb the epic body (`c4f7fcb`) calls out, plus `init`. Stubs
@@ -145,9 +166,53 @@ enum Commands {
         labels: Vec<String>,
     },
 
-    /// Mutate a bug's scalar fields. Not yet implemented (ticket:
-    /// `cli-update`).
-    Update,
+    /// Mutate one or more scalar fields of a bug in a single commit.
+    ///
+    /// Every populated field flag lands as a `Jjf-Op:` trailer on ONE
+    /// new commit on the `bugs` bookmark (spec §5.5 multi-op-per-commit).
+    /// So `update <id> --title T --status closed --body-file -` ships
+    /// three trailers (`set-title`, `set-status`, `set-body`) on one
+    /// commit — distinct from running three sibling verbs back-to-back,
+    /// which would fragment into three commits.
+    ///
+    /// At least one of `--title` / `--status` / `--body-file` /
+    /// `--assignee` / `--unset-assignee` is required; running with none
+    /// is an exit-2 preflight failure (clap can't enforce the
+    /// at-least-one rule for us). `--assignee` and `--unset-assignee`
+    /// are mutually exclusive (clap `conflicts_with`).
+    ///
+    /// `--status` overlaps with `jjf close` / `jjf open` by design — use
+    /// the standalone verbs for the single-shot ergonomic path, this
+    /// verb for the multi-field case.
+    Update {
+        /// Full 7-char hex bug id. Bad parse → exit 2; valid id that
+        /// doesn't exist on the bookmark → exit 1.
+        id: String,
+
+        /// Replace the title. Must be non-empty (after trim) at the
+        /// storage layer.
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Replace the status. Use `open` or `closed`.
+        #[arg(long, value_enum)]
+        status: Option<StatusArg>,
+
+        /// Replace the body. Source is a path, or `-` to read stdin.
+        /// Mirrors the `cli-new` / `cli-comment` body-source convention;
+        /// there is no inline `--body <STRING>` flag in v1.
+        #[arg(long = "body-file", value_name = "PATH")]
+        body_file: Option<PathBuf>,
+
+        /// Set the assignee. Mutually exclusive with `--unset-assignee`.
+        #[arg(long, conflicts_with = "unset_assignee")]
+        assignee: Option<String>,
+
+        /// Clear the assignee (writes `null`). Mutually exclusive with
+        /// `--assignee`.
+        #[arg(long = "unset-assignee")]
+        unset_assignee: bool,
+    },
 
     /// Append a comment to an existing bug on the `bugs` bookmark.
     /// Body source is REQUIRED — pass `-F <path>` or `-F -` for stdin.
@@ -328,6 +393,15 @@ enum CliError {
         "no comment author available; set jj user.name (e.g. `jj config set --user user.name 'Your Name'`) or pass --author <NAME>"
     )]
     MissingAuthor,
+
+    /// `jjf update <id>` ran with no field flags. Clap can't enforce
+    /// the at-least-one rule for us (all the field flags are
+    /// `Option<_>` or bool), so we check in the run fn and surface a
+    /// typed exit-2 hint pointing at the available flags.
+    #[error(
+        "nothing to update; pass at least one of --title / --status / --body-file / --assignee / --unset-assignee"
+    )]
+    NoUpdateFields,
 }
 
 impl CliError {
@@ -347,6 +421,7 @@ impl CliError {
             CliError::EmptyCommentBody => 2,
             CliError::EmptyLabel => 2,
             CliError::MissingAuthor => 2,
+            CliError::NoUpdateFields => 2,
             CliError::Probe(_) => 1,
             // `BugNotFound` is the user typing a valid id that just
             // doesn't exist — runtime failure, not preflight (the input
@@ -388,13 +463,22 @@ fn run(cli: Cli) -> Result<(), CliError> {
             }
             LabelAction::Rm { id, label } => run_label(cli.json, id, label, LabelOp::Rm),
         },
-        // Stubs. We deliberately return a generic runtime error
-        // (exit 1) rather than a clap-level error (exit 2): the
-        // command parsed fine, we just haven't implemented its
-        // body. When the per-verb ticket lands, this arm goes away.
-        Commands::Update => Err(CliError::Storage(StorageError::Invalid(
-            "not yet implemented".into(),
-        ))),
+        Commands::Update {
+            id,
+            title,
+            status,
+            body_file,
+            assignee,
+            unset_assignee,
+        } => run_update(
+            cli.json,
+            id,
+            title,
+            status,
+            body_file,
+            assignee,
+            unset_assignee,
+        ),
     }
 }
 
@@ -754,6 +838,128 @@ fn run_label(json: bool, id: String, label: String, op: LabelOp) -> Result<(), C
         println!("label {action_word}: {label} -> {bug_id}");
     }
     Ok(())
+}
+
+/// `jjf update <id> [--title T] [--status S] [--body-file PATH|-]
+/// [--assignee NAME] [--unset-assignee] [--json]` — mutate one or more
+/// scalar fields of a bug in a single commit.
+///
+/// All populated field flags bundle into ONE `Storage::update` call,
+/// which lands ONE new commit on the `bugs` bookmark carrying N
+/// `Jjf-Op:` trailers (one per field that changed). This is the
+/// multi-op-per-commit dividend the spec §5.5 gives us — running three
+/// sibling verbs (e.g. `set-title` + `close` + a separate body update)
+/// would fragment into three commits instead.
+///
+/// Preflight order matches the other write verbs (`run_set_status`,
+/// `run_label`, `run_comment`): purely-local validation first
+/// (id parse, at-least-one-flag rule, body-file read), then
+/// canonicalize cwd, then probe for the jj repo + `bugs` bookmark.
+/// Bug-not-found surfaces from `Storage::update` as a `BugNotFound`
+/// (exit 1) because the user typed a well-formed id; everything else
+/// the user can mistype is exit 2.
+///
+/// `--assignee` / `--unset-assignee` mutual exclusion is enforced by
+/// clap via `conflicts_with`. The at-least-one-flag rule has no clap
+/// equivalent (every flag is `Option<_>` or `bool`), so we check it
+/// here and surface a typed `NoUpdateFields` (exit 2).
+fn run_update(
+    json: bool,
+    id: String,
+    title: Option<String>,
+    status: Option<StatusArg>,
+    body_file: Option<PathBuf>,
+    assignee: Option<String>,
+    unset_assignee: bool,
+) -> Result<(), CliError> {
+    // 1. Parse the id. Same exit-2 rule as `show` / `close` / `label`.
+    let bug_id =
+        BugId::parse(&id).map_err(|error| CliError::BadBugId { value: id, error })?;
+
+    // 2. Build the `UpdateFields` bundle from the flag matrix. The
+    // body-file read is done UP FRONT (before the at-least-one check,
+    // and before the bookmark probe) so a bogus `--body-file` path
+    // surfaces as a typed `BodyRead` error rather than getting masked
+    // by a subsequent failure. `--assignee X` => `Some(Some(X))`;
+    // `--unset-assignee` => `Some(None)`; neither => `None` (leave
+    // alone) — the storage-side `UpdateFields::assignee` is double-
+    // wrapped exactly to express this three-way distinction.
+    let body = match body_file.as_deref() {
+        Some(path) => Some(read_body(Some(path))?),
+        None => None,
+    };
+    let assignee_field: Option<Option<String>> = if unset_assignee {
+        Some(None)
+    } else {
+        assignee.map(Some)
+    };
+    let fields = UpdateFields {
+        title,
+        status: status.map(Status::from),
+        body,
+        assignee: assignee_field,
+    };
+
+    // 3. At-least-one-flag rule. Clap can't enforce this (every flag
+    // is `Option<_>` / `bool`), so we surface a typed exit-2 hint
+    // pointing at the available flags. The storage layer would also
+    // reject this with `Error::Invalid`, but the CLI message names
+    // the flags so the operator sees what to do next without parsing
+    // a generic storage error.
+    if fields.is_empty() {
+        return Err(CliError::NoUpdateFields);
+    }
+
+    // 4. Resolve + canonicalize cwd.
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+
+    // 5. Preflight: jj repo + `bugs` bookmark present.
+    preflight::bugs_bookmark(&cwd)?;
+
+    // 6. Hand off to storage. One call lands one commit with N
+    // trailers.
+    let storage = Storage::open(&cwd)?;
+    storage.update(&bug_id, fields.clone())?;
+
+    // 7. Render. The list of field names mirrors the populated fields
+    // in field-declaration order (matching the trailer order the
+    // storage layer lands). We compute it once so plain-text and JSON
+    // agree exactly.
+    let changed = changed_field_names(&fields);
+    if json {
+        let out = serde_json::json!({
+            "ok": true,
+            "id": bug_id.as_str(),
+            "fields": changed,
+        });
+        println!("{out}");
+    } else {
+        println!("updated {bug_id}: {}", changed.join(", "));
+    }
+    Ok(())
+}
+
+/// Enumerate the field-name strings for the populated fields of an
+/// `UpdateFields`, in field-declaration order. Used to render both the
+/// plain-text and `--json` outputs of `jjf update` so they list the
+/// same set of names in the same order — and the same order the
+/// storage layer's trailers appear in on the resulting commit.
+fn changed_field_names(fields: &UpdateFields) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    if fields.title.is_some() {
+        out.push("title");
+    }
+    if fields.status.is_some() {
+        out.push("status");
+    }
+    if fields.body.is_some() {
+        out.push("body");
+    }
+    if fields.assignee.is_some() {
+        out.push("assignee");
+    }
+    out
 }
 
 /// `jjf comment <id> -F <path|-> [--author <NAME>] [--json]` — append
