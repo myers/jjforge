@@ -78,7 +78,12 @@ pub struct Comment {
 /// `dependencies` are sorted (the writer guarantees that already, but
 /// the read path re-sorts defensively); `comments` are sorted by
 /// `created_at` ascending (chronological).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The `Serialize` impl is the structured payload `jjf show --json`
+/// emits — field declaration order doubles as on-the-wire JSON field
+/// order, mirroring `BugRecord`'s schema-stability rule (spec §3.3)
+/// even though no merge ever sees this projection on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Bug {
     pub id: BugId,
     pub title: String,

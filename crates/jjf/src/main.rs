@@ -33,12 +33,14 @@
 //! parsed shape to storage, render the result, map errors to exit
 //! codes. No business logic.
 
+mod preflight;
+
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use jjf_storage::{BUGS_BOOKMARK, BugDraft, BugId, Error as StorageError, IdError, Storage};
+use jjf_storage::{BUGS_BOOKMARK, Bug, BugDraft, BugId, Error as StorageError, IdError, Storage};
 
 /// Top-level CLI shape. Subcommands live on the `Commands` enum; the
 /// `--json` flag is global so every verb sees it without restating
@@ -99,8 +101,18 @@ enum Commands {
         assignee: Option<String>,
     },
 
-    /// Print a single bug. Not yet implemented (ticket: `cli-show`).
-    Show,
+    /// Print a single bug from the `bugs` bookmark — title, status,
+    /// labels, assignee, body, and comment thread. Plain-text by
+    /// default; `--json` emits the structured `Bug` record verbatim
+    /// (no envelope — the bug IS the payload). Requires `jjf init`
+    /// to have been run first.
+    Show {
+        /// Full 7-char hex bug id. Prefix lookup isn't supported yet
+        /// (the storage layer is full-id-only); a bad id is a
+        /// preflight failure (exit 2), a valid id that doesn't exist
+        /// at the bookmark tip is a runtime failure (exit 1).
+        id: String,
+    },
 
     /// List bugs, with optional filters. Not yet implemented
     /// (ticket: `cli-ls`).
@@ -157,6 +169,12 @@ enum CliError {
     #[error("invalid bug id for --dep {value:?}: {error}")]
     BadDepId { value: String, error: IdError },
 
+    /// A positional bug id (e.g. `jjf show <id>`) didn't parse as
+    /// a valid `BugId`. Preflight failure (exit 2) — the user typed
+    /// something the storage layer can never resolve.
+    #[error("invalid bug id {value:?}: {error}")]
+    BadBugId { value: String, error: IdError },
+
     /// We're inside a jj repo, but the `bugs` bookmark doesn't
     /// exist yet. Surfaced as a preflight (exit 2) so the user gets
     /// a typed signal that they need to run `jjf init` rather than
@@ -185,8 +203,12 @@ impl CliError {
             CliError::Cwd(_) => 2,
             CliError::BodyRead { .. } => 2,
             CliError::BadDepId { .. } => 2,
+            CliError::BadBugId { .. } => 2,
             CliError::MissingBugsBookmark(_) => 2,
             CliError::Probe(_) => 1,
+            // `BugNotFound` is the user typing a valid id that just
+            // doesn't exist — runtime failure, not preflight (the input
+            // was well-formed; we tried to honor it and it wasn't there).
             CliError::Storage(_) => 1,
         }
     }
@@ -213,12 +235,12 @@ fn run(cli: Cli) -> Result<(), CliError> {
             deps,
             assignee,
         } => run_new(cli.json, title, file, labels, deps, assignee),
+        Commands::Show { id } => run_show(cli.json, id),
         // Stubs. We deliberately return a generic runtime error
         // (exit 1) rather than a clap-level error (exit 2): the
         // command parsed fine, we just haven't implemented its
         // body. When the per-verb ticket lands, this arm goes away.
-        Commands::Show
-        | Commands::Ls
+        Commands::Ls
         | Commands::Update
         | Commands::Comment
         | Commands::Close
@@ -289,10 +311,11 @@ fn run_new(
 
     // 4. Preflight: we're inside a jj repo AND the `bugs` bookmark
     // exists. The storage layer doesn't distinguish missing-bookmark
-    // today (see follow-ups in the closing comment); doing the probe
-    // here keeps the user-facing error precise without expanding the
-    // storage API.
-    preflight_bugs_bookmark(&cwd)?;
+    // today (see follow-ups in the cli-new/cli-show closing comments);
+    // doing the probe here keeps the user-facing error precise without
+    // expanding the storage API. Implementation lives in `preflight`
+    // so the read verbs share the same code.
+    preflight::bugs_bookmark(&cwd)?;
 
     // 5. Hand the draft to storage.
     let storage = Storage::open(&cwd)?;
@@ -347,56 +370,103 @@ fn read_body(file: Option<&Path>) -> Result<String, CliError> {
     })
 }
 
-/// Probe that (a) `cwd` is inside a jj repo and (b) the `bugs`
-/// bookmark exists on it. Both checks shell out to `jj` directly
-/// (mirroring what `Storage::init` does internally) so we can surface
-/// distinct preflight-error variants rather than the storage layer's
-/// generic `Jj` runtime error.
+/// `jjf show <id> [--json]` — fetch one bug's structured record from
+/// the `bugs` bookmark via `Storage::read` and render it.
 ///
-/// Why duplicate the storage layer's probes here rather than extend the
-/// storage API? The `cli-new` ticket explicitly calls this out: if the
-/// `Error` enum doesn't already distinguish missing-bookmark, prefer
-/// surfacing what's there and filing a follow-up over expanding the
-/// storage API as a side-quest.
-fn preflight_bugs_bookmark(cwd: &Path) -> Result<(), CliError> {
-    // Check 1: is this a jj repo at all? Mirrors the
-    // `Storage::init` probe — translate the one specific stderr
-    // we recognize into `NotAJjRepo`, everything else into Probe.
-    let out = Command::new("jj")
-        .arg("--repository")
-        .arg(cwd)
-        .args(["workspace", "root"])
-        .output()
-        .map_err(CliError::Probe)?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.contains("no jj repo") {
-            return Err(CliError::Storage(StorageError::NotAJjRepo(cwd.to_owned())));
-        }
-        // Some other jj failure — surface its stderr verbatim so the
-        // operator can see what jj said.
-        return Err(CliError::Probe(std::io::Error::other(format!(
-            "jj workspace root failed: {stderr}"
-        ))));
-    }
+/// The preflight order matches `run_new`: parse the id, resolve the
+/// cwd, probe for the jj repo + `bugs` bookmark, then hand off to the
+/// storage layer. Bug-not-found is a runtime failure (exit 1) — the
+/// user typed something well-formed, we tried to honor it, and the
+/// answer is "no such bug at the bookmark tip."
+fn run_show(json: bool, id: String) -> Result<(), CliError> {
+    // 1. Parse the id — purely-local validation, no IO. A typo here
+    // is a preflight failure (exit 2), distinct from "valid id that
+    // doesn't exist" (exit 1).
+    let bug_id =
+        BugId::parse(&id).map_err(|error| CliError::BadBugId { value: id, error })?;
 
-    // Check 2: does `bugs` bookmark exist? `jj bookmark list`
-    // exits 0 either way; we key off stdout content.
-    let out = Command::new("jj")
-        .arg("--repository")
-        .arg(cwd)
-        .args(["bookmark", "list", "-T", "name ++ \"\\n\"", BUGS_BOOKMARK])
-        .output()
-        .map_err(CliError::Probe)?;
-    if !out.status.success() {
-        return Err(CliError::Probe(std::io::Error::other(format!(
-            "jj bookmark list failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ))));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    if !stdout.lines().any(|l| l.trim() == BUGS_BOOKMARK) {
-        return Err(CliError::MissingBugsBookmark(cwd.to_owned()));
+    // 2. Resolve the cwd. `Storage::open` wants an absolute path;
+    // canonicalize so symlinks don't bite.
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+
+    // 3. Preflight the same checks the write path runs. `run jjf
+    // init first` is the right error when the bookmark is missing,
+    // not a raw jj-stderr.
+    preflight::bugs_bookmark(&cwd)?;
+
+    // 4. Hand off to storage. `BugNotFound` flows out as a `Storage`
+    // variant of `CliError`, which `exit_code` maps to 1.
+    let storage = Storage::open(&cwd)?;
+    let bug = storage.read(&bug_id)?;
+
+    // 5. Render.
+    if json {
+        // The `Bug` struct IS the structured payload — emit it
+        // verbatim, no `{"ok": true, ...}` envelope. (`init` and `new`
+        // use the envelope because they have no payload beyond a
+        // success signal; `show`'s whole job is to expose the record.)
+        let s = serde_json::to_string_pretty(&bug)
+            .map_err(|e| CliError::Storage(StorageError::Json(e)))?;
+        println!("{s}");
+    } else {
+        print_bug_plain(&bug);
     }
     Ok(())
+}
+
+/// Render a bug as human-readable plain text. v1 shape per the
+/// `cli-show` ticket — readable and stable, not a contract. If a
+/// caller wants machine parsing they should pass `--json`.
+fn print_bug_plain(bug: &Bug) {
+    let status = match bug.status {
+        jjf_storage::Status::Open => "open",
+        jjf_storage::Status::Closed => "closed",
+    };
+    println!("{}  [{}]", bug.id, status);
+    println!("{}", bug.title);
+    let labels = if bug.labels.is_empty() {
+        "(none)".to_owned()
+    } else {
+        bug.labels.join(", ")
+    };
+    println!("labels: {labels}");
+    let assignee = bug.assignee.as_deref().unwrap_or("(none)");
+    println!("assignee: {assignee}");
+    let deps = if bug.dependencies.is_empty() {
+        "(none)".to_owned()
+    } else {
+        bug.dependencies
+            .iter()
+            .map(|d| d.as_str().to_owned())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    println!("dependencies: {deps}");
+    println!(
+        "created: {}   updated: {}",
+        bug.created_at, bug.updated_at
+    );
+    println!();
+    // Body verbatim, no rewrap — the writer preserves bytes exactly,
+    // and the reader's job is to show them. Add a trailing newline
+    // only if the body doesn't already end with one, so two bodies
+    // that differ only in trailing newline still render distinctly.
+    if !bug.body.is_empty() {
+        print!("{}", bug.body);
+        if !bug.body.ends_with('\n') {
+            println!();
+        }
+        println!();
+    }
+    let n = bug.comments.len();
+    println!("--- comments ({n}) ---");
+    for c in &bug.comments {
+        println!("[{}] {}:", c.created_at, c.author);
+        print!("{}", c.body);
+        if !c.body.ends_with('\n') {
+            println!();
+        }
+        println!();
+    }
 }
