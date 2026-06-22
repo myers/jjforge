@@ -54,7 +54,7 @@ mod trailer;
 use std::path::{Path, PathBuf};
 
 pub use history::HistoryEntry;
-pub use id::BugId;
+pub use id::{BugId, IdError};
 pub use jj::JjError;
 pub use op::Op;
 pub use record::{Bug, BugDraft, BugRecord, Comment, Status};

@@ -33,11 +33,12 @@
 //! parsed shape to storage, render the result, map errors to exit
 //! codes. No business logic.
 
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
 
 use clap::{Parser, Subcommand};
-use jjf_storage::{BUGS_BOOKMARK, Error as StorageError, Storage};
+use jjf_storage::{BUGS_BOOKMARK, BugDraft, BugId, Error as StorageError, IdError, Storage};
 
 /// Top-level CLI shape. Subcommands live on the `Commands` enum; the
 /// `--json` flag is global so every verb sees it without restating
@@ -68,8 +69,35 @@ enum Commands {
     /// Idempotent — running twice in the same repo is a no-op.
     Init,
 
-    /// Create a new bug. Not yet implemented (ticket: `cli-new`).
-    New,
+    /// Create a new bug on the `bugs` bookmark. Requires `jjf init` to
+    /// have been run first. Prints the new bug's id on stdout (or the
+    /// `{"ok": true, "id": "..."}` object under `--json`); exits 0.
+    New {
+        /// Title of the new bug. Required, non-empty.
+        #[arg(short = 't', long)]
+        title: String,
+
+        /// Source for the bug body. Path to read, or `-` to read stdin.
+        /// Omit to leave the body empty (the epic's "no prompts ever"
+        /// rule — no editor pop-up).
+        #[arg(short = 'F', long)]
+        file: Option<PathBuf>,
+
+        /// Attach a label. Repeatable (`-l bug -l p1`).
+        #[arg(short = 'l', long = "label")]
+        labels: Vec<String>,
+
+        /// Declare a dependency on another bug id. Repeatable. Each
+        /// value must be a 7-char lowercase-hex bug id; a bad value is
+        /// a preflight failure (exit 2).
+        #[arg(short = 'd', long = "dep")]
+        deps: Vec<String>,
+
+        /// Set the assignee. Optional; omit to leave the field unset
+        /// (creates a record with `assignee: null`).
+        #[arg(short = 'a', long)]
+        assignee: Option<String>,
+    },
 
     /// Print a single bug. Not yet implemented (ticket: `cli-show`).
     Show,
@@ -113,6 +141,36 @@ enum CliError {
     /// it panic.
     #[error("could not determine current working directory: {0}")]
     Cwd(std::io::Error),
+
+    /// Reading the bug body from `-F <path>` (or `-F -`) failed.
+    /// Preflight failure: the user gave us a path we couldn't open
+    /// (or stdin closed in a way we couldn't drain).
+    #[error("could not read body from {from}: {error}")]
+    BodyRead {
+        from: String,
+        error: std::io::Error,
+    },
+
+    /// A `-d / --dep` value didn't parse as a valid `BugId`.
+    /// Preflight failure (exit 2) — the user typed something wrong;
+    /// no point in starting the dance only to fail mid-write.
+    #[error("invalid bug id for --dep {value:?}: {error}")]
+    BadDepId { value: String, error: IdError },
+
+    /// We're inside a jj repo, but the `bugs` bookmark doesn't
+    /// exist yet. Surfaced as a preflight (exit 2) so the user gets
+    /// a typed signal that they need to run `jjf init` rather than
+    /// the raw jj-stderr we'd get from trying to write against an
+    /// empty `bookmarks(bugs)` revset.
+    #[error("the `bugs` bookmark does not exist in {0}; run `jjf init` first")]
+    MissingBugsBookmark(PathBuf),
+
+    /// Probing for the `bugs` bookmark (or for jj-repo-presence)
+    /// failed for a reason other than absence — e.g. the `jj`
+    /// binary isn't on PATH, or returned an unexpected error. This
+    /// is a runtime failure, not a preflight one.
+    #[error("could not probe jj state: {0}")]
+    Probe(std::io::Error),
 }
 
 impl CliError {
@@ -125,6 +183,10 @@ impl CliError {
         match self {
             CliError::Storage(StorageError::NotAJjRepo(_)) => 2,
             CliError::Cwd(_) => 2,
+            CliError::BodyRead { .. } => 2,
+            CliError::BadDepId { .. } => 2,
+            CliError::MissingBugsBookmark(_) => 2,
+            CliError::Probe(_) => 1,
             CliError::Storage(_) => 1,
         }
     }
@@ -144,12 +206,18 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Commands::Init => run_init(cli.json),
+        Commands::New {
+            title,
+            file,
+            labels,
+            deps,
+            assignee,
+        } => run_new(cli.json, title, file, labels, deps, assignee),
         // Stubs. We deliberately return a generic runtime error
         // (exit 1) rather than a clap-level error (exit 2): the
         // command parsed fine, we just haven't implemented its
         // body. When the per-verb ticket lands, this arm goes away.
-        Commands::New
-        | Commands::Show
+        Commands::Show
         | Commands::Ls
         | Commands::Update
         | Commands::Comment
@@ -179,6 +247,156 @@ fn run_init(json: bool) -> Result<(), CliError> {
         println!("{out}");
     } else {
         println!("jjf: initialized bookmark `{BUGS_BOOKMARK}`");
+    }
+    Ok(())
+}
+
+/// `jjf new -t <title> [-F <path|->] [-l <label>...] [-d <id>...] [-a <name>]`
+/// — create one bug on the `bugs` bookmark via the storage write path
+/// and emit its id.
+///
+/// The preflight order matters: we parse the dep ids and read the body
+/// BEFORE shelling out to jj, so user-typo / stdin-empty failures don't
+/// land any half-state on the bookmark. The bookmark-presence probe
+/// then runs against the cwd; if the bookmark is missing we surface a
+/// `run jjf init first` message rather than letting the storage layer
+/// fail mid-write on an empty `bookmarks(bugs)` revset.
+fn run_new(
+    json: bool,
+    title: String,
+    file: Option<PathBuf>,
+    labels: Vec<String>,
+    deps: Vec<String>,
+    assignee: Option<String>,
+) -> Result<(), CliError> {
+    // 1. Parse dep ids first — purely-local validation, no IO.
+    let deps: Vec<BugId> = deps
+        .into_iter()
+        .map(|raw| {
+            BugId::parse(&raw).map_err(|error| CliError::BadDepId { value: raw, error })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // 2. Read the body. `-F -` is stdin; `-F <path>` is the file's
+    // bytes; omitted is empty. We deliberately preserve raw bytes — no
+    // trim, no newline normalization — so round-trip stays exact.
+    let body = read_body(file.as_deref())?;
+
+    // 3. Resolve the cwd as an absolute path. `Storage::open` requires
+    // absolute; we canonicalize so symlinks in the path don't bite us.
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+
+    // 4. Preflight: we're inside a jj repo AND the `bugs` bookmark
+    // exists. The storage layer doesn't distinguish missing-bookmark
+    // today (see follow-ups in the closing comment); doing the probe
+    // here keeps the user-facing error precise without expanding the
+    // storage API.
+    preflight_bugs_bookmark(&cwd)?;
+
+    // 5. Hand the draft to storage.
+    let storage = Storage::open(&cwd)?;
+    let draft = BugDraft {
+        title,
+        body,
+        labels,
+        dependencies: deps,
+        assignee,
+    };
+    let id = storage.create_bug(&draft)?;
+
+    // 6. Emit. Plain text is just the id, one line; --json matches
+    // init's `{"ok": true, ...}` shape.
+    if json {
+        let out = serde_json::json!({
+            "ok": true,
+            "id": id.as_str(),
+        });
+        println!("{out}");
+    } else {
+        println!("{id}");
+    }
+    Ok(())
+}
+
+/// Read the bug body per the `-F` flag's contract.
+///
+/// - `None` — empty body. The epic's "no prompts ever" rule means we do
+///   NOT launch an editor when `-F` is omitted; users who want one can
+///   pipe it in.
+/// - `Some("-")` — read all of stdin, raw bytes. UTF-8 enforced because
+///   bug bodies are serialized into a JSON string field.
+/// - `Some(<path>)` — read the file, same UTF-8 rule.
+fn read_body(file: Option<&Path>) -> Result<String, CliError> {
+    let Some(path) = file else {
+        return Ok(String::new());
+    };
+    if path == Path::new("-") {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|error| CliError::BodyRead {
+                from: "<stdin>".into(),
+                error,
+            })?;
+        return Ok(buf);
+    }
+    std::fs::read_to_string(path).map_err(|error| CliError::BodyRead {
+        from: path.display().to_string(),
+        error,
+    })
+}
+
+/// Probe that (a) `cwd` is inside a jj repo and (b) the `bugs`
+/// bookmark exists on it. Both checks shell out to `jj` directly
+/// (mirroring what `Storage::init` does internally) so we can surface
+/// distinct preflight-error variants rather than the storage layer's
+/// generic `Jj` runtime error.
+///
+/// Why duplicate the storage layer's probes here rather than extend the
+/// storage API? The `cli-new` ticket explicitly calls this out: if the
+/// `Error` enum doesn't already distinguish missing-bookmark, prefer
+/// surfacing what's there and filing a follow-up over expanding the
+/// storage API as a side-quest.
+fn preflight_bugs_bookmark(cwd: &Path) -> Result<(), CliError> {
+    // Check 1: is this a jj repo at all? Mirrors the
+    // `Storage::init` probe — translate the one specific stderr
+    // we recognize into `NotAJjRepo`, everything else into Probe.
+    let out = Command::new("jj")
+        .arg("--repository")
+        .arg(cwd)
+        .args(["workspace", "root"])
+        .output()
+        .map_err(CliError::Probe)?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("no jj repo") {
+            return Err(CliError::Storage(StorageError::NotAJjRepo(cwd.to_owned())));
+        }
+        // Some other jj failure — surface its stderr verbatim so the
+        // operator can see what jj said.
+        return Err(CliError::Probe(std::io::Error::other(format!(
+            "jj workspace root failed: {stderr}"
+        ))));
+    }
+
+    // Check 2: does `bugs` bookmark exist? `jj bookmark list`
+    // exits 0 either way; we key off stdout content.
+    let out = Command::new("jj")
+        .arg("--repository")
+        .arg(cwd)
+        .args(["bookmark", "list", "-T", "name ++ \"\\n\"", BUGS_BOOKMARK])
+        .output()
+        .map_err(CliError::Probe)?;
+    if !out.status.success() {
+        return Err(CliError::Probe(std::io::Error::other(format!(
+            "jj bookmark list failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ))));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !stdout.lines().any(|l| l.trim() == BUGS_BOOKMARK) {
+        return Err(CliError::MissingBugsBookmark(cwd.to_owned()));
     }
     Ok(())
 }
