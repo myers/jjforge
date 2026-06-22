@@ -444,6 +444,69 @@ impl Storage {
         read::read(&self.repo, id)
     }
 
+    /// Enumerate every bug id present at the `bugs` bookmark tip.
+    ///
+    /// Shells out to `jj file list -r bookmarks(bugs) root:bugs/`,
+    /// parses the `bugs/<id>.json` filenames out, and returns the
+    /// sorted-ascending unique id set. `<id>.comments.jsonl` siblings
+    /// are ignored (they belong to bugs that also have a `.json` and
+    /// double-counting would mis-report bug counts); files that don't
+    /// match the `bugs/<7-hex>.json` pattern are skipped silently so a
+    /// future seed-bookmark housekeeping file or stray artifact doesn't
+    /// crash enumeration.
+    ///
+    /// Order: ascending by hex id. Stable, deterministic, cheap. Callers
+    /// that want time order can `read` each one and sort by `created_at`
+    /// afterward.
+    ///
+    /// This is the storage layer's first multi-bug enumeration primitive
+    /// — `jjf ls` is the v1 caller, but `jjf log --bug-changes`, agent
+    /// `ready` selection, and the PWA's home view will all sit on top
+    /// of it.
+    pub fn list_ids(&self) -> Result<Vec<BugId>> {
+        // `jj file list` prints paths relative to the CURRENT WORKING
+        // DIRECTORY by default — which means a subprocess invoked from
+        // any cwd other than the repo root sees its output prefixed with
+        // a relative climb (e.g. `p/jjforge/crates/.../bugs/<id>.json`).
+        // We pin the output to repo-root-relative slash-paths by piping
+        // the `TreeEntry.path()` `RepoPath` through the template (its
+        // template form is exactly that). This is cwd-independent and
+        // stable across platforms.
+        let text = self.repo.run(&[
+            "file",
+            "list",
+            "-r",
+            BUGS_BOOKMARK_REVSET,
+            "-T",
+            "path ++ \"\\n\"",
+            "root:bugs/",
+        ])?;
+        let mut ids: Vec<BugId> = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            // Path shape: `bugs/<7-hex>.json`. We only key off `.json`
+            // entries — `.comments.jsonl` siblings belong to bugs that
+            // also have a `.json`, so they'd double-count. A bare-named
+            // file (no `bugs/` prefix) or a file without `.json` is
+            // skipped silently.
+            let Some(rest) = line.strip_prefix("bugs/") else {
+                continue;
+            };
+            let Some(stem) = rest.strip_suffix(".json") else {
+                continue;
+            };
+            // Defensive: parse as BugId (rejects uppercase, wrong
+            // length, non-hex). A stray `bugs/foo.json` is skipped
+            // rather than blowing up enumeration.
+            if let Ok(id) = BugId::parse(stem) {
+                ids.push(id);
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
     /// Read the full op-by-op timeline for a bug, oldest first.
     ///
     /// Returns one [`HistoryEntry`] per `Jjf-Op:` stanza on the bug's

@@ -39,8 +39,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
-use jjf_storage::{BUGS_BOOKMARK, Bug, BugDraft, BugId, Error as StorageError, IdError, Storage};
+use clap::{Parser, Subcommand, ValueEnum};
+use jjf_storage::{
+    BUGS_BOOKMARK, Bug, BugDraft, BugId, Error as StorageError, IdError, Status, Storage,
+};
 
 /// Top-level CLI shape. Subcommands live on the `Commands` enum; the
 /// `--json` flag is global so every verb sees it without restating
@@ -60,6 +62,16 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
+}
+
+/// What `jjf ls --status <X>` accepts. Distinct from `Status` because
+/// `all` (no filter) is a CLI-only affordance with no storage-layer
+/// equivalent — the `Status` enum only has `Open` / `Closed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum StatusFilter {
+    Open,
+    Closed,
+    All,
 }
 
 /// Every verb the epic body (`c4f7fcb`) calls out, plus `init`. Stubs
@@ -114,9 +126,24 @@ enum Commands {
         id: String,
     },
 
-    /// List bugs, with optional filters. Not yet implemented
-    /// (ticket: `cli-ls`).
-    Ls,
+    /// List bugs from the `bugs` bookmark, with optional filters.
+    /// Default: every open bug. Plain-text output is one row per bug,
+    /// tab-separated columns (`<id-7>\t<status>\t<labels>L\t<title>`),
+    /// no header, sorted newest-first by `created_at`. `--json` emits
+    /// a JSON array of `Bug` records (the same shape `show --json`
+    /// emits per element). Empty result is exit 0 with no output.
+    Ls {
+        /// Filter by status. `open` is the default (matches git-bug and
+        /// the "lists are about what's actionable" convention). `all`
+        /// shows every bug regardless of status.
+        #[arg(long, value_enum, default_value_t = StatusFilter::Open)]
+        status: StatusFilter,
+
+        /// Filter by label. Repeatable. Semantics: AND — a bug must
+        /// carry every listed label to match.
+        #[arg(short = 'l', long = "label")]
+        labels: Vec<String>,
+    },
 
     /// Mutate a bug's scalar fields. Not yet implemented (ticket:
     /// `cli-update`).
@@ -236,12 +263,12 @@ fn run(cli: Cli) -> Result<(), CliError> {
             assignee,
         } => run_new(cli.json, title, file, labels, deps, assignee),
         Commands::Show { id } => run_show(cli.json, id),
+        Commands::Ls { status, labels } => run_ls(cli.json, status, labels),
         // Stubs. We deliberately return a generic runtime error
         // (exit 1) rather than a clap-level error (exit 2): the
         // command parsed fine, we just haven't implemented its
         // body. When the per-verb ticket lands, this arm goes away.
-        Commands::Ls
-        | Commands::Update
+        Commands::Update
         | Commands::Comment
         | Commands::Close
         | Commands::Open
@@ -469,4 +496,97 @@ fn print_bug_plain(bug: &Bug) {
         }
         println!();
     }
+}
+
+/// `jjf ls [--status <S>] [--label <L>...] [--json]` — enumerate every
+/// bug on the `bugs` bookmark, filter by status and labels (AND across
+/// labels), render newest-first.
+///
+/// Implementation strategy is the v1 "read all, filter in memory" path
+/// the ticket calls out: `Storage::list_ids()` returns every id, then
+/// we `Storage::read()` each one and apply the predicates. For repos
+/// with a handful of bugs this is fine; once N gets meaningfully large
+/// the storage layer will grow either a filtered enumeration primitive
+/// or a per-bug metadata cache (separate ticket). The closing comment
+/// on this issue calls out the perf feel.
+fn run_ls(
+    json: bool,
+    status: StatusFilter,
+    labels: Vec<String>,
+) -> Result<(), CliError> {
+    // Preflight: cwd is a jj repo AND `bugs` bookmark exists. Same
+    // order as `run_show` — typed `run jjf init first` message rather
+    // than raw jj stderr if the bookmark is missing.
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    preflight::bugs_bookmark(&cwd)?;
+
+    let storage = Storage::open(&cwd)?;
+    let ids = storage.list_ids()?;
+
+    // Read every bug, filter. v1 is read-all; see the doc-comment.
+    let mut bugs: Vec<Bug> = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let bug = storage.read(id)?;
+        if !status_matches(&bug, status) {
+            continue;
+        }
+        if !labels_match(&bug, &labels) {
+            continue;
+        }
+        bugs.push(bug);
+    }
+
+    // Newest-first by created_at. RFC 3339 second-resolution stamps
+    // sort lexicographically — same trick the read path uses for
+    // comments. `created_at` is set once at create and never bumped,
+    // so the ordering is stable across mutation traffic.
+    bugs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    if json {
+        // Array of `Bug` records, pretty-printed. Same per-element
+        // shape `show --json` emits — callers parsing one parse the
+        // other. Empty result is a valid empty array `[]`, not silence,
+        // because a script expecting JSON wants something it can
+        // `jq length` against. (Plain text uses silence-on-empty because
+        // grep / awk pipelines want zero lines, not a JSON literal.)
+        let s = serde_json::to_string_pretty(&bugs)
+            .map_err(|e| CliError::Storage(StorageError::Json(e)))?;
+        println!("{s}");
+    } else {
+        // Plain text: tab-separated, no header, silent on empty. The
+        // 7-char id prefix is the documented human-display convention
+        // (CLAUDE.md). label-count is rendered with a trailing `L` so
+        // an eyeball can tell `3L` (three labels) apart from a numeric
+        // column that might mean comments or something else later.
+        for bug in &bugs {
+            let status_s = match bug.status {
+                Status::Open => "open",
+                Status::Closed => "closed",
+            };
+            println!(
+                "{id}\t{status}\t{n}L\t{title}",
+                id = bug.id,
+                status = status_s,
+                n = bug.labels.len(),
+                title = bug.title,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `--status` predicate. `All` matches everything.
+fn status_matches(bug: &Bug, filter: StatusFilter) -> bool {
+    match filter {
+        StatusFilter::All => true,
+        StatusFilter::Open => bug.status == Status::Open,
+        StatusFilter::Closed => bug.status == Status::Closed,
+    }
+}
+
+/// `--label` predicate. Empty filter matches every bug. A non-empty
+/// filter requires the bug to carry EVERY listed label (intersection).
+fn labels_match(bug: &Bug, wanted: &[String]) -> bool {
+    wanted.iter().all(|w| bug.labels.iter().any(|l| l == w))
 }

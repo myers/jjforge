@@ -863,3 +863,65 @@ fn init_then_create_bug_lands_on_top_of_seed() {
         "oldest commit should be the seed, got: {chain:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Enumeration-path tests (issue 6b2b555).
+//
+// `Storage::list_ids` is the first multi-bug primitive — `jjf ls`'s
+// foundation. Tests cover: empty bookmark returns empty; three bugs
+// return their ids sorted ascending; comments-jsonl siblings don't
+// cause double-counting.
+// ---------------------------------------------------------------------
+
+#[test]
+fn list_ids_on_empty_bookmark_returns_empty() {
+    let repo = make_scratch_repo("list_ids_empty");
+    let storage = Storage::open(&repo).unwrap();
+    let ids = storage.list_ids().expect("list_ids on empty bookmark");
+    assert!(
+        ids.is_empty(),
+        "empty bookmark should yield zero ids, got: {ids:?}"
+    );
+}
+
+#[test]
+fn list_ids_returns_three_bugs_sorted_with_no_duplicates() {
+    let repo = make_scratch_repo("list_ids_three");
+    let storage = Storage::open(&repo).unwrap();
+
+    // Three bugs. Each one's create lands both `bugs/<id>.json` AND
+    // `bugs/<id>.comments.jsonl` at the bookmark tip — the latter is
+    // the regression we're guarding against (no double-counting).
+    let mut created: Vec<BugId> = Vec::with_capacity(3);
+    for title in ["first", "second", "third"] {
+        let id = storage
+            .create_bug(&BugDraft {
+                title: (*title).into(),
+                ..Default::default()
+            })
+            .expect("create_bug");
+        created.push(id);
+    }
+
+    let ids = storage.list_ids().expect("list_ids after 3 creates");
+
+    // Exactly 3 (not 6 — `.comments.jsonl` siblings must not show up).
+    assert_eq!(
+        ids.len(),
+        3,
+        "expected 3 ids, got {} ({ids:?}): comments-jsonl files may be double-counting",
+        ids.len(),
+    );
+
+    // Same set as what we created.
+    let mut expected = created.clone();
+    expected.sort();
+    assert_eq!(ids, expected, "list_ids must return the same ids that were created");
+
+    // Sorted ascending (the API contract). `sort()` on the expected
+    // gives the same answer, but assert it explicitly so a regression
+    // that returns insertion-order or reverse-sorted is caught.
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(ids, sorted, "ids must be sorted ascending");
+}
