@@ -391,8 +391,10 @@ impl Storage {
     }
 
     /// Append a comment. Generates a fresh 7-hex comment id and updates
-    /// the bug record's `updated_at`.
-    pub fn add_comment(&self, id: &BugId, body: &str, author: &str) -> Result<()> {
+    /// the bug record's `updated_at`. Returns the freshly-generated
+    /// comment id so callers (notably `jjf comment`) can surface it in
+    /// machine-readable output.
+    pub fn add_comment(&self, id: &BugId, body: &str, author: &str) -> Result<BugId> {
         if author.trim().is_empty() {
             return Err(Error::Invalid("comment author must not be empty".into()));
         }
@@ -430,7 +432,7 @@ impl Storage {
                 Ok(())
             },
         )?;
-        Ok(())
+        Ok(comment_id)
     }
 
     /// Read a single bug back from the `bugs` bookmark tip. Returns

@@ -149,9 +149,33 @@ enum Commands {
     /// `cli-update`).
     Update,
 
-    /// Append a comment to a bug. Not yet implemented (ticket:
-    /// `cli-comment`).
-    Comment,
+    /// Append a comment to an existing bug on the `bugs` bookmark.
+    /// Body source is REQUIRED — pass `-F <path>` or `-F -` for stdin.
+    /// Author defaults to the jj user identity (`Name <email>` per jj's
+    /// `author` template); `--author <NAME>` overrides. Empty bodies
+    /// are rejected at the CLI layer (exit 2) because an empty comment
+    /// is almost certainly a user mistake.
+    Comment {
+        /// Full 7-char hex bug id. Bad parse → exit 2; valid id that
+        /// doesn't exist on the bookmark → exit 1.
+        id: String,
+
+        /// Source for the comment body. Path to read, or `-` to read
+        /// stdin. REQUIRED — the epic's "no prompts ever" rule means we
+        /// do NOT launch an editor when this is omitted. Empty body
+        /// (after read) is a preflight failure (exit 2).
+        #[arg(short = 'F', long, required = true)]
+        file: PathBuf,
+
+        /// Override the comment author. Free-form string written
+        /// verbatim into the comment record. When omitted, the author
+        /// is sourced from `jj config get user.name` + `user.email` in
+        /// the `Name <email>` format that matches jj's commit-author
+        /// template. If no jj `user.name` is configured and no override
+        /// is given, the verb exits 2 with a hint to set one.
+        #[arg(long)]
+        author: Option<String>,
+    },
 
     /// Close a bug. Lands a `set-status` op on a new commit on the
     /// `bugs` bookmark. Not idempotent per the spec — closing an
@@ -231,6 +255,23 @@ enum CliError {
     /// is a runtime failure, not a preflight one.
     #[error("could not probe jj state: {0}")]
     Probe(std::io::Error),
+
+    /// The user piped (or pointed `-F` at) an empty body for `jjf
+    /// comment`. An empty comment is almost certainly a mistake; we
+    /// reject at the CLI layer (exit 2) rather than let the storage
+    /// layer record a zero-byte comment.
+    #[error("comment body is empty; pipe non-empty content via -F - or pass -F <path>")]
+    EmptyCommentBody,
+
+    /// `jjf comment` couldn't resolve a comment author. Either jj's
+    /// `user.name` isn't configured AND no `--author` override was
+    /// supplied, or the override itself is empty/whitespace. Preflight
+    /// failure (exit 2) — there's nothing for the storage layer to do
+    /// without an author.
+    #[error(
+        "no comment author available; set jj user.name (e.g. `jj config set --user user.name 'Your Name'`) or pass --author <NAME>"
+    )]
+    MissingAuthor,
 }
 
 impl CliError {
@@ -247,6 +288,8 @@ impl CliError {
             CliError::BadDepId { .. } => 2,
             CliError::BadBugId { .. } => 2,
             CliError::MissingBugsBookmark(_) => 2,
+            CliError::EmptyCommentBody => 2,
+            CliError::MissingAuthor => 2,
             CliError::Probe(_) => 1,
             // `BugNotFound` is the user typing a valid id that just
             // doesn't exist — runtime failure, not preflight (the input
@@ -281,11 +324,12 @@ fn run(cli: Cli) -> Result<(), CliError> {
         Commands::Ls { status, labels } => run_ls(cli.json, status, labels),
         Commands::Close { id } => run_set_status(cli.json, id, Status::Closed),
         Commands::Open { id } => run_set_status(cli.json, id, Status::Open),
+        Commands::Comment { id, file, author } => run_comment(cli.json, id, file, author),
         // Stubs. We deliberately return a generic runtime error
         // (exit 1) rather than a clap-level error (exit 2): the
         // command parsed fine, we just haven't implemented its
         // body. When the per-verb ticket lands, this arm goes away.
-        Commands::Update | Commands::Comment | Commands::Label => Err(CliError::Storage(
+        Commands::Update | Commands::Label => Err(CliError::Storage(
             StorageError::Invalid("not yet implemented".into()),
         )),
     }
@@ -570,6 +614,135 @@ fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError
         println!("{verb} {bug_id}");
     }
     Ok(())
+}
+
+/// `jjf comment <id> -F <path|-> [--author <NAME>] [--json]` — append
+/// one comment to an existing bug via the storage write path.
+///
+/// Preflight order mirrors `run_set_status`: parse the id, read the
+/// body, resolve the author, canonicalize cwd, probe for the jj repo +
+/// `bugs` bookmark, then hand off to storage. We deliberately do the
+/// purely-local checks (id parse, body read, author resolve) BEFORE
+/// shelling out for the bookmark probe so a user typo doesn't kick off
+/// a `jj` subprocess that we'd just throw away.
+///
+/// The storage layer returns the freshly-generated comment id; the
+/// `--json` envelope surfaces it as `comment_id`. Plain-text output is
+/// `comment added to <id>` — one line, no decoration — to slot cleanly
+/// into a shell pipeline.
+fn run_comment(
+    json: bool,
+    id: String,
+    file: PathBuf,
+    author: Option<String>,
+) -> Result<(), CliError> {
+    // 1. Parse the id. Bad shape → exit 2.
+    let bug_id =
+        BugId::parse(&id).map_err(|error| CliError::BadBugId { value: id, error })?;
+
+    // 2. Read the body. `-F -` is stdin; `-F <path>` is the file.
+    // Reuse the same helper `run_new` uses so the contract stays
+    // consistent across verbs.
+    let body = read_body(Some(file.as_path()))?;
+    if body.is_empty() {
+        return Err(CliError::EmptyCommentBody);
+    }
+
+    // 3. Resolve + canonicalize cwd.
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+
+    // 4. Preflight: jj repo + `bugs` bookmark present. We run this
+    // BEFORE author resolution so a non-jj cwd surfaces the typed
+    // "not a jj repo" error rather than the (correct but less useful)
+    // "no comment author available" — the user almost always wants to
+    // hear about the repo problem first.
+    preflight::bugs_bookmark(&cwd)?;
+
+    // 5. Resolve the author. CLI override wins; otherwise we synthesize
+    // `Name <email>` from jj's user config. If neither path yields a
+    // non-empty string we bail with a typed hint rather than letting
+    // the storage layer surface a generic `Invalid` error.
+    let author = resolve_author(author)?;
+
+    // 6. Hand off to storage. `add_comment` returns the freshly-minted
+    // comment id (a 7-hex `BugId`) for the JSON envelope.
+    let storage = Storage::open(&cwd)?;
+    let comment_id = storage.add_comment(&bug_id, &body, &author)?;
+
+    // 7. Render.
+    if json {
+        let out = serde_json::json!({
+            "ok": true,
+            "id": bug_id.as_str(),
+            "comment_id": comment_id.as_str(),
+        });
+        println!("{out}");
+    } else {
+        println!("comment added to {bug_id}");
+    }
+    Ok(())
+}
+
+/// Resolve the comment author. Returns the caller's `--author` override
+/// when present and non-empty; otherwise synthesizes `Name <email>`
+/// from `jj config get user.name` + `jj config get user.email`.
+///
+/// Format matches jj's `author` commit-template field (`Name <email>`)
+/// so a comment author and the surrounding commit's `author` line stay
+/// canonically identical for history walks.
+///
+/// Edge cases:
+/// - Override is empty / whitespace → `MissingAuthor`.
+/// - `user.name` is unset (or empty) → `MissingAuthor`.
+/// - `user.name` is set but `user.email` is unset → return just the
+///   `name`. This matches the spirit of jj's own behavior (it'll let
+///   you commit with just a name) but means the resulting author
+///   string won't have the `<email>` suffix that `read_history`'s
+///   per-commit `author` typically carries. Worth a follow-up to
+///   canonicalize one way or the other.
+fn resolve_author(override_name: Option<String>) -> Result<String, CliError> {
+    if let Some(name) = override_name {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(CliError::MissingAuthor);
+        }
+        return Ok(trimmed.to_owned());
+    }
+    let name = jj_config_get("user.name")?;
+    let Some(name) = name else {
+        return Err(CliError::MissingAuthor);
+    };
+    let email = jj_config_get("user.email")?;
+    Ok(match email {
+        Some(email) => format!("{name} <{email}>"),
+        None => name,
+    })
+}
+
+/// Shell out to `jj config get <key>` and return the trimmed value, or
+/// `None` if the key isn't configured. Any other failure (binary not
+/// on PATH, unexpected stderr) surfaces as a `Probe` error.
+///
+/// `jj config get` exits non-zero when the key is absent — we treat
+/// that specific case as "not configured" rather than a hard probe
+/// failure so the caller can decide what to do.
+fn jj_config_get(key: &str) -> Result<Option<String>, CliError> {
+    let out = std::process::Command::new("jj")
+        .args(["config", "get", key])
+        .output()
+        .map_err(CliError::Probe)?;
+    if !out.status.success() {
+        // jj prints `config error: ... is not defined` (or similar) and
+        // exits non-zero when the key is missing. Treat any non-success
+        // here as "not configured" — the verb falls back accordingly,
+        // and if the real failure was something else (e.g. malformed
+        // config file) the user will hit it on the next jj invocation
+        // with a clearer message than we could synthesize.
+        return Ok(None);
+    }
+    let val = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if val.is_empty() { Ok(None) } else { Ok(Some(val)) }
 }
 
 /// `jjf ls [--status <S>] [--label <L>...] [--json]` — enumerate every
