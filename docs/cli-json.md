@@ -24,7 +24,7 @@ caller "yes, the requested mutation landed"; the verb-specific fields
 identify what it landed.
 
 Verbs in this family: `init`, `new`, `close`, `open`, `update`,
-`comment`, `label add`, `label rm`.
+`comment`, `label add`, `label rm`, `remote add`, `remote rm`.
 
 ### Read verbs — bare payload
 
@@ -32,6 +32,8 @@ The read verbs emit the structured payload directly, with no envelope:
 
 - `show` emits the `Bug` record verbatim.
 - `ls` emits a JSON array of `Bug` records (possibly empty: `[]`).
+- `remote ls` emits a JSON array of `{name, url}` objects (possibly
+  empty: `[]`).
 
 The reasoning, from the in-source comment on `run_show`: the `Bug`
 struct IS the structured payload. Wrapping it in `{"ok": true, "bug":
@@ -82,9 +84,12 @@ from plain-text mode (see the top comment in `main.rs`: `0` success,
 | `empty_label`           | 2    | `EmptyLabel`                  | —                        |
 | `missing_author`        | 2    | `MissingAuthor`               | —                        |
 | `no_update_fields`      | 2    | `NoUpdateFields`              | —                        |
+| `remote_already_exists` | 2    | `RemoteAlreadyExists`         | `name`                   |
+| `remote_not_found`      | 2    | `RemoteNotFound`              | `name`                   |
 | `body_read_error`       | 2    | `BodyRead`                    | `from`                   |
 | `cwd_error`             | 2    | `Cwd`                         | —                        |
 | `probe_error`           | 1    | `Probe`                       | —                        |
+| `jj_git_remote_error`   | 1    | `JjGitRemote`                 | —                        |
 | `invalid_input`         | 1    | `Storage::Invalid`            | —                        |
 | `clock_error`           | 1    | `Storage::Clock`              | —                        |
 | `io_error`              | 1    | `Storage::Io`                 | —                        |
@@ -248,6 +253,65 @@ Error path — empty label:
 ```sh
 $ jjf label add --json a3f9c01 ""
 {"ok":false,"error":{"kind":"empty_label","message":"label must not be empty"}}
+```
+
+### `remote add`
+
+Mutating verb — `{"ok": true, ...}` envelope with the name and URL
+just recorded. `remote add` does NOT talk to the URL; it only
+records it. URL validation is jj's responsibility — whatever jj
+rejects, we surface as `jj_git_remote_error` (exit 1).
+
+```sh
+$ jjf remote add --json origin https://example.com/repo.git
+{"ok":true,"name":"origin","url":"https://example.com/repo.git"}
+```
+
+Error path — name already exists:
+
+```sh
+$ jjf remote add --json origin https://example.com/other.git
+{"ok":false,"error":{"kind":"remote_already_exists","message":"git remote already exists: origin","details":{"name":"origin"}}}
+```
+
+### `remote ls`
+
+Read verb — bare JSON array of `{name, url}` objects. Empty result
+is `[]`, not silence (same `jq length` rationale as `ls`).
+
+```sh
+$ jjf remote ls --json
+[
+  {
+    "name": "origin",
+    "url": "https://example.com/repo.git"
+  }
+]
+```
+
+Error path — running outside a jj repo:
+
+```sh
+$ jjf remote ls --json
+{"ok":false,"error":{"kind":"not_a_jj_repo","message":"not a jj repo: /tmp/foo","details":{"path":"/tmp/foo"}}}
+```
+
+### `remote rm`
+
+Mutating verb — `{"ok": true, "name": "..."}` envelope. Note that
+jj also forgets bookmarks tracked from that remote (its own
+behavior); we surface its successful exit verbatim.
+
+```sh
+$ jjf remote rm --json origin
+{"ok":true,"name":"origin"}
+```
+
+Error path — name not found:
+
+```sh
+$ jjf remote rm --json nope
+{"ok":false,"error":{"kind":"remote_not_found","message":"git remote not found: nope","details":{"name":"nope"}}}
 ```
 
 ## The clap arg-error exception

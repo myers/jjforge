@@ -279,6 +279,20 @@ enum Commands {
         #[command(subcommand)]
         action: LabelAction,
     },
+
+    /// Manage git remotes on the underlying jj repo. Thin wrapper over
+    /// `jj git remote add|list|remove` — jj already supports git
+    /// transport for bookmarks (and bookmarks ARE the unit `bugs`
+    /// travels as), so this verb does NOT need to write per-bookmark
+    /// refspec config. Verified in `experiments/sync-remote/`.
+    ///
+    /// Preflight is jj-repo-only (no `bugs` bookmark required) — adding
+    /// a remote is meaningful BEFORE `jjf init` runs, and the soon-to-
+    /// come `jjf push` will be how the bookmark first reaches a remote.
+    Remote {
+        #[command(subcommand)]
+        action: RemoteAction,
+    },
 }
 
 /// Inner enum for `jjf label <action>`. Separating the action from the
@@ -312,6 +326,41 @@ enum LabelAction {
 
         /// Label to remove. Must be non-empty (same rule as `add`).
         label: String,
+    },
+}
+
+/// Inner enum for `jjf remote <action>`. Same shape rationale as
+/// `LabelAction` — one help page per subcommand, clean clap-derive
+/// `--help` output, plus distinct positional shapes per arm.
+#[derive(Debug, Subcommand)]
+enum RemoteAction {
+    /// Add a git remote to the underlying jj repo. Wraps `jj git
+    /// remote add <name> <url>`. URL is whatever git accepts; jj
+    /// validates it and we surface its error verbatim. Adding a name
+    /// that already exists is exit 2 (`remote_already_exists`).
+    Add {
+        /// Remote name (e.g. `origin`, `upstream`). Free-form string,
+        /// jj decides what's legal.
+        name: String,
+
+        /// Remote URL or local path. Local paths are resolved to
+        /// absolute form by jj.
+        url: String,
+    },
+
+    /// List configured git remotes. Plain-text output is one
+    /// `<name>\t<url>` per line (tab-separated, no header — matches
+    /// the `ls`-style convention every other read verb in jjforge
+    /// uses). `--json` emits a JSON array of `{name, url}` objects.
+    Ls,
+
+    /// Remove a git remote from the underlying jj repo. Wraps `jj git
+    /// remote remove <name>` — note that jj also forgets bookmarks
+    /// tracked from that remote (its own behavior, not jjforge's).
+    /// Removing a name that doesn't exist is exit 2 (`remote_not_found`).
+    Rm {
+        /// Remote name to remove.
+        name: String,
     },
 }
 
@@ -402,6 +451,29 @@ enum CliError {
         "nothing to update; pass at least one of --title / --status / --body-file / --assignee / --unset-assignee"
     )]
     NoUpdateFields,
+
+    /// `jjf remote add <name> <url>` was asked to add a remote whose
+    /// name is already taken. jj surfaces this via stderr containing
+    /// "already exists"; we translate that one phrase to a typed
+    /// preflight error (exit 2) so callers get a stable `kind` to
+    /// branch on rather than having to grep jj's stderr themselves.
+    #[error("git remote already exists: {0}")]
+    RemoteAlreadyExists(String),
+
+    /// `jjf remote rm <name>` was asked to remove a remote that
+    /// doesn't exist. jj surfaces this via stderr containing "No git
+    /// remote named"; we translate to a typed preflight error
+    /// (exit 2) for the same reason as `RemoteAlreadyExists`.
+    #[error("git remote not found: {0}")]
+    RemoteNotFound(String),
+
+    /// `jjf remote *` shelled out to `jj git remote ...` and got a
+    /// non-zero exit that wasn't one of the two typed cases above.
+    /// Runtime failure (exit 1) — surfaces jj's stderr verbatim so
+    /// the operator can see what jj said. URL syntax errors, network-
+    /// adjacent failures, and anything else jj rejects land here.
+    #[error("jj git remote failed: {0}")]
+    JjGitRemote(String),
 }
 
 impl CliError {
@@ -422,7 +494,10 @@ impl CliError {
             CliError::EmptyLabel => 2,
             CliError::MissingAuthor => 2,
             CliError::NoUpdateFields => 2,
+            CliError::RemoteAlreadyExists(_) => 2,
+            CliError::RemoteNotFound(_) => 2,
             CliError::Probe(_) => 1,
+            CliError::JjGitRemote(_) => 1,
             // `BugNotFound` is the user typing a valid id that just
             // doesn't exist — runtime failure, not preflight (the input
             // was well-formed; we tried to honor it and it wasn't there).
@@ -454,6 +529,9 @@ impl CliError {
             CliError::EmptyLabel => "empty_label",
             CliError::MissingAuthor => "missing_author",
             CliError::NoUpdateFields => "no_update_fields",
+            CliError::RemoteAlreadyExists(_) => "remote_already_exists",
+            CliError::RemoteNotFound(_) => "remote_not_found",
+            CliError::JjGitRemote(_) => "jj_git_remote_error",
             CliError::Probe(_) => "probe_error",
         }
     }
@@ -482,6 +560,8 @@ impl CliError {
             CliError::MissingBugsBookmark(path) => {
                 json!({ "path": path.display().to_string() })
             }
+            CliError::RemoteAlreadyExists(name) => json!({ "name": name }),
+            CliError::RemoteNotFound(name) => json!({ "name": name }),
             _ => serde_json::Value::Null,
         }
     }
@@ -567,6 +647,11 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 run_label(cli.json, id, label, LabelOp::Add)
             }
             LabelAction::Rm { id, label } => run_label(cli.json, id, label, LabelOp::Rm),
+        },
+        Commands::Remote { action } => match action {
+            RemoteAction::Add { name, url } => run_remote_add(cli.json, name, url),
+            RemoteAction::Ls => run_remote_ls(cli.json),
+            RemoteAction::Rm { name } => run_remote_rm(cli.json, name),
         },
         Commands::Update {
             id,
@@ -941,6 +1026,158 @@ fn run_label(json: bool, id: String, label: String, op: LabelOp) -> Result<(), C
         println!("{out}");
     } else {
         println!("label {action_word}: {label} -> {bug_id}");
+    }
+    Ok(())
+}
+
+/// `jjf remote add <name> <url>` — wrap `jj git remote add <name>
+/// <url>` against the cwd's jj repo.
+///
+/// jj does the actual remote-add work; we translate the two specific
+/// error stderrs we recognize (`already exists`, anything else) into
+/// typed `CliError` variants so `kind()` stays stable. URL syntax
+/// validation is jj's responsibility — we accept what it accepts and
+/// surface its rejection unchanged.
+///
+/// Preflight is jj-repo-only (no `bugs` bookmark required), because
+/// adding a remote is meaningful before `jjf init` runs.
+fn run_remote_add(json: bool, name: String, url: String) -> Result<(), CliError> {
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    preflight::jj_repo(&cwd)?;
+
+    let out = std::process::Command::new("jj")
+        .arg("--repository")
+        .arg(&cwd)
+        .args(["git", "remote", "add", &name, &url])
+        .output()
+        .map_err(CliError::Probe)?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // jj's canonical phrase: `Error: Git remote named '<name>' already exists`.
+        if stderr.contains("already exists") {
+            return Err(CliError::RemoteAlreadyExists(name));
+        }
+        return Err(CliError::JjGitRemote(stderr.trim().to_owned()));
+    }
+
+    if json {
+        let out = serde_json::json!({
+            "ok": true,
+            "name": &name,
+            "url": &url,
+        });
+        println!("{out}");
+    } else {
+        println!("remote {name} added: {url}");
+    }
+    Ok(())
+}
+
+/// `jjf remote ls` — wrap `jj git remote list` and re-render its
+/// output as tab-separated `<name>\t<url>` lines.
+///
+/// jj's own output uses SPACE as the column separator; we re-render
+/// because every other `ls`-style verb in jjforge emits tab-separated
+/// columns, and a stable separator means downstream `cut -f1` /
+/// `awk -F'\t'` pipelines don't have to guess at column widths.
+///
+/// `--json` emits a JSON array of `{name, url}` objects. Empty result
+/// is `[]` (per the same `ls` / `show` convention — scripts piping to
+/// `jq length` get a useful value), and empty plain-text output is
+/// silence (zero lines), not a header.
+fn run_remote_ls(json: bool) -> Result<(), CliError> {
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    preflight::jj_repo(&cwd)?;
+
+    let out = std::process::Command::new("jj")
+        .arg("--repository")
+        .arg(&cwd)
+        .args(["git", "remote", "list"])
+        .output()
+        .map_err(CliError::Probe)?;
+    if !out.status.success() {
+        return Err(CliError::JjGitRemote(
+            String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let remotes: Vec<(String, String)> = stdout
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            // jj emits `<name> <url>` — split on the FIRST whitespace
+            // run so URLs containing spaces (rare but possible for
+            // local paths on weirdly-named directories) stay intact.
+            let (name, url) = line.split_once(char::is_whitespace)?;
+            Some((name.to_owned(), url.trim().to_owned()))
+        })
+        .collect();
+
+    if json {
+        let arr: Vec<serde_json::Value> = remotes
+            .iter()
+            .map(|(name, url)| {
+                serde_json::json!({
+                    "name": name,
+                    "url": url,
+                })
+            })
+            .collect();
+        let s = serde_json::to_string_pretty(&arr)
+            .map_err(|e| CliError::Storage(StorageError::Json(e)))?;
+        println!("{s}");
+    } else {
+        for (name, url) in &remotes {
+            println!("{name}\t{url}");
+        }
+    }
+    Ok(())
+}
+
+/// `jjf remote rm <name>` — wrap `jj git remote remove <name>`.
+///
+/// Note: jj also forgets bookmarks tracked from the removed remote
+/// (that's jj's behavior, not ours — it's why the underlying command
+/// is `remove`, not `rm`). Documented in the help text so a user
+/// stripping a remote after a pull doesn't get a surprise.
+///
+/// Preflight + error mapping mirror `run_remote_add`. Stderr matching
+/// on `No git remote named` is the typed `RemoteNotFound` (exit 2);
+/// anything else falls through to `JjGitRemote` (exit 1).
+fn run_remote_rm(json: bool, name: String) -> Result<(), CliError> {
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    preflight::jj_repo(&cwd)?;
+
+    let out = std::process::Command::new("jj")
+        .arg("--repository")
+        .arg(&cwd)
+        .args(["git", "remote", "remove", &name])
+        .output()
+        .map_err(CliError::Probe)?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // jj's canonical phrase: `Error: No git remote named '<name>'`.
+        if stderr.contains("No git remote named") {
+            return Err(CliError::RemoteNotFound(name));
+        }
+        return Err(CliError::JjGitRemote(stderr.trim().to_owned()));
+    }
+
+    if json {
+        let out = serde_json::json!({
+            "ok": true,
+            "name": &name,
+        });
+        println!("{out}");
+    } else {
+        println!("remote {name} removed");
     }
     Ok(())
 }

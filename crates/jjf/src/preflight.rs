@@ -26,19 +26,16 @@ use jjf_storage::{BUGS_BOOKMARK, Error as StorageError};
 
 use crate::CliError;
 
-/// Probe that (a) `cwd` is inside a jj repo and (b) the `bugs`
-/// bookmark exists on it. Both checks shell out to `jj` directly
-/// (mirroring what `Storage::init` does internally) so we can surface
-/// distinct preflight-error variants rather than the storage layer's
-/// generic `Jj` runtime error.
+/// Probe that `cwd` is inside a jj repo. Shells out to `jj workspace
+/// root` and translates the one specific "not a jj repo" stderr into
+/// `NotAJjRepo`; everything else becomes a generic `Probe` failure.
 ///
-/// Both `jjf new` and `jjf show` call this. Adding a new verb? Call
-/// it here too — the moment a third caller appears, this module is
-/// still the right home; don't re-open-code the probe.
-pub(crate) fn bugs_bookmark(cwd: &Path) -> Result<(), CliError> {
-    // Check 1: is this a jj repo at all? Mirrors the
-    // `Storage::init` probe — translate the one specific stderr
-    // we recognize into `NotAJjRepo`, everything else into Probe.
+/// Callers that ALSO need the `bugs` bookmark (every read/write verb
+/// that touches an existing bug) should use [`bugs_bookmark`]
+/// instead — it composes this probe with the bookmark check. Callers
+/// that meaningfully run before `jjf init` (today: `jjf remote
+/// add|ls|rm`) call this one directly.
+pub(crate) fn jj_repo(cwd: &Path) -> Result<(), CliError> {
     let out = Command::new("jj")
         .arg("--repository")
         .arg(cwd)
@@ -52,12 +49,26 @@ pub(crate) fn bugs_bookmark(cwd: &Path) -> Result<(), CliError> {
                 PathBuf::from(cwd),
             )));
         }
-        // Some other jj failure — surface its stderr verbatim so the
-        // operator can see what jj said.
         return Err(CliError::Probe(std::io::Error::other(format!(
             "jj workspace root failed: {stderr}"
         ))));
     }
+    Ok(())
+}
+
+/// Probe that (a) `cwd` is inside a jj repo and (b) the `bugs`
+/// bookmark exists on it. Both checks shell out to `jj` directly
+/// (mirroring what `Storage::init` does internally) so we can surface
+/// distinct preflight-error variants rather than the storage layer's
+/// generic `Jj` runtime error.
+///
+/// Most read/write verbs (`jjf new`, `jjf show`, `jjf ls`, etc.) call
+/// this. The `jjf remote *` verbs use the simpler [`jj_repo`] probe
+/// because remote setup is meaningful before `jjf init`.
+pub(crate) fn bugs_bookmark(cwd: &Path) -> Result<(), CliError> {
+    // Check 1: is this a jj repo at all? Same logic as `jj_repo` —
+    // reuse it so the two probes stay in sync.
+    jj_repo(cwd)?;
 
     // Check 2: does `bugs` bookmark exist? `jj bookmark list`
     // exits 0 either way; we key off stdout content.
