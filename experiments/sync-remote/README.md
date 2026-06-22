@@ -75,3 +75,60 @@ Error mapping:
 - Per-bookmark refspec knobs (only matters if a future user wants
   to sync `bugs` to one remote and code to another).
 - Auth (whatever git/jj do already).
+
+## Follow-up: post-fetch divergence surface (for `sync-push-pull`)
+
+Walked this in `.scratch/post-fetch/` via
+`investigate-post-fetch.sh` + `investigate-merge.sh` against jj 0.40.
+
+Headline: **jj surfaces divergence as a "conflicted" bookmark, not
+as conflict markers in the file.** After `jj git fetch` on a clone
+that made a local edit, when the remote moved the bookmark to a
+different commit:
+
+```
+bugs (conflicted):
+  - <base>           ← common ancestor
+  + <local head>     ← @git
+  + <remote head>    ← @origin
+```
+
+The bugs file in the working copy is NOT auto-materialized; `jjf
+show <id>` fails with `Revset 'bookmarks(bugs)' resolved to more
+than one revision`. The hint jj prints is to
+`jj bookmark set <name> -r <rev>`, which would force-pick one side
+and silently drop the other — exactly the wrong default for a bug
+tracker.
+
+To merge, we need to:
+
+1. Detect the conflicted-bookmark state. Cheapest probe is to ask
+   for `heads(bookmarks(bugs))` and check the count — if >1, the
+   bookmark is divergent.
+2. `jj new <head_a> <head_b> -m "<msg with merge trailers>"`. jj
+   materializes the merge commit's working-copy files with its
+   standard textual conflict markers (`<<<<<<<` / `+++++++` /
+   `%%%%%%%` / `\\\\\\\` / `>>>>>>>`) — exactly the shape
+   `jjf-merge::resolve` parses.
+3. For each conflicted `bugs/*.json` file: read it, run
+   `jjf_merge::resolve(&text, &MergeOptions::default())`, write
+   resolved bytes back.
+4. `jj bookmark set bugs -r @ --allow-backwards`. The merge commit
+   becomes the new bookmark tip.
+5. `jj new root()` to step `@` off the bookmark (standard 4-CLI
+   dance suffix).
+
+The merge commit's description carries one `Jjf-Op: merge` trailer
+per resolved bug, per `docs/storage-format.md` §5.2.
+
+A clean fetch (the local clone hadn't edited locally) leaves the
+bookmark non-conflicted; the file in the working copy is
+auto-materialized to the remote's value. No merge driver pass
+needed. We detect this case the same way: `heads(bookmarks(bugs))`
+returns one revision.
+
+Comments file (`bugs/<id>.comments.jsonl`): if conflicted on
+fetch, that's outside the v1 merge driver's scope (`jjf-merge` is
+JSON-record only). We treat a conflicted `.jsonl` as `Unmergeable`
+and exit 1 — the `sync-conflict-fallback` ticket owns the better
+escape hatch.

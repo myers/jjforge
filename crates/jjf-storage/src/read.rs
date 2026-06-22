@@ -65,7 +65,22 @@ pub(crate) fn read(repo: &JjRepo, id: &BugId) -> Result<Bug> {
     #[cfg(debug_assertions)]
     {
         let op_view = replay_ops(repo, id)?;
-        cross_check(&record, &comments, &op_view);
+        // Skip the cross-check whenever the chain has been through a
+        // merge commit. The v1 `Jjf-Op: merge` trailer carries no
+        // payload (spec §5.2): "the merge driver records the
+        // resolution itself in the file diff." Op-replay can therefore
+        // walk both branches of the merge, fold their `set-*` ops in
+        // some order, and end up at a structural view that does NOT
+        // match the file (the merge driver picked a winner that
+        // disagrees with whichever side op-replay happened to apply
+        // last). The file remains authoritative after a merge; the
+        // cross-check is a debug-only safety net for the
+        // non-merged write path. A future ticket may enrich the merge
+        // trailer with per-field "Jjf-Resolved-*" payload so op-replay
+        // can be authoritative across merges too; for now, skip.
+        if !op_view.touched_by_merge {
+            cross_check(&record, &comments, &op_view);
+        }
     }
 
     Ok(Bug {
@@ -166,6 +181,10 @@ struct OpView {
     /// Comment IDs in the order they were added (op chain order, oldest
     /// first). Used to validate that the JSONL file matches.
     comment_ids: Vec<BugId>,
+    /// `true` once a `Jjf-Op: merge` trailer has been seen anywhere in
+    /// the chain. The cross-check honors this by skipping — see the
+    /// rationale at the call-site in `read`.
+    touched_by_merge: bool,
 }
 
 /// Walk the per-bug op chain and fold it into a structural view.
@@ -245,6 +264,7 @@ fn apply_op(view: &mut Option<OpView>, op: Op) {
                 dependencies: Vec::new(),
                 assignee: None,
                 comment_ids: Vec::new(),
+                touched_by_merge: false,
             });
         }
         op => {
@@ -275,7 +295,14 @@ fn apply_op(view: &mut Option<OpView>, op: Op) {
                 Op::CommentAdd { comment_id, .. } => v.comment_ids.push(comment_id),
                 Op::Merge { .. } => {
                     // No structural change; the merge driver records
-                    // the resolution itself in the file diff.
+                    // the resolution itself in the file diff. We flag
+                    // the view so the cross-check skips — op-replay
+                    // can walk the merge's two parent branches in
+                    // some order, fold their `set-*` ops, and produce
+                    // a structural view that doesn't match the file
+                    // (the merge driver's pick disagrees with the
+                    // side op-replay happened to apply last).
+                    v.touched_by_merge = true;
                 }
             }
         }
@@ -455,6 +482,7 @@ mod tests {
             dependencies: Vec::new(),
             assignee: None,
             comment_ids: Vec::new(),
+            touched_by_merge: false,
         });
         apply_op(
             &mut view,

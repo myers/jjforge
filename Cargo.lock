@@ -143,6 +143,7 @@ name = "jjf"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "jjf-merge",
  "jjf-storage",
  "serde_json",
  "thiserror",

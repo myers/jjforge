@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 jjf-storage = { path = "../jjf-storage" }
+jjf-merge = { path = "../jjf-merge" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 clap = { version = "4", features = ["derive"] }

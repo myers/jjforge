@@ -24,7 +24,8 @@ caller "yes, the requested mutation landed"; the verb-specific fields
 identify what it landed.
 
 Verbs in this family: `init`, `new`, `close`, `open`, `update`,
-`comment`, `label add`, `label rm`, `remote add`, `remote rm`.
+`comment`, `label add`, `label rm`, `remote add`, `remote rm`,
+`push`, `pull`.
 
 ### Read verbs — bare payload
 
@@ -90,6 +91,15 @@ from plain-text mode (see the top comment in `main.rs`: `0` success,
 | `cwd_error`             | 2    | `Cwd`                         | —                        |
 | `probe_error`           | 1    | `Probe`                       | —                        |
 | `jj_git_remote_error`   | 1    | `JjGitRemote`                 | —                        |
+| `push_network_failure`  | 1    | `PushNetworkFailure`          | `remote`                 |
+| `push_auth_failure`     | 1    | `PushAuthFailure`             | `remote`                 |
+| `push_rejected`         | 1    | `PushRejected`                | `remote`                 |
+| `jj_git_push_error`     | 1    | `JjGitPush`                   | —                        |
+| `pull_network_failure`  | 1    | `PullNetworkFailure`          | `remote`                 |
+| `pull_auth_failure`     | 1    | `PullAuthFailure`             | `remote`                 |
+| `jj_git_fetch_error`    | 1    | `JjGitFetch`                  | —                        |
+| `unmergeable`           | 1    | `Unmergeable`                 | `bug_id`, `detail`       |
+| `comment_file_conflict` | 1    | `CommentFileConflict`         | `bug_id`                 |
 | `invalid_input`         | 1    | `Storage::Invalid`            | —                        |
 | `clock_error`           | 1    | `Storage::Clock`              | —                        |
 | `io_error`              | 1    | `Storage::Io`                 | —                        |
@@ -312,6 +322,102 @@ Error path — name not found:
 ```sh
 $ jjf remote rm --json nope
 {"ok":false,"error":{"kind":"remote_not_found","message":"git remote not found: nope","details":{"name":"nope"}}}
+```
+
+### `push`
+
+Mutating verb — `{"ok": true, ...}` envelope. Wraps
+`jj git push --bookmark bugs --remote <remote>` and translates the
+common failure modes (network, auth, non-fast-forward rejection,
+unknown remote) into typed kinds so scripts can branch.
+
+Preflight is the full `bugs_bookmark` probe — there's nothing to
+push if the local bookmark doesn't exist. Unknown remote is exit 2
+(preflight); network/auth/reject are exit 1 (runtime — the command
+was well-formed, the remote just said no).
+
+```sh
+$ jjf push --json origin
+{"ok":true,"remote":"origin","bookmark":"bugs"}
+```
+
+Error path — unknown remote:
+
+```sh
+$ jjf push --json nope
+{"ok":false,"error":{"kind":"remote_not_found","message":"git remote not found: nope","details":{"name":"nope"}}}
+```
+
+Error path — non-fast-forward (operator should pull first):
+
+```sh
+$ jjf push --json origin
+{"ok":false,"error":{"kind":"push_rejected","message":"push to origin rejected: …\nhint: run `jjf pull origin` first, then retry the push","details":{"remote":"origin"}}}
+```
+
+### `pull`
+
+Mutating verb — `{"ok": true, ...}` envelope. Three success
+shapes, distinguished by `remote_present` (bool) and `merged_files`
+(non-negative integer):
+
+- **remote has no `bugs` bookmark yet** (first push from the other
+  side hasn't happened) — exit 0, `remote_present: false`,
+  `merged_files: 0`.
+- **clean fetch, no divergence** (jj fast-forwarded or there was
+  nothing new) — exit 0, `remote_present: true`, `merged_files: 0`.
+- **divergence, merge driver ran** (`jjf-merge` resolved N
+  `bugs/<id>.json` files) — exit 0, `remote_present: true`,
+  `merged_files: N`.
+
+Preflight is jj-repo-only (not the full `bugs_bookmark` probe) —
+a fresh clone has `bugs@<remote>` but no local `bugs` yet, and
+`pull` is what materializes the local bookmark via the
+`jj bookmark track` step.
+
+```sh
+$ jjf pull --json origin
+{"ok":true,"remote":"origin","bookmark":"bugs","remote_present":true,"merged_files":0}
+```
+
+Empty-remote variant — first time anyone pulls from a remote whose
+bugs bookmark hasn't been pushed yet:
+
+```sh
+$ jjf pull --json origin
+{"ok":true,"remote":"origin","bookmark":"bugs","remote_present":false,"merged_files":0}
+```
+
+With merges:
+
+```sh
+$ jjf pull --json origin
+{"ok":true,"remote":"origin","bookmark":"bugs","remote_present":true,"merged_files":2}
+```
+
+Error path — unknown remote:
+
+```sh
+$ jjf pull --json nope
+{"ok":false,"error":{"kind":"remote_not_found","message":"git remote not found: nope","details":{"name":"nope"}}}
+```
+
+Error path — body-text or other free-text conflict the v1 merge
+driver can't resolve (the working copy is left with jj's conflict
+markers intact for human resolution; `sync-conflict-fallback` is
+where the better escape hatch will live):
+
+```sh
+$ jjf pull --json origin
+{"ok":false,"error":{"kind":"unmergeable","message":"…","details":{"bug_id":"aa6600b","detail":"…"}}}
+```
+
+Error path — a `bugs/<id>.comments.jsonl` file had a conflict; the
+v1 merge driver doesn't handle comment-file merges:
+
+```sh
+$ jjf pull --json origin
+{"ok":false,"error":{"kind":"comment_file_conflict","message":"…","details":{"bug_id":"aa6600b"}}}
 ```
 
 ## The clap arg-error exception

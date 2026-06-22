@@ -293,6 +293,47 @@ enum Commands {
         #[command(subcommand)]
         action: RemoteAction,
     },
+
+    /// Push the `bugs` bookmark to a git remote. Wraps
+    /// `jj git push --bookmark bugs --remote <remote>`.
+    ///
+    /// Preflight: full `bugs_bookmark` probe (the bookmark must exist
+    /// locally — there's nothing to push otherwise). Unknown remote
+    /// surfaces as `remote_not_found` (exit 2); network / auth / non-
+    /// fast-forward failures are runtime (exit 1) under typed kinds so
+    /// scripts can branch.
+    Push {
+        /// Remote name (must already be configured via
+        /// `jjf remote add <name> <url>`).
+        remote: String,
+    },
+
+    /// Pull the `bugs` bookmark from a git remote, then merge any
+    /// divergence into a single commit via the jjforge merge driver.
+    ///
+    /// Sequence:
+    ///
+    /// 1. `jj git fetch --remote <remote>`. Network / auth failures
+    ///    bubble up as typed runtime errors (exit 1).
+    /// 2. If the remote bookmark `bugs@<remote>` exists but the local
+    ///    `bugs` doesn't yet track it, run
+    ///    `jj bookmark track bugs --remote=<remote>` so subsequent
+    ///    fetches see new commits as bookmark moves rather than as new
+    ///    untracked remote bookmarks.
+    /// 3. If the bookmark is now in a divergent ("conflicted") state —
+    ///    `heads(bookmarks(bugs))` resolves to >1 commit — run the
+    ///    merge driver: for each conflicted `bugs/<id>.json`, call
+    ///    `jjf_merge::resolve` and write the result back. Lands a
+    ///    single merge commit on `bugs` with one `Jjf-Op: merge`
+    ///    trailer per resolved bug (spec §5.2 / §5.5).
+    /// 4. If the remote has no `bugs` bookmark yet (the other side
+    ///    hasn't pushed), exit 0 with `remote_present: false` in the
+    ///    JSON envelope. Not an error.
+    Pull {
+        /// Remote name (must already be configured via
+        /// `jjf remote add <name> <url>`).
+        remote: String,
+    },
 }
 
 /// Inner enum for `jjf label <action>`. Separating the action from the
@@ -474,6 +515,62 @@ enum CliError {
     /// adjacent failures, and anything else jj rejects land here.
     #[error("jj git remote failed: {0}")]
     JjGitRemote(String),
+
+    /// `jjf push` could not reach the remote — network failure,
+    /// hostname unresolvable, TCP closed, etc. Runtime (exit 1): the
+    /// command was well-formed, the network just wasn't.
+    #[error("push to {remote} failed (network): {stderr}")]
+    PushNetworkFailure { remote: String, stderr: String },
+
+    /// `jjf push` reached the remote but the remote rejected our
+    /// credentials. Runtime (exit 1).
+    #[error("push to {remote} failed (auth): {stderr}")]
+    PushAuthFailure { remote: String, stderr: String },
+
+    /// `jjf push` reached the remote but the remote rejected the
+    /// update (non-fast-forward, hook rejection, etc.). Runtime
+    /// (exit 1). The plain-text message includes a hint to `pull`
+    /// first.
+    #[error("push to {remote} rejected: {stderr}\nhint: run `jjf pull {remote}` first, then retry the push")]
+    PushRejected { remote: String, stderr: String },
+
+    /// `jjf push` shelled out and got a non-zero exit that wasn't
+    /// one of the typed cases above. Runtime (exit 1).
+    #[error("jj git push failed: {0}")]
+    JjGitPush(String),
+
+    /// `jjf pull` could not reach the remote. Runtime (exit 1).
+    #[error("pull from {remote} failed (network): {stderr}")]
+    PullNetworkFailure { remote: String, stderr: String },
+
+    /// `jjf pull` reached the remote but credentials were rejected.
+    /// Runtime (exit 1).
+    #[error("pull from {remote} failed (auth): {stderr}")]
+    PullAuthFailure { remote: String, stderr: String },
+
+    /// `jjf pull` shelled out to `jj git fetch` and got a non-zero
+    /// exit that wasn't one of the typed cases above. Runtime
+    /// (exit 1).
+    #[error("jj git fetch failed: {0}")]
+    JjGitFetch(String),
+
+    /// `jjf pull` invoked the merge driver and got
+    /// `jjf_merge::Error::Unmergeable` back — typically the bug
+    /// record's body field has free-text conflicts the LWW/union
+    /// policy can't dispatch. Runtime (exit 1). The
+    /// `sync-conflict-fallback` ticket owns the better escape hatch
+    /// for this case; for now we exit 1 with the bug id(s) and the
+    /// merge driver's message so the operator knows where to look.
+    /// The working copy is left with conflict markers intact so a
+    /// human can resolve.
+    #[error("merge driver could not auto-resolve bug {bug_id}: {detail}\nworking copy left with conflict markers for manual resolution")]
+    Unmergeable { bug_id: String, detail: String },
+
+    /// `jjf pull` saw a conflict on a `bugs/<id>.comments.jsonl`
+    /// file. The v1 merge driver doesn't handle comment-file merges
+    /// (`jjf-merge` is v1, JSON-record only). Runtime (exit 1).
+    #[error("merge driver does not handle conflicted comment file for bug {bug_id} (v1 limitation)\nworking copy left with conflict markers for manual resolution")]
+    CommentFileConflict { bug_id: String },
 }
 
 impl CliError {
@@ -498,6 +595,18 @@ impl CliError {
             CliError::RemoteNotFound(_) => 2,
             CliError::Probe(_) => 1,
             CliError::JjGitRemote(_) => 1,
+            // Sync verbs: the user typed a well-formed command; the
+            // network / remote / merge layer told us "no." Runtime
+            // failures (exit 1), not preflight.
+            CliError::PushNetworkFailure { .. } => 1,
+            CliError::PushAuthFailure { .. } => 1,
+            CliError::PushRejected { .. } => 1,
+            CliError::JjGitPush(_) => 1,
+            CliError::PullNetworkFailure { .. } => 1,
+            CliError::PullAuthFailure { .. } => 1,
+            CliError::JjGitFetch(_) => 1,
+            CliError::Unmergeable { .. } => 1,
+            CliError::CommentFileConflict { .. } => 1,
             // `BugNotFound` is the user typing a valid id that just
             // doesn't exist — runtime failure, not preflight (the input
             // was well-formed; we tried to honor it and it wasn't there).
@@ -533,6 +642,15 @@ impl CliError {
             CliError::RemoteNotFound(_) => "remote_not_found",
             CliError::JjGitRemote(_) => "jj_git_remote_error",
             CliError::Probe(_) => "probe_error",
+            CliError::PushNetworkFailure { .. } => "push_network_failure",
+            CliError::PushAuthFailure { .. } => "push_auth_failure",
+            CliError::PushRejected { .. } => "push_rejected",
+            CliError::JjGitPush(_) => "jj_git_push_error",
+            CliError::PullNetworkFailure { .. } => "pull_network_failure",
+            CliError::PullAuthFailure { .. } => "pull_auth_failure",
+            CliError::JjGitFetch(_) => "jj_git_fetch_error",
+            CliError::Unmergeable { .. } => "unmergeable",
+            CliError::CommentFileConflict { .. } => "comment_file_conflict",
         }
     }
 
@@ -562,6 +680,15 @@ impl CliError {
             }
             CliError::RemoteAlreadyExists(name) => json!({ "name": name }),
             CliError::RemoteNotFound(name) => json!({ "name": name }),
+            CliError::PushNetworkFailure { remote, .. }
+            | CliError::PushAuthFailure { remote, .. }
+            | CliError::PushRejected { remote, .. }
+            | CliError::PullNetworkFailure { remote, .. }
+            | CliError::PullAuthFailure { remote, .. } => json!({ "remote": remote }),
+            CliError::Unmergeable { bug_id, detail } => {
+                json!({ "bug_id": bug_id, "detail": detail })
+            }
+            CliError::CommentFileConflict { bug_id } => json!({ "bug_id": bug_id }),
             _ => serde_json::Value::Null,
         }
     }
@@ -653,6 +780,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             RemoteAction::Ls => run_remote_ls(cli.json),
             RemoteAction::Rm { name } => run_remote_rm(cli.json, name),
         },
+        Commands::Push { remote } => run_push(cli.json, remote),
+        Commands::Pull { remote } => run_pull(cli.json, remote),
         Commands::Update {
             id,
             title,
@@ -1524,4 +1653,593 @@ fn status_matches(bug: &Bug, filter: StatusFilter) -> bool {
 /// filter requires the bug to carry EVERY listed label (intersection).
 fn labels_match(bug: &Bug, wanted: &[String]) -> bool {
     wanted.iter().all(|w| bug.labels.iter().any(|l| l == w))
+}
+
+/// `jjf push <remote>` — shell out to `jj git push --bookmark bugs
+/// --remote <remote>` and translate known failure modes to typed
+/// errors.
+///
+/// jj's stderr for the relevant cases (observed against jj 0.40):
+/// - unknown remote: `Error: No git remote named '<name>'`.
+/// - network unreachable: contains "could not resolve" /
+///   "Connection refused" / "Failed to connect" / "No such device or
+///   address".
+/// - auth: contains "authentication" / "access denied" / "permission
+///   denied" / "could not read Username" / "401".
+/// - non-fast-forward / hook rejection: contains "Refusing to push" /
+///   "rejected" / "non-fast-forward".
+///
+/// Anything else falls through to `jj_git_push_error` with jj's
+/// stderr verbatim in the message so the operator can diagnose.
+///
+/// Preflight: full `bugs_bookmark` probe — the bookmark must exist
+/// locally for there to be anything to push.
+fn run_push(json: bool, remote: String) -> Result<(), CliError> {
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    preflight::bugs_bookmark(&cwd)?;
+
+    let out = std::process::Command::new("jj")
+        .arg("--repository")
+        .arg(&cwd)
+        .args(["git", "push", "--bookmark", "bugs", "--remote", &remote])
+        .output()
+        .map_err(CliError::Probe)?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        return Err(classify_push_error(&remote, stderr));
+    }
+
+    if json {
+        let out = serde_json::json!({
+            "ok": true,
+            "remote": &remote,
+            "bookmark": jjf_storage::BUGS_BOOKMARK,
+        });
+        println!("{out}");
+    } else {
+        println!("pushed bugs -> {remote}");
+    }
+    Ok(())
+}
+
+/// Map jj-git-push stderr to a typed `CliError`. Keeps the
+/// substring-matching out of `run_push` proper so the dispatch logic
+/// stays scannable and so the matcher can be unit-tested directly.
+fn classify_push_error(remote: &str, stderr: String) -> CliError {
+    // Unknown remote — jj's canonical phrase. The `remote rm` verb's
+    // mapper uses the same phrase; we reuse the kind.
+    if stderr.contains("No git remote named") {
+        return CliError::RemoteNotFound(remote.to_owned());
+    }
+    // Authentication. jj surfaces git2's libcurl/libgit2 errors here;
+    // we pattern-match on the lowercase form of the key tokens so
+    // case-variant stderr from different platforms still classifies.
+    let lower = stderr.to_lowercase();
+    if lower.contains("authentication")
+        || lower.contains("permission denied")
+        || lower.contains("access denied")
+        || lower.contains("could not read username")
+        || lower.contains("401 unauthorized")
+    {
+        return CliError::PushAuthFailure {
+            remote: remote.to_owned(),
+            stderr,
+        };
+    }
+    // Non-fast-forward / rejected. The operator path here is "pull
+    // first then retry"; the message embeds that hint.
+    if lower.contains("refusing to push")
+        || lower.contains("rejected")
+        || lower.contains("non-fast-forward")
+        || lower.contains("non fast-forward")
+    {
+        return CliError::PushRejected {
+            remote: remote.to_owned(),
+            stderr,
+        };
+    }
+    // Network. Broad: any signal that we couldn't reach the remote.
+    if lower.contains("could not resolve")
+        || lower.contains("connection refused")
+        || lower.contains("failed to connect")
+        || lower.contains("no such device")
+        || lower.contains("network is unreachable")
+        || lower.contains("could not connect")
+    {
+        return CliError::PushNetworkFailure {
+            remote: remote.to_owned(),
+            stderr,
+        };
+    }
+    CliError::JjGitPush(stderr.trim().to_owned())
+}
+
+/// `jjf pull <remote>` — fetch the remote, track the `bugs@<remote>`
+/// bookmark if needed, then merge any divergence via `jjf_merge`.
+///
+/// See the verb's doc-comment on `Commands::Pull` for the high-level
+/// flow. This function is the orchestrator; it shells out to `jj`
+/// directly (mirroring `run_push` / `run_remote_*`) and calls the
+/// storage layer's `record_merge` primitive when the merge driver pass
+/// is needed.
+fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    // `pull` uses the jj-repo-only preflight: a fresh clone has
+    // `bugs@<remote>` but no local `bugs` yet, and `pull` is precisely
+    // the verb that materializes the local bookmark via
+    // `jj bookmark track`. Requiring the bookmark up front would force
+    // an awkward `jjf init` on a clone that already has the bookmark
+    // server-side. `push`, by contrast, requires the local bookmark
+    // (there's nothing to push without it).
+    preflight::jj_repo(&cwd)?;
+
+    // 1. Fetch. Map known failures the same way push does.
+    let out = std::process::Command::new("jj")
+        .arg("--repository")
+        .arg(&cwd)
+        .args(["git", "fetch", "--remote", &remote])
+        .output()
+        .map_err(CliError::Probe)?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        return Err(classify_fetch_error(&remote, stderr));
+    }
+
+    // 2. Probe for remote-bookmark presence. `jj bookmark list
+    // --all-remotes -T 'name ++ "@" ++ remote ++ "\n"' bugs` lists one
+    // line per (local + each remote) view of the bookmark. If
+    // `bugs@<remote>` is absent, the other side hasn't pushed yet —
+    // not an error.
+    let bm_out = std::process::Command::new("jj")
+        .arg("--repository")
+        .arg(&cwd)
+        .args([
+            "bookmark",
+            "list",
+            "--all-remotes",
+            "-T",
+            "name ++ \"@\" ++ remote ++ \"\\n\"",
+            "bugs",
+        ])
+        .output()
+        .map_err(CliError::Probe)?;
+    if !bm_out.status.success() {
+        return Err(CliError::Probe(std::io::Error::other(format!(
+            "jj bookmark list failed: {}",
+            String::from_utf8_lossy(&bm_out.stderr)
+        ))));
+    }
+    let bm_text = String::from_utf8_lossy(&bm_out.stdout);
+    let remote_marker = format!("bugs@{remote}");
+    let remote_present = bm_text.lines().any(|l| l.trim() == remote_marker);
+
+    if !remote_present {
+        // No remote bookmark — fetch landed nothing for us. Exit 0;
+        // tests pin this case so callers can distinguish "first push
+        // hasn't happened" from network failure (also exit 0 would
+        // mask) by inspecting `remote_present` in the JSON envelope.
+        emit_pull_success(json, &remote, false, 0);
+        return Ok(());
+    }
+
+    // 3. Track-if-absent. The first fetch on a fresh clone leaves
+    // `bugs@<remote>` untracked; subsequent fetches see the bookmark
+    // as new remote bookmarks every time. We want it tracked so a
+    // divergent edit shows up as the conflicted-bookmark state we're
+    // here to resolve. `jj bookmark track` is idempotent in spirit —
+    // it returns success-ish when already tracked, but its stderr
+    // when "already tracked" is harmless; we treat any non-success
+    // that mentions "already tracked" as success and surface
+    // everything else as a generic probe error.
+    let track_out = std::process::Command::new("jj")
+        .arg("--repository")
+        .arg(&cwd)
+        .args(["bookmark", "track", &remote_marker])
+        .output()
+        .map_err(CliError::Probe)?;
+    if !track_out.status.success() {
+        let stderr = String::from_utf8_lossy(&track_out.stderr);
+        if !stderr.contains("already tracked")
+            && !stderr.contains("is already tracking")
+        {
+            return Err(CliError::Probe(std::io::Error::other(format!(
+                "jj bookmark track failed: {stderr}"
+            ))));
+        }
+    }
+
+    // 4. Probe for divergence. `heads(bookmarks(bugs))` returns one
+    // change per head; >1 means the bookmark is in the "conflicted"
+    // state our investigation in `experiments/sync-remote/` documented.
+    let storage = Storage::open(&cwd)?;
+    let heads = storage.bugs_heads()?;
+    if heads.len() < 2 {
+        // Clean fetch — either nothing changed remotely (fast-forward
+        // already done) or there was no local divergence to resolve.
+        emit_pull_success(json, &remote, true, 0);
+        return Ok(());
+    }
+
+    // 5. Merge driver pass. Create a `jj new <heads> -m '<msg>'` merge
+    // commit; jj materializes each conflicted file with its textual
+    // conflict markers. We walk every file under `bugs/` looking for
+    // those markers, run `jjf_merge::resolve` on each, and hand the
+    // bytes to `Storage::record_merge` to write+bookmark-set.
+    //
+    // The merge commit's parents are the heads we list here. jj is
+    // happy to take a list of revisions.
+    let merge_args = {
+        let mut v: Vec<&str> = vec!["new"];
+        for h in &heads {
+            v.push(h.as_str());
+        }
+        v.push("-m");
+        v.push("jjf: temporary merge for conflict probe");
+        v
+    };
+    let merge_out = std::process::Command::new("jj")
+        .arg("--repository")
+        .arg(&cwd)
+        .args(&merge_args)
+        .output()
+        .map_err(CliError::Probe)?;
+    if !merge_out.status.success() {
+        return Err(CliError::Probe(std::io::Error::other(format!(
+            "jj new (probe merge) failed: {}",
+            String::from_utf8_lossy(&merge_out.stderr)
+        ))));
+    }
+
+    // Walk the working copy's `bugs/` directory looking for `.json`
+    // files that contain jj's conflict marker. Anything that doesn't
+    // contain the marker after the probe merge was auto-resolved by
+    // jj's content merger (or never differed) — no action needed.
+    //
+    // For each conflicted `.json` we DON'T feed the conflict-marker
+    // text to the merge driver. jj's textual diff can split a single
+    // logical change into multiple conflict blocks (one for `title`,
+    // one for `updated_at`, …) and may emit the `+++++++` / `%%%%%%%`
+    // markers in either order, which the v1 parser (modeled on the
+    // single-block Python prototype) doesn't accept. Instead we read
+    // the file's pristine contents from each merge parent via
+    // `jj file show -r <head>` and merge those JSON objects directly
+    // through the merge driver's `resolve` path — which canonicalizes
+    // when there are no markers (its no-conflict branch).
+    //
+    // This is robust against jj's marker variability and slightly
+    // faster (no diff reconstruction needed): the parents' files are
+    // each already a valid JSON object.
+    //
+    // Comment files (`.comments.jsonl`) with conflict markers are an
+    // out-of-scope case for v1; we fail loudly so the operator knows
+    // sync-conflict-fallback is the path forward.
+    let bugs_dir = cwd.join("bugs");
+    let mut merged_bugs: Vec<(BugId, String)> = Vec::new();
+    let entries = match std::fs::read_dir(&bugs_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            return Err(CliError::Probe(std::io::Error::other(format!(
+                "could not read bugs/ dir: {e}"
+            ))));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(CliError::Probe)?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(CliError::Probe(std::io::Error::other(format!(
+                    "could not read {}: {e}",
+                    path.display()
+                ))));
+            }
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        // Conflicts contain jj's marker prefix. Cheap check.
+        if !text.contains("<<<<<<< conflict") {
+            continue;
+        }
+        if name.ends_with(".comments.jsonl") {
+            // v1 limitation. Strip prefix `bugs/<id>.comments.jsonl`.
+            let id_stem = name.trim_end_matches(".comments.jsonl");
+            return Err(CliError::CommentFileConflict {
+                bug_id: id_stem.to_owned(),
+            });
+        }
+        if !name.ends_with(".json") {
+            // Some other file under `bugs/` — ignore. (Spec §3 only
+            // pins `.json` and `.comments.jsonl`.)
+            continue;
+        }
+        let stem = name.trim_end_matches(".json");
+        let bug_id = match BugId::parse(stem) {
+            Ok(id) => id,
+            Err(_) => continue, // skip non-bug-shaped files defensively
+        };
+        // Read pristine file from each head; merge directly.
+        let resolved =
+            merge_bug_from_heads(&cwd, &heads, &format!("bugs/{stem}.json"))?;
+        // Wrap any merge-driver error into CliError::Unmergeable.
+        let resolved = match resolved {
+            Ok(s) => s,
+            Err(detail) => {
+                return Err(CliError::Unmergeable {
+                    bug_id: stem.to_owned(),
+                    detail,
+                });
+            }
+        };
+        merged_bugs.push((bug_id, resolved));
+    }
+
+    if merged_bugs.is_empty() {
+        // jj auto-merged everything (or the divergent heads happened
+        // to touch no `bugs/<id>.json` files we recognize). We still
+        // need to land a commit that pins the merge so the bookmark
+        // stops being conflicted: bookmark set bugs -r @ on the
+        // probe-merge commit, then step off.
+        let bm_set = std::process::Command::new("jj")
+            .arg("--repository")
+            .arg(&cwd)
+            .args([
+                "bookmark",
+                "set",
+                "bugs",
+                "-r",
+                "@",
+                "--allow-backwards",
+            ])
+            .output()
+            .map_err(CliError::Probe)?;
+        if !bm_set.status.success() {
+            return Err(CliError::Probe(std::io::Error::other(format!(
+                "jj bookmark set (clean-merge) failed: {}",
+                String::from_utf8_lossy(&bm_set.stderr)
+            ))));
+        }
+        let step = std::process::Command::new("jj")
+            .arg("--repository")
+            .arg(&cwd)
+            .args(["new", "root()"])
+            .output()
+            .map_err(CliError::Probe)?;
+        if !step.status.success() {
+            return Err(CliError::Probe(std::io::Error::other(format!(
+                "jj new root() (clean-merge step-off) failed: {}",
+                String::from_utf8_lossy(&step.stderr)
+            ))));
+        }
+        emit_pull_success(json, &remote, true, 0);
+        return Ok(());
+    }
+
+    // We have a non-empty merge set: discard the temporary merge
+    // commit by stepping `@` somewhere else first, then call the
+    // storage layer's `record_merge` which builds the real merge
+    // commit with the proper `Jjf-Op: merge` trailers per spec §5.2.
+    // Stepping off via `jj new root()` is cheap and matches the
+    // 4-CLI dance's general shape.
+    let abandon = std::process::Command::new("jj")
+        .arg("--repository")
+        .arg(&cwd)
+        .args(["new", "root()"])
+        .output()
+        .map_err(CliError::Probe)?;
+    if !abandon.status.success() {
+        return Err(CliError::Probe(std::io::Error::other(format!(
+            "jj new root() (abandon-probe) failed: {}",
+            String::from_utf8_lossy(&abandon.stderr)
+        ))));
+    }
+
+    storage.record_merge(&heads, &merged_bugs)?;
+    let count = merged_bugs.len();
+    emit_pull_success(json, &remote, true, count);
+    Ok(())
+}
+
+/// Merge one `bugs/<id>.json` across N heads by reading each head's
+/// pristine version via `jj file show -r <head> root:<relpath>` and
+/// pairwise-folding them through `jjf_merge::merge_values`.
+///
+/// We don't go through `jjf_merge::resolve` because that's the
+/// conflict-marker entry point; we already have clean JSON per head
+/// and just need the policy fold. The merge driver crate's
+/// `merge_values` is the right level of abstraction for that.
+///
+/// Returns:
+/// - `Ok(Ok(bytes))` — resolved JSON bytes ready to write back.
+/// - `Ok(Err(detail))` — merge driver said `Unmergeable`; the caller
+///   wraps the detail into `CliError::Unmergeable`.
+/// - `Err(CliError)` — the jj shell-out or JSON parse itself failed.
+fn merge_bug_from_heads(
+    cwd: &Path,
+    heads: &[String],
+    relpath: &str,
+) -> Result<Result<String, String>, CliError> {
+    // For each head, read its author.timestamp AND its version of the
+    // bug file. We use the author timestamp to drive the LWW
+    // tiebreaker per the merge crate's contract (the merge crate
+    // defers this to the caller): the head with the LATER timestamp
+    // is folded LAST so it wins as `Side::B` under the default policy.
+    //
+    // A head that doesn't have the file (e.g. one side deleted it,
+    // which v1 doesn't actually support but we handle defensively) is
+    // skipped. If no head has it we surface that as Unmergeable.
+    // Each entry: (timestamp, head_change_id, json_value). The
+    // change_id is the deterministic tiebreaker when timestamps tie
+    // (jj 0.40's author.timestamp() is second-granularity, so two
+    // commits made within the same second sort equal on `ts` alone —
+    // observed in `experiments/sync-remote/.scratch/dbg-diff/`). Without
+    // the change_id tiebreaker, `heads(bookmarks(bugs))` would dictate
+    // the merge winner, which isn't a stable contract across jj
+    // versions.
+    let mut sides_with_ts: Vec<(String, String, serde_json::Value)> = Vec::new();
+    for h in heads {
+        let ts_out = std::process::Command::new("jj")
+            .arg("--repository")
+            .arg(cwd)
+            .args([
+                "log",
+                "-r",
+                h,
+                "--no-graph",
+                "-T",
+                "author.timestamp().format(\"%Y-%m-%dT%H:%M:%S%.fZ\")",
+            ])
+            .output()
+            .map_err(CliError::Probe)?;
+        if !ts_out.status.success() {
+            return Err(CliError::Probe(std::io::Error::other(format!(
+                "jj log timestamp probe for {h} failed: {}",
+                String::from_utf8_lossy(&ts_out.stderr)
+            ))));
+        }
+        let ts = String::from_utf8_lossy(&ts_out.stdout).trim().to_owned();
+        let out = std::process::Command::new("jj")
+            .arg("--repository")
+            .arg(cwd)
+            .args(["file", "show", "-r", h, &format!("root:{relpath}")])
+            .output()
+            .map_err(CliError::Probe)?;
+        if !out.status.success() {
+            // Missing file on this head: skip; another head may have it.
+            continue;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) => sides_with_ts.push((ts, h.clone(), v)),
+            Err(e) => {
+                return Ok(Err(format!(
+                    "head {h}: bugs file is not valid JSON: {e}"
+                )));
+            }
+        }
+    }
+    // Sort sides by (timestamp ASC, change_id ASC) so the latest is
+    // last — becomes `Side::B` in the pairwise fold and wins LWW. The
+    // change_id tiebreak makes the merge deterministic when two
+    // commits land in the same second (jj's per-second timestamp
+    // granularity).
+    sides_with_ts.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let sides: Vec<serde_json::Value> =
+        sides_with_ts.into_iter().map(|(_, _, v)| v).collect();
+    if sides.is_empty() {
+        return Ok(Err(format!(
+            "no head carries {relpath}; cannot merge"
+        )));
+    }
+    if sides.len() == 1 {
+        // Only one head had the file (typical when a clone deleted
+        // it, which v1 doesn't actually support but we handle
+        // defensively). Canonicalize and return.
+        let mut s = serde_json::to_string_pretty(&sides[0])
+            .map_err(|e| CliError::Storage(StorageError::Json(e)))?;
+        s.push('\n');
+        return Ok(Ok(s));
+    }
+    // Fold pairwise: left-to-right. The merge driver's policy is
+    // commutative for set-union fields and uses `prefer_side` for
+    // LWW scalars; the deterministic-default (`Side::B`) means the
+    // last-folded side wins for the same field. Heads are ordered by
+    // `jj log` (we don't pin their order beyond what jj gives us);
+    // the order is stable within a repo because change_ids sort
+    // deterministically.
+    let opts = jjf_merge::MergeOptions::default();
+    let mut acc = sides[0].clone();
+    for next in &sides[1..] {
+        acc = match jjf_merge::merge::merge_values(&acc, next, &opts) {
+            Ok(v) => v,
+            Err(jjf_merge::Error::Unmergeable(detail)) => {
+                return Ok(Err(detail));
+            }
+            Err(e) => {
+                return Ok(Err(e.to_string()));
+            }
+        };
+    }
+    let mut s = serde_json::to_string_pretty(&acc)
+        .map_err(|e| CliError::Storage(StorageError::Json(e)))?;
+    s.push('\n');
+    Ok(Ok(s))
+}
+
+/// Map jj-git-fetch stderr to a typed `CliError`. Mirrors
+/// `classify_push_error`'s shape; the substring sets are the same set
+/// of "what does libgit2 say when it can't auth / can't reach" lines.
+fn classify_fetch_error(remote: &str, stderr: String) -> CliError {
+    // jj's fetch surface uses a slightly different phrase than its
+    // `git remote remove` surface — "No matching remotes for names:
+    // <name>" (followed by "No git remotes to fetch from") — so we
+    // accept either canonical wording.
+    if stderr.contains("No git remote named")
+        || stderr.contains("No matching remotes for names")
+    {
+        return CliError::RemoteNotFound(remote.to_owned());
+    }
+    let lower = stderr.to_lowercase();
+    if lower.contains("authentication")
+        || lower.contains("permission denied")
+        || lower.contains("access denied")
+        || lower.contains("could not read username")
+        || lower.contains("401 unauthorized")
+    {
+        return CliError::PullAuthFailure {
+            remote: remote.to_owned(),
+            stderr,
+        };
+    }
+    if lower.contains("could not resolve")
+        || lower.contains("connection refused")
+        || lower.contains("failed to connect")
+        || lower.contains("no such device")
+        || lower.contains("network is unreachable")
+        || lower.contains("could not connect")
+    {
+        return CliError::PullNetworkFailure {
+            remote: remote.to_owned(),
+            stderr,
+        };
+    }
+    CliError::JjGitFetch(stderr.trim().to_owned())
+}
+
+/// Emit the success path for `jjf pull`. Kept as a helper so all four
+/// success branches (no-remote-bookmark, clean-fetch-no-divergence,
+/// clean-merge-no-files, real-merge-with-files) render the same
+/// envelope shape with one shared call site.
+fn emit_pull_success(json: bool, remote: &str, remote_present: bool, merged_files: usize) {
+    if json {
+        let mut obj = serde_json::Map::new();
+        obj.insert("ok".into(), serde_json::Value::Bool(true));
+        obj.insert("remote".into(), serde_json::Value::String(remote.to_owned()));
+        obj.insert(
+            "bookmark".into(),
+            serde_json::Value::String(jjf_storage::BUGS_BOOKMARK.to_owned()),
+        );
+        obj.insert(
+            "remote_present".into(),
+            serde_json::Value::Bool(remote_present),
+        );
+        obj.insert(
+            "merged_files".into(),
+            serde_json::Value::from(merged_files),
+        );
+        let envelope = serde_json::Value::Object(obj);
+        println!("{envelope}");
+    } else if !remote_present {
+        println!("pulled {remote}: no bugs bookmark on remote yet");
+    } else if merged_files == 0 {
+        println!("pulled bugs <- {remote}");
+    } else {
+        println!(
+            "pulled bugs <- {remote}; merged {merged_files} file(s)"
+        );
+    }
 }

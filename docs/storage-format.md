@@ -314,7 +314,44 @@ the explicit revset, `jj log` defaults to a working-copy
 revision that doesn't include the bookmark's history once the
 4-CLI dance has stepped `@` off the bookmark.
 
-### 5.7 Create-time fields and op chains
+### 5.7 Merge commits
+
+When `jjf pull` resolves a divergent `bugs` bookmark via the
+merge driver, it lands ONE multi-parent merge commit on `bugs`
+whose description carries one `Jjf-Op: merge` trailer per resolved
+bug (spec §5.2 + §5.5). The merge commit's parents are the heads
+that were diverging; the trailer payload is just the bug-id
+(`Jjf-Bug: <id>`), no extra fields — the resolved file diff IS the
+payload. Multi-bug merges land all `merge` trailers on the same
+commit.
+
+Example single-bug merge commit:
+
+```
+jjf: bug aa6600b - merge
+
+Jjf-Op: merge
+Jjf-Bug: aa6600b
+```
+
+Example two-bug merge commit:
+
+```
+jjf: merge 2 bugs
+
+Jjf-Op: merge
+Jjf-Bug: aa6600b
+Jjf-Op: merge
+Jjf-Bug: bb7700c
+```
+
+Op-replay readers (see `crates/jjf-storage/src/read.rs`) treat
+the `merge` op as a marker that the file diff supersedes the
+op-replay state — the file remains authoritative across merges.
+A v2 enrichment could carry per-field "Jjf-Resolved-*" payload so
+op-replay can stay authoritative across merges too; v1 doesn't.
+
+### 5.8 Create-time fields and op chains
 
 The `create` op trailer carries only `Jjf-Title` and
 `Jjf-Status`. Any other seed fields on a freshly-created bug

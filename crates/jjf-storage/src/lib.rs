@@ -617,6 +617,140 @@ impl Storage {
         Ok(ids)
     }
 
+    /// Enumerate the change_id shorts of every head of the `bugs`
+    /// bookmark. Normally returns exactly one entry; returns more than
+    /// one only when the bookmark is in a divergent ("conflicted")
+    /// state — typically right after `jj git fetch` against a local
+    /// clone that made a concurrent edit. The `sync-push-pull` ticket
+    /// uses this to decide whether `pull` needs to invoke the merge
+    /// driver pass: count > 1 means yes.
+    ///
+    /// Empty result is impossible on a repo where `jjf init` has run
+    /// (the seed commit guarantees at least one head); we treat an
+    /// empty list as a `Jj` error from the caller's perspective rather
+    /// than a typed variant, because hitting it means the bookmark
+    /// vanished between probes.
+    pub fn bugs_heads(&self) -> Result<Vec<String>> {
+        let text = self.repo.run(&[
+            "log",
+            "-r",
+            "heads(bookmarks(bugs))",
+            "--no-graph",
+            "-T",
+            "change_id.short() ++ \"\\n\"",
+        ])?;
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                out.push(line.to_owned());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Land a merge commit that resolves a divergent `bugs` bookmark.
+    ///
+    /// Takes the change_id shorts of the heads being merged (`heads` —
+    /// typically two, but jj supports n-way merges so we accept any
+    /// `>= 2`) and a list of `(bug_id, resolved_file_bytes)` pairs to
+    /// write into the working copy of the merge commit. The bytes are
+    /// what `jjf_merge::resolve` produced (or whatever the caller
+    /// decided is the post-merge content); we write them verbatim into
+    /// `bugs/<id>.json` so what the file ends up containing on the
+    /// bookmark matches exactly.
+    ///
+    /// Per `docs/storage-format.md` §5.2, the resulting commit's
+    /// description carries one `Jjf-Op: merge` trailer per entry in
+    /// `merged_bugs` — that's the per-bug audit signal that the merge
+    /// driver ran. Multi-bug merges land all trailers on one commit
+    /// (spec §5.5).
+    ///
+    /// Sequence (variant of the standard 4-CLI dance):
+    ///
+    /// 1. `jj new <head_a> <head_b> [...] -m '<msg with merge trailers>'`
+    ///    — creates the merge commit. jj materializes any conflicted
+    ///    files with its textual conflict markers.
+    /// 2. Write the resolved bytes into `bugs/<id>.json` for each entry.
+    ///    Overwrites the conflict markers jj just wrote.
+    /// 3. `jj bookmark set bugs -r @ --allow-backwards` — point the
+    ///    bookmark at the merge commit.
+    /// 4. `jj new root()` — step `@` off the bookmark.
+    ///
+    /// Errors with `Invalid` if `heads.len() < 2` (no merge needed) or
+    /// `merged_bugs` is empty (nothing to write — the caller should
+    /// just `jj bookmark set` without going through the merge driver).
+    pub fn record_merge(
+        &self,
+        heads: &[String],
+        merged_bugs: &[(BugId, String)],
+    ) -> Result<()> {
+        if heads.len() < 2 {
+            return Err(Error::Invalid(format!(
+                "record_merge requires >= 2 heads, got {}",
+                heads.len()
+            )));
+        }
+        if merged_bugs.is_empty() {
+            return Err(Error::Invalid(
+                "record_merge requires at least one merged bug".into(),
+            ));
+        }
+
+        // 1. Build the merge commit. `jj new` with N positional
+        // revisions creates an N-parent merge change.
+        let summary = if merged_bugs.len() == 1 {
+            format!("jjf: bug {} - merge", merged_bugs[0].0)
+        } else {
+            format!("jjf: merge {} bugs", merged_bugs.len())
+        };
+        let ops: Vec<Op> = merged_bugs
+            .iter()
+            .map(|(id, _)| Op::Merge {
+                bug_id: id.clone(),
+            })
+            .collect();
+        let msg = build_commit_message(&summary, &ops);
+
+        // `jj new <r1> <r2> ... -m <msg>` — args are owned `String`s so
+        // we build a `Vec<&str>` before handing to `run`.
+        let mut argv: Vec<&str> = vec!["new"];
+        for h in heads {
+            argv.push(h.as_str());
+        }
+        argv.push("-m");
+        argv.push(&msg);
+        self.repo.run(&argv)?;
+
+        // 2. Write resolved bytes into the working copy. We don't read
+        // the existing content; we overwrite. jj snapshots on the next
+        // command.
+        let wc_root = self.repo.root();
+        for (id, bytes) in merged_bugs {
+            let path = wc_root.join(bug_json_relpath(id));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, bytes)?;
+        }
+
+        // 3. Point the bookmark at the new merge commit.
+        self.repo.run(&[
+            "bookmark",
+            "set",
+            BUGS_BOOKMARK,
+            "-r",
+            "@",
+            "--allow-backwards",
+        ])?;
+
+        // 4. Step `@` off the bookmark so subsequent mutations don't
+        // snapshot the merge commit again.
+        self.repo.run(&["new", "root()"])?;
+
+        Ok(())
+    }
+
     /// Read the full op-by-op timeline for a bug, oldest first.
     ///
     /// Returns one [`HistoryEntry`] per `Jjf-Op:` stanza on the bug's
