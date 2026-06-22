@@ -181,6 +181,48 @@ fn init_json_emits_expected_object() {
 }
 
 #[test]
+fn init_json_error_envelope_on_non_jj_directory() {
+    // `--json` plus a failing path: error must surface on stderr as the
+    // documented error envelope, not the plain `jjf: <text>` line. Pins
+    // the contract in `docs/cli-json.md` for the `not_a_jj_repo` kind.
+    let dir = scratch("init_json_err_non_jj");
+
+    let out = run_jjf(&dir, &["--json", "init"]);
+    assert!(!out.status.success(), "init should fail outside a jj repo");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "preflight failure should exit 2, got {:?}; stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    // Stdout should be empty — errors render to stderr, not stdout.
+    assert!(
+        out.stdout.is_empty(),
+        "stdout should be empty on error, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let v: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr must be valid JSON envelope");
+    assert_eq!(v["ok"], serde_json::Value::Bool(false));
+    assert_eq!(
+        v["error"]["kind"].as_str(),
+        Some("not_a_jj_repo"),
+        "kind wrong: {stderr}"
+    );
+    assert!(
+        v["error"]["message"].as_str().is_some_and(|m| !m.is_empty()),
+        "message missing/empty: {stderr}"
+    );
+    assert_eq!(
+        v["error"]["details"]["path"].as_str(),
+        Some(dir.to_string_lossy().as_ref()),
+        "details.path wrong: {stderr}"
+    );
+}
+
+#[test]
 fn global_json_flag_works_before_subcommand_too() {
     // clap's `global = true` lets the flag sit on either side of the
     // subcommand. We assert both shapes so the surface stays stable

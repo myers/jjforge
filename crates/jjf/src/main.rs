@@ -429,16 +429,121 @@ impl CliError {
             CliError::Storage(_) => 1,
         }
     }
+
+    /// Stable, machine-greppable identifier for the error variant. Used
+    /// as the `kind` field in the `--json` error envelope; scripts and
+    /// the upcoming MCP server pattern-match on these strings rather
+    /// than on the human-readable `message`. Adding a new variant?
+    /// Pick a lowercase snake_case name and document it in
+    /// `docs/cli-json.md`'s error-kind table.
+    fn kind(&self) -> &'static str {
+        match self {
+            CliError::Storage(StorageError::NotAJjRepo(_)) => "not_a_jj_repo",
+            CliError::Storage(StorageError::BugNotFound(_)) => "bug_not_found",
+            CliError::Storage(StorageError::Invalid(_)) => "invalid_input",
+            CliError::Storage(StorageError::Clock(_)) => "clock_error",
+            CliError::Storage(StorageError::Io(_)) => "io_error",
+            CliError::Storage(StorageError::Json(_)) => "json_error",
+            CliError::Storage(StorageError::Jj(_)) => "jj_error",
+            CliError::Cwd(_) => "cwd_error",
+            CliError::BodyRead { .. } => "body_read_error",
+            CliError::BadDepId { .. } => "bad_id",
+            CliError::BadBugId { .. } => "bad_id",
+            CliError::MissingBugsBookmark(_) => "missing_bugs_bookmark",
+            CliError::EmptyCommentBody => "empty_body",
+            CliError::EmptyLabel => "empty_label",
+            CliError::MissingAuthor => "missing_author",
+            CliError::NoUpdateFields => "no_update_fields",
+            CliError::Probe(_) => "probe_error",
+        }
+    }
+
+    /// Optional structured per-variant context that goes into the
+    /// `details` field of the error envelope. Returns `Value::Null` if
+    /// the variant has nothing structured to add beyond the kind and
+    /// message — callers should treat null as "no details" and not as
+    /// a meaningful payload.
+    ///
+    /// Fields are chosen for what an automated caller can act on: the
+    /// bug id it asked about, the path it tried to read, the bad
+    /// argument value. Free-form strings live in `message`.
+    fn details(&self) -> serde_json::Value {
+        use serde_json::json;
+        match self {
+            CliError::Storage(StorageError::NotAJjRepo(path)) => {
+                json!({ "path": path.display().to_string() })
+            }
+            CliError::Storage(StorageError::BugNotFound(id)) => {
+                json!({ "id": id.as_str() })
+            }
+            CliError::BodyRead { from, .. } => json!({ "from": from }),
+            CliError::BadDepId { value, .. } => json!({ "value": value, "field": "dep" }),
+            CliError::BadBugId { value, .. } => json!({ "value": value, "field": "id" }),
+            CliError::MissingBugsBookmark(path) => {
+                json!({ "path": path.display().to_string() })
+            }
+            _ => serde_json::Value::Null,
+        }
+    }
 }
+
+/// Whether the top-level `--json` flag was set. Captured into a
+/// process-wide slot the moment `Cli::parse()` succeeds so the error
+/// reporter can render the right shape without needing the (possibly
+/// partially-constructed) `Cli` value threaded through.
+///
+/// Stays `None` if parsing failed — clap exits before we get here, so
+/// arg-parse errors render through clap's own machinery and miss the
+/// JSON envelope. That's the documented exception in `docs/cli-json.md`.
+static JSON_OUTPUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Stash the flag so `report_error` can find it. `set` returns Err
+    // if the cell was already initialized; that only happens in tests
+    // that re-enter `main`, which we don't have — ignore the result.
+    let _ = JSON_OUTPUT.set(cli.json);
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("jjf: {e}");
+            report_error(&e);
             ExitCode::from(e.exit_code())
         }
+    }
+}
+
+/// Render a `CliError` to stderr in either the plain `jjf: <msg>` form
+/// or the `--json` error envelope:
+///
+/// ```json
+/// {"ok": false, "error": {"kind": "<kind>", "message": "<msg>", "details": {...}}}
+/// ```
+///
+/// Always stderr, never stdout — stdout is reserved for the verb's
+/// (now empty) success payload so a caller can `2>/dev/null` a verb
+/// they expect might fail and still get a clean stdout. Exit code is
+/// the caller's job; this function only does the rendering.
+fn report_error(e: &CliError) {
+    let json = JSON_OUTPUT.get().copied().unwrap_or(false);
+    if json {
+        let details = e.details();
+        let mut error_obj = serde_json::Map::new();
+        error_obj.insert("kind".into(), serde_json::Value::String(e.kind().into()));
+        error_obj.insert("message".into(), serde_json::Value::String(e.to_string()));
+        // Only attach `details` when it's actually structured — saves
+        // callers from a `details: null` they have to guard against.
+        // The contract documents this: details is either absent or an
+        // object with variant-specific fields.
+        if !details.is_null() {
+            error_obj.insert("details".into(), details);
+        }
+        let envelope = serde_json::json!({
+            "ok": false,
+            "error": serde_json::Value::Object(error_obj),
+        });
+        eprintln!("{envelope}");
+    } else {
+        eprintln!("jjf: {e}");
     }
 }
 

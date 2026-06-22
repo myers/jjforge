@@ -165,6 +165,43 @@ fn new_json_emits_expected_object_and_id_parses() {
 }
 
 #[test]
+fn new_json_error_envelope_on_missing_bookmark() {
+    // Fresh jj repo, no `jjf init` yet. With `--json` we expect the
+    // documented `missing_bugs_bookmark` envelope on stderr — the same
+    // contract a script wrapping `jjf new` to file bugs would parse.
+    let repo = make_jj_repo("new_json_err_no_bookmark");
+
+    let out = run_jjf_with_stdin(
+        &repo,
+        &["--json", "new", "-t", "should fail", "-F", "-"],
+        b"never written",
+    );
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        out.stdout.is_empty(),
+        "stdout should be empty on error, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let v: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr must be valid JSON envelope");
+    assert_eq!(v["ok"], serde_json::Value::Bool(false));
+    assert_eq!(
+        v["error"]["kind"].as_str(),
+        Some("missing_bugs_bookmark"),
+        "kind wrong: {stderr}"
+    );
+    // details.path should echo the repo dir so a caller can confirm
+    // which working tree the failure came from.
+    assert_eq!(
+        v["error"]["details"]["path"].as_str(),
+        Some(repo.to_string_lossy().as_ref()),
+        "details.path wrong: {stderr}"
+    );
+}
+
+#[test]
 fn new_without_jjf_init_first_exits_two_with_run_jjf_init_first_message() {
     // Fresh jj repo, but no `bugs` bookmark — we expect a typed
     // preflight error, NOT the raw jj stderr we'd get from trying to

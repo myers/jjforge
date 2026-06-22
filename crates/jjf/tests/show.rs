@@ -255,6 +255,38 @@ fn show_json_emits_bug_record_verbatim() {
 }
 
 #[test]
+fn show_json_error_envelope_on_nonexistent_id() {
+    // `--json` and a well-formed-but-missing id: error envelope on
+    // stderr, plain `Bug` JSON nowhere. This is the primary read-verb
+    // error contract — pattern-matchable on `kind` rather than message.
+    let repo = make_initialized_repo("show_json_err_missing");
+    let nonexistent = "deadbee";
+
+    let out = run_jjf(&repo, &["--json", "show", nonexistent]);
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        out.stdout.is_empty(),
+        "stdout should be empty on error, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let v: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr must be valid JSON envelope");
+    assert_eq!(v["ok"], serde_json::Value::Bool(false));
+    assert_eq!(
+        v["error"]["kind"].as_str(),
+        Some("bug_not_found"),
+        "kind wrong: {stderr}"
+    );
+    assert_eq!(
+        v["error"]["details"]["id"].as_str(),
+        Some(nonexistent),
+        "details.id wrong: {stderr}"
+    );
+}
+
+#[test]
 fn show_with_nonexistent_id_exits_one() {
     // A well-formed but never-created bug id is a runtime failure, not
     // a preflight: the user gave us syntactically-valid input that

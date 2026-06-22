@@ -285,6 +285,46 @@ fn comment_two_in_a_row_chronological_order() {
 }
 
 #[test]
+fn comment_json_error_envelope_on_empty_body() {
+    // `--json` plus the most representative comment-side validation
+    // failure (empty body): the documented `empty_body` envelope on
+    // stderr. The `details` field is absent for this kind — message
+    // carries enough context (the flag hint).
+    let repo = make_initialized_repo("comment_json_err_empty");
+    let id = create_bug(&repo, "no empty allowed via json");
+
+    let out = run_jjf_with_stdin(
+        &repo,
+        &["--json", "comment", &id, "-F", "-"],
+        b"",
+    );
+    assert!(!out.status.success(), "empty-body comment must fail");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        out.stdout.is_empty(),
+        "stdout should be empty on error, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let v: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr must be valid JSON envelope");
+    assert_eq!(v["ok"], serde_json::Value::Bool(false));
+    assert_eq!(
+        v["error"]["kind"].as_str(),
+        Some("empty_body"),
+        "kind wrong: {stderr}"
+    );
+    // `empty_body` has no structured details; the field is absent rather
+    // than `null` per the contract. Use `.get()` to check absence
+    // explicitly without tripping over serde_json's index-returns-null
+    // convention.
+    assert!(
+        v["error"].as_object().unwrap().get("details").is_none(),
+        "details should be absent for empty_body, got: {stderr}"
+    );
+}
+
+#[test]
 fn comment_empty_body_exits_two() {
     let repo = make_initialized_repo("comment_empty");
     let id = create_bug(&repo, "no empty allowed");

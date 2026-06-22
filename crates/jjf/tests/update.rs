@@ -377,6 +377,41 @@ fn update_assignee_and_unset_assignee_are_mutually_exclusive() {
 }
 
 #[test]
+fn update_json_error_envelope_on_nonexistent_id() {
+    // `--json` plus a missing id: the documented `bug_not_found` envelope
+    // shows up on stderr. Mirrors the contract pinned for the other
+    // bug-id-taking mutators (`close`, `open`, `comment`, `label add/rm`).
+    let repo = make_initialized_repo("update_json_err_missing");
+    let nonexistent = "deadbee";
+
+    let out = run_jjf(
+        &repo,
+        &["--json", "update", nonexistent, "--title", "x"],
+    );
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        out.stdout.is_empty(),
+        "stdout should be empty on error, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let v: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr must be valid JSON envelope");
+    assert_eq!(v["ok"], serde_json::Value::Bool(false));
+    assert_eq!(
+        v["error"]["kind"].as_str(),
+        Some("bug_not_found"),
+        "kind wrong: {stderr}"
+    );
+    assert_eq!(
+        v["error"]["details"]["id"].as_str(),
+        Some(nonexistent),
+        "details.id wrong: {stderr}"
+    );
+}
+
+#[test]
 fn update_nonexistent_id_exits_one() {
     let repo = make_initialized_repo("update_missing");
     let nonexistent = "deadbee"; // well-formed but unlikely to collide.

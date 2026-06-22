@@ -353,6 +353,39 @@ fn label_rm_absent_label_lands_trailer() {
 }
 
 #[test]
+fn label_json_error_envelope_on_empty_label() {
+    // `--json label add <id> ""`: empty-label is the canonical
+    // CLI-layer rejection for this verb. The envelope's `kind` is
+    // `empty_label`; `details` is absent (the message is enough).
+    // Covers both arms transitively — the empty check lives in
+    // `run_label` before the LabelOp branch.
+    let repo = make_initialized_repo("label_json_err_empty");
+    let id = create_bug(&repo, "json envelope empty label");
+
+    let out = run_jjf(&repo, &["--json", "label", "add", &id, ""]);
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        out.stdout.is_empty(),
+        "stdout should be empty on error, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let v: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr must be valid JSON envelope");
+    assert_eq!(v["ok"], serde_json::Value::Bool(false));
+    assert_eq!(
+        v["error"]["kind"].as_str(),
+        Some("empty_label"),
+        "kind wrong: {stderr}"
+    );
+    assert!(
+        v["error"].as_object().unwrap().get("details").is_none(),
+        "details should be absent for empty_label, got: {stderr}"
+    );
+}
+
+#[test]
 fn label_add_empty_label_exits_two() {
     let repo = make_initialized_repo("label_empty_add");
     let id = create_bug(&repo, "empty label add");

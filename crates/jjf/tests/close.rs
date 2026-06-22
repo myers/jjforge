@@ -279,6 +279,61 @@ fn close_twice_lands_two_set_status_trailers() {
 }
 
 #[test]
+fn close_json_error_envelope_on_nonexistent_id() {
+    // `--json close <missing>`: the documented `bug_not_found` envelope.
+    // Same shape as `update`'s and `comment`'s nonexistent-id envelope;
+    // `open` runs through the same `run_set_status` code path and is
+    // covered transitively. The matching test for `open` lives below.
+    let repo = make_initialized_repo("close_json_err_missing");
+    let nonexistent = "deadbee";
+
+    let out = run_jjf(&repo, &["--json", "close", nonexistent]);
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        out.stdout.is_empty(),
+        "stdout should be empty on error, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let v: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr must be valid JSON envelope");
+    assert_eq!(v["ok"], serde_json::Value::Bool(false));
+    assert_eq!(
+        v["error"]["kind"].as_str(),
+        Some("bug_not_found"),
+        "kind wrong: {stderr}"
+    );
+    assert_eq!(
+        v["error"]["details"]["id"].as_str(),
+        Some(nonexistent),
+        "details.id wrong: {stderr}"
+    );
+}
+
+#[test]
+fn open_json_error_envelope_on_nonexistent_id() {
+    // `open` shares `run_set_status` with `close`, but we pin its
+    // envelope shape too so a future refactor that splits the verbs
+    // can't silently regress one of them.
+    let repo = make_initialized_repo("open_json_err_missing");
+    let nonexistent = "deadbee";
+
+    let out = run_jjf(&repo, &["--json", "open", nonexistent]);
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let v: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr must be valid JSON envelope");
+    assert_eq!(v["ok"], serde_json::Value::Bool(false));
+    assert_eq!(v["error"]["kind"].as_str(), Some("bug_not_found"));
+    assert_eq!(
+        v["error"]["details"]["id"].as_str(),
+        Some(nonexistent),
+    );
+}
+
+#[test]
 fn close_nonexistent_id_exits_one() {
     let repo = make_initialized_repo("close_missing");
     let nonexistent = "deadbee"; // 7-hex, well-formed, unlikely to collide.
