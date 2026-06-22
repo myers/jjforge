@@ -153,11 +153,26 @@ enum Commands {
     /// `cli-comment`).
     Comment,
 
-    /// Close a bug. Not yet implemented (ticket: `cli-status`).
-    Close,
+    /// Close a bug. Lands a `set-status` op on a new commit on the
+    /// `bugs` bookmark. Not idempotent per the spec — closing an
+    /// already-closed bug still writes a fresh trailer so the audit
+    /// log records the intent. Requires `jjf init` to have been run
+    /// first.
+    Close {
+        /// Full 7-char hex bug id. A bad parse is a preflight failure
+        /// (exit 2); a well-formed id that doesn't exist on the
+        /// bookmark is a runtime failure (exit 1).
+        id: String,
+    },
 
-    /// Reopen a bug. Not yet implemented (ticket: `cli-status`).
-    Open,
+    /// Reopen a bug. Same shape and same non-idempotency rules as
+    /// `close`, just lands `set-status=open`.
+    Open {
+        /// Full 7-char hex bug id. A bad parse is a preflight failure
+        /// (exit 2); a well-formed id that doesn't exist on the
+        /// bookmark is a runtime failure (exit 1).
+        id: String,
+    },
 
     /// Add or remove labels. Not yet implemented (ticket:
     /// `cli-label`).
@@ -264,17 +279,15 @@ fn run(cli: Cli) -> Result<(), CliError> {
         } => run_new(cli.json, title, file, labels, deps, assignee),
         Commands::Show { id } => run_show(cli.json, id),
         Commands::Ls { status, labels } => run_ls(cli.json, status, labels),
+        Commands::Close { id } => run_set_status(cli.json, id, Status::Closed),
+        Commands::Open { id } => run_set_status(cli.json, id, Status::Open),
         // Stubs. We deliberately return a generic runtime error
         // (exit 1) rather than a clap-level error (exit 2): the
         // command parsed fine, we just haven't implemented its
         // body. When the per-verb ticket lands, this arm goes away.
-        Commands::Update
-        | Commands::Comment
-        | Commands::Close
-        | Commands::Open
-        | Commands::Label => Err(CliError::Storage(StorageError::Invalid(
-            "not yet implemented".into(),
-        ))),
+        Commands::Update | Commands::Comment | Commands::Label => Err(CliError::Storage(
+            StorageError::Invalid("not yet implemented".into()),
+        )),
     }
 }
 
@@ -496,6 +509,67 @@ fn print_bug_plain(bug: &Bug) {
         }
         println!();
     }
+}
+
+/// `jjf close <id>` / `jjf open <id>` — flip a bug's status via the
+/// storage write path. Both verbs differ only in the `Status` value
+/// they pass to `Storage::set_status`, so they share one helper.
+///
+/// Per the spec (and the `cli-status` ticket): closing an
+/// already-closed bug (or opening an already-open one) is NOT a no-op
+/// — it lands a fresh `set-status` trailer on a new commit. The
+/// storage layer enforces this by always calling `mutate` regardless
+/// of whether the record actually changed; we just pass the request
+/// through.
+///
+/// Preflight order matches `run_show`: parse the id (exit 2 on bad
+/// shape), resolve the cwd, probe for the jj repo + `bugs` bookmark
+/// (exit 2 with `run jjf init first` if absent), then hand off to
+/// storage. A well-formed id that doesn't exist on the bookmark
+/// surfaces as `BugNotFound` and exits 1.
+fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError> {
+    // 1. Parse the id. Same exit-2 rule as `show`.
+    let bug_id =
+        BugId::parse(&id).map_err(|error| CliError::BadBugId { value: id, error })?;
+
+    // 2. Resolve + canonicalize cwd.
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+
+    // 3. Preflight: jj repo + `bugs` bookmark present.
+    preflight::bugs_bookmark(&cwd)?;
+
+    // 4. Hand off to storage.
+    let storage = Storage::open(&cwd)?;
+    storage.set_status(&bug_id, status)?;
+
+    // 5. Render. The plain-text shape (`closed <id>` / `opened <id>`)
+    // is intentionally minimal — one line, no decoration — so it slots
+    // cleanly into a shell pipeline. The `--json` envelope mirrors
+    // `init` / `new`: `{"ok": true, ...}` plus the verb-specific
+    // payload (id + the resulting status).
+    let status_word = match status {
+        Status::Open => "open",
+        Status::Closed => "closed",
+    };
+    if json {
+        let out = serde_json::json!({
+            "ok": true,
+            "id": bug_id.as_str(),
+            "status": status_word,
+        });
+        println!("{out}");
+    } else {
+        // Past tense for the human form: `closed <id>` / `opened <id>`.
+        // The verb describes the action just performed, not the
+        // resulting state — that's `status` in the JSON envelope.
+        let verb = match status {
+            Status::Open => "opened",
+            Status::Closed => "closed",
+        };
+        println!("{verb} {bug_id}");
+    }
+    Ok(())
 }
 
 /// `jjf ls [--status <S>] [--label <L>...] [--json]` — enumerate every

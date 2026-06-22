@@ -112,13 +112,18 @@ fn create_bug(
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
-/// `jjf close <id>` isn't a verb yet (cli-status follow-up), so we drive
-/// `Storage::set_status` directly via the storage crate.
+/// Close a bug via the real `jjf close <id>` verb. Drives the same
+/// code path operators use, so any regression in close-from-the-CLI
+/// surfaces here too (rather than tests passing while the verb is
+/// broken).
 fn close_bug(repo: &Path, id: &str) {
-    use jjf_storage::{BugId, Status, Storage};
-    let storage = Storage::open(repo).expect("Storage::open in test helper");
-    let bug_id = BugId::parse(id).expect("parse id in test helper");
-    storage.set_status(&bug_id, Status::Closed).expect("set_status");
+    let out = run_jjf(repo, &["close", id]);
+    assert!(
+        out.status.success(),
+        "jjf close failed during setup: code={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// Parse `jjf ls` plain-text output into one row per bug. Each row is
