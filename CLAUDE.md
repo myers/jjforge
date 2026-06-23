@@ -40,14 +40,40 @@ rough edge as data, not as something to fix around.
 ### Entry point and discovery
 
 The roadmap is the orientation document. Start there in any
-new session before touching anything else:
+new session before touching anything else; surface persistent
+memories at the same time:
 
 ```bash
-jjf show 9566f52
+jjf show 9566f52 --include-memories
 ```
 
-To navigate from there, see the Queries section at the bottom
-of this file.
+The `--include-memories` flag appends a `## Persistent
+Memories` block listing every `jjf remember` entry on the
+bookmark. These are short declarative facts that travel with
+the planner via `jjf push`/`pull` (operational rules,
+codebase folklore, architectural decisions). Read them; they
+exist so you don't have to re-derive what an earlier session
+already learned.
+
+Manage memories with:
+
+```bash
+jjf remember "<insight>"                 # write; key auto-slugged
+jjf remember "<insight>" --key <slug>    # write with explicit key
+jjf memories                             # list all
+jjf memories <substring>                 # filter
+jjf recall <key>                         # read one
+jjf forget <key>                         # remove
+```
+
+Save a memory when you've learned something the next session
+would otherwise re-derive (a non-obvious workflow rule, a
+gotcha in the codebase, a constraint that's not visible from
+the code alone). Memories are project-scoped; do not save
+operator preferences here — those go in `~/.claude/projects/`.
+
+To navigate from the roadmap, see the Queries section at the
+bottom of this file.
 
 ### Label scheme
 
