@@ -1,64 +1,37 @@
 #!/usr/bin/env bash
 # jjf — the jjforge CLI.
 #
-# Today: this is a thin shim around git-bug, so we plan jjforge in
-# git-bug while we build it. The verb shape we use here is what
-# the real `jjf` will offer eventually.
-#
-# Tomorrow: this script gets replaced by a real Rust binary at
-# target/release/jjf. The wrapper layer in this script will move
-# inside the binary, or vanish entirely.
-#
-# Usage examples (today, via git-bug under the hood):
-#   jjf ls                       # list issues
-#   jjf show <id>                # show one
-#   jjf new "<title>" -F body.md # create from file
-#   jjf comment <id> -F note.md  # add a comment
-#   jjf close <id>               # close it
-#
-# Run with no args: prints help.
+# Delegates to the Rust binary built in this workspace. Picks
+# the most recently built of release/debug; builds release on
+# demand if neither exists.
 
 set -euo pipefail
 
-if [[ $# -eq 0 ]]; then
-    cat <<USAGE
-jjf — jjforge CLI (currently a git-bug shim; real binary forthcoming)
+here="$(cd "$(dirname "$0")" && pwd)"
+workspace_root="$(cd "$here/.." && pwd)"
 
-Verbs:
-  jjf ls                       List issues
-  jjf show <id>                Show one issue
-  jjf new -t "<title>" -F -    Create an issue (-F - reads from stdin)
-  jjf comment <id> -F -        Add a comment (-F - reads from stdin)
-  jjf close <id>               Close an issue
-  jjf open <id>                Reopen an issue
-  jjf label add <id> <label>   Add a label
-  jjf label rm <id> <label>    Remove a label
+release_bin="$workspace_root/target/release/jjf"
+debug_bin="$workspace_root/target/debug/jjf"
 
-Plus anything else git-bug supports — pass directly to git-bug:
-  jjf bug ...
-  jjf push
-  jjf pull
-USAGE
-    exit 0
+# Pick the newer of the two when both exist, so a fresh `cargo
+# build` (debug, by default) doesn't get shadowed by a stale
+# release binary from weeks ago.
+if [[ -x "$release_bin" && -x "$debug_bin" ]]; then
+    if [[ "$debug_bin" -nt "$release_bin" ]]; then
+        exec "$debug_bin" "$@"
+    else
+        exec "$release_bin" "$@"
+    fi
 fi
 
-cmd="$1"
-shift
+if [[ -x "$release_bin" ]]; then
+    exec "$release_bin" "$@"
+fi
 
-case "$cmd" in
-    ls)        exec git-bug bug "$@" ;;
-    show)      exec git-bug bug show "$@" ;;
-    new)       exec git-bug bug new --non-interactive "$@" ;;
-    comment)   exec git-bug bug comment new --non-interactive "$@" ;;
-    close)     exec git-bug bug status close "$@" ;;
-    open)      exec git-bug bug status open "$@" ;;
-    label)
-        sub="$1"; shift
-        case "$sub" in
-            add) exec git-bug bug label new "$@" ;;
-            rm)  exec git-bug bug label rm "$@" ;;
-            *)   echo "jjf label: unknown subcommand '$sub'" >&2; exit 2 ;;
-        esac
-        ;;
-    *)         exec git-bug "$cmd" "$@" ;;
-esac
+if [[ -x "$debug_bin" ]]; then
+    exec "$debug_bin" "$@"
+fi
+
+echo "jjf: no built binary at $release_bin or $debug_bin; building release..." >&2
+cargo build --release --manifest-path "$workspace_root/Cargo.toml" -p jjf >&2
+exec "$release_bin" "$@"

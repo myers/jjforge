@@ -191,19 +191,10 @@ origin` round-trips the planner data alongside.
 
 ### Reading historical (pre-cutover) git-bug data
 
-The `bin/jjf` shell shim still delegates to `git-bug` against
-`refs/bugs/*` (the pre-2026-06-22 planner data). It stays in
-place as a **read-only window** until `cli-replace-shim`
-flips it to the Rust binary. The archived data covers:
-
-- Every status-update comment on each pre-cutover epic.
-- The five 2026-06-21 research tickets and their full closing
-  comments (the source of truth for the storage and sync
-  verdicts pinned in the current epic bodies).
-- Every closed child ticket (the workshop floor: subagent
-  finds, follow-ups, debate notes).
-
-Useful:
+The `bin/jjf` shim now delegates to the Rust binary (prefers
+`target/release/jjf`, falls back to `target/debug/jjf`, builds
+release on demand). To reach pre-2026-06-22 planner data on
+`refs/bugs/*`, use `git-bug` directly:
 
 ```bash
 git-bug bug show <old-7hex-id>      # one ticket
@@ -211,6 +202,13 @@ git-bug bug --label epic            # archived epics
 git-bug bug --label research        # the research record
 git-bug bug --status closed         # archived closed tickets
 ```
+
+The archived data covers every status-update comment on each
+pre-cutover epic, the five 2026-06-21 research tickets and
+their full closing comments (the source of truth for the
+storage and sync verdicts pinned in the current epic bodies),
+and every closed child ticket (the workshop floor: subagent
+finds, follow-ups, debate notes).
 
 The cutover doc at `docs/git-bug-cutover.md` carries the
 old → new id mapping and the historical-bug recipe.
@@ -611,7 +609,6 @@ is preserved in git and remains readable via `git-bug bug show
 rationale for "start fresh" vs. "migrate" — lives in
 `docs/git-bug-cutover.md` and in archived `d12031c`.
 
-The `bin/jjf` shell shim still points at `git-bug` as a
-read-only window into the archive; `cli-replace-shim`
-(under `epic:mvp-cli`, ticket `a5f8122`) flips it to the
-Rust binary.
+The `bin/jjf` shim now delegates to the Rust binary; reach
+the pre-cutover archive via `git-bug` directly. See the
+"Reading historical git-bug data" section above.
