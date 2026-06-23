@@ -22,9 +22,15 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use jjf_storage::{Error as StorageError, ISSUES_BOOKMARK};
+use jjf_storage::{Error as StorageError, ISSUES_BOOKMARK, Storage};
 
 use crate::CliError;
+
+/// The v1 bookmark name. If we see this AND no `issues` bookmark,
+/// the repo is pre-migration; calling `Storage::open` runs the
+/// inline v1→v2 rename. Kept duplicated here because the storage
+/// crate doesn't expose its `V1_BUGS_BOOKMARK` constant publicly.
+const V1_BUGS_BOOKMARK: &str = "bugs";
 
 /// Probe that `cwd` is inside a jj repo. Shells out to `jj workspace
 /// root` and translates the one specific "not a jj repo" stderr into
@@ -86,6 +92,26 @@ pub(crate) fn issues_bookmark(cwd: &Path) -> Result<(), CliError> {
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     if !stdout.lines().any(|l| l.trim() == ISSUES_BOOKMARK) {
+        // `issues` is absent. Before refusing, check if the v1
+        // `bugs` bookmark is present — if so, this is a v1 repo
+        // that hasn't been migrated yet; calling `Storage::open`
+        // triggers the inline v1→v2 rename in the storage layer.
+        // After the migration commits, `issues` exists and the
+        // verb proceeds normally on the next call.
+        let v1_out = Command::new("jj")
+            .arg("--repository")
+            .arg(cwd)
+            .args(["bookmark", "list", "-T", "name ++ \"\\n\"", V1_BUGS_BOOKMARK])
+            .output()
+            .map_err(CliError::Probe)?;
+        let v1_stdout = String::from_utf8_lossy(&v1_out.stdout);
+        if v1_out.status.success()
+            && v1_stdout.lines().any(|l| l.trim() == V1_BUGS_BOOKMARK)
+        {
+            let _ =
+                Storage::open(PathBuf::from(cwd)).map_err(CliError::Storage)?;
+            return Ok(());
+        }
         return Err(CliError::MissingIssuesBookmark(cwd.to_owned()));
     }
     Ok(())

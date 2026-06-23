@@ -43,7 +43,10 @@ use crate::record::Status;
 use crate::record::{Comment, Issue, IssueRecord};
 #[cfg(debug_assertions)]
 use crate::trailer::parse_ops;
-use crate::{issue_comments_relpath, issue_json_relpath, Error, Result, ISSUES_BOOKMARK_REVSET};
+use crate::{
+    issue_comments_relpath, issue_json_relpath, v1_issue_comments_relpath,
+    v1_issue_json_relpath, Error, Result, ISSUES_BOOKMARK_REVSET,
+};
 
 /// Read a single issue from the `issues` bookmark tip.
 ///
@@ -198,14 +201,17 @@ struct OpView {
 fn replay_ops(repo: &JjRepo, id: &IssueId) -> Result<OpView> {
     let json_relpath = issue_json_relpath(id);
     let comments_relpath = issue_comments_relpath(id);
-    // Filter on BOTH files. A naïve filter on just the json record
-    // misses commits whose only change was an append to the comments
-    // jsonl — which happens whenever the writer's `updated_at` lands
-    // in the same second as the prior mutation (the json content is
-    // then byte-identical and jj's snapshotter doesn't record a
-    // change). Spec §5.6 shows the json-only invocation as the
-    // example; this is a gap in the spec the read-path discovered.
-    // Following up in the closing comment.
+    let v1_json_relpath = v1_issue_json_relpath(id);
+    let v1_comments_relpath = v1_issue_comments_relpath(id);
+    // Filter spans all four paths (v1 + v2 × json + comments-jsonl).
+    // Same reasoning as `history.rs::read_history_at`:
+    //   - v1 paths catch pre-migration ops that touched `bugs/<id>.*`.
+    //     Without them, an issue created before the v1→v2 migration
+    //     drops its `create` op out of the replay chain and folds to
+    //     nothing.
+    //   - Both file kinds at each version: spec §5.6 — a comments-jsonl
+    //     append in the same second as a prior mutation produces no
+    //     json diff and gets missed if we filter only on the json file.
     let sep = "\n----JJF-DESC-END-c0ffee----\n";
     let template = format!("description ++ \"{}\"", sep.replace('\n', "\\n"));
     let raw = repo.run(&[
@@ -217,6 +223,8 @@ fn replay_ops(repo: &JjRepo, id: &IssueId) -> Result<OpView> {
         &template,
         &format!("root:{}", json_relpath.display()),
         &format!("root:{}", comments_relpath.display()),
+        &format!("root:{}", v1_json_relpath.display()),
+        &format!("root:{}", v1_comments_relpath.display()),
     ])?;
 
     // Newest-first → oldest-first.

@@ -1084,3 +1084,107 @@ fn list_ids_returns_three_bugs_sorted_with_no_duplicates() {
     sorted.sort();
     assert_eq!(ids, sorted, "ids must be sorted ascending");
 }
+
+/// V1 → v2 migration end-to-end: synthesize a pre-migration repo by
+/// renaming a freshly-created v2 repo back to the v1 shape (paths
+/// `bugs/<id>.*` and bookmark `bugs`), then call `Storage::open` and
+/// assert the migration runs AND post-migration `Storage::read`
+/// finds the issue's full history.
+///
+/// This catches the regression that shipped in commit 20efe38: the
+/// migration renamed paths correctly but the read-side path filter
+/// only looked at `issues/<id>.*` — every pre-migration commit
+/// (containing the `create` op for the issue) dropped out of the
+/// chain and `read` failed with "no `create` op found."
+#[test]
+fn v1_to_v2_migration_preserves_history() {
+    let repo = make_scratch_repo("v1_to_v2_migration_preserves_history");
+
+    // Create an issue in v2 form so we have real `Jjf-Op:` trailers
+    // and real on-disk record files. Land two ops (create + close)
+    // so the history walker has a non-trivial chain to follow.
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "synthetic v1 issue".into(),
+            ..IssueDraft::default()
+        })
+        .unwrap();
+    storage.set_status(&id, Status::Closed).unwrap();
+    drop(storage);
+
+    // Rewrite the bookmark + paths to look like v1. We're synthesizing
+    // a pre-migration state from a known-good post-migration state.
+    // Three jj operations: rename the bookmark, move the files, then
+    // step off (so the next Storage::open sees a clean working copy).
+    let json_old = format!("issues/{}.json", id);
+    let comments_old = format!("issues/{}.comments.jsonl", id);
+    let json_new = format!("bugs/{}.json", id);
+    let comments_new = format!("bugs/{}.comments.jsonl", id);
+
+    // Edit the bookmark tip: a new commit that moves the files from
+    // issues/ to bugs/. This is the inverse of the migration commit
+    // the storage layer produces.
+    sh("jj", &["new", "bookmarks(issues)", "-m", "synthesize v1 layout"], &repo);
+    fs::create_dir_all(repo.join("bugs")).unwrap();
+    fs::rename(repo.join(&json_old), repo.join(&json_new)).unwrap();
+    fs::rename(repo.join(&comments_old), repo.join(&comments_new)).unwrap();
+    let _ = fs::remove_dir(repo.join("issues"));
+
+    // Rename bookmark issues → bugs.
+    sh("jj", &["bookmark", "create", "bugs", "-r", "@"], &repo);
+    sh("jj", &["bookmark", "delete", "issues"], &repo);
+    sh("jj", &["new", "root()"], &repo);
+
+    // Sanity check: we're now in v1 shape.
+    let bookmarks = jj_capture(
+        &["bookmark", "list", "-T", "name ++ \"\\n\""],
+        &repo,
+    );
+    assert!(
+        bookmarks.lines().any(|l| l.trim() == "bugs"),
+        "synthesized v1 must have a `bugs` bookmark, got:\n{bookmarks}"
+    );
+    assert!(
+        !bookmarks.lines().any(|l| l.trim() == "issues"),
+        "synthesized v1 must NOT have an `issues` bookmark, got:\n{bookmarks}"
+    );
+
+    // The actual test: Storage::open detects v1, runs the migration,
+    // and Storage::read succeeds with the full chain (NOT just the
+    // migration commit — the original create + set-status ops must
+    // be found via the v1 path filter).
+    let storage = Storage::open(&repo).expect("Storage::open must succeed on v1 repo");
+    let bug = storage
+        .read(&id)
+        .expect("Storage::read must succeed post-migration; the read-side path filter must include the v1 `bugs/` paths so pre-migration commits are visible");
+    assert_eq!(bug.title, "synthetic v1 issue");
+    assert_eq!(bug.status, Status::Closed);
+
+    // Bookmark renamed.
+    let bookmarks_post = jj_capture(
+        &["bookmark", "list", "-T", "name ++ \"\\n\""],
+        &repo,
+    );
+    assert!(
+        bookmarks_post.lines().any(|l| l.trim() == "issues"),
+        "post-migration must have an `issues` bookmark, got:\n{bookmarks_post}"
+    );
+
+    // History reader sees the full chain (create + set-status +
+    // migration commit's op-free description = at least 2 trailer
+    // entries: create's multi-op stanza, set-status).
+    let history = storage.read_history(&id).expect("history readable after migration");
+    let has_create = history.iter().any(|h| matches!(h.op, Op::Create { .. }));
+    let has_set_status = history.iter().any(|h| matches!(h.op, Op::SetStatus { .. }));
+    assert!(
+        has_create,
+        "history must include the original `create` op; the v1 path filter is what makes it visible. got {} entries",
+        history.len()
+    );
+    assert!(
+        has_set_status,
+        "history must include the `set-status` op landed before the synthesized v1 rewrite. got {} entries",
+        history.len()
+    );
+}

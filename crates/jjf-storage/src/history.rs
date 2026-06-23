@@ -20,7 +20,10 @@ use crate::id::IssueId;
 use crate::jj::JjRepo;
 use crate::op::Op;
 use crate::trailer::parse_ops_with_meta;
-use crate::{issue_comments_relpath, issue_json_relpath, Error, Result};
+use crate::{
+    issue_comments_relpath, issue_json_relpath, v1_issue_comments_relpath,
+    v1_issue_json_relpath, Error, Result,
+};
 
 /// One row of the op-by-op timeline.
 ///
@@ -88,15 +91,23 @@ pub(crate) fn read_history_at(
 ) -> Result<Vec<HistoryEntry>> {
     let json_relpath = issue_json_relpath(id);
     let comments_relpath = issue_comments_relpath(id);
+    let v1_json_relpath = v1_issue_json_relpath(id);
+    let v1_comments_relpath = v1_issue_comments_relpath(id);
 
-    // Same path filter as `read.rs`'s replay query: filter on BOTH the
-    // json record AND the comments jsonl. A naïve filter on just the
-    // json record misses commits whose only change was an append to
-    // the comments jsonl — which happens whenever the writer's
-    // `updated_at` rewrite lands in the same second as the prior
-    // mutation (the json content is then byte-identical and jj's
-    // snapshotter doesn't record a change). See spec §5.6 and the
-    // closing comment on `b650d74`.
+    // Path filter spans four files for v1+v2 coverage:
+    //   - Current v2 paths (`issues/<id>.json`, `issues/<id>.comments.jsonl`).
+    //   - Pre-migration v1 paths (`bugs/<id>.json`, `bugs/<id>.comments.jsonl`).
+    //
+    // The v1 paths are needed because the inline v1→v2 migration
+    // commit renames the file; ancestor commits still touched the old
+    // path. Without the v1 filter entry, the walker drops every
+    // pre-migration op out of the chain and `read.rs`'s replay can't
+    // find the issue's `create` op.
+    //
+    // Filtering on BOTH json AND comments-jsonl at each version is the
+    // same reason as spec §5.6: a commit whose only change is a
+    // comments-jsonl append (same-second `updated_at`, json content
+    // byte-identical, no jj snapshot) would otherwise be missed.
     //
     // We emit one record per commit, packing four fields delimited by
     // a per-field sentinel and a per-record terminator. The sentinels
@@ -127,6 +138,8 @@ pub(crate) fn read_history_at(
         &template,
         &format!("root:{}", json_relpath.display()),
         &format!("root:{}", comments_relpath.display()),
+        &format!("root:{}", v1_json_relpath.display()),
+        &format!("root:{}", v1_comments_relpath.display()),
     ])?;
 
     // jj emits records newest-first; we want oldest-first.

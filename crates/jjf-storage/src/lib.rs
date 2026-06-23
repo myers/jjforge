@@ -1226,6 +1226,22 @@ pub(crate) fn issue_comments_relpath(id: &IssueId) -> PathBuf {
     PathBuf::from("issues").join(format!("{}.comments.jsonl", id))
 }
 
+/// Pre-migration v1 path of an issue's JSON record. The migration
+/// commit (`Storage::maybe_migrate_v1_to_v2`) renames `bugs/<id>.*`
+/// to `issues/<id>.*` on a single commit, but commits *prior* to
+/// the migration touched the v1 paths. The history walker and read
+/// replay query include BOTH paths in their `jj log` filter so they
+/// don't drop pre-migration ops out of the per-issue chain.
+pub(crate) fn v1_issue_json_relpath(id: &IssueId) -> PathBuf {
+    PathBuf::from("bugs").join(format!("{}.json", id))
+}
+
+/// Pre-migration v1 path of an issue's comments file. See
+/// [`v1_issue_json_relpath`] for why both paths are needed.
+pub(crate) fn v1_issue_comments_relpath(id: &IssueId) -> PathBuf {
+    PathBuf::from("bugs").join(format!("{}.comments.jsonl", id))
+}
+
 fn write_record_json(path: &Path, record: &IssueRecord) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
