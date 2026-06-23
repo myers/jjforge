@@ -213,6 +213,25 @@ Until that lands: the skill auto-loads and gives the right
 discipline, but mentally translate `git-bug X` → `jjf X` when
 following its instructions.
 
+## User-facing prompts
+
+When asking the user a multiple-choice question, **label options
+A / B / C / D, never 1 / 2 / 3**. The Claude Code UI uses
+digits on the same input line as the LLM conversation as
+quality-survey responses; if the orchestrator offers options
+"1)" / "2)" / "3)" and the user types "2", the digit may be
+captured by the survey UI before it reaches the conversation,
+silently desynchronizing the user's choice from what the
+orchestrator thinks they picked. Letters route cleanly through
+the conversation channel every time.
+
+Example:
+> Three options for the type field:
+> - **A. Label by convention.** Cheap, no schema change…
+> - **B. First-class `type` field.** Spec bump…
+> - **C. Mandated label on create.** Forced discipline…
+> Which path?
+
 If you're dispatching subagents and the skill isn't loading,
 name it explicitly in the dispatch prompt.
 
