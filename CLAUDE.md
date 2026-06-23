@@ -60,6 +60,25 @@ of this file.
   itself plus child tickets when they're filed). Use the
   colon-prefixed form always.
 
+### Epics vs child issues
+
+Epics describe a **goal**: what "done" looks like, the approach
+sketch, dependency edges to other epics. Child tickets are
+**how we get there** — each one a unit of work.
+
+Keep the two layers separate. The epic body must NOT enumerate
+its children or absorb their findings: no "Child tickets:
+`abc1234` — …" lists, no "Post-X sweep" subsections naming the
+shipped tickets. The child inventory is discovered via
+`jjf ls --label epic:<slug> --status all`; the epic body is
+stable across the life of the epic.
+
+When closing an epic, the body's status section gets a "Done
+as of YYYY-MM-DD" stamp and at most a one-line summary. Per-
+ticket details belong in the child commits, their closing
+comments, and roadmap status comments. Surface a child's
+verdict to the epic via a status comment, not a body edit.
+
 ### Creating a new issue
 
 Use `-F -` to read the body from stdin (the recommended pattern
