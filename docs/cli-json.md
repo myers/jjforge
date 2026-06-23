@@ -466,6 +466,7 @@ from plain-text mode (see the top comment in `main.rs`: `0` success,
 | `already_claimed`            | 2    | `Storage::AlreadyClaimed` / `AlreadyClaimed` | `by` |
 | `no_current_user`            | 2    | `NoCurrentUser`               | —                        |
 | `claim_requires_limit_one`   | 2    | `ClaimRequiresLimitOne`       | —                        |
+| `self_dependency`            | 2    | `Storage::SelfDependency` / `SelfDependency` | `id`                 |
 
 Adding a new variant to `CliError`? Pick a stable kind, add it to
 the `kind()` match in `main.rs`, add a row above, and add a
@@ -510,6 +511,48 @@ argv is a NUL-terminated C string array, so a shell-typed
 `jjf new -t $'a\x00b'` actually loses the bytes after the
 null in the shell's argv expansion before `jjf` sees them —
 the storage-side guard catches it for every other entry point.
+
+### Note on `self_dependency`
+
+Emitted by `jjf dep add <child> <target>` (and the inline
+`jjf new -d <self-id>` / `jjf new --dep <kind>:<self-id>`
+on-create forms) when `<child> == <target>`. Preflight failure
+(exit 2). Added in `qa-dep-validation` (issue `d1a01f0`) after
+a QA red-team round found that `jjf dep add A A` would silently
+land a `blocks`-edge from A to itself — making A permanently
+blocked-by-itself and excluding it from `jjf ready` forever (a
+one-line DoS).
+
+The check applies to every dep kind: `blocks` is the
+load-bearing case (the self-block DoS), but `parent-child`,
+`related`, and `discovered-from` self-edges are nonsense in
+all four cases and reject uniformly.
+
+`details.id` is the offending issue id (the resolved child id,
+which equals the resolved target id by definition).
+
+The companion validation — phantom dep targets — reuses the
+existing `issue_not_found` kind (no new kind needed): the
+target failed to resolve on the bookmark, so it's surfaced the
+same way as `jjf show <bogus-id>`. That kind is exit 1
+(runtime: well-formed input, just doesn't exist), not exit 2
+like `self_dependency`. Scripts pattern-match on the kind;
+the exit code distinguishes preflight from runtime.
+
+```sh
+$ jjf --json dep add a3f9c01 a3f9c01
+{"ok":false,"error":{"kind":"self_dependency","message":"issue a3f9c01 cannot depend on itself","details":{"id":"a3f9c01"}}}
+
+$ jjf --json dep add a3f9c01 deadbee   # phantom target
+{"ok":false,"error":{"kind":"issue_not_found","message":"issue not found in working copy: deadbee","details":{"id":"deadbee"}}}
+
+$ jjf --json new -t "child" -d deadbee -F -
+{"ok":false,"error":{"kind":"issue_not_found","message":"issue not found in working copy: deadbee","details":{"id":"deadbee"}}}
+```
+
+`jjf dep rm` is intentionally permissive against phantom
+targets — removing an edge that doesn't exist is a useful
+cleanup primitive and never lands a dangling edge.
 
 ### Note on `self_hosted_write_refused`
 

@@ -301,6 +301,184 @@ fn new_with_unknown_dep_kind_is_preflight_failure() {
     assert_eq!(v["error"]["kind"], "bad_dep_kind");
 }
 
+// ---- qa-dep-validation (d1a01f0) ------------------------------------
+// Both rejection paths land at the CLI envelope: phantom dep target
+// surfaces as `issue_not_found` (the existing kind, reused per the
+// ticket); self-dep surfaces as `self_dependency` (new).
+// ---------------------------------------------------------------------
+
+#[test]
+fn dep_add_phantom_target_exits_with_issue_not_found() {
+    let repo = make_initialized_repo("dep_add_phantom_target");
+    let child = create_issue(&repo, "child");
+    // `deadbee` is a well-formed 7-hex id that has never existed.
+    let out = run_jjf(&repo, &["--json", "dep", "add", &child, "deadbee"]);
+    // `issue_not_found` is exit 1 (runtime) per the established
+    // convention: a well-formed id that just doesn't exist isn't a
+    // preflight failure. The kind is the load-bearing signal scripts
+    // match on; the code distinguishes preflight from runtime.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected exit 1, got code={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let v: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("json error envelope");
+    assert_eq!(v["error"]["kind"], "issue_not_found");
+    assert_eq!(v["error"]["details"]["id"], "deadbee");
+
+    // Verify no dep edge landed on the child.
+    let show = run_jjf(&repo, &["show", &child]);
+    let show_out = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        !show_out.contains("blocks: deadbee"),
+        "rejected dep_add must not land an edge, got: {show_out}"
+    );
+}
+
+#[test]
+fn dep_add_self_target_exits_2_with_self_dependency() {
+    let repo = make_initialized_repo("dep_add_self_target");
+    let child = create_issue(&repo, "self-targeted");
+    let out = run_jjf(&repo, &["--json", "dep", "add", &child, &child]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected exit 2, got code={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let v: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("json error envelope");
+    assert_eq!(v["error"]["kind"], "self_dependency");
+    assert_eq!(v["error"]["details"]["id"], child.as_str());
+
+    let show = run_jjf(&repo, &["show", &child]);
+    let show_out = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        !show_out.contains(&format!("blocks: {child}")),
+        "rejected self-dep must not land an edge, got: {show_out}"
+    );
+}
+
+#[test]
+fn dep_add_self_target_rejected_for_all_kinds() {
+    let repo = make_initialized_repo("dep_add_self_all_kinds");
+    let child = create_issue(&repo, "all-kinds-self");
+    for kind in &["blocks", "parent-child", "related", "discovered-from"] {
+        let out = run_jjf(
+            &repo,
+            &["--json", "dep", "add", &child, &child, "--kind", kind],
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "kind={kind}: expected exit 2, got code={:?} stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let v: serde_json::Value =
+            serde_json::from_str(stderr.trim()).expect("json error envelope");
+        assert_eq!(v["error"]["kind"], "self_dependency", "kind={kind}");
+    }
+}
+
+#[test]
+fn new_with_phantom_dep_target_exits_with_issue_not_found() {
+    // `jjf new -d <phantom>` — bare 7-hex form, default `blocks`
+    // semantics — must reject at create time.
+    let repo = make_initialized_repo("new_phantom_dep_bare");
+    let out = run_jjf_with_stdin(
+        &repo,
+        &["--json", "new", "-t", "depends on ghost", "-d", "deadbee", "-F", "-"],
+        b"",
+    );
+    // `issue_not_found` is exit 1 (runtime) per the established
+    // convention: a well-formed id that just doesn't exist isn't a
+    // preflight failure. The kind is the load-bearing signal scripts
+    // match on; the code distinguishes preflight from runtime.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected exit 1, got code={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let v: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("json error envelope");
+    assert_eq!(v["error"]["kind"], "issue_not_found");
+    assert_eq!(v["error"]["details"]["id"], "deadbee");
+
+    // `jjf ls` must show no issues.
+    let ls = run_jjf(&repo, &["--json", "ls", "--status", "all"]);
+    let ls_out = String::from_utf8_lossy(&ls.stdout);
+    let v: serde_json::Value = serde_json::from_str(ls_out.trim()).expect("ls json");
+    let items = v.as_array().expect("ls array");
+    assert!(
+        items.is_empty(),
+        "rejected create must not land an issue, got: {ls_out}"
+    );
+}
+
+#[test]
+fn new_with_inline_phantom_dep_kind_exits_with_issue_not_found() {
+    // `jjf new --dep blocks:<phantom>` — explicit-kind form. The
+    // dep kind parses fine; the target doesn't exist; reject.
+    let repo = make_initialized_repo("new_phantom_dep_kind");
+    let out = run_jjf_with_stdin(
+        &repo,
+        &[
+            "--json",
+            "new",
+            "-t",
+            "depends on ghost",
+            "-d",
+            "blocks:deadbee",
+            "-F",
+            "-",
+        ],
+        b"",
+    );
+    // `issue_not_found` is exit 1 (runtime) per the established
+    // convention: a well-formed id that just doesn't exist isn't a
+    // preflight failure. The kind is the load-bearing signal scripts
+    // match on; the code distinguishes preflight from runtime.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected exit 1, got code={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let v: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("json error envelope");
+    assert_eq!(v["error"]["kind"], "issue_not_found");
+    assert_eq!(v["error"]["details"]["id"], "deadbee");
+}
+
+#[test]
+fn dep_rm_against_phantom_target_succeeds_as_noop() {
+    // `jjf dep rm A <phantom>` is permissive — removing a
+    // non-existent edge is a useful cleanup primitive. Don't
+    // adopt the strict validation here.
+    let repo = make_initialized_repo("dep_rm_phantom_noop");
+    let child = create_issue(&repo, "real child");
+    let out = run_jjf(&repo, &["dep", "rm", &child, "deadbee"]);
+    assert!(
+        out.status.success(),
+        "dep rm against phantom should succeed, got code={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn ready_excludes_child_of_blocked_parent_via_cascade() {
     // Setup: blocker (open) → parent (open, blocked by blocker) →

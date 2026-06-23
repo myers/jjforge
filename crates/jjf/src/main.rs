@@ -1057,6 +1057,23 @@ enum CliError {
         reason: TitleInvalidReason,
     },
 
+    /// `jjf dep add <X> <X>` (or the inline `jjf new -d <self-id>`)
+    /// was asked to land an edge from an issue to itself. Self-deps
+    /// make the child permanently blocked by itself, so the
+    /// boundary rejects them. Preflight failure (exit 2). The
+    /// `id` field is the offending issue id, echoed back so the
+    /// operator can correct the call. Added in
+    /// `qa-dep-validation` (issue `d1a01f0`).
+    ///
+    /// In practice the storage layer's
+    /// [`StorageError::SelfDependency`] surfaces this case — the
+    /// CLI-side variant stays defined so future callers (the
+    /// upcoming MCP server, scripted batch creators) can construct
+    /// it directly without going through `Storage`.
+    #[allow(dead_code)]
+    #[error("issue {id} cannot depend on itself")]
+    SelfDependency { id: String },
+
     /// A slug write would collide with an existing open issue.
     /// Preflight failure (exit 2). `conflicts_with` is the id of
     /// the open issue already holding the slug.
@@ -1145,6 +1162,7 @@ impl CliError {
             CliError::Storage(StorageError::SlugCollision { .. }) => 2,
             CliError::Storage(StorageError::SlugNotFound { .. }) => 2,
             CliError::Storage(StorageError::AlreadyClaimed { .. }) => 2,
+            CliError::Storage(StorageError::SelfDependency { .. }) => 2,
             CliError::Cwd(_) => 2,
             CliError::BodyRead { .. } => 2,
             CliError::BadDepId { .. } => 2,
@@ -1160,6 +1178,7 @@ impl CliError {
             CliError::SelfHostedWriteRefused { .. } => 2,
             CliError::InvalidSlug { .. } => 2,
             CliError::InvalidTitle { .. } => 2,
+            CliError::SelfDependency { .. } => 2,
             CliError::SlugCollision { .. } => 2,
             CliError::SlugNotFound { .. } => 2,
             CliError::MissingMemoryValue => 2,
@@ -1209,8 +1228,10 @@ impl CliError {
             CliError::Storage(StorageError::SlugCollision { .. }) => "slug_collision",
             CliError::Storage(StorageError::SlugNotFound { .. }) => "slug_not_found",
             CliError::Storage(StorageError::AlreadyClaimed { .. }) => "already_claimed",
+            CliError::Storage(StorageError::SelfDependency { .. }) => "self_dependency",
             CliError::InvalidSlug { .. } => "invalid_slug",
             CliError::InvalidTitle { .. } => "invalid_title",
+            CliError::SelfDependency { .. } => "self_dependency",
             CliError::SlugCollision { .. } => "slug_collision",
             CliError::SlugNotFound { .. } => "slug_not_found",
             CliError::MissingMemoryValue => "missing_memory_value",
@@ -1327,6 +1348,10 @@ impl CliError {
             CliError::MemoryNotFound { key } => json!({ "key": key }),
             CliError::Storage(StorageError::AlreadyClaimed { by })
             | CliError::AlreadyClaimed { by } => json!({ "by": by }),
+            CliError::Storage(StorageError::SelfDependency { id }) => {
+                json!({ "id": id.as_str() })
+            }
+            CliError::SelfDependency { id } => json!({ "id": id }),
             _ => serde_json::Value::Null,
         }
     }

@@ -1823,24 +1823,66 @@ fn list_ready_limit_clamps_after_sort() {
 #[test]
 fn list_ready_dangling_dependency_does_not_block() {
     // A dangling dep id (one that doesn't exist on the bookmark)
-    // shouldn't wedge progress — a deleted/mistyped dep would
-    // otherwise lock the issue out of `ready` forever. Closed-or-
-    // dangling both pass; only open-and-extant blocks.
+    // shouldn't wedge progress — a deleted dep would otherwise
+    // lock the issue out of `ready` forever. Closed-or-dangling
+    // both pass; only open-and-extant blocks.
+    //
+    // v2.x (`qa-dep-validation`, issue `d1a01f0`): the write path
+    // now rejects phantom dep targets at `Storage::add_dep_edge`
+    // / `Storage::create_issue` boundary, so a dangling dep can
+    // only arise post-creation (a sibling repo pulled, then the
+    // target's record was dropped upstream). We construct that
+    // scenario explicitly: create A, hang a dep on A from B, then
+    // drop A's record from the bookmark via raw `jj` commands,
+    // and verify `list_ready` still returns B.
     let repo = make_scratch_repo("ready_dangling_dep");
     let storage = Storage::open(&repo).unwrap();
-    let phantom = IssueId::parse("deadbee").unwrap();
-    let issue = storage
+
+    let target = storage
         .create_issue(&IssueDraft {
-            title: "depends on a ghost".into(),
+            title: "real target".into(),
             type_: Some(IssueType::Bug),
-            dependencies: vec![DepEdge::blocks(phantom)],
             ..Default::default()
         })
         .unwrap();
+    let depender = storage
+        .create_issue(&IssueDraft {
+            title: "depender".into(),
+            type_: Some(IssueType::Bug),
+            ..Default::default()
+        })
+        .unwrap();
+    storage
+        .add_dep_edge(&depender, &target, DepKind::Blocks)
+        .unwrap();
 
+    // Drop the target's record from the bookmark with a raw jj
+    // commit. This simulates the post-merge state where the
+    // target's file disappeared upstream (an admin force-cleaned
+    // a stale record, the merge driver dropped it, etc.). We
+    // mirror the 4-CLI dance the storage layer uses for writes.
+    sh(
+        "jj",
+        &["new", "bookmarks(issues)", "-m", "drop dangling target"],
+        &repo,
+    );
+    fs::remove_file(repo.join("issues").join(format!("{}.json", target))).unwrap();
+    // Snapshot the working copy into the new commit, then move
+    // the bookmark forward and step the working copy back to root
+    // so the next storage write doesn't snapshot stale state.
+    sh(
+        "jj",
+        &["bookmark", "set", "issues", "-r", "@", "--allow-backwards"],
+        &repo,
+    );
+    sh("jj", &["new", "root()"], &repo);
+
+    // Re-open storage to drop the snapshot memo so the next read
+    // re-probes the bookmark and sees the dropped target.
+    let storage = Storage::open(&repo).unwrap();
     let ready = storage.list_ready(&ReadyFilter::default()).unwrap();
-    assert_eq!(ready.len(), 1);
-    assert_eq!(ready[0].id, issue);
+    assert_eq!(ready.len(), 1, "expected only the depender: {ready:#?}");
+    assert_eq!(ready[0].id, depender);
 }
 
 #[test]
@@ -3160,4 +3202,155 @@ fn validate_title_accepts_unicode_and_punctuation() {
             "validator wrongly rejected {t:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// qa-dep-validation (d1a01f0): the write path rejects phantom dep
+// targets and self-deps at the storage boundary. Both checks fire
+// BEFORE any mutating IO so a rejection leaves the bookmark
+// untouched.
+// ---------------------------------------------------------------------
+
+#[test]
+fn add_dep_edge_with_phantom_target_rejects_with_issue_not_found() {
+    // `jjf dep add A <phantom>` — `<phantom>` has never existed on
+    // the bookmark. Pre-validation rejects so the trailer doesn't
+    // land.
+    let repo = make_scratch_repo("dep_phantom_target_rejects");
+    let storage = Storage::open(&repo).unwrap();
+
+    let real = storage
+        .create_issue(&IssueDraft {
+            title: "real child".into(),
+            type_: Some(IssueType::Bug),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let phantom = IssueId::parse("deadbee").unwrap();
+    let err = storage
+        .add_dep_edge(&real, &phantom, DepKind::Blocks)
+        .unwrap_err();
+    match err {
+        StorageError::IssueNotFound(id) => assert_eq!(id, phantom),
+        other => panic!("expected IssueNotFound, got {other:?}"),
+    }
+
+    // The depender's record must have no dep edges.
+    let after = storage.read(&real).unwrap();
+    assert!(
+        after.dependencies.is_empty(),
+        "rejected dep_add must not land an edge: {:?}",
+        after.dependencies,
+    );
+}
+
+#[test]
+fn add_dep_edge_with_self_target_rejects_with_self_dependency() {
+    // `jjf dep add A A` — self-dep would make A permanently
+    // blocked by itself. Reject at the boundary; no commit.
+    let repo = make_scratch_repo("dep_self_rejects");
+    let storage = Storage::open(&repo).unwrap();
+
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "would self-block".into(),
+            type_: Some(IssueType::Bug),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let err = storage.add_dep_edge(&id, &id, DepKind::Blocks).unwrap_err();
+    match err {
+        StorageError::SelfDependency { id: bad } => assert_eq!(bad, id),
+        other => panic!("expected SelfDependency, got {other:?}"),
+    }
+
+    let after = storage.read(&id).unwrap();
+    assert!(
+        after.dependencies.is_empty(),
+        "rejected self-dep must not land an edge: {:?}",
+        after.dependencies,
+    );
+}
+
+#[test]
+fn add_dep_edge_self_dep_rejected_for_all_kinds() {
+    // Self-dep nonsense applies to every kind: blocks self-blocks,
+    // parent-child self-parents, related/discovered-from are
+    // nonsense pointing at self. Reject uniformly.
+    let repo = make_scratch_repo("dep_self_all_kinds");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "self-only".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+
+    for kind in [
+        DepKind::Blocks,
+        DepKind::ParentChild,
+        DepKind::Related,
+        DepKind::DiscoveredFrom,
+    ] {
+        let err = storage.add_dep_edge(&id, &id, kind).unwrap_err();
+        assert!(
+            matches!(err, StorageError::SelfDependency { .. }),
+            "kind={kind:?}: expected SelfDependency, got {err:?}",
+        );
+    }
+}
+
+#[test]
+fn create_issue_with_phantom_dep_target_rejects() {
+    // `jjf new -d <phantom>` — the inline-on-create form. Validate
+    // each dep target at create time so the resulting record can't
+    // carry a dangling edge.
+    let repo = make_scratch_repo("create_phantom_dep_rejects");
+    let storage = Storage::open(&repo).unwrap();
+    let phantom = IssueId::parse("deadbee").unwrap();
+
+    let err = storage
+        .create_issue(&IssueDraft {
+            title: "depends on a ghost".into(),
+            type_: Some(IssueType::Bug),
+            dependencies: vec![DepEdge::blocks(phantom.clone())],
+            ..Default::default()
+        })
+        .unwrap_err();
+    match err {
+        StorageError::IssueNotFound(id) => assert_eq!(id, phantom),
+        other => panic!("expected IssueNotFound, got {other:?}"),
+    }
+
+    // The bookmark must not now contain any issue.
+    let ready = storage.list_ready(&ReadyFilter::default()).unwrap();
+    assert!(
+        ready.is_empty(),
+        "rejected create_issue must not land a record: {ready:#?}",
+    );
+}
+
+#[test]
+fn remove_dep_edge_against_phantom_target_is_no_op() {
+    // `jjf dep rm` against a dep target that doesn't resolve is
+    // permissive — removing a non-existent edge is harmless and
+    // useful for cleanup. The op-side `retain` is a no-op when no
+    // edge matches.
+    let repo = make_scratch_repo("dep_rm_phantom_noop");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "real".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let phantom = IssueId::parse("deadbee").unwrap();
+
+    // Should not error.
+    storage
+        .remove_dep_edge(&id, &phantom, DepKind::Blocks)
+        .expect("remove_dep_edge against phantom must not error");
 }

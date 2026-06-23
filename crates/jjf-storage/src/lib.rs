@@ -205,6 +205,17 @@ pub enum Error {
     /// v2.3 (`agent-claim-atomic`).
     #[error("issue already claimed by {by:?}")]
     AlreadyClaimed { by: String },
+
+    /// `Storage::add_dep_edge` (and `create_issue` at draft-time)
+    /// was asked to add an edge where the child and target are the
+    /// same issue. A self-dep makes the issue permanently
+    /// `blocks`-blocked by itself (a one-line DoS); the other dep
+    /// kinds (parent-child, related, discovered-from) are nonsense
+    /// applied to self. Reject all kinds at the boundary. The CLI
+    /// envelope kind is `self_dependency`. v2.x
+    /// (`qa-dep-validation`, issue `d1a01f0`).
+    #[error("issue {id} cannot depend on itself")]
+    SelfDependency { id: IssueId },
 }
 
 /// Filter bundle for [`Storage::list_ready`].
@@ -970,6 +981,19 @@ impl Storage {
             });
         }
 
+        // Validate each dep target exists on the bookmark. The
+        // child id isn't known yet (it's rerolled below), so
+        // self-dep is structurally impossible at create time;
+        // only phantom-target rejection applies. v2.x
+        // (`qa-dep-validation`, issue `d1a01f0`): without this, `jjf
+        // new -d <fake-id>` (and `jjf new --dep blocks:<fake-id>`)
+        // silently lands a dangling edge in the new issue's record.
+        for edge in &draft.dependencies {
+            if !self.issue_exists_on_bookmark(&edge.target)? {
+                return Err(Error::IssueNotFound(edge.target.clone()));
+            }
+        }
+
         // Pre-validate the slug, if any, BEFORE the (cheap) id reroll
         // and the (expensive) uniqueness probe. The first check is
         // purely local; the second is a list-and-read across every
@@ -1548,12 +1572,27 @@ impl Storage {
     /// kind)` pair can't appear twice — the in-memory record dedupes —
     /// but a fresh `dep-add` op still lands so the audit log records
     /// intent. v2.4 (`agent-dep-types`).
+    ///
+    /// Validation (v2.x `qa-dep-validation`, issue `d1a01f0`):
+    ///
+    /// - `child == target` is rejected with `Error::SelfDependency`
+    ///   (self-deps make the issue permanently blocked by itself).
+    /// - `target` is resolved against the bookmark; if it's not
+    ///   present, return `Error::IssueNotFound { id: target }`. Both
+    ///   checks happen before any mutating IO so a rejection leaves
+    ///   the bookmark untouched.
     pub fn add_dep_edge(
         &self,
         id: &IssueId,
         target: &IssueId,
         kind: DepKind,
     ) -> Result<()> {
+        if id == target {
+            return Err(Error::SelfDependency { id: id.clone() });
+        }
+        if !self.issue_exists_on_bookmark(target)? {
+            return Err(Error::IssueNotFound(target.clone()));
+        }
         let target = target.clone();
         self.mutate(id, &format!("jjf: issue {} - dep-add", id), |rec| {
             let edge = DepEdge {
