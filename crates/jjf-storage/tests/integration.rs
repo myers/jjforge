@@ -434,10 +434,7 @@ fn read_then_serialize_byte_equals_on_disk_record() {
         title: &bug.title,
         slug: bug.slug.as_deref(),
         body: &bug.body,
-        status: match bug.status {
-            Status::Open => "open",
-            Status::Closed => "closed",
-        },
+        status: bug.status.as_str(),
         type_: bug.type_.as_str(),
         labels: &bug.labels,
         dependencies: &bug.dependencies,
@@ -2173,4 +2170,280 @@ fn memory_ops_do_not_pollute_issue_history() {
         hist.iter().all(|e| !matches!(e.op, Op::Merge { .. })),
         "no merge ops expected, got {hist:?}"
     );
+}
+
+// ---- agent-claim-atomic (v2.3) ---------------------------------------
+
+#[test]
+fn claim_lands_set_assignee_and_set_status_in_one_commit() {
+    // The headline acceptance criterion: `Storage::claim` sets
+    // assignee + status=in-progress in ONE commit carrying TWO
+    // `Jjf-Op:` trailers.
+    let repo = make_scratch_repo("claim_atomic_one_commit");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "claim me".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let baseline = storage.read_history(&id).unwrap().len();
+
+    storage.claim(&id, "alice").unwrap();
+
+    // Record state.
+    let issue = storage.read(&id).unwrap();
+    assert_eq!(issue.assignee.as_deref(), Some("alice"));
+    assert_eq!(issue.status, Status::InProgress);
+
+    // History: two new ops on ONE commit.
+    let hist = storage.read_history(&id).unwrap();
+    let new = &hist[baseline..];
+    assert_eq!(
+        new.len(),
+        2,
+        "expected two ops (set-assignee + set-status), got {new:#?}"
+    );
+    let commit = &new[0].commit;
+    assert!(
+        new.iter().all(|e| &e.commit == commit),
+        "both new ops must share ONE commit: {new:#?}"
+    );
+    assert!(matches!(
+        new[0].op,
+        Op::SetAssignee {
+            assignee: Some(ref a),
+            ..
+        } if a == "alice"
+    ));
+    assert!(matches!(
+        new[1].op,
+        Op::SetStatus {
+            status: Status::InProgress,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn claim_idempotent_same_user_is_no_op() {
+    // Re-claiming an already-claimed issue by the SAME user is a
+    // no-op: returns Ok(()) without writing a new commit.
+    let repo = make_scratch_repo("claim_idempotent_same_user");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.claim(&id, "alice").unwrap();
+    let after_first = storage.read_history(&id).unwrap().len();
+    storage.claim(&id, "alice").unwrap();
+    let after_second = storage.read_history(&id).unwrap().len();
+    assert_eq!(
+        after_first, after_second,
+        "second claim by same user must not write a new commit"
+    );
+}
+
+#[test]
+fn claim_different_user_errors_with_already_claimed() {
+    let repo = make_scratch_repo("claim_different_user");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.claim(&id, "alice").unwrap();
+    let err = storage.claim(&id, "bob").unwrap_err();
+    match err {
+        StorageError::AlreadyClaimed { by } => {
+            assert_eq!(by, "alice");
+        }
+        other => panic!("expected AlreadyClaimed, got {other:?}"),
+    }
+}
+
+#[test]
+fn unclaim_clears_assignee_and_status_to_open() {
+    let repo = make_scratch_repo("unclaim_round_trip");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.claim(&id, "alice").unwrap();
+    storage.unclaim(&id).unwrap();
+    let issue = storage.read(&id).unwrap();
+    assert_eq!(issue.assignee, None);
+    assert_eq!(issue.status, Status::Open);
+}
+
+#[test]
+fn unclaim_lands_two_trailers_on_one_commit() {
+    let repo = make_scratch_repo("unclaim_one_commit");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.claim(&id, "alice").unwrap();
+    let before_unclaim = storage.read_history(&id).unwrap().len();
+    storage.unclaim(&id).unwrap();
+    let hist = storage.read_history(&id).unwrap();
+    let new = &hist[before_unclaim..];
+    assert_eq!(new.len(), 2, "expected two ops, got {new:#?}");
+    let commit = &new[0].commit;
+    assert!(
+        new.iter().all(|e| &e.commit == commit),
+        "both unclaim ops must share ONE commit: {new:#?}"
+    );
+    assert!(matches!(
+        new[0].op,
+        Op::SetAssignee { assignee: None, .. }
+    ));
+    assert!(matches!(
+        new[1].op,
+        Op::SetStatus {
+            status: Status::Open,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn unclaim_on_already_open_unassigned_is_no_op() {
+    let repo = make_scratch_repo("unclaim_no_op");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let baseline = storage.read_history(&id).unwrap().len();
+    storage.unclaim(&id).unwrap();
+    let after = storage.read_history(&id).unwrap().len();
+    assert_eq!(baseline, after, "unclaim on unclaimed must not commit");
+}
+
+#[test]
+fn claim_on_closed_issue_errors_invalid() {
+    let repo = make_scratch_repo("claim_closed_errors");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.set_status(&id, Status::Closed).unwrap();
+    let err = storage.claim(&id, "alice").unwrap_err();
+    assert!(
+        matches!(err, StorageError::Invalid(_)),
+        "expected Invalid, got {err:?}"
+    );
+}
+
+#[test]
+fn list_ready_excludes_in_progress_by_default() {
+    let repo = make_scratch_repo("ready_excludes_claimed");
+    let storage = Storage::open(&repo).unwrap();
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+    let _b = storage
+        .create_issue(&IssueDraft {
+            title: "B".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.claim(&a, "alice").unwrap();
+
+    let ready = storage.list_ready(&ReadyFilter::default()).unwrap();
+    let ids: Vec<&IssueId> = ready.iter().map(|i| &i.id).collect();
+    assert!(!ids.contains(&&a), "claimed A must not appear in ready: {ids:?}");
+    assert_eq!(ready.len(), 1, "only B should be ready: {ready:#?}");
+}
+
+#[test]
+fn list_ready_includes_in_progress_when_include_claimed_set() {
+    let repo = make_scratch_repo("ready_include_claimed");
+    let storage = Storage::open(&repo).unwrap();
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+    let _b = storage
+        .create_issue(&IssueDraft {
+            title: "B".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.claim(&a, "alice").unwrap();
+
+    let ready = storage
+        .list_ready(&ReadyFilter {
+            include_claimed: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let ids: Vec<&IssueId> = ready.iter().map(|i| &i.id).collect();
+    assert!(ids.contains(&&a), "claimed A must appear with include_claimed: {ids:?}");
+    assert_eq!(ready.len(), 2, "both A and B should be visible: {ready:#?}");
+}
+
+#[test]
+fn status_in_progress_serializes_with_hyphen() {
+    // Wire spelling: serde rename `in-progress` (hyphenated).
+    let s = serde_json::to_string(&Status::InProgress).unwrap();
+    assert_eq!(s, "\"in-progress\"");
+    let back: Status = serde_json::from_str("\"in-progress\"").unwrap();
+    assert_eq!(back, Status::InProgress);
+}
+
+#[test]
+fn in_progress_dep_blocks_dependent_from_ready() {
+    // An InProgress dep blocks the same as Open: the dep isn't
+    // closed, so the dependent is still blocked.
+    let repo = make_scratch_repo("ready_in_progress_dep_blocks");
+    let storage = Storage::open(&repo).unwrap();
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+    let b = storage
+        .create_issue(&IssueDraft {
+            title: "B".into(),
+            type_: Some(IssueType::Feature),
+            dependencies: vec![a.clone()],
+            ..Default::default()
+        })
+        .unwrap();
+    storage.claim(&a, "alice").unwrap();
+    // Default filter excludes A (claimed) AND B (blocked on A
+    // which is InProgress, not Closed).
+    let ready = storage.list_ready(&ReadyFilter::default()).unwrap();
+    let ids: Vec<&IssueId> = ready.iter().map(|i| &i.id).collect();
+    assert!(!ids.contains(&&a), "A is claimed: {ids:?}");
+    assert!(!ids.contains(&&b), "B blocked on InProgress A: {ids:?}");
 }

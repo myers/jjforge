@@ -11,19 +11,32 @@ use serde::{Deserialize, Serialize};
 
 use crate::id::IssueId;
 
-/// Issue status. v1 has exactly two values; spec §3 calls out the enum
-/// as extensible later.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Issue status. Spec §3 — `open`, `in-progress`, `closed`. v2.3
+/// added [`Status::InProgress`] (spelled `in-progress` on the wire)
+/// as the "claimed by some agent" state between [`Status::Open`]
+/// (idle, available) and [`Status::Closed`] (terminal). `Open` and
+/// `InProgress` are both "active"; `Closed` is terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
+    #[default]
     Open,
+    /// Claimed by an agent / operator. Wire spelling: `in-progress`
+    /// (hyphenated). v2.3 (`agent-claim-atomic`).
+    #[serde(rename = "in-progress")]
+    InProgress,
     Closed,
 }
 
 impl Status {
-    pub(crate) fn as_str(self) -> &'static str {
+    /// The lowercase wire spelling used in trailer payloads
+    /// (`Jjf-Status:`), `jjf` plain-text output, and CLI `--status`
+    /// flag values. `InProgress` renders as `in-progress`
+    /// (hyphenated), matching the serde rename.
+    pub fn as_str(self) -> &'static str {
         match self {
             Status::Open => "open",
+            Status::InProgress => "in-progress",
             Status::Closed => "closed",
         }
     }

@@ -179,18 +179,32 @@ pub enum Error {
     /// surface the operator-supplied value.
     #[error("no issue with handle {handle:?}")]
     SlugNotFound { handle: String },
+
+    /// `Storage::claim` was called on an issue that's already
+    /// `InProgress` with a DIFFERENT assignee. The `by` field is the
+    /// existing assignee (per the read at the time of the claim).
+    /// Surfaces from the storage-side preflight; the CLI's
+    /// `already_claimed` error envelope carries it as `details.by`.
+    /// v2.3 (`agent-claim-atomic`).
+    #[error("issue already claimed by {by:?}")]
+    AlreadyClaimed { by: String },
 }
 
 /// Filter bundle for [`Storage::list_ready`].
 ///
-/// All filters AND with the implicit "open + unblocked" criteria;
-/// within each filter axis the semantics match `jjf ls`:
+/// All filters AND with the implicit "active + unblocked + unclaimed"
+/// criteria; within each filter axis the semantics match `jjf ls`:
 ///
 /// - `labels`: AND — an issue must carry EVERY listed label.
 /// - `types`: OR — an issue's type must equal AT LEAST ONE listed
 ///   type. Empty filter accepts every type.
 /// - `limit`: truncate the returned vec after the priority sort.
 ///   `None` means unlimited.
+/// - `include_claimed`: when `false` (default, v2.3
+///   `agent-claim-atomic`), [`Status::InProgress`] issues are
+///   excluded — they're claimed and another agent shouldn't see
+///   them as ready work. When `true`, InProgress issues are
+///   included so an operator can see "what's in flight."
 ///
 /// The default value (`ReadyFilter::default()`) is "no extra
 /// filters" — equivalent to `jjf ready` with no flags.
@@ -199,6 +213,9 @@ pub struct ReadyFilter {
     pub labels: Vec<String>,
     pub types: Vec<IssueType>,
     pub limit: Option<usize>,
+    /// v2.3 (`agent-claim-atomic`). When `false` (default),
+    /// `Storage::list_ready` excludes [`Status::InProgress`] issues.
+    pub include_claimed: bool,
 }
 
 /// Priority weight for `Storage::list_ready`'s primary sort key.
@@ -898,6 +915,125 @@ impl Storage {
         })
     }
 
+    /// Atomically claim an issue: set its assignee to `who` and
+    /// advance status to [`Status::InProgress`] in ONE multi-op
+    /// commit (one `set-assignee` and one `set-status` trailer).
+    /// v2.3 (`agent-claim-atomic`).
+    ///
+    /// Semantics:
+    ///
+    /// - Idempotent: if the issue is already InProgress and assigned
+    ///   to `who`, this is a no-op (no commit lands). Same-user
+    ///   re-claim is safe and cheap.
+    /// - First-write-wins on the bookmark: two concurrent claims
+    ///   race at the underlying `jj bookmark set` step; jj rejects
+    ///   the loser as a non-fast-forward (the surface is a `Jj`
+    ///   error from the shell-out). The loser re-reads `ready` and
+    ///   tries again — duplicate-work avoidance falls out of
+    ///   bookmark ordering.
+    /// - Returns [`Error::AlreadyClaimed`] if the issue is already
+    ///   InProgress with a DIFFERENT assignee. The CLI surfaces
+    ///   this as the `already_claimed` envelope.
+    /// - Returns [`Error::Invalid`] if the issue is closed —
+    ///   claiming a closed issue is almost certainly a mistake (the
+    ///   operator probably meant to reopen first).
+    /// - Returns [`Error::Invalid`] if `who` is empty after trim.
+    ///
+    /// The commit lands one [`Op::SetAssignee`] and one
+    /// [`Op::SetStatus`] in field-declaration order: assignee, then
+    /// status. (Two ops, one commit; the op-space resolver's LWW
+    /// projection lands on the same final state regardless of read
+    /// order.)
+    pub fn claim(&self, id: &IssueId, who: &str) -> Result<()> {
+        let who = who.trim();
+        if who.is_empty() {
+            return Err(Error::Invalid(
+                "claim: assignee must not be empty".into(),
+            ));
+        }
+        let current = self.read_record_from_bookmark(id)?;
+        match current.status {
+            Status::Closed => {
+                return Err(Error::Invalid(format!(
+                    "issue {id} is closed; reopen before claiming"
+                )));
+            }
+            Status::InProgress => {
+                // Already claimed. Same user → no-op (return Ok
+                // without writing). Different user → AlreadyClaimed.
+                match current.assignee.as_deref() {
+                    Some(existing) if existing == who => return Ok(()),
+                    Some(existing) => {
+                        return Err(Error::AlreadyClaimed {
+                            by: existing.to_owned(),
+                        })
+                    }
+                    // InProgress without an assignee is a degenerate
+                    // state (shouldn't happen via the normal claim
+                    // path), but treat it as claimable rather than
+                    // wedging.
+                    None => {}
+                }
+            }
+            Status::Open => {}
+        }
+        let who_owned = who.to_owned();
+        self.mutate(id, &format!("jjf: issue {} - claim", id), |rec| {
+            rec.assignee = Some(who_owned.clone());
+            rec.status = Status::InProgress;
+            Ok(vec![
+                Op::SetAssignee {
+                    issue_id: rec.id.clone(),
+                    assignee: Some(who_owned.clone()),
+                },
+                Op::SetStatus {
+                    issue_id: rec.id.clone(),
+                    status: Status::InProgress,
+                },
+            ])
+        })
+    }
+
+    /// Atomically unclaim an issue: clear the assignee and set
+    /// status back to [`Status::Open`] in ONE multi-op commit. v2.3
+    /// (`agent-claim-atomic`). Inverse of [`Storage::claim`].
+    ///
+    /// Semantics:
+    ///
+    /// - Idempotent: if the issue is already Open and unassigned,
+    ///   this is a no-op.
+    /// - Returns [`Error::Invalid`] if the issue is closed (same
+    ///   rationale as `claim`).
+    ///
+    /// Like `claim`, lands two ops (`SetAssignee None` and
+    /// `SetStatus Open`) in field-declaration order.
+    pub fn unclaim(&self, id: &IssueId) -> Result<()> {
+        let current = self.read_record_from_bookmark(id)?;
+        if current.status == Status::Closed {
+            return Err(Error::Invalid(format!(
+                "issue {id} is closed; nothing to unclaim"
+            )));
+        }
+        if current.status == Status::Open && current.assignee.is_none() {
+            // No-op: already in the unclaimed state.
+            return Ok(());
+        }
+        self.mutate(id, &format!("jjf: issue {} - unclaim", id), |rec| {
+            rec.assignee = None;
+            rec.status = Status::Open;
+            Ok(vec![
+                Op::SetAssignee {
+                    issue_id: rec.id.clone(),
+                    assignee: None,
+                },
+                Op::SetStatus {
+                    issue_id: rec.id.clone(),
+                    status: Status::Open,
+                },
+            ])
+        })
+    }
+
     /// Add a label. No-op (per spec §5.2) if already present, but the
     /// commit is still landed so the audit log records intent.
     pub fn add_label(&self, id: &IssueId, label: &str) -> Result<()> {
@@ -1151,15 +1287,16 @@ impl Storage {
         })
     }
 
-    /// Probe for a slug collision among OPEN issues. Returns
-    /// `Some(id)` for the offending open issue if any other open
-    /// issue carries this exact slug, `None` if the slug is free.
-    /// `self_id` (if provided) is excluded from the probe — used by
-    /// the update path so re-setting an issue's existing slug
-    /// doesn't self-conflict.
+    /// Probe for a slug collision among ACTIVE (Open or
+    /// InProgress) issues. Returns `Some(id)` for the offending
+    /// active issue if any other active issue carries this exact
+    /// slug, `None` if the slug is free. `self_id` (if provided) is
+    /// excluded from the probe — used by the update path so
+    /// re-setting an issue's existing slug doesn't self-conflict.
     ///
     /// Closed issues do NOT participate: spec v2.1 says closed
-    /// issues release their slug.
+    /// issues release their slug. v2.3: InProgress issues DO
+    /// participate — claiming doesn't free the slug.
     fn find_open_slug_collision(
         &self,
         slug: &str,
@@ -1170,7 +1307,7 @@ impl Storage {
                 continue;
             }
             let rec = self.read_record_from_bookmark(&id)?;
-            if rec.status != Status::Open {
+            if rec.status == Status::Closed {
                 continue;
             }
             if rec.slug.as_deref() == Some(slug) {
@@ -1243,16 +1380,20 @@ impl Storage {
         Ok(ids)
     }
 
-    /// Enumerate every OPEN issue whose dependencies are all closed —
+    /// Enumerate every issue whose dependencies are all closed —
     /// the agent-ready set.
     ///
     /// An issue is "ready" iff:
     ///
-    /// - Its `status` is [`Status::Open`].
+    /// - Its `status` is [`Status::Open`]. With
+    ///   `filter.include_claimed = true`, [`Status::InProgress`]
+    ///   issues are also included; otherwise they're excluded as
+    ///   "claimed by another agent" (v2.3 `agent-claim-atomic`).
     /// - Every id in its `dependencies` field either points at a
     ///   [`Status::Closed`] issue OR at a non-existent issue id (a
     ///   dangling reference). Open deps block; closed and dangling
-    ///   deps don't.
+    ///   deps don't. (An `InProgress` dep blocks just like an Open
+    ///   one — it's not done yet.)
     /// - It passes any `filter.labels` (AND across labels — same
     ///   semantics as `jjf ls --label`).
     /// - It passes any `filter.types` (OR across types — same
@@ -1305,13 +1446,23 @@ impl Storage {
         // Roadmap-type issues are never returned. They're never work
         // to do; they're the planning surface itself. The ticket and
         // the closing comment on `7100b51` both pin this.
+        //
+        // v2.3 (`agent-claim-atomic`): InProgress issues are excluded
+        // by default — they're claimed by another agent. The
+        // `include_claimed` flag flips them back in for "what's in
+        // flight" views.
+        let include_claimed = filter.include_claimed;
         let mut ready: Vec<Issue> = all
             .into_iter()
-            .filter(|i| i.status == Status::Open)
+            .filter(|i| match i.status {
+                Status::Open => true,
+                Status::InProgress => include_claimed,
+                Status::Closed => false,
+            })
             .filter(|i| i.type_ != IssueType::Roadmap)
             .filter(|i| {
-                // Every dep is either closed or dangling. An open,
-                // existing dep blocks.
+                // Every dep is either closed or dangling. An open or
+                // in-progress, existing dep blocks.
                 i.dependencies
                     .iter()
                     .all(|d| !known.contains(d) || closed.contains(d))

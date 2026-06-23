@@ -226,6 +226,7 @@ fn stanza_to_op(stanza: &[(&str, &str)], id: &IssueId) -> Option<Op> {
 fn parse_status(s: &str) -> Option<Status> {
     match s {
         "open" => Some(Status::Open),
+        "in-progress" => Some(Status::InProgress),
         "closed" => Some(Status::Closed),
         _ => None,
     }

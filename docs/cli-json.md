@@ -1,5 +1,64 @@
 # `jjf --json` output contract
 
+## v2.2 → v2.3 changelog
+
+Backwards-compatible additions, landed in the
+`agent-claim-atomic` ticket (`c3cc807`).
+
+- **`jjf update` gains `--claim` / `--unclaim`** atomic
+  shorthand flags. `--claim` sets assignee = current jj
+  `user.name` AND status = `in-progress` in one multi-op
+  commit. `--unclaim` clears the assignee AND sets status =
+  `open` in one multi-op commit. Mutually exclusive with each
+  other AND with `--assignee` / `--unset-assignee` /
+  `--status`.
+- **`jjf ready` gains `--include-claimed` and `--claim`.**
+  Without `--include-claimed`, `in-progress` issues are
+  excluded from the ready set (an idle agent shouldn't see
+  another's claimed work). With `--include-claimed`, they
+  appear alongside open issues. `--claim` is the
+  "pick-and-claim-atomically" shorthand: `ready --claim
+  --limit 1` returns one top result AND atomically claims it
+  in a single CLI call. Requires `--limit 1`; other values
+  exit 2 with `claim_requires_limit_one`.
+- **New status enum value `in-progress`** on every verb that
+  emits or accepts status (`show`, `ls`, `ready`, `update
+  --status`). `jjf ls --status in-progress` and `jjf update
+  --status in-progress` are valid.
+- **Three new error kinds.**
+  - `already_claimed` — preflight, exit 2. `--claim` was
+    asked to claim an issue already InProgress with a
+    different assignee. `details.by` is the existing
+    assignee.
+  - `no_current_user` — preflight, exit 2. `--claim` had no
+    `jj user.name` configured.
+  - `claim_requires_limit_one` — preflight, exit 2. `ready
+    --claim` was used with `--limit` other than 1.
+- **`jjf update --claim` mutating envelope**:
+
+  ```json
+  {"ok": true, "id": "aa6600b", "assignee": "alice", "status": "in-progress", "claimed": true}
+  ```
+
+- **`jjf update --unclaim` mutating envelope**:
+
+  ```json
+  {"ok": true, "id": "aa6600b", "status": "open", "claimed": false}
+  ```
+
+- **`jjf ready --claim --limit 1` mutating envelope** (when
+  a claim landed):
+
+  ```json
+  {"ok": true, "id": "aa6600b", "assignee": "alice", "status": "in-progress", "claimed": true}
+  ```
+
+  When the ready set is empty:
+
+  ```json
+  {"ok": true, "id": null, "claimed": false}
+  ```
+
 ## v2.1 → v2.2 changelog
 
 Backwards-compatible additions, landed in the `agent-remember`
@@ -255,6 +314,9 @@ from plain-text mode (see the top comment in `main.rs`: `0` success,
 | `io_error`                   | 1    | `Storage::Io`                 | —                        |
 | `json_error`                 | 1    | `Storage::Json`               | —                        |
 | `jj_error`                   | 1    | `Storage::Jj`                 | —                        |
+| `already_claimed`            | 2    | `Storage::AlreadyClaimed` / `AlreadyClaimed` | `by` |
+| `no_current_user`            | 2    | `NoCurrentUser`               | —                        |
+| `claim_requires_limit_one`   | 2    | `ClaimRequiresLimitOne`       | —                        |
 
 Adding a new variant to `CliError`? Pick a stable kind, add it to
 the `kind()` match in `main.rs`, add a row above, and add a
@@ -457,14 +519,24 @@ Filters:
   surface, not work to do — regardless of this filter.
 - `--limit <N>` — truncate to the first N entries AFTER the
   priority sort. Omit for unlimited.
+- `--include-claimed` (v2.3) — also include `in-progress`
+  issues in the result. Off by default so idle agents don't
+  see another agent's claimed work as available.
+- `--claim` (v2.3) — atomic shorthand: pick the top result
+  AND claim it. Requires `--limit 1`; other values exit 2
+  with `claim_requires_limit_one`. Emits the mutating
+  envelope shown in the v2.3 changelog at the top of this
+  file.
 
 Selection criteria — an issue is "ready" iff:
 
-- Its `status` is `open`.
+- Its `status` is `open`. With `--include-claimed`,
+  `in-progress` issues are included too.
 - Its `type` is not `roadmap`.
 - Every `dependencies[]` id either points at a CLOSED issue or
   at a non-existent issue id (a dangling reference is treated
-  as unblocking — a deleted dep doesn't wedge progress).
+  as unblocking — a deleted dep doesn't wedge progress). An
+  InProgress dep still BLOCKS — it's not closed yet.
 - It passes all `--label` / `--type` filters.
 
 Sort order:
@@ -521,6 +593,26 @@ $ jjf update --json a3f9c01 --type bug --slug fix-the-thing
 
 $ jjf update --json a3f9c01 --unset-slug
 {"ok":true,"id":"a3f9c01","fields":["slug"]}
+```
+
+v2.3 added `--claim` / `--unclaim` shorthand:
+
+```sh
+$ jjf update --json a3f9c01 --claim
+{"ok":true,"id":"a3f9c01","assignee":"alice","status":"in-progress","claimed":true}
+
+$ jjf update --json a3f9c01 --unclaim
+{"ok":true,"id":"a3f9c01","status":"open","claimed":false}
+```
+
+`--claim` is mutually exclusive with `--unclaim`, `--assignee`,
+`--unset-assignee`, and `--status` (clap-enforced). Same-user
+re-claim is a no-op (exit 0, no new commit). Different-user
+re-claim exits 2 with `already_claimed`:
+
+```sh
+$ jjf update --json a3f9c01 --claim
+{"ok":false,"error":{"kind":"already_claimed","message":"issue already claimed by \"alice\"","details":{"by":"alice"}}}
 ```
 
 Error path — nonexistent id:

@@ -1,6 +1,6 @@
-# jjforge on-disk storage format — v2.2
+# jjforge on-disk storage format — v2.3
 
-Status: v2.2, current. This is the contract every other crate
+Status: v2.3, current. This is the contract every other crate
 implements against. Verdicts pinned by:
 
 - `dcd4b57` — Shape A (dedicated bookmark for issue data).
@@ -8,6 +8,40 @@ implements against. Verdicts pinned by:
   audit surface.
 - `2130de1` — shell out to the `jj` CLI; do not link `jj-lib`.
 - `72638a0` — the `mvp-storage` epic.
+
+## v2.2 → v2.3 changelog
+
+Backwards-compatible additions, landed in the `agent-claim-atomic`
+ticket (`c3cc807`). v2.2 readers tolerate v2.3 commits (the
+existing parser only knew `open`/`closed`; `in-progress` arrives
+as an unknown enum variant which surfaces as a typed
+deserialize failure — older readers that crawl history MUST be
+upgraded before they hit a v2.3 commit). v2.3 readers tolerate
+v2.2 records (`status` defaults to `open` via serde-derive's
+`#[default]` if the field is missing).
+
+- **New `status` value `in-progress`** — `Status::InProgress`.
+  Wire spelling: `in-progress` (hyphenated, lowercase, via a
+  serde rename). Semantically: claimed by an agent / operator,
+  not yet closed. Both `open` and `in-progress` are "active";
+  only `closed` is terminal.
+- **New atomic verbs.**
+  - `Storage::claim(id, who)` — set assignee + status=in-progress
+    in ONE multi-op commit (`set-assignee` + `set-status`).
+    Idempotent for same-user re-claim; errors with
+    `Error::AlreadyClaimed { by }` on different-user re-claim;
+    errors with `Error::Invalid` on closed-issue claim.
+  - `Storage::unclaim(id)` — inverse: clear assignee + status=open
+    in ONE multi-op commit. Idempotent when already
+    open+unassigned.
+- **Slug uniqueness scope** widens from "OPEN issues" to
+  "ACTIVE (Open OR InProgress) issues" — claiming an issue
+  shouldn't free its slug. Closed issues still release their
+  slug as before.
+- **`Storage::list_ready` excludes `InProgress` by default.**
+  The `ReadyFilter` adds `include_claimed: bool`; when `true`,
+  InProgress issues are included. An `InProgress` dependency
+  still BLOCKS dependents (it's not closed).
 
 ## v2.1 → v2.2 changelog
 
@@ -198,7 +232,7 @@ separate lines).
 | `title`        | string                | yes  | Single-line. Must not be empty.                                |
 | `slug`         | string \| null        | yes  | v2.1 — kebab-case orientation handle. Default `null`. See §3.4. |
 | `body`         | string                | yes  | Opening description. May be empty.                             |
-| `status`       | string enum           | yes  | `open` or `closed`. Extensible by adding values in later vN.   |
+| `status`       | string enum           | yes  | `open` \| `in-progress` \| `closed`. Default `open`. (v2.3 added `in-progress`.)   |
 | `type`         | string enum           | yes  | v2.1 — `bug` \| `feature` \| `epic` \| `research` \| `roadmap` \| `unspecified`. Default `unspecified`. |
 | `labels`       | array of string       | yes  | Sorted alphabetically. Empty array if none.                    |
 | `dependencies` | array of string       | yes  | Issue IDs this depends on. Sorted. Empty array if none.        |
@@ -387,7 +421,7 @@ trap that §5.6's filter-on-both-files workaround papers over.
 | ------------ | --------------------------------------------------------- | ---------------------------------------------------- |
 | `create`     | `Jjf-Title`, `Jjf-Status` (always `open`)                 | Must be the first op on this issue.                  |
 | `set-title`  | `Jjf-Title`                                               | Replaces title outright.                             |
-| `set-status` | `Jjf-Status` (`open` \| `closed`)                         | Replaces status outright.                            |
+| `set-status` | `Jjf-Status` (`open` \| `in-progress` \| `closed`)        | Replaces status outright. v2.3 added `in-progress`.  |
 | `set-body`   | `Jjf-Body-Hash` (sha-256 of new body, hex)                | Body itself lives in the JSON; trailer carries hash. |
 | `label-add`  | `Jjf-Label` (one label string; may repeat for >1 label)   | No-op if label already present.                      |
 | `label-rm`   | `Jjf-Label`                                               | No-op if not present.                                |
@@ -544,6 +578,41 @@ per dependency, sorted), `set-assignee` (if present). Order
 follows the record's field-declaration order (§3.1) so the
 op-replay view's structural fold matches the file-read view
 exactly.
+
+### 5.9 Atomic claim / unclaim (v2.3)
+
+The `claim` and `unclaim` operator-facing verbs each land ONE
+commit on the `issues` bookmark with EXACTLY TWO `Jjf-Op:`
+trailers — a `set-assignee` and a `set-status`, in that order
+(field-declaration order per §3.1).
+
+Claim shape:
+
+```
+jjf: issue aa6600b - claim
+
+Jjf-Op: set-assignee
+Jjf-Issue: aa6600b
+Jjf-At: 2026-06-23T12:34:56.123456789Z
+Jjf-Assignee: alice
+Jjf-Op: set-status
+Jjf-Issue: aa6600b
+Jjf-At: 2026-06-23T12:34:56.123456789Z
+Jjf-Status: in-progress
+```
+
+Unclaim shape: same two ops with `Jjf-Assignee:` empty and
+`Jjf-Status: open`.
+
+The atomicity matters for **parallel-claim race safety**: two
+agents racing `Storage::claim` against the same id both
+construct a commit on `bookmarks(issues)`, then both attempt
+`jj bookmark set issues -r @ --allow-backwards`. jj rejects
+the second writer's `bookmark set` as a non-fast-forward (its
+parent is the bookmark tip the first writer ALREADY moved
+off). The loser's `Storage::claim` returns a `Jj` error and
+the orchestrator re-reads `ready` to pick a different id. No
+duplicate work — the bookmark itself is the lock.
 
 ---
 

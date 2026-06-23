@@ -67,10 +67,13 @@ struct Cli {
 
 /// What `jjf ls --status <X>` accepts. Distinct from `Status` because
 /// `all` (no filter) is a CLI-only affordance with no storage-layer
-/// equivalent — the `Status` enum only has `Open` / `Closed`.
+/// equivalent. v2.3 added `in-progress` mirroring the new
+/// `Status::InProgress` variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum StatusFilter {
     Open,
+    #[value(name = "in-progress")]
+    InProgress,
     Closed,
     All,
 }
@@ -83,6 +86,8 @@ enum StatusFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum StatusArg {
     Open,
+    #[value(name = "in-progress")]
+    InProgress,
     Closed,
 }
 
@@ -90,6 +95,7 @@ impl From<StatusArg> for Status {
     fn from(s: StatusArg) -> Self {
         match s {
             StatusArg::Open => Status::Open,
+            StatusArg::InProgress => Status::InProgress,
             StatusArg::Closed => Status::Closed,
         }
     }
@@ -267,6 +273,24 @@ enum Commands {
         /// agent-loop call is `jjf ready --limit 1 --json`.
         #[arg(long)]
         limit: Option<usize>,
+
+        /// Include `in-progress` (claimed) issues in the ready
+        /// set. Off by default so an idle agent doesn't see
+        /// another agent's claimed work as available. Useful for
+        /// "what's in flight" views. v2.3 (`agent-claim-atomic`).
+        #[arg(long = "include-claimed")]
+        include_claimed: bool,
+
+        /// Atomically claim the top result and emit its id. Only
+        /// makes sense with `--limit 1` (claiming multiple at once
+        /// would be ambiguous); other values are rejected at exit 2.
+        /// Equivalent to `jjf ready --limit 1` followed by
+        /// `jjf update <id> --claim`, but as one atomic compound:
+        /// the same `jj` rejection that blocks two parallel claims
+        /// of the same id rolls this call back too. v2.3
+        /// (`agent-claim-atomic`).
+        #[arg(long = "claim")]
+        claim: bool,
     },
 
     /// Mutate one or more scalar fields of an issue in a single commit.
@@ -333,6 +357,40 @@ enum Commands {
         /// `--assignee`.
         #[arg(long = "unset-assignee")]
         unset_assignee: bool,
+
+        /// Atomically claim the issue: set assignee = current jj
+        /// `user.name` AND set status = `in-progress` in one
+        /// multi-op commit. Two parallel `--claim` calls on the
+        /// same id are race-free — bookmark ordering decides the
+        /// winner, the loser sees a `Jj` error and re-reads ready.
+        /// Mutually exclusive with `--unclaim`, `--assignee`,
+        /// `--unset-assignee`, `--status`. v2.3
+        /// (`agent-claim-atomic`).
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "unclaim",
+                "assignee",
+                "unset_assignee",
+                "status",
+            ],
+        )]
+        claim: bool,
+
+        /// Atomically unclaim the issue: clear the assignee AND
+        /// set status back to `open` in one multi-op commit.
+        /// Inverse of `--claim`. Mutually exclusive with
+        /// `--claim`, `--assignee`, `--unset-assignee`, `--status`.
+        /// v2.3 (`agent-claim-atomic`).
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "assignee",
+                "unset_assignee",
+                "status",
+            ],
+        )]
+        unclaim: bool,
     },
 
     /// Append a comment to an existing issue on the `issues` bookmark.
@@ -691,7 +749,7 @@ enum CliError {
     /// `Option<_>` or bool), so we check in the run fn and surface a
     /// typed exit-2 hint pointing at the available flags.
     #[error(
-        "nothing to update; pass at least one of --title / --status / --body-file / --assignee / --unset-assignee"
+        "nothing to update; pass at least one of --title / --status / --body-file / --assignee / --unset-assignee / --claim / --unclaim"
     )]
     NoUpdateFields,
 
@@ -853,6 +911,37 @@ enum CliError {
     /// memory."
     #[error("no memory with key {key:?}")]
     MemoryNotFound { key: String },
+
+    /// `jjf update --claim` (or `jjf ready --claim`) couldn't find
+    /// a `user.name` in jj's config. Preflight failure (exit 2) —
+    /// claims require an identity to assign to.
+    /// v2.3 (`agent-claim-atomic`).
+    #[error(
+        "no current user available; set jj user.name (e.g. `jj config set --user user.name 'Your Name'`) to claim issues"
+    )]
+    NoCurrentUser,
+
+    /// `jjf ready --claim` was used with `--limit` other than 1.
+    /// Atomically claiming multiple issues at once doesn't compose
+    /// — agents work one ticket at a time. Preflight failure
+    /// (exit 2). v2.3 (`agent-claim-atomic`).
+    #[error("--claim requires --limit 1; claiming multiple at once doesn't compose")]
+    ClaimRequiresLimitOne,
+
+    /// `jjf update --claim` was asked to claim an issue already in
+    /// the InProgress state with a different assignee. Preflight
+    /// failure (exit 2) so the orchestrator can branch on
+    /// `already_claimed`. The `by` field carries the existing
+    /// assignee for the operator's hint.
+    ///
+    /// In practice the storage layer's
+    /// [`StorageError::AlreadyClaimed`] surfaces this case — the
+    /// CLI-side variant stays defined so future callers can
+    /// construct it directly without going through `Storage`. v2.3
+    /// (`agent-claim-atomic`).
+    #[allow(dead_code)]
+    #[error("issue already claimed by {by:?}")]
+    AlreadyClaimed { by: String },
 }
 
 impl CliError {
@@ -867,6 +956,7 @@ impl CliError {
             CliError::Storage(StorageError::InvalidSlug { .. }) => 2,
             CliError::Storage(StorageError::SlugCollision { .. }) => 2,
             CliError::Storage(StorageError::SlugNotFound { .. }) => 2,
+            CliError::Storage(StorageError::AlreadyClaimed { .. }) => 2,
             CliError::Cwd(_) => 2,
             CliError::BodyRead { .. } => 2,
             CliError::BadDepId { .. } => 2,
@@ -885,6 +975,9 @@ impl CliError {
             CliError::MissingMemoryValue => 2,
             CliError::EmptyMemoryKey { .. } => 2,
             CliError::MemoryNotFound { .. } => 1,
+            CliError::NoCurrentUser => 2,
+            CliError::ClaimRequiresLimitOne => 2,
+            CliError::AlreadyClaimed { .. } => 2,
             CliError::Probe(_) => 1,
             CliError::JjGitRemote(_) => 1,
             // Sync verbs: the user typed a well-formed command; the
@@ -924,6 +1017,7 @@ impl CliError {
             CliError::Storage(StorageError::InvalidSlug { .. }) => "invalid_slug",
             CliError::Storage(StorageError::SlugCollision { .. }) => "slug_collision",
             CliError::Storage(StorageError::SlugNotFound { .. }) => "slug_not_found",
+            CliError::Storage(StorageError::AlreadyClaimed { .. }) => "already_claimed",
             CliError::InvalidSlug { .. } => "invalid_slug",
             CliError::SlugCollision { .. } => "slug_collision",
             CliError::SlugNotFound { .. } => "slug_not_found",
@@ -953,6 +1047,9 @@ impl CliError {
             CliError::JjGitFetch(_) => "jj_git_fetch_error",
             CliError::Unmergeable { .. } => "unmergeable",
             CliError::CommentFileConflict { .. } => "comment_file_conflict",
+            CliError::NoCurrentUser => "no_current_user",
+            CliError::ClaimRequiresLimitOne => "claim_requires_limit_one",
+            CliError::AlreadyClaimed { .. } => "already_claimed",
         }
     }
 
@@ -1009,6 +1106,8 @@ impl CliError {
             | CliError::SlugNotFound { handle } => json!({ "handle": handle }),
             CliError::EmptyMemoryKey { value } => json!({ "value": value }),
             CliError::MemoryNotFound { key } => json!({ "key": key }),
+            CliError::Storage(StorageError::AlreadyClaimed { by })
+            | CliError::AlreadyClaimed { by } => json!({ "by": by }),
             _ => serde_json::Value::Null,
         }
     }
@@ -1105,7 +1204,9 @@ fn run(cli: Cli) -> Result<(), CliError> {
             labels,
             types,
             limit,
-        } => run_ready(cli.json, labels, types, limit),
+            include_claimed,
+            claim,
+        } => run_ready(cli.json, labels, types, limit, include_claimed, claim),
         Commands::Close { id } => run_set_status(cli.json, id, Status::Closed),
         Commands::Open { id } => run_set_status(cli.json, id, Status::Open),
         Commands::Comment { id, file, author } => run_comment(cli.json, id, file, author),
@@ -1132,6 +1233,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             body_file,
             assignee,
             unset_assignee,
+            claim,
+            unclaim,
         } => run_update(
             cli.json,
             id,
@@ -1143,6 +1246,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             body_file,
             assignee,
             unset_assignee,
+            claim,
+            unclaim,
         ),
     }
 }
@@ -1609,10 +1714,7 @@ fn truncate_memory(s: &str, max_len: usize) -> String {
 /// `cli-show` ticket — readable and stable, not a contract. If a
 /// caller wants machine parsing they should pass `--json`.
 fn print_issue_plain(issue: &Issue) {
-    let status = match issue.status {
-        jjf_storage::Status::Open => "open",
-        jjf_storage::Status::Closed => "closed",
-    };
+    let status = issue.status.as_str();
     println!("{}  [{}]", issue.id, status);
     println!("{}", issue.title);
     // type + slug rendered alongside the rest of the header. type
@@ -1708,10 +1810,7 @@ fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError
     // cleanly into a shell pipeline. The `--json` envelope mirrors
     // `init` / `new`: `{"ok": true, ...}` plus the verb-specific
     // payload (id + the resulting status).
-    let status_word = match status {
-        Status::Open => "open",
-        Status::Closed => "closed",
-    };
+    let status_word = status.as_str();
     if json {
         let out = serde_json::json!({
             "ok": true,
@@ -1723,9 +1822,14 @@ fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError
         // Past tense for the human form: `closed <id>` / `opened <id>`.
         // The verb describes the action just performed, not the
         // resulting state — that's `status` in the JSON envelope.
+        // `InProgress` is unreachable here (the `close`/`open` verbs
+        // are the only callers and they only pass Open/Closed) but we
+        // fall through to `as_str` for safety so a future verb that
+        // routes through this helper renders sanely.
         let verb = match status {
             Status::Open => "opened",
             Status::Closed => "closed",
+            Status::InProgress => "claimed",
         };
         println!("{verb} {issue_id}");
     }
@@ -1985,6 +2089,8 @@ fn run_update(
     body_file: Option<PathBuf>,
     assignee: Option<String>,
     unset_assignee: bool,
+    claim: bool,
+    unclaim: bool,
 ) -> Result<(), CliError> {
     // 1. Build the `UpdateFields` bundle from the flag matrix. The
     // body-file read is done UP FRONT (before the at-least-one check,
@@ -2035,11 +2141,11 @@ fn run_update(
 
     // 2. At-least-one-flag rule. Clap can't enforce this (every flag
     // is `Option<_>` / `bool`), so we surface a typed exit-2 hint
-    // pointing at the available flags. The storage layer would also
-    // reject this with `Error::Invalid`, but the CLI message names
-    // the flags so the operator sees what to do next without parsing
-    // a generic storage error.
-    if fields.is_empty() {
+    // pointing at the available flags. `--claim` and `--unclaim`
+    // count as "something to do" even though they don't populate
+    // `UpdateFields`; they route through `Storage::claim` /
+    // `Storage::unclaim` directly.
+    if fields.is_empty() && !claim && !unclaim {
         return Err(CliError::NoUpdateFields);
     }
 
@@ -2054,11 +2160,50 @@ fn run_update(
     // 5. Preflight: jj repo + `issues` bookmark present.
     preflight::issues_bookmark(&cwd)?;
 
-    // 6. Open storage, resolve handle (`id`-or-`slug`), then hand off
-    // the multi-field update. One call lands one commit with N
-    // trailers.
+    // 6. Open storage, resolve handle.
     let storage = Storage::open(&cwd)?;
     let issue_id = resolve_handle(&storage, &id)?;
+
+    // 6a. `--claim` / `--unclaim` take the direct storage path. Clap
+    // already enforces mutual exclusion with the field-level flags
+    // (status/assignee/unset-assignee), so by the time we land here
+    // `fields.is_empty()` is true and the only branch a user could
+    // possibly want is the atomic claim verb.
+    if claim {
+        let who = resolve_current_user()?;
+        storage.claim(&issue_id, &who)?;
+        if json {
+            let out = serde_json::json!({
+                "ok": true,
+                "id": issue_id.as_str(),
+                "assignee": who,
+                "status": Status::InProgress.as_str(),
+                "claimed": true,
+            });
+            println!("{out}");
+        } else {
+            println!("claimed {issue_id} by {who}");
+        }
+        return Ok(());
+    }
+    if unclaim {
+        storage.unclaim(&issue_id)?;
+        if json {
+            let out = serde_json::json!({
+                "ok": true,
+                "id": issue_id.as_str(),
+                "status": Status::Open.as_str(),
+                "claimed": false,
+            });
+            println!("{out}");
+        } else {
+            println!("unclaimed {issue_id}");
+        }
+        return Ok(());
+    }
+
+    // 6b. Field-update path. One call lands one commit with N
+    // trailers.
     storage.update(&issue_id, fields.clone())?;
 
     // 7. Render. The list of field names mirrors the populated fields
@@ -2175,6 +2320,21 @@ fn run_comment(
         println!("comment added to {issue_id}");
     }
     Ok(())
+}
+
+/// Resolve the current jj user's `user.name` for `--claim`.
+/// Returns the trimmed value or [`CliError::NoCurrentUser`] when
+/// `jj config get user.name` is unset / empty. Differs from
+/// [`resolve_author`] in that it doesn't synthesize `Name <email>`
+/// — claims are short identity strings stored in `assignee`, not
+/// authorship strings stored in `comments.jsonl`. v2.3
+/// (`agent-claim-atomic`).
+fn resolve_current_user() -> Result<String, CliError> {
+    let name = jj_config_get("user.name")?;
+    match name {
+        Some(n) => Ok(n),
+        None => Err(CliError::NoCurrentUser),
+    }
 }
 
 /// Resolve the comment author. Returns the caller's `--author` override
@@ -2311,10 +2471,7 @@ fn run_ls(
         // an eyeball can tell `3L` (three labels) apart from a numeric
         // column that might mean comments or something else later.
         for issue in &issues {
-            let status_s = match issue.status {
-                Status::Open => "open",
-                Status::Closed => "closed",
-            };
+            let status_s = issue.status.as_str();
             println!(
                 "{id}\t{status}\t{n}L\t{title}",
                 id = issue.id,
@@ -2345,10 +2502,28 @@ fn run_ready(
     labels: Vec<String>,
     types: Vec<TypeArg>,
     limit: Option<usize>,
+    include_claimed: bool,
+    claim: bool,
 ) -> Result<(), CliError> {
+    // Preflight: --claim only composes with --limit 1. Reject any
+    // other shape up front so callers don't quietly claim the first
+    // of N candidates and forget the rest.
+    if claim {
+        match limit {
+            Some(1) => {}
+            _ => return Err(CliError::ClaimRequiresLimitOne),
+        }
+    }
+
     // Preflight: cwd is a jj repo AND `issues` bookmark exists.
+    // --claim is a mutating shape, so it also gets the self-host
+    // write guard (otherwise we'd silently drift git HEAD in the
+    // source repo).
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    if claim {
+        preflight::refuse_self_hosted_write(&cwd, json)?;
+    }
     preflight::issues_bookmark(&cwd)?;
 
     let storage = Storage::open(&cwd)?;
@@ -2356,8 +2531,51 @@ fn run_ready(
         labels,
         types: types.into_iter().map(IssueType::from).collect(),
         limit,
+        include_claimed,
     };
     let issues = storage.list_ready(&filter)?;
+
+    if claim {
+        // Top result (if any) gets claimed atomically. Empty
+        // ready set → exit 0 with `null` id under --json, silent
+        // under plain text (mirrors --limit 1 on an empty set).
+        // Race semantics: two parallel `ready --claim --limit 1`
+        // calls both pick the same top id; both `Storage::claim`
+        // calls race at `jj bookmark set`. jj rejects the loser
+        // (non-fast-forward) and the loser surfaces a typed `Jj`
+        // error — the orchestrator re-runs and picks the next id.
+        let target = issues.first().cloned();
+        match target {
+            Some(issue) => {
+                let who = resolve_current_user()?;
+                storage.claim(&issue.id, &who)?;
+                if json {
+                    let out = serde_json::json!({
+                        "ok": true,
+                        "id": issue.id.as_str(),
+                        "assignee": who,
+                        "status": Status::InProgress.as_str(),
+                        "claimed": true,
+                    });
+                    println!("{out}");
+                } else {
+                    println!("claimed {} by {who}", issue.id);
+                }
+            }
+            None => {
+                if json {
+                    let out = serde_json::json!({
+                        "ok": true,
+                        "id": serde_json::Value::Null,
+                        "claimed": false,
+                    });
+                    println!("{out}");
+                }
+                // plain text: silent on empty, mirroring `ls`.
+            }
+        }
+        return Ok(());
+    }
 
     if json {
         // Array of `Issue` records, pretty-printed. Same per-element
@@ -2370,10 +2588,7 @@ fn run_ready(
         // Plain text: tab-separated rows mirroring `ls`'s shape so a
         // single awk/cut pipeline handles both. Silent on empty.
         for issue in &issues {
-            let status_s = match issue.status {
-                Status::Open => "open",
-                Status::Closed => "closed",
-            };
+            let status_s = issue.status.as_str();
             println!(
                 "{id}\t{status}\t{n}L\t{title}",
                 id = issue.id,
@@ -2391,6 +2606,7 @@ fn status_matches(issue: &Issue, filter: StatusFilter) -> bool {
     match filter {
         StatusFilter::All => true,
         StatusFilter::Open => issue.status == Status::Open,
+        StatusFilter::InProgress => issue.status == Status::InProgress,
         StatusFilter::Closed => issue.status == Status::Closed,
     }
 }
