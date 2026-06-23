@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "scale-index"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[dependencies]
+jjf-storage = { path = "../../crates/jjf-storage" }
+serde_json = "1"
+
+[profile.release]
+debug = 1
+opt-level = 3
