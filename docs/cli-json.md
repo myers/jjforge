@@ -1,15 +1,53 @@
 # `jjf --json` output contract
 
 This document is the canonical reference for what `jjf <verb> --json`
-emits. The contract here is what scripts, the upcoming `mvp-sync`
-orchestrator, and the `agent-ergonomics` MCP server are entitled to
-rely on. Changes to the shapes below are breaking changes — they
-require a deprecation note here and a parallel test update.
+emits. The contract here is what scripts, the `mvp-sync` orchestrator,
+and the `agent-ergonomics` MCP server are entitled to rely on. Changes
+to the shapes below are breaking changes — they require a deprecation
+note here and a parallel test update.
 
 The CLI binary lives in `crates/jjf/src/main.rs`. The
 integration-test pins for each shape live in
 `crates/jjf/tests/<verb>.rs` under names containing
 `json_envelope_shape` or `json_error_envelope`.
+
+## v1 → v2 changelog
+
+The nomenclature rename in the storage spec (`docs/storage-format.md`
+"v1 → v2 changelog") carries through here. Breaking changes for any
+script that pattern-matches the wire shape:
+
+- **Error kinds renamed** (full table in the next section):
+  - `bug_not_found` → `issue_not_found`
+  - `missing_bugs_bookmark` → `missing_issues_bookmark`
+  - The `bad_id` kind's `details.field` value `"id"` is unchanged
+    (`bad_id` previously sourced from `BadBugId` / `BadDepId`; v2
+    sources from `BadIssueId` / `BadDepId`, same wire shape).
+- **Error `details` field renames** on the two legacy
+  merge-driver kinds (`unmergeable`, `comment_file_conflict`): the
+  `bug_id` key under `details` is now `issue_id`. Both kinds are
+  unreachable from `jjf pull` post-`bfc732b`; only external callers
+  of `jjf_merge::resolve` can surface them.
+- **`jjf pull` envelope:** the `resolved_bugs` field is now
+  `resolved_issues`. The `bookmark` field's value changes from
+  `"bugs"` to `"issues"`.
+- **`jjf push` envelope:** the `bookmark` field's value changes
+  from `"bugs"` to `"issues"`.
+- **`jjf init` envelope:** the `bookmark` field's value changes
+  from `"bugs"` to `"issues"`.
+- **Plain-text messages** (not contract, but observable):
+  `pushed bugs -> X` → `pushed issues -> X`, etc.
+
+The terminology rationale: jjforge tracks issues (the broad set —
+roadmap, epic, defect, research note), not just bugs (the defect
+subset). The user-facing prose has been "issue" since the cutover
+blog post; v2 catches the wire shape up.
+
+The `Issue` record's JSON shape (the bare payload `jjf show` /
+`jjf ls` emit) was already documented as the `Bug` rust type's
+serde projection in v1; the field names inside the record didn't
+change in v2 (the record itself never used `bug_id` — its `id`
+field has always been called `id`).
 
 ## Two envelope shapes
 
@@ -31,17 +69,17 @@ Verbs in this family: `init`, `new`, `close`, `open`, `update`,
 
 The read verbs emit the structured payload directly, with no envelope:
 
-- `show` emits the `Bug` record verbatim.
-- `ls` emits a JSON array of `Bug` records (possibly empty: `[]`).
+- `show` emits the `Issue` record verbatim.
+- `ls` emits a JSON array of `Issue` records (possibly empty: `[]`).
 - `remote ls` emits a JSON array of `{name, url}` objects (possibly
   empty: `[]`).
 
-The reasoning, from the in-source comment on `run_show`: the `Bug`
-struct IS the structured payload. Wrapping it in `{"ok": true, "bug":
-{...}}` would force every caller into one extra unwrap step with no
-benefit — `show` either succeeds and emits a Bug, or fails and emits
-an error envelope (see below). The success/failure distinction is
-already carried by the exit code and stderr shape.
+The reasoning, from the in-source comment on `run_show`: the `Issue`
+struct IS the structured payload. Wrapping it in `{"ok": true,
+"issue": {...}}` would force every caller into one extra unwrap step
+with no benefit — `show` either succeeds and emits an `Issue`, or
+fails and emits an error envelope (see below). The success/failure
+distinction is already carried by the exit code and stderr shape.
 
 ### Error envelope — `{"ok": false, "error": {...}}`
 
@@ -75,37 +113,37 @@ from plain-text mode (see the top comment in `main.rs`: `0` success,
 
 ## Error-kind table
 
-| `kind`                  | Exit | Source variant                | `details` keys           |
-|-------------------------|------|-------------------------------|--------------------------|
-| `not_a_jj_repo`         | 2    | `Storage::NotAJjRepo`         | `path`                   |
-| `missing_bugs_bookmark` | 2    | `MissingBugsBookmark`         | `path`                   |
-| `bug_not_found`         | 1    | `Storage::BugNotFound`        | `id`                     |
-| `bad_id`                | 2    | `BadBugId` / `BadDepId`       | `value`, `field`         |
-| `empty_body`            | 2    | `EmptyCommentBody`            | —                        |
-| `empty_label`           | 2    | `EmptyLabel`                  | —                        |
-| `missing_author`        | 2    | `MissingAuthor`               | —                        |
-| `no_update_fields`      | 2    | `NoUpdateFields`              | —                        |
-| `remote_already_exists` | 2    | `RemoteAlreadyExists`         | `name`                   |
-| `remote_not_found`      | 2    | `RemoteNotFound`              | `name`                   |
-| `self_hosted_write_refused` | 2 | `SelfHostedWriteRefused`      | `path`, `markers`        |
-| `body_read_error`       | 2    | `BodyRead`                    | `from`                   |
-| `cwd_error`             | 2    | `Cwd`                         | —                        |
-| `probe_error`           | 1    | `Probe`                       | —                        |
-| `jj_git_remote_error`   | 1    | `JjGitRemote`                 | —                        |
-| `push_network_failure`  | 1    | `PushNetworkFailure`          | `remote`                 |
-| `push_auth_failure`     | 1    | `PushAuthFailure`             | `remote`                 |
-| `push_rejected`         | 1    | `PushRejected`                | `remote`                 |
-| `jj_git_push_error`     | 1    | `JjGitPush`                   | —                        |
-| `pull_network_failure`  | 1    | `PullNetworkFailure`          | `remote`                 |
-| `pull_auth_failure`     | 1    | `PullAuthFailure`             | `remote`                 |
-| `jj_git_fetch_error`    | 1    | `JjGitFetch`                  | —                        |
-| `unmergeable`           | 1    | `Unmergeable`                 | `bug_id`, `detail`       |
-| `comment_file_conflict` | 1    | `CommentFileConflict`         | `bug_id`                 |
-| `invalid_input`         | 1    | `Storage::Invalid`            | —                        |
-| `clock_error`           | 1    | `Storage::Clock`              | —                        |
-| `io_error`              | 1    | `Storage::Io`                 | —                        |
-| `json_error`            | 1    | `Storage::Json`               | —                        |
-| `jj_error`              | 1    | `Storage::Jj`                 | —                        |
+| `kind`                       | Exit | Source variant                | `details` keys           |
+|------------------------------|------|-------------------------------|--------------------------|
+| `not_a_jj_repo`              | 2    | `Storage::NotAJjRepo`         | `path`                   |
+| `missing_issues_bookmark`    | 2    | `MissingIssuesBookmark`       | `path`                   |
+| `issue_not_found`            | 1    | `Storage::IssueNotFound`      | `id`                     |
+| `bad_id`                     | 2    | `BadIssueId` / `BadDepId`     | `value`, `field`         |
+| `empty_body`                 | 2    | `EmptyCommentBody`            | —                        |
+| `empty_label`                | 2    | `EmptyLabel`                  | —                        |
+| `missing_author`             | 2    | `MissingAuthor`               | —                        |
+| `no_update_fields`           | 2    | `NoUpdateFields`              | —                        |
+| `remote_already_exists`      | 2    | `RemoteAlreadyExists`         | `name`                   |
+| `remote_not_found`           | 2    | `RemoteNotFound`              | `name`                   |
+| `self_hosted_write_refused`  | 2    | `SelfHostedWriteRefused`      | `path`, `markers`        |
+| `body_read_error`            | 2    | `BodyRead`                    | `from`                   |
+| `cwd_error`                  | 2    | `Cwd`                         | —                        |
+| `probe_error`                | 1    | `Probe`                       | —                        |
+| `jj_git_remote_error`        | 1    | `JjGitRemote`                 | —                        |
+| `push_network_failure`       | 1    | `PushNetworkFailure`          | `remote`                 |
+| `push_auth_failure`          | 1    | `PushAuthFailure`             | `remote`                 |
+| `push_rejected`              | 1    | `PushRejected`                | `remote`                 |
+| `jj_git_push_error`          | 1    | `JjGitPush`                   | —                        |
+| `pull_network_failure`       | 1    | `PullNetworkFailure`          | `remote`                 |
+| `pull_auth_failure`          | 1    | `PullAuthFailure`             | `remote`                 |
+| `jj_git_fetch_error`         | 1    | `JjGitFetch`                  | —                        |
+| `unmergeable`                | 1    | `Unmergeable`                 | `issue_id`, `detail`     |
+| `comment_file_conflict`      | 1    | `CommentFileConflict`         | `issue_id`               |
+| `invalid_input`              | 1    | `Storage::Invalid`            | —                        |
+| `clock_error`                | 1    | `Storage::Clock`              | —                        |
+| `io_error`                   | 1    | `Storage::Io`                 | —                        |
+| `json_error`                 | 1    | `Storage::Json`               | —                        |
+| `jj_error`                   | 1    | `Storage::Jj`                 | —                        |
 
 Adding a new variant to `CliError`? Pick a stable kind, add it to
 the `kind()` match in `main.rs`, add a row above, and add a
@@ -146,7 +184,7 @@ here, change the test too.
 
 ```sh
 $ jjf init --json
-{"ok":true,"bookmark":"bugs"}
+{"ok":true,"bookmark":"issues"}
 ```
 
 Error path — running in a directory that isn't a jj repo:
@@ -163,16 +201,16 @@ $ echo "body" | jjf new --json -t "fix the thing" -F -
 {"ok":true,"id":"a3f9c01"}
 ```
 
-Error path — `bugs` bookmark missing (didn't run `jjf init` first):
+Error path — `issues` bookmark missing (didn't run `jjf init` first):
 
 ```sh
 $ echo body | jjf new --json -t x -F -
-{"ok":false,"error":{"kind":"missing_bugs_bookmark","message":"the `bugs` bookmark does not exist in /repo; run `jjf init` first","details":{"path":"/repo"}}}
+{"ok":false,"error":{"kind":"missing_issues_bookmark","message":"the `issues` bookmark does not exist in /repo; run `jjf init` first","details":{"path":"/repo"}}}
 ```
 
 ### `show`
 
-Success path emits the `Bug` record verbatim — no envelope:
+Success path emits the `Issue` record verbatim — no envelope:
 
 ```sh
 $ jjf show --json a3f9c01
@@ -194,7 +232,7 @@ Error path — nonexistent id:
 
 ```sh
 $ jjf show --json deadbee
-{"ok":false,"error":{"kind":"bug_not_found","message":"bug not found in working copy: deadbee","details":{"id":"deadbee"}}}
+{"ok":false,"error":{"kind":"issue_not_found","message":"issue not found in working copy: deadbee","details":{"id":"deadbee"}}}
 ```
 
 ### `ls`
@@ -239,7 +277,7 @@ Error path — nonexistent id:
 
 ```sh
 $ jjf update --json deadbee --title x
-{"ok":false,"error":{"kind":"bug_not_found","message":"bug not found in working copy: deadbee","details":{"id":"deadbee"}}}
+{"ok":false,"error":{"kind":"issue_not_found","message":"issue not found in working copy: deadbee","details":{"id":"deadbee"}}}
 ```
 
 ### `comment`
@@ -270,7 +308,7 @@ Error path — nonexistent id:
 
 ```sh
 $ jjf close --json deadbee
-{"ok":false,"error":{"kind":"bug_not_found","message":"bug not found in working copy: deadbee","details":{"id":"deadbee"}}}
+{"ok":false,"error":{"kind":"issue_not_found","message":"issue not found in working copy: deadbee","details":{"id":"deadbee"}}}
 ```
 
 ### `label add` / `label rm`
@@ -352,18 +390,18 @@ $ jjf remote rm --json nope
 ### `push`
 
 Mutating verb — `{"ok": true, ...}` envelope. Wraps
-`jj git push --bookmark bugs --remote <remote>` and translates the
+`jj git push --bookmark issues --remote <remote>` and translates the
 common failure modes (network, auth, non-fast-forward rejection,
 unknown remote) into typed kinds so scripts can branch.
 
-Preflight is the full `bugs_bookmark` probe — there's nothing to
+Preflight is the full `issues_bookmark` probe — there's nothing to
 push if the local bookmark doesn't exist. Unknown remote is exit 2
 (preflight); network/auth/reject are exit 1 (runtime — the command
 was well-formed, the remote just said no).
 
 ```sh
 $ jjf push --json origin
-{"ok":true,"remote":"origin","bookmark":"bugs"}
+{"ok":true,"remote":"origin","bookmark":"issues"}
 ```
 
 Error path — unknown remote:
@@ -384,45 +422,46 @@ $ jjf push --json origin
 
 Mutating verb — `{"ok": true, ...}` envelope. Three success
 shapes, distinguished by `remote_present` (bool) and
-`resolved_bugs` (non-negative integer):
+`resolved_issues` (non-negative integer):
 
-- **remote has no `bugs` bookmark yet** (first push from the other
-  side hasn't happened) — exit 0, `remote_present: false`,
-  `resolved_bugs: 0`.
+- **remote has no `issues` bookmark yet** (first push from the
+  other side hasn't happened) — exit 0, `remote_present: false`,
+  `resolved_issues: 0`.
 - **clean fetch, no divergence** (jj fast-forwarded or there was
-  nothing new) — exit 0, `remote_present: true`, `resolved_bugs: 0`.
+  nothing new) — exit 0, `remote_present: true`,
+  `resolved_issues: 0`.
 - **divergence, op-space resolver ran** (`Storage::
-  resolve_divergence` reduced N bugs across the divergent heads) —
-  exit 0, `remote_present: true`, `resolved_bugs: N`.
+  resolve_divergence` reduced N issues across the divergent
+  heads) — exit 0, `remote_present: true`, `resolved_issues: N`.
 
 Every success envelope carries `merge_strategy: "op_space"` to pin
 which driver ran. The field exists for forward-compat — a future
 `jjf` may grow alternate strategies (e.g. a `file_bytes` escape
 hatch, see `bfc732b`); today the only value is `op_space`.
 
-Preflight is jj-repo-only (not the full `bugs_bookmark` probe) —
-a fresh clone has `bugs@<remote>` but no local `bugs` yet, and
+Preflight is jj-repo-only (not the full `issues_bookmark` probe) —
+a fresh clone has `issues@<remote>` but no local `issues` yet, and
 `pull` is what materializes the local bookmark via the
 `jj bookmark track` step.
 
 ```sh
 $ jjf pull --json origin
-{"ok":true,"remote":"origin","bookmark":"bugs","remote_present":true,"merge_strategy":"op_space","resolved_bugs":0}
+{"ok":true,"remote":"origin","bookmark":"issues","remote_present":true,"merge_strategy":"op_space","resolved_issues":0}
 ```
 
 Empty-remote variant — first time anyone pulls from a remote whose
-bugs bookmark hasn't been pushed yet:
+issues bookmark hasn't been pushed yet:
 
 ```sh
 $ jjf pull --json origin
-{"ok":true,"remote":"origin","bookmark":"bugs","remote_present":false,"merge_strategy":"op_space","resolved_bugs":0}
+{"ok":true,"remote":"origin","bookmark":"issues","remote_present":false,"merge_strategy":"op_space","resolved_issues":0}
 ```
 
 With merges:
 
 ```sh
 $ jjf pull --json origin
-{"ok":true,"remote":"origin","bookmark":"bugs","remote_present":true,"merge_strategy":"op_space","resolved_bugs":2}
+{"ok":true,"remote":"origin","bookmark":"issues","remote_present":true,"merge_strategy":"op_space","resolved_issues":2}
 ```
 
 Error path — unknown remote:
@@ -456,12 +495,12 @@ The two error kinds' historic shape (kept for reference):
 
 ```sh
 $ jjf pull --json origin
-{"ok":false,"error":{"kind":"unmergeable","message":"…","details":{"bug_id":"aa6600b","detail":"…"}}}
+{"ok":false,"error":{"kind":"unmergeable","message":"…","details":{"issue_id":"aa6600b","detail":"…"}}}
 ```
 
 ```sh
 $ jjf pull --json origin
-{"ok":false,"error":{"kind":"comment_file_conflict","message":"…","details":{"bug_id":"aa6600b"}}}
+{"ok":false,"error":{"kind":"comment_file_conflict","message":"…","details":{"issue_id":"aa6600b"}}}
 ```
 
 ## The clap arg-error exception

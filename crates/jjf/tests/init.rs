@@ -36,7 +36,7 @@ fn scratch(name: &str) -> PathBuf {
     fs::canonicalize(&dir).unwrap()
 }
 
-/// Make a directory that's a fresh jj repo with no `bugs` bookmark.
+/// Make a directory that's a fresh jj repo with no `issues` bookmark.
 fn make_jj_repo(name: &str) -> PathBuf {
     let dir = scratch(name);
     let out = Command::new("jj")
@@ -62,13 +62,13 @@ fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
         .expect("spawn jjf")
 }
 
-/// Convenience: list the `bugs` bookmark via jj, return true if it
+/// Convenience: list the `issues` bookmark via jj, return true if it
 /// exists. We re-implement the storage crate's probe here rather than
 /// import it, so the test exercises observable repo state rather
 /// than the very function we're indirectly testing.
 fn bugs_bookmark_present(repo: &Path) -> bool {
     let out = Command::new("jj")
-        .args(["bookmark", "list", "-T", "name ++ \"\\n\"", "bugs"])
+        .args(["bookmark", "list", "-T", "name ++ \"\\n\"", "issues"])
         .current_dir(repo)
         .output()
         .expect("spawn jj");
@@ -79,7 +79,7 @@ fn bugs_bookmark_present(repo: &Path) -> bool {
     );
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .any(|l| l.trim() == "bugs")
+        .any(|l| l.trim() == "issues")
 }
 
 #[test]
@@ -87,7 +87,7 @@ fn init_on_fresh_jj_repo_succeeds_and_creates_bookmark() {
     let repo = make_jj_repo("init_fresh");
     assert!(
         !bugs_bookmark_present(&repo),
-        "precondition: bugs bookmark must not exist before init"
+        "precondition: issues bookmark must not exist before init"
     );
 
     let out = run_jjf(&repo, &["init"]);
@@ -99,13 +99,13 @@ fn init_on_fresh_jj_repo_succeeds_and_creates_bookmark() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("bugs"),
+        stdout.contains("issues"),
         "expected human-readable output to mention `bugs`, got: {stdout}"
     );
 
     assert!(
         bugs_bookmark_present(&repo),
-        "init should create the bugs bookmark"
+        "init should create the issues bookmark"
     );
 }
 
@@ -178,7 +178,7 @@ fn init_json_emits_expected_object() {
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("init --json output should be valid JSON");
     assert_eq!(v["ok"], serde_json::Value::Bool(true));
-    assert_eq!(v["bookmark"], serde_json::Value::String("bugs".into()));
+    assert_eq!(v["bookmark"], serde_json::Value::String("issues".into()));
 }
 
 #[test]

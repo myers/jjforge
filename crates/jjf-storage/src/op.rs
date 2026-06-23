@@ -5,70 +5,77 @@
 //!
 //! ```text
 //! Jjf-Op: set-status
-//! Jjf-Bug: aa6600b
+//! Jjf-Issue: aa6600b
 //! Jjf-Status: closed
 //! ```
 //!
 //! The `merge` op is included so the trailer round-trips cleanly when
 //! a reader encounters one — the merge driver crate is what actually
 //! writes them.
+//!
+//! ## v1 → v2 forward compatibility
+//!
+//! v1 trailers used `Jjf-Bug:` for the issue id; v2 emits `Jjf-Issue:`.
+//! The parser in [`crate::trailer`] tolerates both spellings on read,
+//! so any existing repo data with the v1 trailer continues to op-replay.
+//! This module only emits v2 (`Jjf-Issue:`).
 
 use serde::{Deserialize, Serialize};
 
-use crate::id::BugId;
+use crate::id::IssueId;
 use crate::record::Status;
 
 /// The op vocabulary per spec §5.2.
 ///
 /// `serde` is derived so the payload round-trips for callers that want
-/// JSON-shaped op records (e.g. tests, the upcoming read path that
-/// reconstructs the typed audit chain).
+/// JSON-shaped op records (e.g. tests, the read path that reconstructs
+/// the typed audit chain).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 pub enum Op {
     Create {
-        bug_id: BugId,
+        issue_id: IssueId,
         title: String,
         status: Status,
     },
     SetTitle {
-        bug_id: BugId,
+        issue_id: IssueId,
         title: String,
     },
     SetStatus {
-        bug_id: BugId,
+        issue_id: IssueId,
         status: Status,
     },
     SetBody {
-        bug_id: BugId,
+        issue_id: IssueId,
         body_hash: String,
     },
     LabelAdd {
-        bug_id: BugId,
+        issue_id: IssueId,
         label: String,
     },
     LabelRm {
-        bug_id: BugId,
+        issue_id: IssueId,
         label: String,
     },
     DepAdd {
-        bug_id: BugId,
-        dep: BugId,
+        issue_id: IssueId,
+        dep: IssueId,
     },
     DepRm {
-        bug_id: BugId,
-        dep: BugId,
+        issue_id: IssueId,
+        dep: IssueId,
     },
     SetAssignee {
-        bug_id: BugId,
+        issue_id: IssueId,
         assignee: Option<String>,
     },
     CommentAdd {
-        bug_id: BugId,
-        comment_id: BugId,
+        issue_id: IssueId,
+        comment_id: IssueId,
     },
     Merge {
-        bug_id: BugId,
+        issue_id: IssueId,
     },
 }
 
@@ -90,24 +97,24 @@ impl Op {
         }
     }
 
-    /// The `Jjf-Bug:` value (every op carries one — spec §5.1).
-    pub fn bug_id(&self) -> &BugId {
+    /// The `Jjf-Issue:` value (every op carries one — spec §5.1).
+    pub fn issue_id(&self) -> &IssueId {
         match self {
-            Op::Create { bug_id, .. }
-            | Op::SetTitle { bug_id, .. }
-            | Op::SetStatus { bug_id, .. }
-            | Op::SetBody { bug_id, .. }
-            | Op::LabelAdd { bug_id, .. }
-            | Op::LabelRm { bug_id, .. }
-            | Op::DepAdd { bug_id, .. }
-            | Op::DepRm { bug_id, .. }
-            | Op::SetAssignee { bug_id, .. }
-            | Op::CommentAdd { bug_id, .. }
-            | Op::Merge { bug_id } => bug_id,
+            Op::Create { issue_id, .. }
+            | Op::SetTitle { issue_id, .. }
+            | Op::SetStatus { issue_id, .. }
+            | Op::SetBody { issue_id, .. }
+            | Op::LabelAdd { issue_id, .. }
+            | Op::LabelRm { issue_id, .. }
+            | Op::DepAdd { issue_id, .. }
+            | Op::DepRm { issue_id, .. }
+            | Op::SetAssignee { issue_id, .. }
+            | Op::CommentAdd { issue_id, .. }
+            | Op::Merge { issue_id } => issue_id,
         }
     }
 
-    /// Render one op stanza: the `Jjf-Op:` line, the `Jjf-Bug:` line,
+    /// Render one op stanza: the `Jjf-Op:` line, the `Jjf-Issue:` line,
     /// the `Jjf-At:` line, and any op-specific payload trailers, each
     /// terminated with `\n`.
     ///
@@ -120,8 +127,8 @@ impl Op {
         s.push_str("Jjf-Op: ");
         s.push_str(self.op_type());
         s.push('\n');
-        s.push_str("Jjf-Bug: ");
-        s.push_str(self.bug_id().as_str());
+        s.push_str("Jjf-Issue: ");
+        s.push_str(self.issue_id().as_str());
         s.push('\n');
         s.push_str("Jjf-At: ");
         s.push_str(jjf_at);

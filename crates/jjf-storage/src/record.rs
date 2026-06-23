@@ -1,5 +1,5 @@
-//! Per-bug record schema for `bugs/<id>.json` (spec §3) and comment
-//! schema for `bugs/<id>.comments.jsonl` (spec §4).
+//! Per-issue record schema for `issues/<id>.json` (spec §3) and comment
+//! schema for `issues/<id>.comments.jsonl` (spec §4).
 //!
 //! Field ORDER on the JSON record matters: spec §3.3 requires the
 //! writer to emit fields in the schema order so jj's textual
@@ -9,9 +9,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::id::BugId;
+use crate::id::IssueId;
 
-/// Bug status. v1 has exactly two values; spec §3 calls out the enum
+/// Issue status. v1 has exactly two values; spec §3 calls out the enum
 /// as extensible later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -29,68 +29,68 @@ impl Status {
     }
 }
 
-/// The full v1 record. Field declaration order == on-disk emission
+/// The full v2 record. Field declaration order == on-disk emission
 /// order. Don't reorder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BugRecord {
+pub struct IssueRecord {
     pub version: u32,
-    pub id: BugId,
+    pub id: IssueId,
     pub title: String,
     pub body: String,
     pub status: Status,
     pub labels: Vec<String>,
-    pub dependencies: Vec<BugId>,
+    pub dependencies: Vec<IssueId>,
     pub assignee: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
 
-/// User-supplied input to `Storage::create_bug`. The crate fills in
+/// User-supplied input to `Storage::create_issue`. The crate fills in
 /// id, status, created_at, updated_at, version.
 #[derive(Debug, Clone, Default)]
-pub struct BugDraft {
+pub struct IssueDraft {
     pub title: String,
     pub body: String,
     pub labels: Vec<String>,
-    pub dependencies: Vec<BugId>,
+    pub dependencies: Vec<IssueId>,
     pub assignee: Option<String>,
 }
 
-/// One line of `bugs/<id>.comments.jsonl`. Serialized one per line,
+/// One line of `issues/<id>.comments.jsonl`. Serialized one per line,
 /// no surrounding array (spec §4.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Comment {
-    pub id: BugId,
+    pub id: IssueId,
     pub author: String,
     pub created_at: String,
     pub body: String,
 }
 
-/// The read-side view of a bug: the latest scalar state plus the full
+/// The read-side view of an issue: the latest scalar state plus the full
 /// chronological comment thread. Returned by `Storage::read`.
 ///
 /// This is a flattened projection of the on-disk pair
-/// (`bugs/<id>.json` + `bugs/<id>.comments.jsonl`) that callers (the
-/// upcoming `jjf` CLI, the merge driver once it consumes records) can
-/// use without knowing about the underlying file layout.
+/// (`issues/<id>.json` + `issues/<id>.comments.jsonl`) that callers (the
+/// `jjf` CLI, the merge driver once it consumes records) can use
+/// without knowing about the underlying file layout.
 ///
-/// Fields mirror `BugRecord` plus a `comments` vector. `labels` and
+/// Fields mirror `IssueRecord` plus a `comments` vector. `labels` and
 /// `dependencies` are sorted (the writer guarantees that already, but
 /// the read path re-sorts defensively); `comments` are sorted by
 /// `created_at` ascending (chronological).
 ///
 /// The `Serialize` impl is the structured payload `jjf show --json`
 /// emits — field declaration order doubles as on-the-wire JSON field
-/// order, mirroring `BugRecord`'s schema-stability rule (spec §3.3)
+/// order, mirroring `IssueRecord`'s schema-stability rule (spec §3.3)
 /// even though no merge ever sees this projection on disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Bug {
-    pub id: BugId,
+pub struct Issue {
+    pub id: IssueId,
     pub title: String,
     pub body: String,
     pub status: Status,
     pub labels: Vec<String>,
-    pub dependencies: Vec<BugId>,
+    pub dependencies: Vec<IssueId>,
     pub assignee: Option<String>,
     pub comments: Vec<Comment>,
     pub created_at: String,

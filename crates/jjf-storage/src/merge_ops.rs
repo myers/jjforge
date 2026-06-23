@@ -1,6 +1,6 @@
 //! Op-space merge driver: replay each head's op chain, reduce
 //! field-by-field with the LWW ordering tuple defined in spec §6, and
-//! render the merged bug record. The file becomes a deterministic
+//! render the merged issue record. The file becomes a deterministic
 //! projection of the op stream — there is no body-text "unmergeable"
 //! failure mode, and label add/remove from different heads composes
 //! by causal order rather than the v1 file-bytes driver's set-union
@@ -36,7 +36,7 @@
 //!
 //! `Op::SetBody` carries only `body_hash` (spec §5.2). The op-space
 //! reducer picks the winning hash; the body bytes themselves come
-//! from whichever head's rendered `bugs/<id>.json` matches that
+//! from whichever head's rendered `issues/<id>.json` matches that
 //! hash. Both heads might match if they shared the body op (the
 //! bytes are identical either way); at least one head will match by
 //! construction since `SetBody` always lands on top of a record write.
@@ -44,30 +44,31 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::history::HistoryEntry;
-use crate::id::BugId;
+use crate::id::IssueId;
 use crate::jj::JjRepo;
 use crate::op::Op;
-use crate::record::{BugRecord, Comment};
-use crate::{bug_comments_relpath, bug_json_relpath, Error, Result};
+use crate::record::{Comment, IssueRecord};
+use crate::{issue_comments_relpath, issue_json_relpath, Error, Result};
 
-/// One bug after the op-space reducer has folded all heads' chains
+/// One issue after the op-space reducer has folded all heads' chains
 /// into a single winning state. The merged on-disk file
-/// (`bugs/<id>.json`) is `record` serialized canonically; the merged
+/// (`issues/<id>.json`) is `record` serialized canonically; the merged
 /// comments file is `comments` written one JSON-per-line.
 #[derive(Debug, Clone)]
-pub struct MergedBug {
-    pub id: BugId,
-    pub record: BugRecord,
+pub struct MergedIssue {
+    pub id: IssueId,
+    pub record: IssueRecord,
     pub comments: Vec<Comment>,
 }
 
 /// What [`super::Storage::resolve_divergence`] returns: one
-/// [`MergedBug`] per bug that needed resolution. A bug that exists
-/// only on one head still appears here so the caller can write its
-/// bytes into the merge commit's working copy without special-casing.
+/// [`MergedIssue`] per issue that needed resolution. An issue that
+/// exists only on one head still appears here so the caller can write
+/// its bytes into the merge commit's working copy without
+/// special-casing.
 #[derive(Debug, Clone)]
 pub struct MergeReport {
-    pub bugs: Vec<MergedBug>,
+    pub issues: Vec<MergedIssue>,
 }
 
 /// The reducer's ordering key. Total order across all (head, op)
@@ -108,40 +109,40 @@ impl OpKey {
 }
 
 /// Run the op-space resolver against the given heads. Returns one
-/// [`MergedBug`] per bug touched by any head's chain.
+/// [`MergedIssue`] per issue touched by any head's chain.
 ///
 /// Errors:
-/// - `BugNotFound` is impossible here — we only consider bugs that at
-///   least one head saw, and `read_history_at` only returns
-///   `BugNotFound` when we ask it about a bug no commit touches.
+/// - `IssueNotFound` is impossible here — we only consider issues that
+///   at least one head saw, and `read_history_at` only returns
+///   `IssueNotFound` when we ask it about an issue no commit touches.
 /// - `Jj` if any of the `jj log` / `jj file show` shell-outs fail.
 pub(crate) fn resolve(repo: &JjRepo, heads: &[String]) -> Result<MergeReport> {
     if heads.is_empty() {
-        return Ok(MergeReport { bugs: Vec::new() });
+        return Ok(MergeReport { issues: Vec::new() });
     }
 
-    // 1. Enumerate every bug id that appears on any head. Reuse the
-    //    same `bugs/` directory listing pattern `list_ids` uses, but
+    // 1. Enumerate every issue id that appears on any head. Reuse the
+    //    same `issues/` directory listing pattern `list_ids` uses, but
     //    parameterized on the head rev so we don't accidentally
     //    enumerate the bookmark tip's view.
-    let mut bug_ids: BTreeSet<BugId> = BTreeSet::new();
+    let mut issue_ids: BTreeSet<IssueId> = BTreeSet::new();
     for head in heads {
         for id in list_ids_at(repo, head)? {
-            bug_ids.insert(id);
+            issue_ids.insert(id);
         }
     }
 
-    let mut out: Vec<MergedBug> = Vec::new();
-    for id in bug_ids {
+    let mut out: Vec<MergedIssue> = Vec::new();
+    for id in issue_ids {
         let merged = resolve_one(repo, heads, &id)?;
         out.push(merged);
     }
 
-    Ok(MergeReport { bugs: out })
+    Ok(MergeReport { issues: out })
 }
 
-/// List every bug id present in `bugs/<id>.json` at the given rev.
-fn list_ids_at(repo: &JjRepo, rev: &str) -> Result<Vec<BugId>> {
+/// List every issue id present in `issues/<id>.json` at the given rev.
+fn list_ids_at(repo: &JjRepo, rev: &str) -> Result<Vec<IssueId>> {
     let text = repo.run(&[
         "file",
         "list",
@@ -149,37 +150,37 @@ fn list_ids_at(repo: &JjRepo, rev: &str) -> Result<Vec<BugId>> {
         rev,
         "-T",
         "path ++ \"\\n\"",
-        "root:bugs/",
+        "root:issues/",
     ])?;
-    let mut ids: Vec<BugId> = Vec::new();
+    let mut ids: Vec<IssueId> = Vec::new();
     for line in text.lines() {
         let line = line.trim();
-        let Some(rest) = line.strip_prefix("bugs/") else {
+        let Some(rest) = line.strip_prefix("issues/") else {
             continue;
         };
         let Some(stem) = rest.strip_suffix(".json") else {
             continue;
         };
-        if let Ok(id) = BugId::parse(stem) {
+        if let Ok(id) = IssueId::parse(stem) {
             ids.push(id);
         }
     }
     Ok(ids)
 }
 
-/// Replay one bug across every head and produce the merged
-/// [`MergedBug`].
+/// Replay one issue across every head and produce the merged
+/// [`MergedIssue`].
 ///
 /// For each head:
 /// - Walk its op chain via `read_history_at`.
 /// - Read its rendered record + comments file (if present) so we can
 ///   look up body bytes by hash and union comment bodies by id.
-fn resolve_one(repo: &JjRepo, heads: &[String], id: &BugId) -> Result<MergedBug> {
+fn resolve_one(repo: &JjRepo, heads: &[String], id: &IssueId) -> Result<MergedIssue> {
     // Per-head structural snapshots. The reducer uses the op chain
     // for everything that can be op-replayed (title/status/labels/…);
     // the rendered files provide body bytes and comment bodies.
     struct HeadSnapshot {
-        record: Option<BugRecord>,
+        record: Option<IssueRecord>,
         comments: Vec<Comment>,
         entries: Vec<HistoryEntry>,
     }
@@ -188,7 +189,7 @@ fn resolve_one(repo: &JjRepo, heads: &[String], id: &BugId) -> Result<MergedBug>
     for head in heads {
         let entries = match super::history::read_history_at(repo, head, id) {
             Ok(v) => v,
-            Err(Error::BugNotFound(_)) => Vec::new(),
+            Err(Error::IssueNotFound(_)) => Vec::new(),
             Err(e) => return Err(e),
         };
         let record = read_record_at(repo, head, id)?;
@@ -217,12 +218,12 @@ fn resolve_one(repo: &JjRepo, heads: &[String], id: &BugId) -> Result<MergedBug>
     all_entries.sort_by(|a, b| OpKey::from_entry(a).cmp(&OpKey::from_entry(b)));
 
     if all_entries.is_empty() {
-        // Both heads agree the bug doesn't exist. Should be
+        // Both heads agree the issue doesn't exist. Should be
         // unreachable because list_ids_at only surfaced ids present
         // on at least one head; we synthesize a sensible error rather
         // than panic.
         return Err(Error::Invalid(format!(
-            "resolve: bug {} not present on any head, yet enumerated",
+            "resolve: issue {} not present on any head, yet enumerated",
             id
         )));
     }
@@ -243,12 +244,12 @@ fn resolve_one(repo: &JjRepo, heads: &[String], id: &BugId) -> Result<MergedBug>
     // formed chain).
     let mut record = match &all_entries[0].op {
         Op::Create {
-            bug_id,
+            issue_id,
             title,
             status,
-        } => BugRecord {
-            version: 1,
-            id: bug_id.clone(),
+        } => IssueRecord {
+            version: 2,
+            id: issue_id.clone(),
             title: title.clone(),
             body: String::new(),
             status: *status,
@@ -262,7 +263,7 @@ fn resolve_one(repo: &JjRepo, heads: &[String], id: &BugId) -> Result<MergedBug>
         },
         _ => {
             return Err(Error::Invalid(format!(
-                "resolve: bug {} chain does not start with `create`",
+                "resolve: issue {} chain does not start with `create`",
                 id
             )));
         }
@@ -272,7 +273,7 @@ fn resolve_one(repo: &JjRepo, heads: &[String], id: &BugId) -> Result<MergedBug>
     // `Some(())`, a `LabelRm` writes `None`; final pass takes
     // present-labels = keys whose final value is `Some`.
     let mut label_state: BTreeMap<String, bool> = BTreeMap::new();
-    let mut dep_state: BTreeMap<BugId, bool> = BTreeMap::new();
+    let mut dep_state: BTreeMap<IssueId, bool> = BTreeMap::new();
 
     // Track the latest SetBody op's hash so we can look up the
     // matching head's body bytes once the reduce is done.
@@ -280,7 +281,7 @@ fn resolve_one(repo: &JjRepo, heads: &[String], id: &BugId) -> Result<MergedBug>
     // Pre-seed from `Create` whose ops also include `set-body` per
     // spec §5.7 (multi-op create). The fold below picks that up.
 
-    let mut comment_ids: Vec<BugId> = Vec::new();
+    let mut comment_ids: Vec<IssueId> = Vec::new();
 
     for entry in &all_entries {
         // Bump updated_at to the latest op's stamp. Use the op-time
@@ -334,7 +335,7 @@ fn resolve_one(repo: &JjRepo, heads: &[String], id: &BugId) -> Result<MergedBug>
     labels.sort();
     record.labels = labels;
 
-    let mut deps: Vec<BugId> = dep_state
+    let mut deps: Vec<IssueId> = dep_state
         .into_iter()
         .filter_map(|(d, present)| if present { Some(d) } else { None })
         .collect();
@@ -361,7 +362,7 @@ fn resolve_one(repo: &JjRepo, heads: &[String], id: &BugId) -> Result<MergedBug>
                 // a record write that includes the body). Surface a
                 // typed error rather than a panic.
                 return Err(Error::Invalid(format!(
-                    "resolve: bug {} winning body hash {} not present on any head",
+                    "resolve: issue {} winning body hash {} not present on any head",
                     id, hash
                 )));
             }
@@ -385,7 +386,7 @@ fn resolve_one(repo: &JjRepo, heads: &[String], id: &BugId) -> Result<MergedBug>
     //    carries it (both heads' bytes are identical for shared ops).
     //    Sort by `created_at` ascending per spec §4.2 (file is
     //    append-only by created_at).
-    let mut seen_comments: BTreeSet<BugId> = BTreeSet::new();
+    let mut seen_comments: BTreeSet<IssueId> = BTreeSet::new();
     let mut comments: Vec<Comment> = Vec::new();
     for cid in &comment_ids {
         if !seen_comments.insert(cid.clone()) {
@@ -408,18 +409,18 @@ fn resolve_one(repo: &JjRepo, heads: &[String], id: &BugId) -> Result<MergedBug>
     }
     comments.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
-    Ok(MergedBug {
+    Ok(MergedIssue {
         id: id.clone(),
         record,
         comments,
     })
 }
 
-/// Read `bugs/<id>.json` at `rev`. Returns `Ok(None)` if the file is
+/// Read `issues/<id>.json` at `rev`. Returns `Ok(None)` if the file is
 /// absent at that revision (e.g. one head deleted it, which v1 doesn't
 /// actually support but we tolerate defensively).
-fn read_record_at(repo: &JjRepo, rev: &str, id: &BugId) -> Result<Option<BugRecord>> {
-    let relpath = bug_json_relpath(id);
+fn read_record_at(repo: &JjRepo, rev: &str, id: &IssueId) -> Result<Option<IssueRecord>> {
+    let relpath = issue_json_relpath(id);
     let text = match repo.run(&[
         "file",
         "show",
@@ -433,10 +434,10 @@ fn read_record_at(repo: &JjRepo, rev: &str, id: &BugId) -> Result<Option<BugReco
     Ok(Some(serde_json::from_str(&text)?))
 }
 
-/// Read `bugs/<id>.comments.jsonl` at `rev`. Missing file => no
+/// Read `issues/<id>.comments.jsonl` at `rev`. Missing file => no
 /// comments. JSON-line errors bubble up as `Error::Json`.
-fn read_comments_at(repo: &JjRepo, rev: &str, id: &BugId) -> Result<Vec<Comment>> {
-    let relpath = bug_comments_relpath(id);
+fn read_comments_at(repo: &JjRepo, rev: &str, id: &IssueId) -> Result<Vec<Comment>> {
+    let relpath = issue_comments_relpath(id);
     let text = match repo.run(&[
         "file",
         "show",

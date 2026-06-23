@@ -1,16 +1,25 @@
 //! Shared `Jjf-Op:` trailer parser.
 //!
 //! Both the read path (`read.rs`, debug-build cross-check that re-derives
-//! a bug's structural state from its op chain) and the history path
-//! (`history.rs`, the per-bug op-by-op timeline) need to parse trailer
+//! an issue's structural state from its op chain) and the history path
+//! (`history.rs`, the per-issue op-by-op timeline) need to parse trailer
 //! stanzas out of a commit description and turn them into typed `Op`
 //! values. This module is the single source of truth for that parse so
 //! the two callers can't drift.
 //!
 //! See `docs/storage-format.md` §5 for the trailer schema, §5.3 for the
 //! multi-op ordering rule, and §5.7 for the create-time multi-op rule.
+//!
+//! ## v1 → v2 forward compatibility
+//!
+//! v1 trailers used `Jjf-Bug:` for the issue id; v2 emits `Jjf-Issue:`.
+//! The parser accepts BOTH spellings transparently. This is the
+//! load-bearing forward-compat seam — repos written under v1 (the
+//! original `bugs` bookmark) continue to op-replay through this
+//! parser even after the v2 cutover, so the inline-detect migration in
+//! `Storage::open` can run safely against existing data.
 
-use crate::id::BugId;
+use crate::id::IssueId;
 use crate::op::Op;
 use crate::record::Status;
 
@@ -28,17 +37,18 @@ pub(crate) struct ParsedOp {
 }
 
 /// Parse all `Jjf-Op:` stanzas from a commit description, returning
-/// typed ops in trailer order. Stanzas whose `Jjf-Bug:` field doesn't
-/// match `id` are dropped (spec allows multi-bug commits even though
-/// the v1 writer doesn't emit them). Unknown op-types are tolerated
-/// per spec §5.2 — they're skipped silently.
+/// typed ops in trailer order. Stanzas whose `Jjf-Issue:` (or legacy
+/// `Jjf-Bug:`) field doesn't match `id` are dropped (spec allows
+/// multi-issue commits even though the v1 writer doesn't emit them).
+/// Unknown op-types are tolerated per spec §5.2 — they're skipped
+/// silently.
 ///
 /// Convenience wrapper around `parse_ops_with_meta` that drops the
 /// trailer-level metadata; preserved so call sites that only care
 /// about the typed op (the debug-only read-path cross-check, the
-/// per-bug history view's payload) don't have to thread the meta
+/// per-issue history view's payload) don't have to thread the meta
 /// they don't use.
-pub(crate) fn parse_ops(desc: &str, id: &BugId) -> Vec<Op> {
+pub(crate) fn parse_ops(desc: &str, id: &IssueId) -> Vec<Op> {
     parse_ops_with_meta(desc, id)
         .into_iter()
         .map(|p| p.op)
@@ -48,10 +58,10 @@ pub(crate) fn parse_ops(desc: &str, id: &BugId) -> Vec<Op> {
 /// Parse all `Jjf-Op:` stanzas from a commit description, returning
 /// each typed op alongside the `Jjf-At:` value (if present).
 ///
-/// Stanzas whose `Jjf-Bug:` field doesn't match `id` are dropped,
-/// matching `parse_ops`'s semantics. Unknown op-types are tolerated
-/// per spec §5.2 — skipped silently.
-pub(crate) fn parse_ops_with_meta(desc: &str, id: &BugId) -> Vec<ParsedOp> {
+/// Stanzas whose `Jjf-Issue:`/`Jjf-Bug:` field doesn't match `id` are
+/// dropped, matching `parse_ops`'s semantics. Unknown op-types are
+/// tolerated per spec §5.2 — skipped silently.
+pub(crate) fn parse_ops_with_meta(desc: &str, id: &IssueId) -> Vec<ParsedOp> {
     // Find the trailer block: the last paragraph of trailer lines at
     // the end of the description. We don't need to be too clever — we
     // just iterate every `Jjf-Op:` we see and pair it with subsequent
@@ -110,9 +120,10 @@ pub(crate) fn parse_ops_with_meta(desc: &str, id: &BugId) -> Vec<ParsedOp> {
 }
 
 /// Convert one parsed trailer stanza (starting with `Jjf-Op`) into a
-/// typed op for the requested bug, or `None` if it's missing required
-/// fields, references a different bug, or has an unknown op-type.
-fn stanza_to_op(stanza: &[(&str, &str)], id: &BugId) -> Option<Op> {
+/// typed op for the requested issue, or `None` if it's missing
+/// required fields, references a different issue, or has an unknown
+/// op-type.
+fn stanza_to_op(stanza: &[(&str, &str)], id: &IssueId) -> Option<Op> {
     if stanza.is_empty() || stanza[0].0 != "Jjf-Op" {
         return None;
     }
@@ -126,59 +137,64 @@ fn stanza_to_op(stanza: &[(&str, &str)], id: &BugId) -> Option<Op> {
             .map(|(_, v)| (*v).to_owned())
     };
 
-    let bug_id_str = get("Jjf-Bug")?;
-    if bug_id_str != id.as_str() {
-        // Op for a different bug — drop.
+    // v2 emits `Jjf-Issue:`; v1 emitted `Jjf-Bug:`. Read either —
+    // forward-compat with pre-v2 commits is load-bearing for the
+    // inline-detect migration. New name preferred when both are
+    // present (defensive — should never happen, but if it does the
+    // v2 name wins).
+    let issue_id_str = get("Jjf-Issue").or_else(|| get("Jjf-Bug"))?;
+    if issue_id_str != id.as_str() {
+        // Op for a different issue — drop.
         return None;
     }
-    let bug_id = BugId::parse(&bug_id_str).ok()?;
+    let issue_id = IssueId::parse(&issue_id_str).ok()?;
 
     let op = match op_type {
         "create" => Op::Create {
-            bug_id,
+            issue_id,
             title: get("Jjf-Title")?,
             status: parse_status(&get("Jjf-Status")?)?,
         },
         "set-title" => Op::SetTitle {
-            bug_id,
+            issue_id,
             title: get("Jjf-Title")?,
         },
         "set-status" => Op::SetStatus {
-            bug_id,
+            issue_id,
             status: parse_status(&get("Jjf-Status")?)?,
         },
         "set-body" => Op::SetBody {
-            bug_id,
+            issue_id,
             body_hash: get("Jjf-Body-Hash")?,
         },
         "label-add" => Op::LabelAdd {
-            bug_id,
+            issue_id,
             label: get("Jjf-Label")?,
         },
         "label-rm" => Op::LabelRm {
-            bug_id,
+            issue_id,
             label: get("Jjf-Label")?,
         },
         "dep-add" => Op::DepAdd {
-            bug_id,
-            dep: BugId::parse(&get("Jjf-Dep")?).ok()?,
+            issue_id,
+            dep: IssueId::parse(&get("Jjf-Dep")?).ok()?,
         },
         "dep-rm" => Op::DepRm {
-            bug_id,
-            dep: BugId::parse(&get("Jjf-Dep")?).ok()?,
+            issue_id,
+            dep: IssueId::parse(&get("Jjf-Dep")?).ok()?,
         },
         "set-assignee" => {
             let v = get("Jjf-Assignee").unwrap_or_default();
             Op::SetAssignee {
-                bug_id,
+                issue_id,
                 assignee: if v.is_empty() { None } else { Some(v) },
             }
         }
         "comment-add" => Op::CommentAdd {
-            bug_id,
-            comment_id: BugId::parse(&get("Jjf-Comment-Id")?).ok()?,
+            issue_id,
+            comment_id: IssueId::parse(&get("Jjf-Comment-Id")?).ok()?,
         },
-        "merge" => Op::Merge { bug_id },
+        "merge" => Op::Merge { issue_id },
         // Unknown op-type: spec §5.2 says tolerate. Skip silently;
         // history callers that care about the unknown can see the
         // raw trailer chain via the underlying `jj log`.
@@ -215,12 +231,35 @@ fn split_trailer(line: &str) -> Option<(&str, &str)> {
 mod tests {
     use super::*;
 
-    fn id(s: &str) -> BugId {
-        BugId::parse(s).unwrap()
+    fn id(s: &str) -> IssueId {
+        IssueId::parse(s).unwrap()
     }
 
     #[test]
     fn parses_single_op_create_trailer() {
+        let desc = "\
+jjf: issue aa6600b - create
+
+Jjf-Op: create
+Jjf-Issue: aa6600b
+Jjf-Title: segfault on empty input
+Jjf-Status: open
+";
+        let ops = parse_ops(desc, &id("aa6600b"));
+        assert_eq!(
+            ops,
+            vec![Op::Create {
+                issue_id: id("aa6600b"),
+                title: "segfault on empty input".into(),
+                status: Status::Open,
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_v1_legacy_jjf_bug_trailer() {
+        // v1 trailers used `Jjf-Bug:`; the parser must accept that
+        // spelling so pre-v2 repo data continues to op-replay.
         let desc = "\
 jjf: bug aa6600b - create
 
@@ -233,7 +272,7 @@ Jjf-Status: open
         assert_eq!(
             ops,
             vec![Op::Create {
-                bug_id: id("aa6600b"),
+                issue_id: id("aa6600b"),
                 title: "segfault on empty input".into(),
                 status: Status::Open,
             }]
@@ -241,18 +280,41 @@ Jjf-Status: open
     }
 
     #[test]
+    fn jjf_issue_takes_precedence_over_jjf_bug_when_both_present() {
+        // Defensive: should never happen, but if a hand-built stanza
+        // carries both, the v2 name wins so the cutover semantics are
+        // clear (v2 forward-compat reads v1; v2's name is authoritative
+        // when there's a conflict).
+        let desc = "\
+jjf: issue aa6600b - create
+
+Jjf-Op: create
+Jjf-Issue: aa6600b
+Jjf-Bug: bbbbbbb
+Jjf-Title: t
+Jjf-Status: open
+";
+        let ops = parse_ops(desc, &id("aa6600b"));
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            Op::Create { issue_id, .. } => assert_eq!(issue_id, &id("aa6600b")),
+            other => panic!("expected Create, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn parses_multi_op_stanza_in_order() {
         // Spec §5.5 example.
         let desc = "\
-jjf: bug aa6600b - close + label
+jjf: issue aa6600b - close + label
 
 Closing as fixed in #42.
 
 Jjf-Op: set-status
-Jjf-Bug: aa6600b
+Jjf-Issue: aa6600b
 Jjf-Status: closed
 Jjf-Op: label-add
-Jjf-Bug: aa6600b
+Jjf-Issue: aa6600b
 Jjf-Label: fixed
 ";
         let ops = parse_ops(desc, &id("aa6600b"));
@@ -260,11 +322,11 @@ Jjf-Label: fixed
             ops,
             vec![
                 Op::SetStatus {
-                    bug_id: id("aa6600b"),
+                    issue_id: id("aa6600b"),
                     status: Status::Closed,
                 },
                 Op::LabelAdd {
-                    bug_id: id("aa6600b"),
+                    issue_id: id("aa6600b"),
                     label: "fixed".into(),
                 },
             ]
@@ -276,20 +338,20 @@ Jjf-Label: fixed
         // Unknown op-types must be tolerated, not panicked-on
         // (spec §5.2).
         let desc = "\
-jjf: bug aa6600b - speculative
+jjf: issue aa6600b - speculative
 
 Jjf-Op: not-yet-invented
-Jjf-Bug: aa6600b
+Jjf-Issue: aa6600b
 Jjf-Foo: bar
 Jjf-Op: set-status
-Jjf-Bug: aa6600b
+Jjf-Issue: aa6600b
 Jjf-Status: closed
 ";
         let ops = parse_ops(desc, &id("aa6600b"));
         assert_eq!(
             ops,
             vec![Op::SetStatus {
-                bug_id: id("aa6600b"),
+                issue_id: id("aa6600b"),
                 status: Status::Closed,
             }]
         );
@@ -299,10 +361,10 @@ Jjf-Status: closed
     fn parses_jjf_at_when_present() {
         // Stanza carries the optional Jjf-At trailer — surface it.
         let desc = "\
-jjf: bug aa6600b - close
+jjf: issue aa6600b - close
 
 Jjf-Op: set-status
-Jjf-Bug: aa6600b
+Jjf-Issue: aa6600b
 Jjf-At: 2026-06-22T12:34:56.123456789Z
 Jjf-Status: closed
 ";
@@ -315,7 +377,7 @@ Jjf-Status: closed
         assert_eq!(
             parsed[0].op,
             Op::SetStatus {
-                bug_id: id("aa6600b"),
+                issue_id: id("aa6600b"),
                 status: Status::Closed,
             }
         );
@@ -326,10 +388,10 @@ Jjf-Status: closed
         // Older fixtures and pre-spec-bump data have no Jjf-At; spec
         // §5 says parsers MUST tolerate that. Surface as None.
         let desc = "\
-jjf: bug aa6600b - close
+jjf: issue aa6600b - close
 
 Jjf-Op: set-status
-Jjf-Bug: aa6600b
+Jjf-Issue: aa6600b
 Jjf-Status: closed
 ";
         let parsed = parse_ops_with_meta(desc, &id("aa6600b"));
@@ -338,24 +400,24 @@ Jjf-Status: closed
     }
 
     #[test]
-    fn ignores_ops_for_other_bugs() {
-        // Multi-bug commits aren't a v1 pattern but the spec doesn't
-        // forbid them; readers must filter by Jjf-Bug.
+    fn ignores_ops_for_other_issues() {
+        // Multi-issue commits aren't a v1 pattern but the spec doesn't
+        // forbid them; readers must filter by Jjf-Issue.
         let desc = "\
-jjf: cross-bug
+jjf: cross-issue
 
 Jjf-Op: set-status
-Jjf-Bug: bbbbbbb
+Jjf-Issue: bbbbbbb
 Jjf-Status: closed
 Jjf-Op: set-status
-Jjf-Bug: aa6600b
+Jjf-Issue: aa6600b
 Jjf-Status: closed
 ";
         let ops = parse_ops(desc, &id("aa6600b"));
         assert_eq!(
             ops,
             vec![Op::SetStatus {
-                bug_id: id("aa6600b"),
+                issue_id: id("aa6600b"),
                 status: Status::Closed,
             }]
         );

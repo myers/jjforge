@@ -117,15 +117,15 @@ fn push_pull_single_clone_round_trip() {
     let push = run_jjf(&alice, &["push", "origin"]);
     must_succeed(&push, "jjf push origin (alice)");
     let push_stdout = String::from_utf8_lossy(&push.stdout);
-    assert_eq!(push_stdout.trim(), "pushed bugs -> origin");
+    assert_eq!(push_stdout.trim(), "pushed issues -> origin");
 
-    // Bob pulls (fresh clone with no local bugs bookmark).
+    // Bob pulls (fresh clone with no local issues bookmark).
     let pull = run_jjf(&bob, &["pull", "origin"]);
     must_succeed(&pull, "jjf pull origin (bob)");
     let pull_stdout = String::from_utf8_lossy(&pull.stdout);
     assert_eq!(
         pull_stdout.trim(),
-        "pulled bugs <- origin",
+        "pulled issues <- origin",
         "first pull should report clean fetch (no merge driver)",
     );
 
@@ -152,13 +152,13 @@ fn push_json_envelope_shape() {
         serde_json::from_str(stdout.trim()).expect("push --json must be valid JSON");
     assert_eq!(v["ok"].as_bool(), Some(true));
     assert_eq!(v["remote"].as_str(), Some("origin"));
-    assert_eq!(v["bookmark"].as_str(), Some("bugs"));
+    assert_eq!(v["bookmark"].as_str(), Some("issues"));
 }
 
 #[test]
 fn pull_json_envelope_with_no_remote_bookmark_yet() {
     // Alice clones a fresh bare remote and pulls before pushing —
-    // remote has no `bugs` bookmark yet, exit 0, `remote_present:
+    // remote has no `issues` bookmark yet, exit 0, `remote_present:
     // false`.
     let root = setup("pull_empty", &["alice"]);
     let alice = root.join("alice");
@@ -169,13 +169,13 @@ fn pull_json_envelope_with_no_remote_bookmark_yet() {
         serde_json::from_str(stdout.trim()).expect("pull --json must be valid JSON");
     assert_eq!(v["ok"].as_bool(), Some(true));
     assert_eq!(v["remote"].as_str(), Some("origin"));
-    assert_eq!(v["bookmark"].as_str(), Some("bugs"));
+    assert_eq!(v["bookmark"].as_str(), Some("issues"));
     assert_eq!(
         v["remote_present"].as_bool(),
         Some(false),
-        "remote_present must be false when remote has no bugs bookmark; got: {stdout}"
+        "remote_present must be false when remote has no issues bookmark; got: {stdout}"
     );
-    assert_eq!(v["resolved_bugs"].as_i64(), Some(0));
+    assert_eq!(v["resolved_issues"].as_i64(), Some(0));
     assert_eq!(v["merge_strategy"].as_str(), Some("op_space"));
 
     // Plain-text variant.
@@ -183,7 +183,7 @@ fn pull_json_envelope_with_no_remote_bookmark_yet() {
     must_succeed(&out, "pull (empty remote)");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("no bugs bookmark on remote yet"),
+        stdout.contains("no issues bookmark on remote yet"),
         "plain stdout should mention empty remote; got: {stdout}"
     );
 }
@@ -229,8 +229,8 @@ fn pull_two_clones_same_field_lww_converges() {
     must_succeed(&pull, "bob pull (divergent)");
     let pull_stdout = String::from_utf8_lossy(&pull.stdout);
     assert!(
-        pull_stdout.contains("resolved 1 bug"),
-        "pull stdout should mention resolved bug count; got: {pull_stdout}"
+        pull_stdout.contains("resolved 1 issue"),
+        "pull stdout should mention resolved issue count; got: {pull_stdout}"
     );
 
     // Verify bob's view post-merge: one of the two titles wins; never
@@ -358,7 +358,7 @@ fn pull_outside_jj_repo_exits_two_not_a_jj_repo() {
 
 #[test]
 fn push_without_bugs_bookmark_exits_two_missing_bookmark() {
-    // jj repo exists but `jjf init` was never run — local `bugs` is
+    // jj repo exists but `jjf init` was never run — local `issues` is
     // absent. `push` requires the bookmark.
     let root = setup("push_no_bookmark", &["alice"]);
     let alice = root.join("alice");
@@ -367,8 +367,8 @@ fn push_without_bugs_bookmark_exits_two_missing_bookmark() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("bugs"),
-        "stderr should mention bugs bookmark; got: {stderr}"
+        stderr.contains("issues"),
+        "stderr should mention issues bookmark; got: {stderr}"
     );
 
     // JSON envelope variant.
@@ -377,7 +377,7 @@ fn push_without_bugs_bookmark_exits_two_missing_bookmark() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let v: serde_json::Value =
         serde_json::from_str(stderr.trim()).expect("stderr must be JSON envelope");
-    assert_eq!(v["error"]["kind"].as_str(), Some("missing_bugs_bookmark"));
+    assert_eq!(v["error"]["kind"].as_str(), Some("missing_issues_bookmark"));
 }
 
 #[test]
@@ -414,22 +414,22 @@ fn push_help_lists_remote_positional() {
     );
 }
 
-/// `--json` push to a remote without the bugs bookmark locally: error
-/// envelope with `missing_bugs_bookmark`. Sister test of
+/// `--json` push to a remote without the issues bookmark locally: error
+/// envelope with `missing_issues_bookmark`. Sister test of
 /// `push_without_bugs_bookmark_exits_two_missing_bookmark` but exposing
 /// the json shape contract.
 #[test]
 fn pull_first_time_tracks_and_materializes_local_bugs() {
     // Verifies the `track` step in `pull`'s flow on a fresh second
-    // clone: bob's `bugs@origin` exists post-fetch but local `bugs`
+    // clone: bob's `issues@origin` exists post-fetch but local `issues`
     // is untracked until we explicitly track it.
     //
     // Test sequence:
     //   1. Alice inits + pushes (creates `bugs` on the bare remote).
     //   2. Bob was cloned BEFORE alice pushed, so bob has no
-    //      `bugs@origin` yet.
-    //   3. Bob pulls — under the hood: fetch (now sees bugs@origin),
-    //      track (materializes local bugs), no divergence (clean).
+    //      `issues@origin` yet.
+    //   3. Bob pulls — under the hood: fetch (now sees issues@origin),
+    //      track (materializes local issues), no divergence (clean).
     //   4. Local `bugs` should be present in bob's bookmark list.
     let root = setup("round_trip_track", &["alice", "bob"]);
     let alice = root.join("alice");
@@ -438,19 +438,19 @@ fn pull_first_time_tracks_and_materializes_local_bugs() {
     must_succeed(&run_jjf(&alice, &["new", "-t", "from alice"]), "new alice");
     must_succeed(&run_jjf(&alice, &["push", "origin"]), "push alice");
 
-    // Pull — fetches, then tracks bugs@origin so local `bugs` appears.
+    // Pull — fetches, then tracks issues@origin so local `issues` appears.
     must_succeed(&run_jjf(&bob, &["pull", "origin"]), "bob pull");
 
     let bm = run_jj(&bob, &["bookmark", "list", "--all-remotes"]);
     let bm_stdout = String::from_utf8_lossy(&bm.stdout);
-    // After tracking, local `bugs` should appear (the local-only line
+    // After tracking, local `issues` should appear (the local-only line
     // doesn't have an `@` segment — that's how we distinguish it from
-    // `bugs@origin`).
-    let has_local_bugs = bm_stdout
+    // `issues@origin`).
+    let has_local_issues = bm_stdout
         .lines()
-        .any(|line| line.trim_start().starts_with("bugs:") || line.trim_start().starts_with("bugs "));
+        .any(|line| line.trim_start().starts_with("issues:") || line.trim_start().starts_with("issues "));
     assert!(
-        has_local_bugs,
-        "after pull, local `bugs` should exist; got:\n{bm_stdout}"
+        has_local_issues,
+        "after pull, local `issues` should exist; got:\n{bm_stdout}"
     );
 }

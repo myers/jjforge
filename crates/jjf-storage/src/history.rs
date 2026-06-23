@@ -1,8 +1,8 @@
-//! Per-bug op-by-op timeline reconstructed from the `Jjf-Op:` trailer
-//! chain on the `bugs` bookmark.
+//! Per-issue op-by-op timeline reconstructed from the `Jjf-Op:` trailer
+//! chain on the `issues` bookmark.
 //!
-//! Given a bug id, returns one [`HistoryEntry`] per op, in commit order
-//! (oldest first). A commit that carries multiple ops (e.g. the
+//! Given an issue id, returns one [`HistoryEntry`] per op, in commit
+//! order (oldest first). A commit that carries multiple ops (e.g. the
 //! create-time multi-op stanza of spec §5.7, or a single-call close +
 //! label-add) emits one entry per op — all sharing the same `commit`,
 //! `author`, and `timestamp`, with the op-specific payload in `op`.
@@ -13,14 +13,14 @@
 //!
 //! # Scope
 //!
-//! This is the per-bug stream. A whole-bookmark audit log
-//! (every bug, every op) is a separate ticket.
+//! This is the per-issue stream. A whole-bookmark audit log
+//! (every issue, every op) is a separate ticket.
 
-use crate::id::BugId;
+use crate::id::IssueId;
 use crate::jj::JjRepo;
 use crate::op::Op;
 use crate::trailer::parse_ops_with_meta;
-use crate::{bug_comments_relpath, bug_json_relpath, Error, Result};
+use crate::{issue_comments_relpath, issue_json_relpath, Error, Result};
 
 /// One row of the op-by-op timeline.
 ///
@@ -31,7 +31,7 @@ use crate::{bug_comments_relpath, bug_json_relpath, Error, Result};
 ///
 /// `timestamp` is the commit's **author timestamp** formatted as
 /// `YYYY-MM-DDTHH:MM:SSZ` (UTC, second resolution). This is what jj
-/// stamps on the commit when the writer's `jj new bookmarks(bugs)`
+/// stamps on the commit when the writer's `jj new bookmarks(issues)`
 /// lands; it's distinct from (and may differ by a fraction of a second
 /// from) the writer's own `now_rfc3339()` that lands in the on-disk
 /// record's `created_at` / `updated_at`. See spec §5 and the closing
@@ -60,34 +60,34 @@ pub struct HistoryEntry {
     pub op: Op,
 }
 
-/// Walk the per-bug op chain on the `bugs` bookmark and return one
+/// Walk the per-issue op chain on the `issues` bookmark and return one
 /// entry per op, oldest first.
 ///
 /// Errors:
-/// - `BugNotFound` if the chain is empty (no commit on the bookmark
-///   touches `bugs/<id>.json` or `bugs/<id>.comments.jsonl`).
+/// - `IssueNotFound` if the chain is empty (no commit on the bookmark
+///   touches `issues/<id>.json` or `issues/<id>.comments.jsonl`).
 /// - `Jj` if the underlying `jj log` shell-out fails.
-pub(crate) fn read_history(repo: &JjRepo, id: &BugId) -> Result<Vec<HistoryEntry>> {
-    read_history_at(repo, "bookmarks(bugs)", id)
+pub(crate) fn read_history(repo: &JjRepo, id: &IssueId) -> Result<Vec<HistoryEntry>> {
+    read_history_at(repo, "bookmarks(issues)", id)
 }
 
-/// Walk the per-bug op chain rooted at `rev` and return one entry per
+/// Walk the per-issue op chain rooted at `rev` and return one entry per
 /// op, oldest first. The default `read_history` is this with `rev =
-/// bookmarks(bugs)`; pass an explicit commit (e.g. a change_id short
-/// from `bugs_heads`) to walk one head of a divergent bookmark
+/// bookmarks(issues)`; pass an explicit commit (e.g. a change_id short
+/// from `issues_heads`) to walk one head of a divergent bookmark
 /// independently of the others.
 ///
 /// Errors:
-/// - `BugNotFound` if no commit reachable from `rev` touches this
-///   bug's files.
+/// - `IssueNotFound` if no commit reachable from `rev` touches this
+///   issue's files.
 /// - `Jj` if the underlying `jj log` shell-out fails.
 pub(crate) fn read_history_at(
     repo: &JjRepo,
     rev: &str,
-    id: &BugId,
+    id: &IssueId,
 ) -> Result<Vec<HistoryEntry>> {
-    let json_relpath = bug_json_relpath(id);
-    let comments_relpath = bug_comments_relpath(id);
+    let json_relpath = issue_json_relpath(id);
+    let comments_relpath = issue_comments_relpath(id);
 
     // Same path filter as `read.rs`'s replay query: filter on BOTH the
     // json record AND the comments jsonl. A naïve filter on just the
@@ -137,7 +137,7 @@ pub(crate) fn read_history_at(
     records.reverse();
 
     if records.is_empty() {
-        return Err(Error::BugNotFound(id.clone()));
+        return Err(Error::IssueNotFound(id.clone()));
     }
 
     let mut out = Vec::new();
@@ -159,7 +159,7 @@ pub(crate) fn read_history_at(
         let description = parts[3];
 
         // One commit, possibly many ops. parse_ops_with_meta already
-        // filters to this bug and drops unknown op-types per spec §5.2;
+        // filters to this issue and drops unknown op-types per spec §5.2;
         // we trust its order (trailer order = spec §5.3 application
         // order). `trailer_index` is the 0-based stanza position within
         // this commit — used by the op-space merge driver as the

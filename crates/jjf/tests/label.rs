@@ -16,7 +16,7 @@
 //! - nonexistent id → exit 1,
 //! - bad id → exit 2,
 //! - non-jj cwd → exit 2,
-//! - jj repo without `bugs` bookmark → exit 2 + init hint (both arms),
+//! - jj repo without `issues` bookmark → exit 2 + init hint (both arms),
 //! - `--help` documents the positionals + `--json` (both arms).
 //!
 //! Same hermetic-scratch / no-`assert_cmd` discipline as the other
@@ -107,7 +107,7 @@ fn run_jjf_with_stdin(cwd: &Path, args: &[&str], stdin_bytes: &[u8]) -> Output {
 }
 
 /// Create a bug via `jjf new`, return its id.
-fn create_bug(repo: &Path, title: &str) -> String {
+fn create_issue(repo: &Path, title: &str) -> String {
     let out = run_jjf_with_stdin(repo, &["new", "-t", title, "-F", "-"], b"");
     assert!(
         out.status.success(),
@@ -123,7 +123,7 @@ fn create_bug(repo: &Path, title: &str) -> String {
 #[test]
 fn label_add_happy_path_show_reports_label() {
     let repo = make_initialized_repo("label_add_happy");
-    let id = create_bug(&repo, "label me");
+    let id = create_issue(&repo, "label me");
 
     let out = run_jjf(&repo, &["label", "add", &id, "backend"]);
     assert!(
@@ -149,7 +149,7 @@ fn label_add_happy_path_show_reports_label() {
 #[test]
 fn label_add_then_rm_round_trip() {
     let repo = make_initialized_repo("label_add_rm_round_trip");
-    let id = create_bug(&repo, "round trip");
+    let id = create_issue(&repo, "round trip");
 
     // add → show says backend.
     let out = run_jjf(&repo, &["label", "add", &id, "backend"]);
@@ -184,7 +184,7 @@ fn label_add_then_rm_round_trip() {
 #[test]
 fn label_add_json_envelope_shape() {
     let repo = make_initialized_repo("label_add_json");
-    let id = create_bug(&repo, "json add");
+    let id = create_issue(&repo, "json add");
 
     let out = run_jjf(&repo, &["label", "--json", "add", &id, "frontend"]);
     assert!(
@@ -225,7 +225,7 @@ fn label_rm_json_envelope_shape() {
     // `action` word. Catches a regression where the two arms' JSON
     // payloads drift apart.
     let repo = make_initialized_repo("label_rm_json");
-    let id = create_bug(&repo, "json rm");
+    let id = create_issue(&repo, "json rm");
     // Seed a label so the rm has something to take off.
     let out = run_jjf(&repo, &["label", "add", &id, "tooling"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -253,15 +253,15 @@ fn label_double_add_lands_two_trailers_one_label() {
     // fresh `label-add` op so the audit log records the intent. We
     // verify both: the record carries exactly one `backend`, and the
     // history carries exactly two `LabelAdd` entries.
-    use jjf_storage::{BugId, Op, Storage};
+    use jjf_storage::{IssueId, Op, Storage};
 
     let repo = make_initialized_repo("label_double_add");
-    let id = create_bug(&repo, "double add");
+    let id = create_issue(&repo, "double add");
 
     let storage = Storage::open(&repo).expect("Storage::open");
-    let bug_id = BugId::parse(&id).expect("parse id");
+    let issue_id = IssueId::parse(&id).expect("parse id");
     let baseline = storage
-        .read_history(&bug_id)
+        .read_history(&issue_id)
         .expect("read_history")
         .into_iter()
         .filter(|e| matches!(e.op, Op::LabelAdd { .. }))
@@ -274,6 +274,12 @@ fn label_double_add_lands_two_trailers_one_label() {
     // First add.
     let out = run_jjf(&repo, &["label", "add", &id, "backend"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // Same-second guard: see comment on `close_twice_lands_two_set_status_trailers`.
+    // Two adds in the same wall-clock second produce a byte-identical
+    // JSON record (`updated_at` is second-resolution per spec §3.1),
+    // which jj's snapshotter records as no file change — the path-
+    // filtered history then misses the second commit.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
     // Second add — same label.
     let out = run_jjf(&repo, &["label", "add", &id, "backend"]);
     assert!(
@@ -284,7 +290,7 @@ fn label_double_add_lands_two_trailers_one_label() {
     );
 
     let after = storage
-        .read_history(&bug_id)
+        .read_history(&issue_id)
         .expect("read_history")
         .into_iter()
         .filter(|e| matches!(e.op, Op::LabelAdd { .. }))
@@ -295,7 +301,7 @@ fn label_double_add_lands_two_trailers_one_label() {
     );
 
     // Record-level dedupe: one `backend`, not two.
-    let bug = storage.read(&bug_id).expect("read");
+    let bug = storage.read(&issue_id).expect("read");
     let backend_count = bug.labels.iter().filter(|l| *l == "backend").count();
     assert_eq!(
         backend_count, 1,
@@ -308,15 +314,15 @@ fn label_rm_absent_label_lands_trailer() {
     // Per spec §5.2: removing an absent label is a no-op at the
     // record level but still lands a fresh `label-rm` op. The CLI
     // exits 0 either way.
-    use jjf_storage::{BugId, Op, Storage};
+    use jjf_storage::{IssueId, Op, Storage};
 
     let repo = make_initialized_repo("label_rm_absent");
-    let id = create_bug(&repo, "rm absent");
+    let id = create_issue(&repo, "rm absent");
 
     let storage = Storage::open(&repo).expect("Storage::open");
-    let bug_id = BugId::parse(&id).expect("parse id");
+    let issue_id = IssueId::parse(&id).expect("parse id");
     let baseline = storage
-        .read_history(&bug_id)
+        .read_history(&issue_id)
         .expect("read_history")
         .into_iter()
         .filter(|e| matches!(e.op, Op::LabelRm { .. }))
@@ -336,7 +342,7 @@ fn label_rm_absent_label_lands_trailer() {
     );
 
     let after = storage
-        .read_history(&bug_id)
+        .read_history(&issue_id)
         .expect("read_history")
         .into_iter()
         .filter(|e| matches!(e.op, Op::LabelRm { .. }))
@@ -347,7 +353,7 @@ fn label_rm_absent_label_lands_trailer() {
     );
 
     // Record's label set stays empty — nothing was there to remove.
-    let bug = storage.read(&bug_id).expect("read");
+    let bug = storage.read(&issue_id).expect("read");
     assert!(
         bug.labels.is_empty(),
         "record labels should stay empty after no-op rm, got {:?}",
@@ -363,7 +369,7 @@ fn label_json_error_envelope_on_empty_label() {
     // Covers both arms transitively — the empty check lives in
     // `run_label` before the LabelOp branch.
     let repo = make_initialized_repo("label_json_err_empty");
-    let id = create_bug(&repo, "json envelope empty label");
+    let id = create_issue(&repo, "json envelope empty label");
 
     let out = run_jjf(&repo, &["--json", "label", "add", &id, ""]);
     assert!(!out.status.success());
@@ -391,7 +397,7 @@ fn label_json_error_envelope_on_empty_label() {
 #[test]
 fn label_add_empty_label_exits_two() {
     let repo = make_initialized_repo("label_empty_add");
-    let id = create_bug(&repo, "empty label add");
+    let id = create_issue(&repo, "empty label add");
 
     let out = run_jjf(&repo, &["label", "add", &id, ""]);
     assert!(!out.status.success(), "empty label should fail");
@@ -415,7 +421,7 @@ fn label_rm_empty_label_exits_two() {
     // regression where one arm's empty-label check diverges from the
     // other's.
     let repo = make_initialized_repo("label_empty_rm");
-    let id = create_bug(&repo, "empty label rm");
+    let id = create_issue(&repo, "empty label rm");
 
     let out = run_jjf(&repo, &["label", "rm", &id, ""]);
     assert!(!out.status.success(), "empty label should fail");
@@ -505,7 +511,7 @@ fn label_add_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`bugs` bookmark") && stderr.contains("jjf init"),
+        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
         "stderr should tell the user to run `jjf init` first, got: {stderr}"
     );
 }
@@ -520,7 +526,7 @@ fn label_rm_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`bugs` bookmark") && stderr.contains("jjf init"),
+        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
         "stderr should tell the user to run `jjf init` first, got: {stderr}"
     );
 }

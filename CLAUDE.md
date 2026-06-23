@@ -20,10 +20,13 @@ first.**
   `push`, `pull`) with `--json` on every verb. Storage spec
   pinned in `docs/storage-format.md`; CLI output contract in
   `docs/cli-json.md`. 178 workspace tests green.
-- **Planning surface:** `jjforge` itself, on the `bugs` bookmark
+- **Planning surface:** `jjforge` itself, on the `issues` bookmark
   in this repo. As of 2026-06-22 the project's own planning runs
   on `jjf`. Pre-cutover history lives in archived git-bug refs
-  (`refs/bugs/*`); the bridge is `docs/git-bug-cutover.md`.
+  (`refs/bugs/*`); the bridge is `docs/git-bug-cutover.md`. (The
+  v1 → v2 rename in `docs/storage-format.md` moved the live planner
+  data from `bugs` to `issues` automatically — the storage layer
+  detects v1-shape repos and migrates on first `Storage::open`.)
 - **Entry point:** the roadmap (`9566f52`). Read it first.
 - **CI:** `.woodpecker/blog.yaml` builds and pushes a Zola site
   image. Mirrors zfs-workspace's pattern except for the
@@ -57,7 +60,7 @@ of this file.
   itself plus child tickets when they're filed). Use the
   colon-prefixed form always.
 
-### Creating a new bug
+### Creating a new issue
 
 Use `-F -` to read the body from stdin (the recommended pattern
 — no interactive flow, no editor invocation, scripts cleanly).
@@ -95,7 +98,7 @@ Capture the new id from the JSON envelope:
 NEW_ID=$(jjf new --json -t "..." -F body.txt -l epic | jq -r .id)
 ```
 
-### Updating bugs
+### Updating issues
 
 ```bash
 jjf update <id> --title "New title"          # rename
@@ -122,7 +125,7 @@ multi-op commit (one trailer per field).
 
 ### Bodies are editable now
 
-Unlike pre-cutover git-bug, **jjforge supports editing a bug's
+Unlike pre-cutover git-bug, **jjforge supports editing an issue's
 body in place** via `jjf update <id> --body-file <path>`. This
 is the right way to revise a roadmap, fix an epic's plan, or
 restate scope. Comments are still useful for status updates and
@@ -146,7 +149,7 @@ canonical id is the 7-char string `jjf ls` prints.
 
 ### Push / pull
 
-`jjf push <remote>` and `jjf pull <remote>` round-trip the `bugs`
+`jjf push <remote>` and `jjf pull <remote>` round-trip the `issues`
 bookmark via standard git transport. No special refspec config
 needed — jj 0.40 carries the bookmark automatically (finding
 verified in archived `refs/bugs/07780aa`). `jjf remote
@@ -156,7 +159,7 @@ add|ls|rm` wraps `jj git remote *` for managing remotes.
 a Forgejo on the user's infrastructure) IS configured.** It's
 the canonical home of the code; `main` tracks `origin/main`.
 Push at the end of every issue (see Commits section). The
-jjforge `bugs` bookmark also rides this remote — `jjf push
+jjforge `issues` bookmark also rides this remote — `jjf push
 origin` round-trips the planner data alongside.
 
 ### Reading historical (pre-cutover) git-bug data
@@ -287,7 +290,7 @@ git add experiments/<topic>
   git push origin main
   ```
   And, when the issue's work mutated jjforge data on the
-  `bugs` bookmark (status comments, new tickets, etc.):
+  `issues` bookmark (status comments, new tickets, etc.):
   ```bash
   jjf push origin
   ```
@@ -329,10 +332,10 @@ When the user asks you to "orchestrate" or "make progress" or
    body via `jjf new`; let the subagent close it.
 
 5. **Dispatch serially, not in parallel.** Subagents writing to
-   the `bugs` bookmark race each other — concurrent commits on
+   the `issues` bookmark race each other — concurrent commits on
    the same bookmark force one to lose and re-run. Parallel is
    fine ONLY when the subagents have disjoint write targets
-   (different bug ids, different files in `experiments/<topic>/`).
+   (different issue ids, different files in `experiments/<topic>/`).
    When in doubt, serial.
 
 6. **Commit between dispatches.** Each subagent's experiments,
@@ -381,7 +384,7 @@ work and commits stay in the worktree. Do NOT chdir to
 `~/p/jjforge` to commit if you were invoked elsewhere — that
 contaminates the real working tree with experimental state.
 
-jjforge data lives on the `bugs` bookmark in the same repo; it
+jjforge data lives on the `issues` bookmark in the same repo; it
 travels between worktrees automatically with the bookmark.
 Code and experiments do not.
 
@@ -390,7 +393,7 @@ Code and experiments do not.
 This repo is colocated (`jj git init --colocate` was run during
 the cutover). The colocate setup creates a footgun: the storage
 layer's 4-CLI write dance moves the jj working copy onto an
-empty descendant of the `bugs` bookmark, which in a colocated
+empty descendant of the `issues` bookmark, which in a colocated
 repo also drives **git** HEAD onto `refs/jj/root` — a phantom
 empty root commit. Recovery is destructive
 (`git symbolic-ref HEAD refs/heads/main && git reset --hard main`)
@@ -503,7 +506,7 @@ Two filters jjforge doesn't yet ship that we want (file as
 agent-ergonomics tickets when needed):
 
 - A real `blocks` / `blocked-by` relation. `jjf ls --ready`
-  filtering open bugs whose dependencies are all closed is
+  filtering open issues whose dependencies are all closed is
   the headline agent-ergonomics primitive (`jjf ready`).
 - Full-text search across bodies and comments. git-bug had a
   query language; jjforge has none yet.

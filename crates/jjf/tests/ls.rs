@@ -6,9 +6,9 @@
 //! - status filter: open/closed/all,
 //! - label filter: single + intersection (AND),
 //! - `--json` is an array of Bug records,
-//! - empty bugs bookmark → exit 0, zero output,
+//! - empty issues bookmark → exit 0, zero output,
 //! - non-jj cwd → exit 2,
-//! - jj repo without `bugs` bookmark → exit 2 + init hint,
+//! - jj repo without `issues` bookmark → exit 2 + init hint,
 //! - `--help` documents both flags.
 //!
 //! Same hermetic-scratch / no-`assert_cmd` discipline as the other test
@@ -97,7 +97,7 @@ fn run_jjf_with_stdin(cwd: &Path, args: &[&str], stdin_bytes: &[u8]) -> Output {
 }
 
 /// Create a bug via `jjf new`, return its id.
-fn create_bug(
+fn create_issue(
     repo: &Path,
     title: &str,
     body: &[u8],
@@ -159,9 +159,9 @@ fn parse_ls_rows(stdout: &str) -> Vec<(String, String, String, String)> {
 #[test]
 fn ls_default_status_open_returns_every_bug_when_all_open() {
     let repo = make_initialized_repo("ls_three_open");
-    let a = create_bug(&repo, "alpha bug", b"", &[]);
-    let b = create_bug(&repo, "beta bug", b"", &[]);
-    let c = create_bug(&repo, "gamma bug", b"", &[]);
+    let a = create_issue(&repo, "alpha bug", b"", &[]);
+    let b = create_issue(&repo, "beta bug", b"", &[]);
+    let c = create_issue(&repo, "gamma bug", b"", &[]);
 
     let out = run_jjf(&repo, &["ls"]);
     assert!(
@@ -199,9 +199,9 @@ fn ls_default_status_open_returns_every_bug_when_all_open() {
 #[test]
 fn ls_status_filter_open_closed_all() {
     let repo = make_initialized_repo("ls_status_matrix");
-    let a = create_bug(&repo, "stay open A", b"", &[]);
-    let b = create_bug(&repo, "stay open B", b"", &[]);
-    let c = create_bug(&repo, "close me", b"", &[]);
+    let a = create_issue(&repo, "stay open A", b"", &[]);
+    let b = create_issue(&repo, "stay open B", b"", &[]);
+    let c = create_issue(&repo, "close me", b"", &[]);
     close_bug(&repo, &c);
 
     // Default (open) → 2 rows.
@@ -239,9 +239,9 @@ fn ls_label_filter_single_and_intersection() {
     //   only-x:   [x]
     //   only-y:   [y]
     //   both-xy:  [x, y]
-    let only_x = create_bug(&repo, "only-x", b"", &["-l", "x"]);
-    let only_y = create_bug(&repo, "only-y", b"", &["-l", "y"]);
-    let both_xy = create_bug(&repo, "both-xy", b"", &["-l", "x", "-l", "y"]);
+    let only_x = create_issue(&repo, "only-x", b"", &["-l", "x"]);
+    let only_y = create_issue(&repo, "only-y", b"", &["-l", "y"]);
+    let both_xy = create_issue(&repo, "both-xy", b"", &["-l", "x", "-l", "y"]);
 
     // --label x → matches only-x AND both-xy (2 rows).
     let out = run_jjf(&repo, &["ls", "--label", "x"]);
@@ -279,8 +279,8 @@ fn ls_label_filter_single_and_intersection() {
 #[test]
 fn ls_json_emits_array_of_bug_records() {
     let repo = make_initialized_repo("ls_json");
-    let _a = create_bug(&repo, "first", b"body of first\n", &["-l", "bug", "-a", "alice"]);
-    let _b = create_bug(&repo, "second", b"", &[]);
+    let _a = create_issue(&repo, "first", b"body of first\n", &["-l", "bug", "-a", "alice"]);
+    let _b = create_issue(&repo, "second", b"", &[]);
 
     let out = run_jjf(&repo, &["ls", "--json"]);
     assert!(
@@ -388,7 +388,7 @@ fn ls_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`bugs` bookmark") && stderr.contains("jjf init"),
+        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
         "stderr should tell the user to run `jjf init` first, got: {stderr}"
     );
 }

@@ -12,7 +12,7 @@
 //! - nonexistent id → exit 1,
 //! - bad id → exit 2,
 //! - non-jj cwd → exit 2,
-//! - jj repo without `bugs` bookmark → exit 2 + init hint,
+//! - jj repo without `issues` bookmark → exit 2 + init hint,
 //! - `--help` documents the positional + `--json`.
 //!
 //! Same hermetic-scratch / no-`assert_cmd` discipline as the other
@@ -103,7 +103,7 @@ fn run_jjf_with_stdin(cwd: &Path, args: &[&str], stdin_bytes: &[u8]) -> Output {
 }
 
 /// Create a bug via `jjf new`, return its id.
-fn create_bug(repo: &Path, title: &str) -> String {
+fn create_issue(repo: &Path, title: &str) -> String {
     let out = run_jjf_with_stdin(repo, &["new", "-t", title, "-F", "-"], b"");
     assert!(
         out.status.success(),
@@ -119,7 +119,7 @@ fn create_bug(repo: &Path, title: &str) -> String {
 #[test]
 fn close_happy_path_show_reports_closed() {
     let repo = make_initialized_repo("close_happy");
-    let id = create_bug(&repo, "to be closed");
+    let id = create_issue(&repo, "to be closed");
 
     let out = run_jjf(&repo, &["close", &id]);
     assert!(
@@ -145,7 +145,7 @@ fn close_happy_path_show_reports_closed() {
 #[test]
 fn close_json_envelope_shape() {
     let repo = make_initialized_repo("close_json");
-    let id = create_bug(&repo, "json close");
+    let id = create_issue(&repo, "json close");
 
     let out = run_jjf(&repo, &["close", "--json", &id]);
     assert!(
@@ -180,7 +180,7 @@ fn close_json_envelope_shape() {
 #[test]
 fn close_then_open_round_trip() {
     let repo = make_initialized_repo("close_then_open");
-    let id = create_bug(&repo, "flip-flop");
+    let id = create_issue(&repo, "flip-flop");
 
     // close → show says closed.
     let out = run_jjf(&repo, &["close", &id]);
@@ -215,7 +215,7 @@ fn open_json_envelope_shape() {
     // non-idempotency test below covers the trailer-counting case;
     // this one is purely the JSON shape).
     let repo = make_initialized_repo("open_json");
-    let id = create_bug(&repo, "json open");
+    let id = create_issue(&repo, "json open");
 
     let out = run_jjf(&repo, &["open", "--json", &id]);
     assert!(
@@ -238,16 +238,16 @@ fn close_twice_lands_two_set_status_trailers() {
     // lands a fresh `set-status` op so the audit log records the
     // intent. We verify by counting `SetStatus` entries in the bug's
     // history.
-    use jjf_storage::{BugId, Op, Storage};
+    use jjf_storage::{IssueId, Op, Storage};
 
     let repo = make_initialized_repo("close_twice");
-    let id = create_bug(&repo, "close me twice");
+    let id = create_issue(&repo, "close me twice");
 
     // Baseline: zero set-status ops (just the create-time multi-op).
     let storage = Storage::open(&repo).expect("Storage::open");
-    let bug_id = BugId::parse(&id).expect("parse id");
+    let issue_id = IssueId::parse(&id).expect("parse id");
     let baseline = storage
-        .read_history(&bug_id)
+        .read_history(&issue_id)
         .expect("read_history")
         .into_iter()
         .filter(|e| matches!(e.op, Op::SetStatus { .. }))
@@ -260,6 +260,14 @@ fn close_twice_lands_two_set_status_trailers() {
     // First close.
     let out = run_jjf(&repo, &["close", &id]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // Same-second guard: the writer stamps `updated_at` at second
+    // resolution (spec §3.1). If two `close`s land in the same wall-
+    // clock second, the JSON record is byte-identical, jj's snapshotter
+    // records no file change, and the path-filtered `read_history`
+    // misses the second commit. Sleep just past a second boundary so
+    // the second close gets a distinguishable file delta. See spec
+    // §5.6 "same-second collision" note.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
     // Second close — same bug, same target status.
     let out = run_jjf(&repo, &["close", &id]);
     assert!(
@@ -270,7 +278,7 @@ fn close_twice_lands_two_set_status_trailers() {
     );
 
     let after = storage
-        .read_history(&bug_id)
+        .read_history(&issue_id)
         .expect("read_history")
         .into_iter()
         .filter(|e| matches!(e.op, Op::SetStatus { .. }))
@@ -283,7 +291,7 @@ fn close_twice_lands_two_set_status_trailers() {
 
 #[test]
 fn close_json_error_envelope_on_nonexistent_id() {
-    // `--json close <missing>`: the documented `bug_not_found` envelope.
+    // `--json close <missing>`: the documented `issue_not_found` envelope.
     // Same shape as `update`'s and `comment`'s nonexistent-id envelope;
     // `open` runs through the same `run_set_status` code path and is
     // covered transitively. The matching test for `open` lives below.
@@ -304,7 +312,7 @@ fn close_json_error_envelope_on_nonexistent_id() {
     assert_eq!(v["ok"], serde_json::Value::Bool(false));
     assert_eq!(
         v["error"]["kind"].as_str(),
-        Some("bug_not_found"),
+        Some("issue_not_found"),
         "kind wrong: {stderr}"
     );
     assert_eq!(
@@ -329,7 +337,7 @@ fn open_json_error_envelope_on_nonexistent_id() {
     let v: serde_json::Value =
         serde_json::from_str(stderr.trim()).expect("stderr must be valid JSON envelope");
     assert_eq!(v["ok"], serde_json::Value::Bool(false));
-    assert_eq!(v["error"]["kind"].as_str(), Some("bug_not_found"));
+    assert_eq!(v["error"]["kind"].as_str(), Some("issue_not_found"));
     assert_eq!(
         v["error"]["details"]["id"].as_str(),
         Some(nonexistent),
@@ -408,7 +416,7 @@ fn close_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`bugs` bookmark") && stderr.contains("jjf init"),
+        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
         "stderr should tell the user to run `jjf init` first, got: {stderr}"
     );
 }
@@ -424,7 +432,7 @@ fn open_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`bugs` bookmark") && stderr.contains("jjf init"),
+        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
         "stderr should tell the user to run `jjf init` first, got: {stderr}"
     );
 }

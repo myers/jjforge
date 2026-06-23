@@ -2,25 +2,42 @@
 //! layer.
 //!
 //! This crate implements the 4-CLI working-copy dance that lands a
-//! single bug mutation as one commit on the `bugs` bookmark, with a
-//! `Jjf-Op:` trailer (and an accompanying `Jjf-Bug:` trailer) recording
-//! what changed. The on-disk schema is pinned by `docs/storage-format.md`
-//! v1 (commit `2d79305`).
+//! single issue mutation as one commit on the `issues` bookmark, with a
+//! `Jjf-Op:` trailer (and an accompanying `Jjf-Issue:` trailer)
+//! recording what changed. The on-disk schema is pinned by
+//! `docs/storage-format.md` v2.
 //!
 //! # The dance
 //!
 //! For one mutation:
 //!
 //! ```text
-//! jj new bookmarks(bugs) -m '<msg with trailers>'
-//! <edit bugs/<id>.json (and bugs/<id>.comments.jsonl if applicable)>
-//! jj bookmark set bugs -r @ --allow-backwards
+//! jj new bookmarks(issues) -m '<msg with trailers>'
+//! <edit issues/<id>.json (and issues/<id>.comments.jsonl if applicable)>
+//! jj bookmark set issues -r @ --allow-backwards
 //! jj new root()
 //! ```
 //!
 //! Step 4 steps `@` off the bookmark so the next mutation's `jj new
-//! bookmarks(bugs)` doesn't snapshot the previous edit into a stale
+//! bookmarks(issues)` doesn't snapshot the previous edit into a stale
 //! working copy. Lifted directly from `experiments/jj-shellout-hello/`.
+//!
+//! # v1 → v2 migration
+//!
+//! v1 spelled this bookmark `bugs` and put records under `bugs/`. v2
+//! uses `issues` and `issues/`. The trailer field that names the issue
+//! id was `Jjf-Bug:` in v1 and is `Jjf-Issue:` in v2. The parser in
+//! [`crate::trailer`] reads either spelling so existing op chains
+//! continue to replay; the writer here only emits the v2 spelling.
+//!
+//! Storage automatically detects a v1-shape repo (the `bugs` bookmark
+//! exists; `issues` does not) and runs an inline migration on the
+//! next [`Storage::open`] or [`Storage::init`] call. The migration
+//! lands one commit on the new `issues` bookmark that renames every
+//! `bugs/<id>.json` → `issues/<id>.json` (and the `.comments.jsonl`
+//! sibling), then deletes the v1 `bugs` bookmark. See [`Storage::open`]
+//! for the detection logic; the migration itself is in
+//! [`Storage::migrate_v1_to_v2`].
 //!
 //! # Out of scope
 //!
@@ -30,7 +47,7 @@
 //!
 //! # In scope (now landed)
 //!
-//! - Write path: [`Storage::create_bug`], the mutators, [`Storage::add_comment`].
+//! - Write path: [`Storage::create_issue`], the mutators, [`Storage::add_comment`].
 //! - Read path: [`Storage::read`], [`Storage::read_history`].
 //! - Bookmark bootstrap: [`Storage::init`] (idempotent; the `mvp-cli`
 //!   `jjf init` verb is a thin wrapper).
@@ -39,7 +56,7 @@
 //!
 //! - `2130de1` — shell out to `jj`; do not link `jj-lib`.
 //! - `a60bb95` — `Jjf-Op:` trailers are the audit surface.
-//! - `dcd4b57` — dedicated `bugs` bookmark.
+//! - `dcd4b57` — dedicated bookmark for issue data.
 
 #![forbid(unsafe_code)]
 
@@ -55,11 +72,11 @@ mod trailer;
 use std::path::{Path, PathBuf};
 
 pub use history::HistoryEntry;
-pub use id::{BugId, IdError};
+pub use id::{IdError, IssueId};
 pub use jj::JjError;
-pub use merge_ops::{MergeReport, MergedBug};
+pub use merge_ops::{MergeReport, MergedIssue};
 pub use op::Op;
-pub use record::{Bug, BugDraft, BugRecord, Comment, Status};
+pub use record::{Comment, Issue, IssueDraft, IssueRecord, Status};
 
 /// Field-update bundle for [`Storage::update`].
 ///
@@ -108,8 +125,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("bug not found in working copy: {0}")]
-    BugNotFound(BugId),
+    #[error("issue not found in working copy: {0}")]
+    IssueNotFound(IssueId),
     #[error("invalid input: {0}")]
     Invalid(String),
     #[error("clock: {0}")]
@@ -125,22 +142,28 @@ pub enum Error {
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// The name of the bookmark bug data lives on. See
+/// The name of the bookmark issue data lives on. See
 /// `docs/storage-format.md` §1.
-pub const BUGS_BOOKMARK: &str = "bugs";
+pub const ISSUES_BOOKMARK: &str = "issues";
 
-/// The revset that resolves to the tip of the `bugs` bookmark. We use
-/// the function form (`bookmarks(bugs)`) rather than the bare bookmark
-/// name so a stray collision with another revset never bites.
-pub const BUGS_BOOKMARK_REVSET: &str = "bookmarks(bugs)";
+/// The revset that resolves to the tip of the `issues` bookmark. We use
+/// the function form (`bookmarks(issues)`) rather than the bare
+/// bookmark name so a stray collision with another revset never bites.
+pub const ISSUES_BOOKMARK_REVSET: &str = "bookmarks(issues)";
 
-/// Description on the empty seed commit that anchors the `bugs`
+/// Description on the empty seed commit that anchors the `issues`
 /// bookmark in a fresh repo. Spec §1.1 pins the exact text: no
 /// `Jjf-Op:` trailer (the seed predates any op chain), human-readable,
 /// stable across versions.
-pub const BUGS_SEED_DESCRIPTION: &str = "jjf: seed bugs bookmark";
+pub const ISSUES_SEED_DESCRIPTION: &str = "jjf: seed issues bookmark";
 
-/// A handle to a repo whose `bugs` bookmark exists. Use
+/// The v1 bookmark name. Detected by [`Storage::init`] /
+/// [`Storage::open`] so the inline-detect migration can rename it.
+/// Storage never *writes* to this bookmark; it only checks for its
+/// presence so the migration knows when to run.
+const V1_BUGS_BOOKMARK: &str = "bugs";
+
+/// A handle to a repo whose `issues` bookmark exists. Use
 /// [`Storage::init`] to create the bookmark (idempotent) in a fresh
 /// repo, or [`Storage::open`] when you know the bookmark is already
 /// in place.
@@ -152,8 +175,17 @@ pub struct Storage {
 impl Storage {
     /// Open a storage handle at the given repo root. The path must be
     /// absolute; we don't resolve `~` or relative paths — that's the
-    /// caller's job (mvp-cli, tests). The `bugs` bookmark must already
-    /// exist; call [`Storage::init`] first if you're not sure.
+    /// caller's job (mvp-cli, tests). The `issues` bookmark must
+    /// already exist; call [`Storage::init`] first if you're not sure.
+    ///
+    /// **v1 → v2 inline migration.** If the v1 `bugs` bookmark is
+    /// present but `issues` is not, `open` runs the migration in place
+    /// (renames every `bugs/<id>.json` and `bugs/<id>.comments.jsonl`
+    /// to its `issues/` sibling on a single commit, lands it on the
+    /// new `issues` bookmark, and deletes the old `bugs` bookmark).
+    /// Repos that only have `issues` (the post-migration steady state)
+    /// fall through without changes; repos that have neither bookmark
+    /// surface their bookmark probe failure unchanged.
     pub fn open(repo_root: impl Into<PathBuf>) -> Result<Self> {
         let root = repo_root.into();
         if !root.is_absolute() {
@@ -162,25 +194,31 @@ impl Storage {
                 root.display()
             )));
         }
-        Ok(Self {
+        let storage = Self {
             repo: JjRepo::open(root),
-        })
+        };
+        storage.maybe_migrate_v1_to_v2()?;
+        Ok(storage)
     }
 
-    /// Open or create a storage handle, bootstrapping the `bugs`
+    /// Open or create a storage handle, bootstrapping the `issues`
     /// bookmark per spec §1.1 if absent. Idempotent: calling twice
     /// against the same repo is a no-op the second time.
     ///
     /// Three distinct outcomes:
     ///
     /// - `repo_root` is not a jj repo at all → [`Error::NotAJjRepo`].
-    /// - `repo_root` is a jj repo and `bugs` is missing → create an
-    ///   empty seed commit (description: [`BUGS_SEED_DESCRIPTION`]),
-    ///   point the `bugs` bookmark at it, step `@` off the bookmark
-    ///   (so the first subsequent mutation's `jj new bookmarks(bugs)`
+    /// - `repo_root` is a jj repo and `issues` is missing → create an
+    ///   empty seed commit (description: [`ISSUES_SEED_DESCRIPTION`]),
+    ///   point the `issues` bookmark at it, step `@` off the bookmark
+    ///   (so the first subsequent mutation's `jj new bookmarks(issues)`
     ///   doesn't snapshot stale working-copy state). Return Storage.
-    /// - `repo_root` is a jj repo and `bugs` already exists → return
+    /// - `repo_root` is a jj repo and `issues` already exists → return
     ///   Storage with no repo-side changes.
+    ///
+    /// **v1 → v2 inline migration.** If the v1 `bugs` bookmark is
+    /// present and `issues` is not, `init` runs the migration before
+    /// returning. Subsequent calls are no-ops.
     ///
     /// The `mvp-cli` `jjf init` verb is a thin wrapper over this.
     pub fn init(repo_root: impl Into<PathBuf>) -> Result<Self> {
@@ -207,31 +245,163 @@ impl Storage {
             return Err(Error::Jj(e));
         }
 
-        // Probe: does the `bugs` bookmark already exist? `jj bookmark
-        // list -T 'name ++ "\n"' bugs` prints just `bugs\n` to stdout
-        // when present and an empty stdout (with a stderr warning)
-        // when absent. Exit status is 0 either way, so we key off
-        // stdout content.
+        // v1 → v2 migration first. If a `bugs` bookmark exists and
+        // `issues` doesn't, rename. After this point, the bookmark
+        // probe below will succeed if migration ran.
+        let storage = Self { repo: repo.clone() };
+        storage.maybe_migrate_v1_to_v2()?;
+
+        // Probe: does the `issues` bookmark already exist? `jj bookmark
+        // list -T 'name ++ "\n"' issues` prints just `issues\n` to
+        // stdout when present and an empty stdout (with a stderr
+        // warning) when absent. Exit status is 0 either way, so we
+        // key off stdout content.
         let stdout = repo.run(&[
             "bookmark",
             "list",
             "-T",
             "name ++ \"\\n\"",
-            BUGS_BOOKMARK,
+            ISSUES_BOOKMARK,
         ])?;
-        if stdout.lines().any(|line| line.trim() == BUGS_BOOKMARK) {
-            // Already initialized; nothing to do.
-            return Ok(Self { repo });
+        if stdout.lines().any(|line| line.trim() == ISSUES_BOOKMARK) {
+            // Already initialized (or just-migrated); nothing to do.
+            return Ok(storage);
         }
 
         // Bootstrap. Three jj calls: branch a fresh empty change off
         // root() with the seed description, point the bookmark at it,
         // then step @ off the bookmark.
-        repo.run(&["new", "root()", "-m", BUGS_SEED_DESCRIPTION])?;
-        repo.run(&["bookmark", "create", BUGS_BOOKMARK, "-r", "@"])?;
+        repo.run(&["new", "root()", "-m", ISSUES_SEED_DESCRIPTION])?;
+        repo.run(&["bookmark", "create", ISSUES_BOOKMARK, "-r", "@"])?;
         repo.run(&["new", "root()"])?;
 
-        Ok(Self { repo })
+        Ok(storage)
+    }
+
+    /// If a v1 `bugs` bookmark is present and the v2 `issues`
+    /// bookmark is not, perform the inline rename. Safe to call from
+    /// either [`Storage::init`] or [`Storage::open`]; idempotent on
+    /// repos that have already migrated (or have neither bookmark).
+    ///
+    /// The migration lands a single commit on top of the `bugs`
+    /// bookmark whose tree renames every `bugs/<id>.json` →
+    /// `issues/<id>.json` (and the `.comments.jsonl` sibling), then
+    /// creates the new `issues` bookmark pointing at that commit,
+    /// then deletes the old `bugs` bookmark.
+    ///
+    /// The commit description is a fixed string (no `Jjf-Op:` trailer)
+    /// so it doesn't appear in any per-issue op chain — the migration
+    /// isn't an issue mutation, it's a structural repo-level rename.
+    fn maybe_migrate_v1_to_v2(&self) -> Result<()> {
+        // Skip if the new bookmark already exists — already migrated.
+        if self.bookmark_exists(ISSUES_BOOKMARK)? {
+            return Ok(());
+        }
+        // Skip if the v1 bookmark is absent — nothing to migrate.
+        if !self.bookmark_exists(V1_BUGS_BOOKMARK)? {
+            return Ok(());
+        }
+
+        // Enumerate every issue id present on the v1 bookmark, by
+        // listing `bugs/*.json` files at that revision. We treat the
+        // `bugs/<id>.comments.jsonl` sibling as part of the rename
+        // — if a `.json` exists, its `.comments.jsonl` is also renamed
+        // (the writer always emits an empty `.comments.jsonl` at
+        // create time, so the sibling is always present).
+        let v1_revset = format!("bookmarks({})", V1_BUGS_BOOKMARK);
+        let listing = self.repo.run(&[
+            "file",
+            "list",
+            "-r",
+            &v1_revset,
+            "-T",
+            "path ++ \"\\n\"",
+            "root:bugs/",
+        ])?;
+        let mut ids: Vec<IssueId> = Vec::new();
+        for line in listing.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("bugs/") else {
+                continue;
+            };
+            let Some(stem) = rest.strip_suffix(".json") else {
+                continue;
+            };
+            if let Ok(id) = IssueId::parse(stem) {
+                ids.push(id);
+            }
+        }
+        ids.sort();
+        ids.dedup();
+
+        // Build a new commit on top of the v1 bookmark and rewrite the
+        // tree. We need the FILE BYTES from each old path so we can
+        // write them into the new path; we read via `jj file show -r
+        // bookmarks(bugs)` (the working copy at this point is on
+        // root() or wherever the operator left it — we don't trust it).
+        let summary = "jjf: migrate v1 bugs/ → v2 issues/";
+        // `jj new <v1-bookmark>` creates a new commit on top of the v1
+        // bookmark; we'll edit the working copy to remove the old
+        // paths and add the new ones.
+        self.repo.run(&["new", &v1_revset, "-m", summary])?;
+
+        let wc_root = self.repo.root();
+        // Drain the working copy of any existing `bugs/`/`issues/`
+        // residue first — we want the renames to be authoritative.
+        let bugs_dir = wc_root.join("bugs");
+        let issues_dir = wc_root.join("issues");
+        if bugs_dir.exists() {
+            // jj has materialized the v1 tree here. We'll move files
+            // one by one rather than removing the whole dir, so any
+            // unexpected sibling under `bugs/` is preserved on the v1
+            // bookmark (we delete the `bugs` bookmark at the end; any
+            // stray content is unreachable but not silently deleted
+            // from history).
+        }
+        std::fs::create_dir_all(&issues_dir)?;
+
+        for id in &ids {
+            let json_name = format!("{}.json", id);
+            let comments_name = format!("{}.comments.jsonl", id);
+            let v1_json = bugs_dir.join(&json_name);
+            let v1_comments = bugs_dir.join(&comments_name);
+            let v2_json = issues_dir.join(&json_name);
+            let v2_comments = issues_dir.join(&comments_name);
+
+            if v1_json.is_file() {
+                std::fs::rename(&v1_json, &v2_json)?;
+            }
+            if v1_comments.is_file() {
+                std::fs::rename(&v1_comments, &v2_comments)?;
+            }
+        }
+        // After moving every recognized id, the bugs/ directory should
+        // be empty for ids we know about. Remove if empty; leave alone
+        // otherwise (defensive — a future schema-extension file under
+        // bugs/ would otherwise vanish silently).
+        if bugs_dir.is_dir() {
+            // best-effort empty-dir removal; ignore the error if the
+            // dir is non-empty (some stray file persists, which we
+            // don't want to delete).
+            let _ = std::fs::remove_dir(&bugs_dir);
+        }
+
+        // Land the new bookmark, delete the old one, step @ off.
+        self.repo
+            .run(&["bookmark", "create", ISSUES_BOOKMARK, "-r", "@"])?;
+        self.repo.run(&["bookmark", "delete", V1_BUGS_BOOKMARK])?;
+        self.repo.run(&["new", "root()"])?;
+
+        Ok(())
+    }
+
+    /// Does the named bookmark exist on this repo? Used internally for
+    /// the v1 → v2 migration detector.
+    fn bookmark_exists(&self, name: &str) -> Result<bool> {
+        let stdout = self
+            .repo
+            .run(&["bookmark", "list", "-T", "name ++ \"\\n\"", name])?;
+        Ok(stdout.lines().any(|line| line.trim() == name))
     }
 
     /// The repo root this storage handle is rooted at.
@@ -239,29 +409,29 @@ impl Storage {
         self.repo.root()
     }
 
-    /// Create a new bug from a draft. Returns the freshly-minted bug
-    /// ID. Lands one commit on the `bugs` bookmark with op vocabulary
-    /// `create`.
-    pub fn create_bug(&self, draft: &BugDraft) -> Result<BugId> {
+    /// Create a new issue from a draft. Returns the freshly-minted
+    /// issue ID. Lands one commit on the `issues` bookmark with op
+    /// vocabulary `create`.
+    pub fn create_issue(&self, draft: &IssueDraft) -> Result<IssueId> {
         if draft.title.trim().is_empty() {
-            return Err(Error::Invalid("bug title must not be empty".into()));
+            return Err(Error::Invalid("issue title must not be empty".into()));
         }
 
         // Reroll on collision. The space is 2^28 ≈ 268M and a repo
         // typically has only a handful, so this loop never runs more
         // than once in practice. We probe the bookmark (not the
         // working copy) because the dance leaves @ on root() with no
-        // bug files staged.
+        // issue files staged.
         let id = loop {
-            let candidate = BugId::random();
-            if !self.bug_exists_on_bookmark(&candidate)? {
+            let candidate = IssueId::random();
+            if !self.issue_exists_on_bookmark(&candidate)? {
                 break candidate;
             }
         };
 
         let now = now_rfc3339()?;
-        let record = BugRecord {
-            version: 1,
+        let record = IssueRecord {
+            version: 2,
             id: id.clone(),
             title: draft.title.clone(),
             body: draft.body.clone(),
@@ -280,42 +450,42 @@ impl Storage {
         // this, the audit chain (and the read-path op-replay) would
         // miss seed-time fields entirely, and the v1-contract
         // cross-check would fire on every non-trivial create.
-        let summary = format!("jjf: bug {} - create", id);
+        let summary = format!("jjf: issue {} - create", id);
         let mut ops: Vec<Op> = Vec::new();
         ops.push(Op::Create {
-            bug_id: id.clone(),
+            issue_id: id.clone(),
             title: record.title.clone(),
             status: Status::Open,
         });
         if !record.body.is_empty() {
             ops.push(Op::SetBody {
-                bug_id: id.clone(),
+                issue_id: id.clone(),
                 body_hash: sha256_hex(record.body.as_bytes()),
             });
         }
         for label in &record.labels {
             ops.push(Op::LabelAdd {
-                bug_id: id.clone(),
+                issue_id: id.clone(),
                 label: label.clone(),
             });
         }
         for dep in &record.dependencies {
             ops.push(Op::DepAdd {
-                bug_id: id.clone(),
+                issue_id: id.clone(),
                 dep: dep.clone(),
             });
         }
         if let Some(assignee) = &record.assignee {
             ops.push(Op::SetAssignee {
-                bug_id: id.clone(),
+                issue_id: id.clone(),
                 assignee: Some(assignee.clone()),
             });
         }
         self.commit_record_change(&summary, &ops, |wc_root| {
-            write_record_json(&wc_root.join(bug_json_relpath(&id)), &record)?;
+            write_record_json(&wc_root.join(issue_json_relpath(&id)), &record)?;
             // Comments file: create empty so readers don't trip on
-            // ENOENT for new bugs. Spec §4 allows empty == no comments.
-            write_comments_jsonl(&wc_root.join(bug_comments_relpath(&id)), &[])?;
+            // ENOENT for new issues. Spec §4 allows empty == no comments.
+            write_comments_jsonl(&wc_root.join(issue_comments_relpath(&id)), &[])?;
             Ok(())
         })?;
 
@@ -323,51 +493,51 @@ impl Storage {
     }
 
     /// Replace the title.
-    pub fn set_title(&self, id: &BugId, title: &str) -> Result<()> {
+    pub fn set_title(&self, id: &IssueId, title: &str) -> Result<()> {
         if title.trim().is_empty() {
             return Err(Error::Invalid("title must not be empty".into()));
         }
         let title = title.to_owned();
-        self.mutate(id, &format!("jjf: bug {} - set-title", id), |rec| {
+        self.mutate(id, &format!("jjf: issue {} - set-title", id), |rec| {
             rec.title = title.clone();
             Ok(vec![Op::SetTitle {
-                bug_id: rec.id.clone(),
+                issue_id: rec.id.clone(),
                 title: title.clone(),
             }])
         })
     }
 
     /// Replace the status.
-    pub fn set_status(&self, id: &BugId, status: Status) -> Result<()> {
-        self.mutate(id, &format!("jjf: bug {} - set-status", id), |rec| {
+    pub fn set_status(&self, id: &IssueId, status: Status) -> Result<()> {
+        self.mutate(id, &format!("jjf: issue {} - set-status", id), |rec| {
             rec.status = status;
             Ok(vec![Op::SetStatus {
-                bug_id: rec.id.clone(),
+                issue_id: rec.id.clone(),
                 status,
             }])
         })
     }
 
     /// Replace the body.
-    pub fn set_body(&self, id: &BugId, body: &str) -> Result<()> {
+    pub fn set_body(&self, id: &IssueId, body: &str) -> Result<()> {
         let body = body.to_owned();
-        self.mutate(id, &format!("jjf: bug {} - set-body", id), |rec| {
+        self.mutate(id, &format!("jjf: issue {} - set-body", id), |rec| {
             rec.body = body.clone();
             let hash = sha256_hex(body.as_bytes());
             Ok(vec![Op::SetBody {
-                bug_id: rec.id.clone(),
+                issue_id: rec.id.clone(),
                 body_hash: hash,
             }])
         })
     }
 
     /// Replace the assignee. `None` clears it.
-    pub fn set_assignee(&self, id: &BugId, assignee: Option<&str>) -> Result<()> {
+    pub fn set_assignee(&self, id: &IssueId, assignee: Option<&str>) -> Result<()> {
         let assignee = assignee.map(str::to_owned);
-        self.mutate(id, &format!("jjf: bug {} - set-assignee", id), |rec| {
+        self.mutate(id, &format!("jjf: issue {} - set-assignee", id), |rec| {
             rec.assignee = assignee.clone();
             Ok(vec![Op::SetAssignee {
-                bug_id: rec.id.clone(),
+                issue_id: rec.id.clone(),
                 assignee: assignee.clone(),
             }])
         })
@@ -377,7 +547,7 @@ impl Storage {
     ///
     /// Bundles every populated field of [`UpdateFields`] into one call
     /// to [`Storage::mutate`], which produces ONE new commit on the
-    /// `bugs` bookmark carrying N `Jjf-Op:` trailers (spec §5.5).
+    /// `issues` bookmark carrying N `Jjf-Op:` trailers (spec §5.5).
     /// This is the operator-facing "change title + status + body in one
     /// go" path that the per-field scalar mutators
     /// (`set_title` / `set_status` / `set_body` / `set_assignee`) can't
@@ -385,9 +555,9 @@ impl Storage {
     ///
     /// Op order in the resulting commit follows the field-declaration
     /// order of `UpdateFields` (title, status, body, assignee). This
-    /// matches the spec §5.7 convention used by `create_bug` — readers
-    /// that op-replay see fields applied in the same order the on-disk
-    /// record's schema declares them.
+    /// matches the spec §5.7 convention used by `create_issue` —
+    /// readers that op-replay see fields applied in the same order
+    /// the on-disk record's schema declares them.
     ///
     /// Empty bundles (every field `None`) are rejected with
     /// [`Error::Invalid`]: the call would land an empty commit with no
@@ -399,7 +569,7 @@ impl Storage {
     ///
     /// Title validation matches `set_title` (non-empty after trim);
     /// other fields accept any string.
-    pub fn update(&self, id: &BugId, fields: UpdateFields) -> Result<()> {
+    pub fn update(&self, id: &IssueId, fields: UpdateFields) -> Result<()> {
         if fields.is_empty() {
             return Err(Error::Invalid(
                 "update called with no fields set".into(),
@@ -410,34 +580,34 @@ impl Storage {
                 return Err(Error::Invalid("title must not be empty".into()));
             }
         }
-        let summary = format!("jjf: bug {} - update", id);
+        let summary = format!("jjf: issue {} - update", id);
         self.mutate(id, &summary, |rec| {
             let mut ops: Vec<Op> = Vec::new();
             if let Some(title) = &fields.title {
                 rec.title = title.clone();
                 ops.push(Op::SetTitle {
-                    bug_id: rec.id.clone(),
+                    issue_id: rec.id.clone(),
                     title: title.clone(),
                 });
             }
             if let Some(status) = fields.status {
                 rec.status = status;
                 ops.push(Op::SetStatus {
-                    bug_id: rec.id.clone(),
+                    issue_id: rec.id.clone(),
                     status,
                 });
             }
             if let Some(body) = &fields.body {
                 rec.body = body.clone();
                 ops.push(Op::SetBody {
-                    bug_id: rec.id.clone(),
+                    issue_id: rec.id.clone(),
                     body_hash: sha256_hex(body.as_bytes()),
                 });
             }
             if let Some(assignee) = &fields.assignee {
                 rec.assignee = assignee.clone();
                 ops.push(Op::SetAssignee {
-                    bug_id: rec.id.clone(),
+                    issue_id: rec.id.clone(),
                     assignee: assignee.clone(),
                 });
             }
@@ -447,96 +617,96 @@ impl Storage {
 
     /// Add a label. No-op (per spec §5.2) if already present, but the
     /// commit is still landed so the audit log records intent.
-    pub fn add_label(&self, id: &BugId, label: &str) -> Result<()> {
+    pub fn add_label(&self, id: &IssueId, label: &str) -> Result<()> {
         let label = label.to_owned();
-        self.mutate(id, &format!("jjf: bug {} - label-add", id), |rec| {
+        self.mutate(id, &format!("jjf: issue {} - label-add", id), |rec| {
             if !rec.labels.iter().any(|l| l == &label) {
                 rec.labels.push(label.clone());
                 rec.labels.sort();
             }
             Ok(vec![Op::LabelAdd {
-                bug_id: rec.id.clone(),
+                issue_id: rec.id.clone(),
                 label: label.clone(),
             }])
         })
     }
 
     /// Remove a label. No-op (spec §5.2) if not present.
-    pub fn remove_label(&self, id: &BugId, label: &str) -> Result<()> {
+    pub fn remove_label(&self, id: &IssueId, label: &str) -> Result<()> {
         let label = label.to_owned();
-        self.mutate(id, &format!("jjf: bug {} - label-rm", id), |rec| {
+        self.mutate(id, &format!("jjf: issue {} - label-rm", id), |rec| {
             rec.labels.retain(|l| l != &label);
             Ok(vec![Op::LabelRm {
-                bug_id: rec.id.clone(),
+                issue_id: rec.id.clone(),
                 label: label.clone(),
             }])
         })
     }
 
     /// Add a dependency.
-    pub fn add_dependency(&self, id: &BugId, dep: &BugId) -> Result<()> {
+    pub fn add_dependency(&self, id: &IssueId, dep: &IssueId) -> Result<()> {
         let dep = dep.clone();
-        self.mutate(id, &format!("jjf: bug {} - dep-add", id), |rec| {
+        self.mutate(id, &format!("jjf: issue {} - dep-add", id), |rec| {
             if !rec.dependencies.iter().any(|d| d == &dep) {
                 rec.dependencies.push(dep.clone());
                 rec.dependencies.sort();
             }
             Ok(vec![Op::DepAdd {
-                bug_id: rec.id.clone(),
+                issue_id: rec.id.clone(),
                 dep: dep.clone(),
             }])
         })
     }
 
     /// Remove a dependency.
-    pub fn remove_dependency(&self, id: &BugId, dep: &BugId) -> Result<()> {
+    pub fn remove_dependency(&self, id: &IssueId, dep: &IssueId) -> Result<()> {
         let dep = dep.clone();
-        self.mutate(id, &format!("jjf: bug {} - dep-rm", id), |rec| {
+        self.mutate(id, &format!("jjf: issue {} - dep-rm", id), |rec| {
             rec.dependencies.retain(|d| d != &dep);
             Ok(vec![Op::DepRm {
-                bug_id: rec.id.clone(),
+                issue_id: rec.id.clone(),
                 dep: dep.clone(),
             }])
         })
     }
 
     /// Append a comment. Generates a fresh 7-hex comment id and updates
-    /// the bug record's `updated_at`. Returns the freshly-generated
+    /// the issue record's `updated_at`. Returns the freshly-generated
     /// comment id so callers (notably `jjf comment`) can surface it in
     /// machine-readable output.
-    pub fn add_comment(&self, id: &BugId, body: &str, author: &str) -> Result<BugId> {
+    pub fn add_comment(&self, id: &IssueId, body: &str, author: &str) -> Result<IssueId> {
         if author.trim().is_empty() {
             return Err(Error::Invalid("comment author must not be empty".into()));
         }
         let id = id.clone();
         let body = body.to_owned();
         let author = author.to_owned();
-        // The bug record's update + the comments file edit are part of
+        // The issue record's update + the comments file edit are part of
         // one commit. We can't piggyback `add_comment` on `mutate()`
         // because the comments file isn't part of the JSON record.
         let mut record = self.read_record_from_bookmark(&id)?;
         let existing_comments = self.read_comments_from_bookmark(&id)?;
         record.updated_at = now_rfc3339()?;
-        let comment_id = BugId::random();
+        let comment_id = IssueId::random();
         let comment = Comment {
             id: comment_id.clone(),
             author,
             created_at: record.updated_at.clone(),
             body,
         };
-        let summary = format!("jjf: bug {} - comment-add", id);
+        let summary = format!("jjf: issue {} - comment-add", id);
         let mut all_comments = existing_comments;
         all_comments.push(comment);
         self.commit_record_change(
             &summary,
             &[Op::CommentAdd {
-                bug_id: id.clone(),
+                issue_id: id.clone(),
                 comment_id: comment_id.clone(),
             }],
             |wc_root| {
-                write_record_json(&wc_root.join(bug_json_relpath(&id)), &record)?;
+                write_record_json(&wc_root.join(issue_json_relpath(&id)), &record)?;
                 write_comments_jsonl(
-                    &wc_root.join(bug_comments_relpath(&id)),
+                    &wc_root.join(issue_comments_relpath(&id)),
                     &all_comments,
                 )?;
                 Ok(())
@@ -545,41 +715,41 @@ impl Storage {
         Ok(comment_id)
     }
 
-    /// Read a single bug back from the `bugs` bookmark tip. Returns
+    /// Read a single issue back from the `issues` bookmark tip. Returns
     /// the latest scalar field values plus the full chronological
-    /// comment thread. Errors with `BugNotFound` if `bugs/<id>.json`
+    /// comment thread. Errors with `IssueNotFound` if `issues/<id>.json`
     /// is absent at the bookmark.
     ///
     /// Implementation cross-checks the file-read view against an
     /// op-replay view in debug builds — see `read.rs` for the rules.
-    pub fn read(&self, id: &BugId) -> Result<Bug> {
+    pub fn read(&self, id: &IssueId) -> Result<Issue> {
         read::read(&self.repo, id)
     }
 
-    /// Enumerate every bug id present at the `bugs` bookmark tip.
+    /// Enumerate every issue id present at the `issues` bookmark tip.
     ///
-    /// Shells out to `jj file list -r bookmarks(bugs) root:bugs/`,
-    /// parses the `bugs/<id>.json` filenames out, and returns the
+    /// Shells out to `jj file list -r bookmarks(issues) root:issues/`,
+    /// parses the `issues/<id>.json` filenames out, and returns the
     /// sorted-ascending unique id set. `<id>.comments.jsonl` siblings
-    /// are ignored (they belong to bugs that also have a `.json` and
-    /// double-counting would mis-report bug counts); files that don't
-    /// match the `bugs/<7-hex>.json` pattern are skipped silently so a
+    /// are ignored (they belong to issues that also have a `.json` and
+    /// double-counting would mis-report issue counts); files that don't
+    /// match the `issues/<7-hex>.json` pattern are skipped silently so a
     /// future seed-bookmark housekeeping file or stray artifact doesn't
     /// crash enumeration.
     ///
-    /// Order: ascending by hex id. Stable, deterministic, cheap. Callers
-    /// that want time order can `read` each one and sort by `created_at`
-    /// afterward.
+    /// Order: ascending by hex id. Stable, deterministic, cheap.
+    /// Callers that want time order can `read` each one and sort by
+    /// `created_at` afterward.
     ///
-    /// This is the storage layer's first multi-bug enumeration primitive
-    /// — `jjf ls` is the v1 caller, but `jjf log --bug-changes`, agent
-    /// `ready` selection, and the PWA's home view will all sit on top
-    /// of it.
-    pub fn list_ids(&self) -> Result<Vec<BugId>> {
+    /// This is the storage layer's first multi-issue enumeration
+    /// primitive — `jjf ls` is the v1 caller, but `jjf log
+    /// --issue-changes`, agent `ready` selection, and the PWA's home
+    /// view will all sit on top of it.
+    pub fn list_ids(&self) -> Result<Vec<IssueId>> {
         // `jj file list` prints paths relative to the CURRENT WORKING
         // DIRECTORY by default — which means a subprocess invoked from
         // any cwd other than the repo root sees its output prefixed with
-        // a relative climb (e.g. `p/jjforge/crates/.../bugs/<id>.json`).
+        // a relative climb (e.g. `p/jjforge/crates/.../issues/<id>.json`).
         // We pin the output to repo-root-relative slash-paths by piping
         // the `TreeEntry.path()` `RepoPath` through the template (its
         // template form is exactly that). This is cwd-independent and
@@ -588,29 +758,29 @@ impl Storage {
             "file",
             "list",
             "-r",
-            BUGS_BOOKMARK_REVSET,
+            ISSUES_BOOKMARK_REVSET,
             "-T",
             "path ++ \"\\n\"",
-            "root:bugs/",
+            "root:issues/",
         ])?;
-        let mut ids: Vec<BugId> = Vec::new();
+        let mut ids: Vec<IssueId> = Vec::new();
         for line in text.lines() {
             let line = line.trim();
-            // Path shape: `bugs/<7-hex>.json`. We only key off `.json`
-            // entries — `.comments.jsonl` siblings belong to bugs that
+            // Path shape: `issues/<7-hex>.json`. We only key off `.json`
+            // entries — `.comments.jsonl` siblings belong to issues that
             // also have a `.json`, so they'd double-count. A bare-named
-            // file (no `bugs/` prefix) or a file without `.json` is
+            // file (no `issues/` prefix) or a file without `.json` is
             // skipped silently.
-            let Some(rest) = line.strip_prefix("bugs/") else {
+            let Some(rest) = line.strip_prefix("issues/") else {
                 continue;
             };
             let Some(stem) = rest.strip_suffix(".json") else {
                 continue;
             };
-            // Defensive: parse as BugId (rejects uppercase, wrong
-            // length, non-hex). A stray `bugs/foo.json` is skipped
+            // Defensive: parse as IssueId (rejects uppercase, wrong
+            // length, non-hex). A stray `issues/foo.json` is skipped
             // rather than blowing up enumeration.
-            if let Ok(id) = BugId::parse(stem) {
+            if let Ok(id) = IssueId::parse(stem) {
                 ids.push(id);
             }
         }
@@ -619,7 +789,7 @@ impl Storage {
         Ok(ids)
     }
 
-    /// Enumerate the change_id shorts of every head of the `bugs`
+    /// Enumerate the change_id shorts of every head of the `issues`
     /// bookmark. Normally returns exactly one entry; returns more than
     /// one only when the bookmark is in a divergent ("conflicted")
     /// state — typically right after `jj git fetch` against a local
@@ -632,11 +802,11 @@ impl Storage {
     /// empty list as a `Jj` error from the caller's perspective rather
     /// than a typed variant, because hitting it means the bookmark
     /// vanished between probes.
-    pub fn bugs_heads(&self) -> Result<Vec<String>> {
+    pub fn issues_heads(&self) -> Result<Vec<String>> {
         let text = self.repo.run(&[
             "log",
             "-r",
-            "heads(bookmarks(bugs))",
+            "heads(bookmarks(issues))",
             "--no-graph",
             "-T",
             "change_id.short() ++ \"\\n\"",
@@ -651,41 +821,41 @@ impl Storage {
         Ok(out)
     }
 
-    /// Land a merge commit that resolves a divergent `bugs` bookmark.
+    /// Land a merge commit that resolves a divergent `issues` bookmark.
     ///
     /// Takes the change_id shorts of the heads being merged (`heads` —
     /// typically two, but jj supports n-way merges so we accept any
-    /// `>= 2`) and a list of `(bug_id, resolved_file_bytes)` pairs to
+    /// `>= 2`) and a list of `(issue_id, resolved_file_bytes)` pairs to
     /// write into the working copy of the merge commit. The bytes are
     /// what `jjf_merge::resolve` produced (or whatever the caller
     /// decided is the post-merge content); we write them verbatim into
-    /// `bugs/<id>.json` so what the file ends up containing on the
+    /// `issues/<id>.json` so what the file ends up containing on the
     /// bookmark matches exactly.
     ///
     /// Per `docs/storage-format.md` §5.2, the resulting commit's
     /// description carries one `Jjf-Op: merge` trailer per entry in
-    /// `merged_bugs` — that's the per-bug audit signal that the merge
-    /// driver ran. Multi-bug merges land all trailers on one commit
-    /// (spec §5.5).
+    /// `merged_issues` — that's the per-issue audit signal that the
+    /// merge driver ran. Multi-issue merges land all trailers on one
+    /// commit (spec §5.5).
     ///
     /// Sequence (variant of the standard 4-CLI dance):
     ///
     /// 1. `jj new <head_a> <head_b> [...] -m '<msg with merge trailers>'`
     ///    — creates the merge commit. jj materializes any conflicted
     ///    files with its textual conflict markers.
-    /// 2. Write the resolved bytes into `bugs/<id>.json` for each entry.
-    ///    Overwrites the conflict markers jj just wrote.
-    /// 3. `jj bookmark set bugs -r @ --allow-backwards` — point the
+    /// 2. Write the resolved bytes into `issues/<id>.json` for each
+    ///    entry. Overwrites the conflict markers jj just wrote.
+    /// 3. `jj bookmark set issues -r @ --allow-backwards` — point the
     ///    bookmark at the merge commit.
     /// 4. `jj new root()` — step `@` off the bookmark.
     ///
     /// Errors with `Invalid` if `heads.len() < 2` (no merge needed) or
-    /// `merged_bugs` is empty (nothing to write — the caller should
+    /// `merged_issues` is empty (nothing to write — the caller should
     /// just `jj bookmark set` without going through the merge driver).
     pub fn record_merge(
         &self,
         heads: &[String],
-        merged_bugs: &[(BugId, String)],
+        merged_issues: &[(IssueId, String)],
     ) -> Result<()> {
         if heads.len() < 2 {
             return Err(Error::Invalid(format!(
@@ -693,23 +863,23 @@ impl Storage {
                 heads.len()
             )));
         }
-        if merged_bugs.is_empty() {
+        if merged_issues.is_empty() {
             return Err(Error::Invalid(
-                "record_merge requires at least one merged bug".into(),
+                "record_merge requires at least one merged issue".into(),
             ));
         }
 
         // 1. Build the merge commit. `jj new` with N positional
         // revisions creates an N-parent merge change.
-        let summary = if merged_bugs.len() == 1 {
-            format!("jjf: bug {} - merge", merged_bugs[0].0)
+        let summary = if merged_issues.len() == 1 {
+            format!("jjf: issue {} - merge", merged_issues[0].0)
         } else {
-            format!("jjf: merge {} bugs", merged_bugs.len())
+            format!("jjf: merge {} issues", merged_issues.len())
         };
-        let ops: Vec<Op> = merged_bugs
+        let ops: Vec<Op> = merged_issues
             .iter()
             .map(|(id, _)| Op::Merge {
-                bug_id: id.clone(),
+                issue_id: id.clone(),
             })
             .collect();
         let jjf_at = now_rfc3339_nanos()?;
@@ -729,8 +899,8 @@ impl Storage {
         // the existing content; we overwrite. jj snapshots on the next
         // command.
         let wc_root = self.repo.root();
-        for (id, bytes) in merged_bugs {
-            let path = wc_root.join(bug_json_relpath(id));
+        for (id, bytes) in merged_issues {
+            let path = wc_root.join(issue_json_relpath(id));
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -741,7 +911,7 @@ impl Storage {
         self.repo.run(&[
             "bookmark",
             "set",
-            BUGS_BOOKMARK,
+            ISSUES_BOOKMARK,
             "-r",
             "@",
             "--allow-backwards",
@@ -754,55 +924,55 @@ impl Storage {
         Ok(())
     }
 
-    /// Read the full op-by-op timeline for a bug, oldest first.
+    /// Read the full op-by-op timeline for an issue, oldest first.
     ///
-    /// Returns one [`HistoryEntry`] per `Jjf-Op:` stanza on the bug's
+    /// Returns one [`HistoryEntry`] per `Jjf-Op:` stanza on the issue's
     /// commit chain. A commit with multiple ops (the create-time
     /// multi-op stanza of spec §5.7, or any other multi-op commit)
     /// emits one entry per op, all sharing `commit` / `author` /
     /// `timestamp`. Comment ops appear in the stream alongside scalar
     /// mutations — they're commits like any other.
     ///
-    /// Errors with `BugNotFound` if no commit on the `bugs` bookmark
-    /// touches this bug's files.
-    pub fn read_history(&self, id: &BugId) -> Result<Vec<HistoryEntry>> {
+    /// Errors with `IssueNotFound` if no commit on the `issues`
+    /// bookmark touches this issue's files.
+    pub fn read_history(&self, id: &IssueId) -> Result<Vec<HistoryEntry>> {
         history::read_history(&self.repo, id)
     }
 
     /// Op-space resolver entry point. Discovers heads via
-    /// [`Storage::bugs_heads`]; for each bug touched on any head, walks
-    /// each head's op chain via [`Storage::read_history_at`] and
+    /// [`Storage::issues_heads`]; for each issue touched on any head,
+    /// walks each head's op chain via [`Storage::read_history_at`] and
     /// reduces field-by-field per spec §6's ordering tuple. Returns
-    /// the merged state for every touched bug.
+    /// the merged state for every touched issue.
     ///
     /// **Does not land a commit.** Pair with
     /// [`Storage::record_merge_op_space`] to write the merged record
     /// + comments back and land a single merge commit with one
-    /// `Jjf-Op: merge` trailer per resolved bug.
+    /// `Jjf-Op: merge` trailer per resolved issue.
     ///
-    /// Returns an empty [`MergeReport`] if `bugs_heads()` finds zero
+    /// Returns an empty [`MergeReport`] if `issues_heads()` finds zero
     /// or one head — there's no divergence to resolve.
     pub fn resolve_divergence(&self) -> Result<MergeReport> {
-        let heads = self.bugs_heads()?;
+        let heads = self.issues_heads()?;
         if heads.len() < 2 {
-            return Ok(MergeReport { bugs: Vec::new() });
+            return Ok(MergeReport { issues: Vec::new() });
         }
         merge_ops::resolve(&self.repo, &heads)
     }
 
     /// Land the resolved merge as a single multi-parent commit on the
-    /// `bugs` bookmark. Companion to [`Storage::resolve_divergence`]:
+    /// `issues` bookmark. Companion to [`Storage::resolve_divergence`]:
     /// the report it returns plus the heads it walked feed straight
     /// into this call.
     ///
     /// Behavior:
     /// - Creates a merge commit with `heads` as its parents and one
-    ///   `Jjf-Op: merge` trailer per bug in `report` (spec §5.7).
-    /// - Writes the merged `bugs/<id>.json` and
-    ///   `bugs/<id>.comments.jsonl` for every bug in the report,
+    ///   `Jjf-Op: merge` trailer per issue in `report` (spec §5.7).
+    /// - Writes the merged `issues/<id>.json` and
+    ///   `issues/<id>.comments.jsonl` for every issue in the report,
     ///   overwriting whatever jj materialized in the merge's working
     ///   copy (including the textual conflict markers).
-    /// - Points the `bugs` bookmark at the merge commit and steps
+    /// - Points the `issues` bookmark at the merge commit and steps
     ///   `@` off it, matching the 4-CLI dance.
     ///
     /// Errors with `Invalid` if `heads.len() < 2` (no merge needed) or
@@ -819,23 +989,23 @@ impl Storage {
                 heads.len()
             )));
         }
-        if report.bugs.is_empty() {
+        if report.issues.is_empty() {
             return Err(Error::Invalid(
-                "record_merge_op_space requires at least one resolved bug".into(),
+                "record_merge_op_space requires at least one resolved issue".into(),
             ));
         }
 
-        // 1. Build the merge commit. One `Jjf-Op: merge` per bug.
-        let summary = if report.bugs.len() == 1 {
-            format!("jjf: bug {} - merge", report.bugs[0].id)
+        // 1. Build the merge commit. One `Jjf-Op: merge` per issue.
+        let summary = if report.issues.len() == 1 {
+            format!("jjf: issue {} - merge", report.issues[0].id)
         } else {
-            format!("jjf: merge {} bugs", report.bugs.len())
+            format!("jjf: merge {} issues", report.issues.len())
         };
         let ops: Vec<Op> = report
-            .bugs
+            .issues
             .iter()
             .map(|b| Op::Merge {
-                bug_id: b.id.clone(),
+                issue_id: b.id.clone(),
             })
             .collect();
         let jjf_at = now_rfc3339_nanos()?;
@@ -849,15 +1019,15 @@ impl Storage {
         argv.push(&msg);
         self.repo.run(&argv)?;
 
-        // 2. Write resolved bytes — record + comments — for every bug.
+        // 2. Write resolved bytes — record + comments — for every issue.
         let wc_root = self.repo.root();
-        for merged in &report.bugs {
-            let json_path = wc_root.join(bug_json_relpath(&merged.id));
+        for merged in &report.issues {
+            let json_path = wc_root.join(issue_json_relpath(&merged.id));
             if let Some(parent) = json_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             write_record_json(&json_path, &merged.record)?;
-            let comments_path = wc_root.join(bug_comments_relpath(&merged.id));
+            let comments_path = wc_root.join(issue_comments_relpath(&merged.id));
             write_comments_jsonl(&comments_path, &merged.comments)?;
         }
 
@@ -865,7 +1035,7 @@ impl Storage {
         self.repo.run(&[
             "bookmark",
             "set",
-            BUGS_BOOKMARK,
+            ISSUES_BOOKMARK,
             "-r",
             "@",
             "--allow-backwards",
@@ -877,26 +1047,26 @@ impl Storage {
         Ok(())
     }
 
-    /// Read the per-bug op chain rooted at an explicit revision rather
-    /// than the bookmark tip. The default [`Storage::read_history`] is
-    /// this with `rev = "bookmarks(bugs)"`.
+    /// Read the per-issue op chain rooted at an explicit revision
+    /// rather than the bookmark tip. The default
+    /// [`Storage::read_history`] is this with `rev = "bookmarks(issues)"`.
     ///
     /// Used by the op-space merge driver to walk each head of a
-    /// divergent `bugs` bookmark independently: pass each entry of
-    /// [`Storage::bugs_heads`] as `rev` to get that head's full op
+    /// divergent `issues` bookmark independently: pass each entry of
+    /// [`Storage::issues_heads`] as `rev` to get that head's full op
     /// chain in isolation. The returned [`HistoryEntry`] vector is in
     /// chronological commit order (oldest first) — the LWW reducer
     /// sorts by the spec §6 ordering tuple `(jjf_at_or_commit_time,
     /// commit, trailer_index)` itself.
     ///
     /// `rev` can be any revset jj accepts (typically a change_id short
-    /// from `bugs_heads()`, but `bookmarks(bugs)`, a commit_id short,
-    /// or any other shape works). Errors with `BugNotFound` if no
-    /// commit reachable from `rev` touches this bug's files.
+    /// from `issues_heads()`, but `bookmarks(issues)`, a commit_id
+    /// short, or any other shape works). Errors with `IssueNotFound`
+    /// if no commit reachable from `rev` touches this issue's files.
     pub fn read_history_at(
         &self,
         rev: &str,
-        id: &BugId,
+        id: &IssueId,
     ) -> Result<Vec<HistoryEntry>> {
         history::read_history_at(&self.repo, rev, id)
     }
@@ -908,63 +1078,63 @@ impl Storage {
     /// op-list construction, bumps `updated_at`, writes it back inside
     /// one commit.
     ///
-    /// We read from the bookmark (via `jj file show -r bookmarks(bugs)`)
+    /// We read from the bookmark (via `jj file show -r bookmarks(issues)`)
     /// rather than from the working copy because step 4 of the dance
     /// (`jj new root()`) leaves the working copy on a fresh empty
-    /// change with no bug files in it. The authoritative state lives
+    /// change with no issue files in it. The authoritative state lives
     /// at the bookmark.
-    fn mutate<F>(&self, id: &BugId, summary: &str, f: F) -> Result<()>
+    fn mutate<F>(&self, id: &IssueId, summary: &str, f: F) -> Result<()>
     where
-        F: FnOnce(&mut BugRecord) -> Result<Vec<Op>>,
+        F: FnOnce(&mut IssueRecord) -> Result<Vec<Op>>,
     {
         let mut record = self.read_record_from_bookmark(id)?;
         let ops = f(&mut record)?;
         record.updated_at = now_rfc3339()?;
         let id = id.clone();
         self.commit_record_change(summary, &ops, |wc_root| {
-            write_record_json(&wc_root.join(bug_json_relpath(&id)), &record)?;
+            write_record_json(&wc_root.join(issue_json_relpath(&id)), &record)?;
             Ok(())
         })
     }
 
-    /// Read the current `bugs/<id>.json` from the bookmark tip.
-    fn read_record_from_bookmark(&self, id: &BugId) -> Result<BugRecord> {
-        let relpath = bug_json_relpath(id);
+    /// Read the current `issues/<id>.json` from the bookmark tip.
+    fn read_record_from_bookmark(&self, id: &IssueId) -> Result<IssueRecord> {
+        let relpath = issue_json_relpath(id);
         let text = match self.repo.run(&[
             "file",
             "show",
             "-r",
-            BUGS_BOOKMARK_REVSET,
+            ISSUES_BOOKMARK_REVSET,
             &format!("root:{}", relpath.display()),
         ]) {
             Ok(s) => s,
             Err(_) => {
                 // jj returns non-zero if the path doesn't exist at that
-                // revision. Treat that as bug-not-found rather than
+                // revision. Treat that as issue-not-found rather than
                 // surfacing the raw jj error — callers expect a typed
                 // signal.
-                return Err(Error::BugNotFound(id.clone()));
+                return Err(Error::IssueNotFound(id.clone()));
             }
         };
         Ok(serde_json::from_str(&text)?)
     }
 
-    /// Read the current `bugs/<id>.comments.jsonl` from the bookmark
-    /// tip. Returns an empty vec if the file is empty (the v1 writer
-    /// creates an empty file at bug-create time).
-    fn read_comments_from_bookmark(&self, id: &BugId) -> Result<Vec<Comment>> {
-        let relpath = bug_comments_relpath(id);
+    /// Read the current `issues/<id>.comments.jsonl` from the bookmark
+    /// tip. Returns an empty vec if the file is empty (the writer
+    /// creates an empty file at issue-create time).
+    fn read_comments_from_bookmark(&self, id: &IssueId) -> Result<Vec<Comment>> {
+        let relpath = issue_comments_relpath(id);
         let text = match self.repo.run(&[
             "file",
             "show",
             "-r",
-            BUGS_BOOKMARK_REVSET,
+            ISSUES_BOOKMARK_REVSET,
             &format!("root:{}", relpath.display()),
         ]) {
             Ok(s) => s,
             Err(_) => {
                 // Missing comments file => no comments. The record's
-                // existence is the source of truth on whether the bug
+                // existence is the source of truth on whether the issue
                 // exists; callers should check that first.
                 return Ok(Vec::new());
             }
@@ -1001,17 +1171,17 @@ impl Storage {
         let jjf_at = now_rfc3339_nanos()?;
         let msg = build_commit_message(summary, ops, &jjf_at);
 
-        // 1. jj new bookmarks(bugs) -m '<msg>'
-        self.repo.run(&["new", BUGS_BOOKMARK_REVSET, "-m", &msg])?;
+        // 1. jj new bookmarks(issues) -m '<msg>'
+        self.repo.run(&["new", ISSUES_BOOKMARK_REVSET, "-m", &msg])?;
 
         // 2. Edit the working copy. jj snapshots on the next command.
         apply(self.repo.root())?;
 
-        // 3. jj bookmark set bugs -r @ --allow-backwards
+        // 3. jj bookmark set issues -r @ --allow-backwards
         self.repo.run(&[
             "bookmark",
             "set",
-            BUGS_BOOKMARK,
+            ISSUES_BOOKMARK,
             "-r",
             "@",
             "--allow-backwards",
@@ -1023,10 +1193,10 @@ impl Storage {
         Ok(())
     }
 
-    /// Does this bug id already have a record on the bookmark? Used
-    /// for the collision retry in `create_bug`.
-    fn bug_exists_on_bookmark(&self, id: &BugId) -> Result<bool> {
-        let relpath = bug_json_relpath(id);
+    /// Does this issue id already have a record on the bookmark? Used
+    /// for the collision retry in `create_issue`.
+    fn issue_exists_on_bookmark(&self, id: &IssueId) -> Result<bool> {
+        let relpath = issue_json_relpath(id);
         // `jj file show` exits non-zero if the path is absent at the
         // requested revision. We don't distinguish "missing file" from
         // "jj broke"; the latter is vanishingly unlikely here and the
@@ -1037,7 +1207,7 @@ impl Storage {
                 "file",
                 "show",
                 "-r",
-                BUGS_BOOKMARK_REVSET,
+                ISSUES_BOOKMARK_REVSET,
                 &format!("root:{}", relpath.display()),
             ])
             .is_ok())
@@ -1046,17 +1216,17 @@ impl Storage {
 
 // ---- record I/O ------------------------------------------------------
 
-/// Relative path of a bug's JSON record from repo root.
-pub(crate) fn bug_json_relpath(id: &BugId) -> PathBuf {
-    PathBuf::from("bugs").join(format!("{}.json", id))
+/// Relative path of an issue's JSON record from repo root.
+pub(crate) fn issue_json_relpath(id: &IssueId) -> PathBuf {
+    PathBuf::from("issues").join(format!("{}.json", id))
 }
 
-/// Relative path of a bug's comments file from repo root.
-pub(crate) fn bug_comments_relpath(id: &BugId) -> PathBuf {
-    PathBuf::from("bugs").join(format!("{}.comments.jsonl", id))
+/// Relative path of an issue's comments file from repo root.
+pub(crate) fn issue_comments_relpath(id: &IssueId) -> PathBuf {
+    PathBuf::from("issues").join(format!("{}.comments.jsonl", id))
 }
 
-fn write_record_json(path: &Path, record: &BugRecord) -> Result<()> {
+fn write_record_json(path: &Path, record: &IssueRecord) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1112,8 +1282,8 @@ fn sorted_dedup(xs: &[String]) -> Vec<String> {
     v
 }
 
-fn sorted_dedup_ids(xs: &[BugId]) -> Vec<BugId> {
-    let mut v: Vec<BugId> = xs.to_vec();
+fn sorted_dedup_ids(xs: &[IssueId]) -> Vec<IssueId> {
+    let mut v: Vec<IssueId> = xs.to_vec();
     v.sort();
     v.dedup();
     v
@@ -1326,9 +1496,9 @@ mod tests {
 
     #[test]
     fn record_roundtrip_canonical() {
-        let rec = BugRecord {
-            version: 1,
-            id: BugId::parse("aa6600b").unwrap(),
+        let rec = IssueRecord {
+            version: 2,
+            id: IssueId::parse("aa6600b").unwrap(),
             title: "segfault on empty input".into(),
             body: "Running `./app` with no arguments crashes.".into(),
             status: Status::Open,
@@ -1339,7 +1509,7 @@ mod tests {
             updated_at: "2026-06-21T15:34:48Z".into(),
         };
         let s = serde_json::to_string_pretty(&rec).unwrap();
-        let back: BugRecord = serde_json::from_str(&s).unwrap();
+        let back: IssueRecord = serde_json::from_str(&s).unwrap();
         assert_eq!(back, rec);
         // Field-ordering check: version must come before id, etc.
         let v_idx = s.find("\"version\"").unwrap();
@@ -1365,20 +1535,20 @@ mod tests {
     fn op_roundtrip_serde() {
         let ops = [
             Op::Create {
-                bug_id: BugId::parse("aa6600b").unwrap(),
+                issue_id: IssueId::parse("aa6600b").unwrap(),
                 title: "t".into(),
                 status: Status::Open,
             },
             Op::SetStatus {
-                bug_id: BugId::parse("aa6600b").unwrap(),
+                issue_id: IssueId::parse("aa6600b").unwrap(),
                 status: Status::Closed,
             },
             Op::LabelAdd {
-                bug_id: BugId::parse("aa6600b").unwrap(),
+                issue_id: IssueId::parse("aa6600b").unwrap(),
                 label: "fixed".into(),
             },
             Op::Merge {
-                bug_id: BugId::parse("aa6600b").unwrap(),
+                issue_id: IssueId::parse("aa6600b").unwrap(),
             },
         ];
         for op in &ops {
@@ -1389,23 +1559,43 @@ mod tests {
     }
 
     #[test]
+    fn op_serde_emits_v2_issue_id_field() {
+        // Spec §5.2 (v2): the JSON shape of an op uses `issue_id`. v1
+        // emitted `bug_id` — that shape is gone on the new write path
+        // (the trailer parser still reads either, see trailer.rs).
+        let op = Op::SetStatus {
+            issue_id: IssueId::parse("aa6600b").unwrap(),
+            status: Status::Closed,
+        };
+        let s = serde_json::to_string(&op).unwrap();
+        assert!(
+            s.contains("\"issue_id\":\"aa6600b\""),
+            "op serde should emit `issue_id`, got: {s}"
+        );
+        assert!(
+            !s.contains("\"bug_id\""),
+            "op serde must NOT emit legacy `bug_id`, got: {s}"
+        );
+    }
+
+    #[test]
     fn trailer_format_single_op_create_matches_spec() {
         // §5.4 example, extended with the §5-mandated `Jjf-At:` line.
         let op = Op::Create {
-            bug_id: BugId::parse("aa6600b").unwrap(),
+            issue_id: IssueId::parse("aa6600b").unwrap(),
             title: "segfault on empty input".into(),
             status: Status::Open,
         };
         let msg = build_commit_message(
-            "jjf: bug aa6600b - create",
+            "jjf: issue aa6600b - create",
             &[op],
             "2026-06-22T12:34:56.123456789Z",
         );
         let expected = "\
-jjf: bug aa6600b - create
+jjf: issue aa6600b - create
 
 Jjf-Op: create
-Jjf-Bug: aa6600b
+Jjf-Issue: aa6600b
 Jjf-At: 2026-06-22T12:34:56.123456789Z
 Jjf-Title: segfault on empty input
 Jjf-Status: open
@@ -1419,31 +1609,31 @@ Jjf-Status: open
         // helper doesn't synthesize that — callers pass it via summary
         // if they want it). Every stanza in a multi-op commit shares
         // the same `Jjf-At:` — they were issued together.
-        let bug = BugId::parse("aa6600b").unwrap();
+        let issue = IssueId::parse("aa6600b").unwrap();
         let ops = [
             Op::SetStatus {
-                bug_id: bug.clone(),
+                issue_id: issue.clone(),
                 status: Status::Closed,
             },
             Op::LabelAdd {
-                bug_id: bug.clone(),
+                issue_id: issue.clone(),
                 label: "fixed".into(),
             },
         ];
         let msg = build_commit_message(
-            "jjf: bug aa6600b - close + label",
+            "jjf: issue aa6600b - close + label",
             &ops,
             "2026-06-22T12:34:56.123456789Z",
         );
         let expected = "\
-jjf: bug aa6600b - close + label
+jjf: issue aa6600b - close + label
 
 Jjf-Op: set-status
-Jjf-Bug: aa6600b
+Jjf-Issue: aa6600b
 Jjf-At: 2026-06-22T12:34:56.123456789Z
 Jjf-Status: closed
 Jjf-Op: label-add
-Jjf-Bug: aa6600b
+Jjf-Issue: aa6600b
 Jjf-At: 2026-06-22T12:34:56.123456789Z
 Jjf-Label: fixed
 ";
@@ -1466,7 +1656,7 @@ Jjf-Label: fixed
     #[test]
     fn id_shape() {
         for _ in 0..1000 {
-            let id = BugId::random();
+            let id = IssueId::random();
             assert_eq!(id.as_str().len(), 7);
             assert!(
                 id.as_str().chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
@@ -1478,11 +1668,11 @@ Jjf-Label: fixed
 
     #[test]
     fn id_parses_lowercase_hex_only() {
-        assert!(BugId::parse("aa6600b").is_ok());
-        assert!(BugId::parse("AA6600B").is_err());
-        assert!(BugId::parse("abcdefg").is_err());
-        assert!(BugId::parse("123").is_err());
-        assert!(BugId::parse("12345678").is_err());
+        assert!(IssueId::parse("aa6600b").is_ok());
+        assert!(IssueId::parse("AA6600B").is_err());
+        assert!(IssueId::parse("abcdefg").is_err());
+        assert!(IssueId::parse("123").is_err());
+        assert!(IssueId::parse("12345678").is_err());
     }
 
     #[test]

@@ -46,9 +46,9 @@ research note, defect, whatever. Each issue has an id, title,
 status (open / closed), body, labels, dependencies, assignee,
 and an append-only comment thread.
 
-> Heads-up: the code still says `Bug` / `BugId` in a few
-> places — the rename is filed as issue `199ed91`. The
-> user-facing terminology is "issue."
+As of `199ed91` (v1 → v2 storage spec) the Rust types, wire
+trailers, bookmark, and on-disk paths all say "issue" too —
+the type-level rename catches the code up to the prose.
 
 ## First-time setup
 

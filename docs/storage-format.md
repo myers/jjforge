@@ -1,56 +1,93 @@
-# jjforge on-disk storage format — v1
+# jjforge on-disk storage format — v2
 
-Status: v1, draft for `mvp-storage`. This is the contract every
-other `mvp-storage` and `mvp-sync` ticket implements against.
-Verdicts pinned by:
+Status: v2, current. This is the contract every other crate
+implements against. Verdicts pinned by:
 
-- `dcd4b57` — Shape A (dedicated `bugs` bookmark).
+- `dcd4b57` — Shape A (dedicated bookmark for issue data).
 - `a60bb95` — `Jjf-Op:` trailers in commit descriptions are the
   audit surface.
 - `2130de1` — shell out to the `jj` CLI; do not link `jj-lib`.
-- `72638a0` — the `mvp-storage` epic that lists this spec as a
-  ticket.
+- `72638a0` — the `mvp-storage` epic.
 
-Non-goals here: CLI surface (that's `mvp-cli`'s territory),
-sync/merge resolution (that's `e2e473b`), and any implementation
-choices the writer wants — those land in `storage-write` and
-peers.
+## v1 → v2 changelog
+
+This spec revs from v1 (which spelled the storage surface as
+"bugs") to v2 ("issues"). The wire/disk changes are:
+
+- **Bookmark name:** `bugs` → `issues`.
+- **File paths:** `bugs/<id>.json` → `issues/<id>.json` and
+  `bugs/<id>.comments.jsonl` → `issues/<id>.comments.jsonl`.
+- **Trailer field:** `Jjf-Bug:` → `Jjf-Issue:` (every op
+  stanza identifies its issue by this name).
+- **JSON op field:** the `Op` enum's `bug_id` field is now
+  `issue_id` (relevant only to programmatic callers that JSON-
+  serialize a parsed `Op`).
+- **Record `version`:** new records emit `version: 2`. The
+  field's meaning is unchanged.
+- **Seed commit description:** `jjf: seed bugs bookmark` →
+  `jjf: seed issues bookmark`.
+
+The terminology change is the rename of "bug" to "issue" — the
+project's user-facing nomenclature has been "issue" since the
+post-cutover blog post; v2 catches the on-disk artifacts up.
+The substantive shape of every record, every commit, and every
+op is unchanged. The merge semantics (§6) are unchanged.
+
+### Forward compatibility
+
+- The trailer parser MUST accept BOTH `Jjf-Issue:` and the
+  legacy `Jjf-Bug:` spellings on read. Existing repos with v1
+  commit chains continue to op-replay through v2 readers. The
+  writer only emits the v2 form.
+- The Rust storage layer (`jjf-storage`) detects a v1 repo on
+  `Storage::open` / `Storage::init` (the `bugs` bookmark
+  exists; `issues` does not) and runs an inline migration that
+  renames every `bugs/<id>.*` → `issues/<id>.*` on a single
+  commit, lands the new `issues` bookmark, and deletes the old
+  `bugs` bookmark. The migration is idempotent — repos that
+  have already migrated (or were created fresh at v2) pass
+  through without changes.
+
+Non-goals here: CLI surface (`docs/cli-json.md`), and any
+implementation choices the writer wants — those are in the
+storage crate.
 
 ---
 
-## 1. Where bugs live
+## 1. Where issues live
 
-Bugs are files on a dedicated jj/git bookmark. The bookmark name
-in v1 is **`bugs`**. The bookmark lives in the same repo as the
-project code, but is conceptually separate from `main` — code
-merges to `main` are never blocked by a contended bug edit
-(blast-radius argument from `dcd4b57`).
+Issues are files on a dedicated jj/git bookmark. The bookmark
+name in v2 is **`issues`**. The bookmark lives in the same repo
+as the project code, but is conceptually separate from `main` —
+code merges to `main` are never blocked by a contended issue
+edit (blast-radius argument from `dcd4b57`).
 
 ```
 <repo>/
-  bugs/
-    aa6600b.json            ← per-bug record
-    aa6600b.comments.jsonl  ← per-bug comments (one JSON per line)
+  issues/
+    aa6600b.json            ← per-issue record
+    aa6600b.comments.jsonl  ← per-issue comments (one JSON per line)
     bb7700c.json
     ...
 ```
 
-Files live under `bugs/` in the tree, on commits reachable from
-`refs/heads/bugs`. Stock git remotes (Forgejo, GitHub, bare)
-serve this with no jj-aware infrastructure.
+Files live under `issues/` in the tree, on commits reachable
+from `refs/heads/issues`. Stock git remotes (Forgejo, GitHub,
+bare) serve this with no jj-aware infrastructure.
 
 ### 1.1 Seed commit
 
 `jjf init` either:
 
-- creates the `bugs` bookmark pointing at a fresh empty commit
-  whose description is `jjf: seed bugs bookmark` (no trailer), if
-  the bookmark doesn't exist; or
-- leaves an existing `bugs` bookmark alone.
+- creates the `issues` bookmark pointing at a fresh empty commit
+  whose description is `jjf: seed issues bookmark` (no trailer),
+  if the bookmark doesn't exist; or
+- leaves an existing `issues` bookmark alone.
 
 The seed commit's only job is to exist so the bookmark has
-somewhere to point before any bug is created. Bug commits chain
-off it; the parent of the first bug-create commit is the seed.
+somewhere to point before any issue is created. Issue commits
+chain off it; the parent of the first issue-create commit is
+the seed.
 
 ### 1.2 Path resolution
 
@@ -59,7 +96,7 @@ with `--repository` set. **Always use the `root:` fileset prefix**
 when feeding paths to `jj log` / `jj diff`:
 
 ```sh
-jj log --no-graph 'root:bugs/aa6600b.json' -T 'json(self)'
+jj log --no-graph 'root:issues/aa6600b.json' -T 'json(self)'
 ```
 
 This is a hard rule. Don't rely on cwd.
@@ -68,12 +105,12 @@ This is a hard rule. Don't rely on cwd.
 
 ## 2. ID format
 
-Bug ID = **7-character lowercase hex string**, drawn from
+Issue ID = **7-character lowercase hex string**, drawn from
 `/[0-9a-f]{7}/`. Mirrors git short-SHA convention so users already
 read them fluently.
 
 - Generation: random 28 bits (≈268M space). On collision with an
-  existing `bugs/<id>.json`, re-roll. Probability is negligible
+  existing `issues/<id>.json`, re-roll. Probability is negligible
   at jjforge's scale; v1 doesn't need anything fancier.
 - Prefix disambiguation: like `git-bug` and `git`, jjforge
   commands accept any unambiguous prefix. A 4-char prefix is
@@ -83,13 +120,13 @@ read them fluently.
   Both are too long (40 chars) and change_ids are jj-specific.
   The simpler 7-hex random ID is friendlier for prose and CLI.
 
-The ID is stamped into the file name (`bugs/<id>.json`), into the
-JSON record's `id` field, and into the `Jjf-Bug:` trailer of every
-commit that touches it. All three must agree.
+The ID is stamped into the file name (`issues/<id>.json`), into
+the JSON record's `id` field, and into the `Jjf-Issue:` trailer
+of every commit that touches it. All three must agree.
 
 ---
 
-## 3. Per-bug record: `bugs/<id>.json`
+## 3. Per-issue record: `issues/<id>.json`
 
 One JSON object per file, pretty-printed with 2-space indentation
 and a trailing newline. Pretty-printing is deliberate: it makes
@@ -100,13 +137,13 @@ separate lines).
 
 | Field          | Type                  | Req? | Notes                                                          |
 | -------------- | --------------------- | ---- | -------------------------------------------------------------- |
-| `version`      | integer               | yes  | Schema version. v1 = `1`.                                      |
+| `version`      | integer               | yes  | Schema version. v2 = `2`. Older records may carry `1`.         |
 | `id`           | string (7-hex)        | yes  | Must equal the filename stem.                                  |
 | `title`        | string                | yes  | Single-line. Must not be empty.                                |
 | `body`         | string                | yes  | Opening description. May be empty.                             |
 | `status`       | string enum           | yes  | `open` or `closed`. Extensible by adding values in later vN.   |
 | `labels`       | array of string       | yes  | Sorted alphabetically. Empty array if none.                    |
-| `dependencies` | array of string       | yes  | Bug IDs this depends on. Sorted. Empty array if none.          |
+| `dependencies` | array of string       | yes  | Issue IDs this depends on. Sorted. Empty array if none.        |
 | `assignee`     | string \| null        | yes  | Free-text identifier. `null` if unassigned.                    |
 | `created_at`   | string (RFC 3339)     | yes  | UTC. Set at create time; never modified.                       |
 | `updated_at`   | string (RFC 3339)     | yes  | UTC. Updated on every mutation.                                |
@@ -115,22 +152,22 @@ Drops from git-bug's model, on purpose:
 
 - **No `actors` / `participants`** — derivable from commit/comment
   authors. Not stored.
-- **No `nonce`** — bug ID is the identity.
+- **No `nonce`** — issue ID is the identity.
 - **No per-op identity blocks** — the commit's git author/email
   is the authority.
 
 Adds over git-bug:
 
 - **`version`** — git-bug's format version is repo-global; ours
-  is per-record so we can migrate one bug at a time.
+  is per-record so we can migrate one issue at a time.
 
 ### 3.2 Example
 
-`bugs/aa6600b.json`:
+`issues/aa6600b.json`:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "id": "aa6600b",
   "title": "segfault on empty input",
   "body": "Running `./app` with no arguments crashes.",
@@ -143,6 +180,10 @@ Adds over git-bug:
 }
 ```
 
+(The label `"bug"` here is just a user-chosen string in the
+free-form `labels` array — defect classification. It has nothing
+to do with the v1 → v2 nomenclature rename.)
+
 ### 3.3 Field-ordering rule
 
 Writers **must** emit fields in the order above. This is not for
@@ -152,7 +193,7 @@ spurious conflicts when two clones touch different fields.
 
 ---
 
-## 4. Comments file: `bugs/<id>.comments.jsonl`
+## 4. Comments file: `issues/<id>.comments.jsonl`
 
 One JSON object per line. No surrounding array, no trailing
 comma. Empty file = no comments. The file is **append-only** in
@@ -163,7 +204,7 @@ last line of the file.
 
 | Field        | Type              | Req? | Notes                                       |
 | ------------ | ----------------- | ---- | ------------------------------------------- |
-| `id`         | string (7-hex)    | yes  | Comment ID, scoped per-bug. Locally unique. |
+| `id`         | string (7-hex)    | yes  | Comment ID, scoped per-issue. Locally unique. |
 | `author`     | string            | yes  | Git author identity (`name <email>`).       |
 | `created_at` | string (RFC 3339) | yes  | UTC.                                        |
 | `body`       | string            | yes  | Markdown. May contain newlines (JSON-escaped). |
@@ -177,7 +218,7 @@ unions both lines and re-sorts.
 
 ### 4.3 Example
 
-`bugs/aa6600b.comments.jsonl`:
+`issues/aa6600b.comments.jsonl`:
 
 ```jsonl
 {"id":"c01a23b","author":"alice <alice@example.com>","created_at":"2026-06-21T13:00:00Z","body":"I can reproduce on macOS 14.5."}
@@ -202,11 +243,11 @@ Two reasons:
 
 ## 5. `Jjf-Op:` commit trailer
 
-Every commit on the `bugs` bookmark that mutates a bug carries
-**one or more `Jjf-Op:` trailers** in its description. The
-trailers are git-trailer-style (`Key: value` lines at the bottom
-of the message, after a blank line). Git trailers survive `jj
-describe` reflow and round-trip through `jj log -T description`
+Every commit on the `issues` bookmark that mutates an issue
+carries **one or more `Jjf-Op:` trailers** in its description.
+The trailers are git-trailer-style (`Key: value` lines at the
+bottom of the message, after a blank line). Git trailers survive
+`jj describe` reflow and round-trip through `jj log -T description`
 cleanly — this is why we chose them over JSON-on-first-line.
 
 ### 5.1 Commit-message shape
@@ -218,11 +259,11 @@ jjf: <human summary>
 
 Jjf-Op: <op-type>
 Jjf-At: <rfc3339-nano>
-Jjf-Bug: <bug-id>
+Jjf-Issue: <issue-id>
 Jjf-...: <payload field>
 [Jjf-Op: <second-op-type>  ← multi-op-per-commit supported]
 [Jjf-At: <rfc3339-nano>]
-[Jjf-Bug: <bug-id>]
+[Jjf-Issue: <issue-id>]
 [Jjf-...: ...]
 ```
 
@@ -242,6 +283,12 @@ unstamped stanzas before stamped ones at the same commit-time
 second, which is the desired migration semantics (older data
 loses to newer data when they tie on commit-time).
 
+**Parsers MUST also tolerate the v1 spelling `Jjf-Bug:`** in
+place of `Jjf-Issue:`. The two field names carry identical
+semantics — the parser maps either to the same op. When a stanza
+carries both (defensive; should never happen), the v2 name
+(`Jjf-Issue:`) takes precedence.
+
 Why nanos in the trailer when the JSON record's `created_at` /
 `updated_at` are second-resolution (§3.1)? Because the byte-equality
 round-trip property test on the JSON record is load-bearing for
@@ -252,15 +299,15 @@ trap that §5.6's filter-on-both-files workaround papers over.
 
 ### 5.2 Op-type vocabulary
 
-| Op-type      | Trailer-payload fields (in addition to `Jjf-Bug`)         | Notes                                                |
+| Op-type      | Trailer-payload fields (in addition to `Jjf-Issue`)       | Notes                                                |
 | ------------ | --------------------------------------------------------- | ---------------------------------------------------- |
-| `create`     | `Jjf-Title`, `Jjf-Status` (always `open`)                 | Must be the first op on this bug.                    |
+| `create`     | `Jjf-Title`, `Jjf-Status` (always `open`)                 | Must be the first op on this issue.                  |
 | `set-title`  | `Jjf-Title`                                               | Replaces title outright.                             |
 | `set-status` | `Jjf-Status` (`open` \| `closed`)                         | Replaces status outright.                            |
 | `set-body`   | `Jjf-Body-Hash` (sha-256 of new body, hex)                | Body itself lives in the JSON; trailer carries hash. |
 | `label-add`  | `Jjf-Label` (one label string; may repeat for >1 label)   | No-op if label already present.                      |
 | `label-rm`   | `Jjf-Label`                                               | No-op if not present.                                |
-| `dep-add`    | `Jjf-Dep` (target bug-id)                                 |                                                      |
+| `dep-add`    | `Jjf-Dep` (target issue-id)                               |                                                      |
 | `dep-rm`     | `Jjf-Dep`                                                 |                                                      |
 | `set-assignee` | `Jjf-Assignee` (string or empty for unassign)           |                                                      |
 | `comment-add` | `Jjf-Comment-Id` (the new comment's 7-hex id)            | The comment body lives in `<id>.comments.jsonl`.     |
@@ -269,16 +316,16 @@ trap that §5.6's filter-on-both-files workaround papers over.
 Unknown trailers and unknown op-types **must be tolerated** by
 readers — they get logged in the audit view as
 `unknown(<op-type>)` but don't fail the read. This lets us add
-ops in v1.1 without breaking older readers.
+ops in v2.1 without breaking older readers.
 
 ### 5.3 Multi-op-per-commit ordering
 
 A commit may carry more than one `Jjf-Op:` trailer (e.g. when a
-single `jjf` invocation closes a bug *and* adds a label). Ops in
-the same commit are applied **top-to-bottom in trailer order**.
-The `Jjf-Bug:` immediately following a `Jjf-Op:` (and any payload
-fields up to the next `Jjf-Op:` or end-of-message) belong to that
-op.
+single `jjf` invocation closes an issue *and* adds a label). Ops
+in the same commit are applied **top-to-bottom in trailer order**.
+The `Jjf-Issue:` immediately following a `Jjf-Op:` (and any
+payload fields up to the next `Jjf-Op:` or end-of-message) belong
+to that op.
 
 Each op's payload window is delimited by the next `Jjf-Op:` line
 or end-of-trailers. Implementers: split on `Jjf-Op:`, parse each
@@ -287,11 +334,11 @@ chunk independently.
 ### 5.4 Example: single-op commit
 
 ```
-jjf: bug aa6600b - create
+jjf: issue aa6600b - create
 
 Jjf-Op: create
 Jjf-At: 2026-06-22T12:34:56.123456789Z
-Jjf-Bug: aa6600b
+Jjf-Issue: aa6600b
 Jjf-Title: segfault on empty input
 Jjf-Status: open
 ```
@@ -301,29 +348,29 @@ Jjf-Status: open
 Both ops share the same `Jjf-At:` — they were issued together.
 
 ```
-jjf: bug aa6600b - close + label
+jjf: issue aa6600b - close + label
 
 Closing as fixed in #42.
 
 Jjf-Op: set-status
 Jjf-At: 2026-06-22T12:34:56.123456789Z
-Jjf-Bug: aa6600b
+Jjf-Issue: aa6600b
 Jjf-Status: closed
 Jjf-Op: label-add
 Jjf-At: 2026-06-22T12:34:56.123456789Z
-Jjf-Bug: aa6600b
+Jjf-Issue: aa6600b
 Jjf-Label: fixed
 ```
 
 Applied in order: status → closed, then label `fixed` added.
 
-### 5.6 Reading the per-bug op chain
+### 5.6 Reading the per-issue op chain
 
 ```sh
 jj log --no-graph \
-   -r 'ancestors(bookmarks(bugs))' \
-   'root:bugs/aa6600b.json' \
-   'root:bugs/aa6600b.comments.jsonl' \
+   -r 'ancestors(bookmarks(issues))' \
+   'root:issues/aa6600b.json' \
+   'root:issues/aa6600b.comments.jsonl' \
    -T 'change_id.short() ++ "\t" ++ json(description) ++ "\n"'
 ```
 
@@ -344,44 +391,44 @@ makes the same-second collision case observationally rare, but
 not impossible — the workaround stays in place as a belt-and-
 braces guard against future regressions.)
 
-**Anchor the revset to `ancestors(bookmarks(bugs))`.** Without
+**Anchor the revset to `ancestors(bookmarks(issues))`.** Without
 the explicit revset, `jj log` defaults to a working-copy
 revision that doesn't include the bookmark's history once the
 4-CLI dance has stepped `@` off the bookmark.
 
 ### 5.7 Merge commits
 
-When `jjf pull` resolves a divergent `bugs` bookmark via the
-merge driver, it lands ONE multi-parent merge commit on `bugs`
+When `jjf pull` resolves a divergent `issues` bookmark via the
+merge driver, it lands ONE multi-parent merge commit on `issues`
 whose description carries one `Jjf-Op: merge` trailer per resolved
-bug (spec §5.2 + §5.5). The merge commit's parents are the heads
-that were diverging; the trailer payload is just the bug-id
-(`Jjf-Bug: <id>`), no extra fields — the resolved file diff IS the
-payload. Multi-bug merges land all `merge` trailers on the same
-commit.
+issue (spec §5.2 + §5.5). The merge commit's parents are the
+heads that were diverging; the trailer payload is just the
+issue-id (`Jjf-Issue: <id>`), no extra fields — the resolved file
+diff IS the payload. Multi-issue merges land all `merge` trailers
+on the same commit.
 
-Example single-bug merge commit:
+Example single-issue merge commit:
 
 ```
-jjf: bug aa6600b - merge
+jjf: issue aa6600b - merge
 
 Jjf-Op: merge
 Jjf-At: 2026-06-22T12:34:56.123456789Z
-Jjf-Bug: aa6600b
+Jjf-Issue: aa6600b
 ```
 
-Example two-bug merge commit (both ops share the same `Jjf-At:`
+Example two-issue merge commit (both ops share the same `Jjf-At:`
 — they were issued together):
 
 ```
-jjf: merge 2 bugs
+jjf: merge 2 issues
 
 Jjf-Op: merge
 Jjf-At: 2026-06-22T12:34:56.123456789Z
-Jjf-Bug: aa6600b
+Jjf-Issue: aa6600b
 Jjf-Op: merge
 Jjf-At: 2026-06-22T12:34:56.123456789Z
-Jjf-Bug: bb7700c
+Jjf-Issue: bb7700c
 ```
 
 The merge commit's file diff IS the resolution, and that
@@ -394,7 +441,7 @@ chains together," not a per-field decision.
 ### 5.8 Create-time fields and op chains
 
 The `create` op trailer carries only `Jjf-Title` and
-`Jjf-Status`. Any other seed fields on a freshly-created bug
+`Jjf-Status`. Any other seed fields on a freshly-created issue
 (`body`, `labels`, `dependencies`, `assignee`) must be recorded
 as **additional ops in the same commit** — the multi-op pattern
 of §5.5. Without this, a reader that re-derives state from the
@@ -411,14 +458,14 @@ present).
 
 ## 6. Merge semantics
 
-When a divergent `bugs` bookmark needs to converge — two clones
+When a divergent `issues` bookmark needs to converge — two clones
 both pushed concurrent edits, or any two heads exist under
-`heads(bookmarks(bugs))` — the op-space resolver in
+`heads(bookmarks(issues))` — the op-space resolver in
 `crates/jjf-storage/src/merge_ops.rs` reduces both heads' op
 chains to a single rendered state. **The file is a deterministic
 projection of the op chain.** Divergence resolves in op-space;
-the rendered `bugs/<id>.json` and `bugs/<id>.comments.jsonl` fall
-out as the projection of the merged op stream.
+the rendered `issues/<id>.json` and `issues/<id>.comments.jsonl`
+fall out as the projection of the merged op stream.
 
 ### 6.1 LWW ordering tuple
 
@@ -458,12 +505,12 @@ runs the merge.
 
 `Op::SetBody` carries only `body_hash` (§5.2). The reducer picks
 the winning hash from the ordering tuple, but the body bytes
-themselves live in the rendered `bugs/<id>.json`, not in any
+themselves live in the rendered `issues/<id>.json`, not in any
 trailer. To recover the body text:
 
 1. Pick the winning `set-body` op's `body_hash` from the sorted
    stream.
-2. Look up that hash in each head's rendered `bugs/<id>.json`
+2. Look up that hash in each head's rendered `issues/<id>.json`
    (compute `sha-256(body)` on the JSON record's `body` field for
    each head).
 3. The hash will match exactly one head by construction — that
@@ -480,7 +527,7 @@ duplicating the body text in every trailer.
 ### 6.4 Comment union
 
 Each `comment-add` op references a `comment_id`; the actual
-comment body lives in `bugs/<id>.comments.jsonl`. The resolver
+comment body lives in `issues/<id>.comments.jsonl`. The resolver
 reads each head's `.comments.jsonl` (via `jj file show -r
 <head>`), unions them by `comment_id`, and re-renders the merged
 file in `created_at` ascending order (§4.2). Same-id-different-body
@@ -505,14 +552,15 @@ fixture; `jjf pull` no longer wires it in.
 
 ## 7. Write path summary (informative)
 
-The exact write path is `storage-write`'s ticket, but the format
+The exact write path is in `crates/jjf-storage`, but the format
 constrains it. The 4-CLI dance (jj 0.40–0.42 has no `file write
 -r <change>`):
 
-1. `jj new bookmarks(bugs) -m '<msg with trailers>'`
-2. Edit `bugs/<id>.json` (and append to `bugs/<id>.comments.jsonl`
-   if applicable) in the working copy.
-3. `jj bookmark set bugs -r @ --allow-backwards`
+1. `jj new bookmarks(issues) -m '<msg with trailers>'`
+2. Edit `issues/<id>.json` (and append to
+   `issues/<id>.comments.jsonl` if applicable) in the working
+   copy.
+3. `jj bookmark set issues -r @ --allow-backwards`
 4. `jj new root()` to step @ off the bookmark so the next
    mutation doesn't snapshot stale files.
 
@@ -521,17 +569,18 @@ Cost ≈60ms per mutation at jj's measured ~15ms/CLI call
 
 ---
 
-## 8. What's deliberately out of scope for v1
+## 8. What's deliberately out of scope for v2
 
 - **Attachments / binary blobs.** No `files` array (git-bug
   uses git blob refs; we don't need it yet).
-- **Edit-comment / delete-comment.** Append-only in v1.
+- **Edit-comment / delete-comment.** Append-only.
 - **Identity / signatures.** Git author/email is enough; PGP
   signing is a later issue.
-- **Multi-bookmark / multi-project sharding.** One `bugs`
+- **Multi-bookmark / multi-project sharding.** One `issues`
   bookmark per repo.
-- **Format migrations.** Once we ship a v2, the `version` field
-  on each record drives a per-record migration. Not yet needed.
+- **Schema-level format migrations** beyond the v1→v2 inline
+  rename. Once we ship a v3, the `version` field on each record
+  drives a per-record migration. Not yet needed.
 
 ---
 

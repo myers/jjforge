@@ -22,7 +22,7 @@
 //! `--json` is a global flag accepted by every verb. For verbs that
 //! haven't been implemented yet, the flag is parsed but ignored
 //! (they error out the same way regardless). For `init`, the JSON
-//! output is `{"ok": true, "bookmark": "bugs"}` per the
+//! output is `{"ok": true, "bookmark": "issues"}` per the
 //! `cli-skeleton` ticket.
 //!
 //! # What lives here vs. `jjf-storage`
@@ -41,8 +41,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use jjf_storage::{
-    BUGS_BOOKMARK, Bug, BugDraft, BugId, Error as StorageError, IdError, Status, Storage,
-    UpdateFields,
+    ISSUES_BOOKMARK, Error as StorageError, IdError, Issue, IssueDraft, IssueId, Status,
+    Storage, UpdateFields,
 };
 
 /// Top-level CLI shape. Subcommands live on the `Commands` enum; the
@@ -100,21 +100,22 @@ impl From<StatusArg> for Status {
 /// per-verb tickets replace the stubs with real implementations.
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Initialize the `bugs` bookmark on the current jj repo.
+    /// Initialize the `issues` bookmark on the current jj repo.
     /// Idempotent — running twice in the same repo is a no-op.
     Init,
 
-    /// Create a new bug on the `bugs` bookmark. Requires `jjf init` to
-    /// have been run first. Prints the new bug's id on stdout (or the
-    /// `{"ok": true, "id": "..."}` object under `--json`); exits 0.
+    /// Create a new issue on the `issues` bookmark. Requires `jjf init`
+    /// to have been run first. Prints the new issue's id on stdout
+    /// (or the `{"ok": true, "id": "..."}` object under `--json`);
+    /// exits 0.
     New {
-        /// Title of the new bug. Required, non-empty.
+        /// Title of the new issue. Required, non-empty.
         #[arg(short = 't', long)]
         title: String,
 
-        /// Source for the bug body. Path to read, or `-` to read stdin.
-        /// Omit to leave the body empty (the epic's "no prompts ever"
-        /// rule — no editor pop-up).
+        /// Source for the issue body. Path to read, or `-` to read
+        /// stdin. Omit to leave the body empty (the epic's "no
+        /// prompts ever" rule — no editor pop-up).
         #[arg(short = 'F', long)]
         file: Option<PathBuf>,
 
@@ -122,9 +123,9 @@ enum Commands {
         #[arg(short = 'l', long = "label")]
         labels: Vec<String>,
 
-        /// Declare a dependency on another bug id. Repeatable. Each
-        /// value must be a 7-char lowercase-hex bug id; a bad value is
-        /// a preflight failure (exit 2).
+        /// Declare a dependency on another issue id. Repeatable. Each
+        /// value must be a 7-char lowercase-hex issue id; a bad value
+        /// is a preflight failure (exit 2).
         #[arg(short = 'd', long = "dep")]
         deps: Vec<String>,
 
@@ -134,59 +135,61 @@ enum Commands {
         assignee: Option<String>,
     },
 
-    /// Print a single bug from the `bugs` bookmark — title, status,
-    /// labels, assignee, body, and comment thread. Plain-text by
-    /// default; `--json` emits the structured `Bug` record verbatim
-    /// (no envelope — the bug IS the payload). Requires `jjf init`
-    /// to have been run first.
+    /// Print a single issue from the `issues` bookmark — title,
+    /// status, labels, assignee, body, and comment thread. Plain-text
+    /// by default; `--json` emits the structured `Issue` record
+    /// verbatim (no envelope — the issue IS the payload). Requires
+    /// `jjf init` to have been run first.
     Show {
-        /// Full 7-char hex bug id. Prefix lookup isn't supported yet
+        /// Full 7-char hex issue id. Prefix lookup isn't supported yet
         /// (the storage layer is full-id-only); a bad id is a
         /// preflight failure (exit 2), a valid id that doesn't exist
         /// at the bookmark tip is a runtime failure (exit 1).
         id: String,
     },
 
-    /// List bugs from the `bugs` bookmark, with optional filters.
-    /// Default: every open bug. Plain-text output is one row per bug,
-    /// tab-separated columns (`<id-7>\t<status>\t<labels>L\t<title>`),
-    /// no header, sorted newest-first by `created_at`. `--json` emits
-    /// a JSON array of `Bug` records (the same shape `show --json`
-    /// emits per element). Empty result is exit 0 with no output.
+    /// List issues from the `issues` bookmark, with optional filters.
+    /// Default: every open issue. Plain-text output is one row per
+    /// issue, tab-separated columns
+    /// (`<id-7>\t<status>\t<labels>L\t<title>`), no header, sorted
+    /// newest-first by `created_at`. `--json` emits a JSON array of
+    /// `Issue` records (the same shape `show --json` emits per
+    /// element). Empty result is exit 0 with no output.
     Ls {
-        /// Filter by status. `open` is the default (matches git-bug and
-        /// the "lists are about what's actionable" convention). `all`
-        /// shows every bug regardless of status.
+        /// Filter by status. `open` is the default (matches git-bug
+        /// and the "lists are about what's actionable" convention).
+        /// `all` shows every issue regardless of status.
         #[arg(long, value_enum, default_value_t = StatusFilter::Open)]
         status: StatusFilter,
 
-        /// Filter by label. Repeatable. Semantics: AND — a bug must
-        /// carry every listed label to match.
+        /// Filter by label. Repeatable. Semantics: AND — an issue
+        /// must carry every listed label to match.
         #[arg(short = 'l', long = "label")]
         labels: Vec<String>,
     },
 
-    /// Mutate one or more scalar fields of a bug in a single commit.
+    /// Mutate one or more scalar fields of an issue in a single commit.
     ///
     /// Every populated field flag lands as a `Jjf-Op:` trailer on ONE
-    /// new commit on the `bugs` bookmark (spec §5.5 multi-op-per-commit).
-    /// So `update <id> --title T --status closed --body-file -` ships
-    /// three trailers (`set-title`, `set-status`, `set-body`) on one
-    /// commit — distinct from running three sibling verbs back-to-back,
-    /// which would fragment into three commits.
+    /// new commit on the `issues` bookmark (spec §5.5
+    /// multi-op-per-commit). So `update <id> --title T --status closed
+    /// --body-file -` ships three trailers (`set-title`,
+    /// `set-status`, `set-body`) on one commit — distinct from
+    /// running three sibling verbs back-to-back, which would fragment
+    /// into three commits.
     ///
     /// At least one of `--title` / `--status` / `--body-file` /
-    /// `--assignee` / `--unset-assignee` is required; running with none
-    /// is an exit-2 preflight failure (clap can't enforce the
+    /// `--assignee` / `--unset-assignee` is required; running with
+    /// none is an exit-2 preflight failure (clap can't enforce the
     /// at-least-one rule for us). `--assignee` and `--unset-assignee`
     /// are mutually exclusive (clap `conflicts_with`).
     ///
-    /// `--status` overlaps with `jjf close` / `jjf open` by design — use
-    /// the standalone verbs for the single-shot ergonomic path, this
-    /// verb for the multi-field case.
+    /// `--status` overlaps with `jjf close` / `jjf open` by design —
+    /// use the standalone verbs for the single-shot ergonomic path,
+    /// this verb for the multi-field case.
     Update {
-        /// Full 7-char hex bug id. Bad parse → exit 2; valid id that
-        /// doesn't exist on the bookmark → exit 1.
+        /// Full 7-char hex issue id. Bad parse → exit 2; valid id
+        /// that doesn't exist on the bookmark → exit 1.
         id: String,
 
         /// Replace the title. Must be non-empty (after trim) at the
@@ -214,64 +217,65 @@ enum Commands {
         unset_assignee: bool,
     },
 
-    /// Append a comment to an existing bug on the `bugs` bookmark.
+    /// Append a comment to an existing issue on the `issues` bookmark.
     /// Body source is REQUIRED — pass `-F <path>` or `-F -` for stdin.
-    /// Author defaults to the jj user identity (`Name <email>` per jj's
-    /// `author` template); `--author <NAME>` overrides. Empty bodies
-    /// are rejected at the CLI layer (exit 2) because an empty comment
-    /// is almost certainly a user mistake.
+    /// Author defaults to the jj user identity (`Name <email>` per
+    /// jj's `author` template); `--author <NAME>` overrides. Empty
+    /// bodies are rejected at the CLI layer (exit 2) because an empty
+    /// comment is almost certainly a user mistake.
     Comment {
-        /// Full 7-char hex bug id. Bad parse → exit 2; valid id that
-        /// doesn't exist on the bookmark → exit 1.
+        /// Full 7-char hex issue id. Bad parse → exit 2; valid id
+        /// that doesn't exist on the bookmark → exit 1.
         id: String,
 
         /// Source for the comment body. Path to read, or `-` to read
-        /// stdin. REQUIRED — the epic's "no prompts ever" rule means we
-        /// do NOT launch an editor when this is omitted. Empty body
+        /// stdin. REQUIRED — the epic's "no prompts ever" rule means
+        /// we do NOT launch an editor when this is omitted. Empty body
         /// (after read) is a preflight failure (exit 2).
         #[arg(short = 'F', long, required = true)]
         file: PathBuf,
 
         /// Override the comment author. Free-form string written
         /// verbatim into the comment record. When omitted, the author
-        /// is sourced from `jj config get user.name` + `user.email` in
-        /// the `Name <email>` format that matches jj's commit-author
-        /// template. If no jj `user.name` is configured and no override
-        /// is given, the verb exits 2 with a hint to set one.
+        /// is sourced from `jj config get user.name` + `user.email`
+        /// in the `Name <email>` format that matches jj's commit-author
+        /// template. If no jj `user.name` is configured and no
+        /// override is given, the verb exits 2 with a hint to set one.
         #[arg(long)]
         author: Option<String>,
     },
 
-    /// Close a bug. Lands a `set-status` op on a new commit on the
-    /// `bugs` bookmark. Not idempotent per the spec — closing an
-    /// already-closed bug still writes a fresh trailer so the audit
+    /// Close an issue. Lands a `set-status` op on a new commit on the
+    /// `issues` bookmark. Not idempotent per the spec — closing an
+    /// already-closed issue still writes a fresh trailer so the audit
     /// log records the intent. Requires `jjf init` to have been run
     /// first.
     Close {
-        /// Full 7-char hex bug id. A bad parse is a preflight failure
-        /// (exit 2); a well-formed id that doesn't exist on the
-        /// bookmark is a runtime failure (exit 1).
+        /// Full 7-char hex issue id. A bad parse is a preflight
+        /// failure (exit 2); a well-formed id that doesn't exist on
+        /// the bookmark is a runtime failure (exit 1).
         id: String,
     },
 
-    /// Reopen a bug. Same shape and same non-idempotency rules as
+    /// Reopen an issue. Same shape and same non-idempotency rules as
     /// `close`, just lands `set-status=open`.
     Open {
-        /// Full 7-char hex bug id. A bad parse is a preflight failure
-        /// (exit 2); a well-formed id that doesn't exist on the
-        /// bookmark is a runtime failure (exit 1).
+        /// Full 7-char hex issue id. A bad parse is a preflight
+        /// failure (exit 2); a well-formed id that doesn't exist on
+        /// the bookmark is a runtime failure (exit 1).
         id: String,
     },
 
-    /// Add or remove a single label on a bug. Lands a fresh
-    /// `label-add` or `label-rm` op on a new commit on the `bugs`
+    /// Add or remove a single label on an issue. Lands a fresh
+    /// `label-add` or `label-rm` op on a new commit on the `issues`
     /// bookmark.
     ///
     /// Per the spec (§5.2) and matching `close`/`open`'s twin-mutator
-    /// shape: the call is NOT idempotent — re-adding an already-present
-    /// label, or removing one that isn't there, still writes a fresh
-    /// trailer so the audit log records the intent. The in-memory
-    /// label set is dedup'd, so `show` reports a clean list either way.
+    /// shape: the call is NOT idempotent — re-adding an
+    /// already-present label, or removing one that isn't there, still
+    /// writes a fresh trailer so the audit log records the intent.
+    /// The in-memory label set is dedup'd, so `show` reports a clean
+    /// list either way.
     ///
     /// v1 is single-label-per-call. Bulk (`label add <id> a b c`) is
     /// out of scope; repeat the command in a loop for now.
@@ -282,51 +286,52 @@ enum Commands {
 
     /// Manage git remotes on the underlying jj repo. Thin wrapper over
     /// `jj git remote add|list|remove` — jj already supports git
-    /// transport for bookmarks (and bookmarks ARE the unit `bugs`
+    /// transport for bookmarks (and bookmarks ARE the unit `issues`
     /// travels as), so this verb does NOT need to write per-bookmark
     /// refspec config. Verified in `experiments/sync-remote/`.
     ///
-    /// Preflight is jj-repo-only (no `bugs` bookmark required) — adding
-    /// a remote is meaningful BEFORE `jjf init` runs, and the soon-to-
-    /// come `jjf push` will be how the bookmark first reaches a remote.
+    /// Preflight is jj-repo-only (no `issues` bookmark required) —
+    /// adding a remote is meaningful BEFORE `jjf init` runs, and the
+    /// soon-to-come `jjf push` will be how the bookmark first reaches
+    /// a remote.
     Remote {
         #[command(subcommand)]
         action: RemoteAction,
     },
 
-    /// Push the `bugs` bookmark to a git remote. Wraps
-    /// `jj git push --bookmark bugs --remote <remote>`.
+    /// Push the `issues` bookmark to a git remote. Wraps
+    /// `jj git push --bookmark issues --remote <remote>`.
     ///
-    /// Preflight: full `bugs_bookmark` probe (the bookmark must exist
-    /// locally — there's nothing to push otherwise). Unknown remote
-    /// surfaces as `remote_not_found` (exit 2); network / auth / non-
-    /// fast-forward failures are runtime (exit 1) under typed kinds so
-    /// scripts can branch.
+    /// Preflight: full `issues_bookmark` probe (the bookmark must
+    /// exist locally — there's nothing to push otherwise). Unknown
+    /// remote surfaces as `remote_not_found` (exit 2); network /
+    /// auth / non-fast-forward failures are runtime (exit 1) under
+    /// typed kinds so scripts can branch.
     Push {
         /// Remote name (must already be configured via
         /// `jjf remote add <name> <url>`).
         remote: String,
     },
 
-    /// Pull the `bugs` bookmark from a git remote, then merge any
+    /// Pull the `issues` bookmark from a git remote, then merge any
     /// divergence into a single commit via the jjforge merge driver.
     ///
     /// Sequence:
     ///
     /// 1. `jj git fetch --remote <remote>`. Network / auth failures
     ///    bubble up as typed runtime errors (exit 1).
-    /// 2. If the remote bookmark `bugs@<remote>` exists but the local
-    ///    `bugs` doesn't yet track it, run
-    ///    `jj bookmark track bugs --remote=<remote>` so subsequent
+    /// 2. If the remote bookmark `issues@<remote>` exists but the
+    ///    local `issues` doesn't yet track it, run
+    ///    `jj bookmark track issues --remote=<remote>` so subsequent
     ///    fetches see new commits as bookmark moves rather than as new
     ///    untracked remote bookmarks.
     /// 3. If the bookmark is now in a divergent ("conflicted") state —
-    ///    `heads(bookmarks(bugs))` resolves to >1 commit — run the
-    ///    merge driver: for each conflicted `bugs/<id>.json`, call
+    ///    `heads(bookmarks(issues))` resolves to >1 commit — run the
+    ///    merge driver: for each conflicted `issues/<id>.json`, call
     ///    `jjf_merge::resolve` and write the result back. Lands a
-    ///    single merge commit on `bugs` with one `Jjf-Op: merge`
-    ///    trailer per resolved bug (spec §5.2 / §5.5).
-    /// 4. If the remote has no `bugs` bookmark yet (the other side
+    ///    single merge commit on `issues` with one `Jjf-Op: merge`
+    ///    trailer per resolved issue (spec §5.2 / §5.5).
+    /// 4. If the remote has no `issues` bookmark yet (the other side
     ///    hasn't pushed), exit 0 with `remote_present: false` in the
     ///    JSON envelope. Not an error.
     Pull {
@@ -343,12 +348,12 @@ enum Commands {
 /// subcommands instead of flags.
 #[derive(Debug, Subcommand)]
 enum LabelAction {
-    /// Add a label to a bug. Idempotent at the record level (the label
-    /// set dedupes) but NOT at the commit level — a fresh `label-add`
-    /// op lands either way per spec §5.2.
+    /// Add a label to an issue. Idempotent at the record level (the
+    /// label set dedupes) but NOT at the commit level — a fresh
+    /// `label-add` op lands either way per spec §5.2.
     Add {
-        /// Full 7-char hex bug id. Bad parse → exit 2; valid id that
-        /// doesn't exist on the bookmark → exit 1.
+        /// Full 7-char hex issue id. Bad parse → exit 2; valid id
+        /// that doesn't exist on the bookmark → exit 1.
         id: String,
 
         /// Label to add. Must be non-empty; an empty string is a
@@ -357,12 +362,12 @@ enum LabelAction {
         label: String,
     },
 
-    /// Remove a label from a bug. No-op at the record level if the
+    /// Remove a label from an issue. No-op at the record level if the
     /// label isn't present, but a fresh `label-rm` op lands either way
     /// per spec §5.2.
     Rm {
-        /// Full 7-char hex bug id. Bad parse → exit 2; valid id that
-        /// doesn't exist on the bookmark → exit 1.
+        /// Full 7-char hex issue id. Bad parse → exit 2; valid id
+        /// that doesn't exist on the bookmark → exit 1.
         id: String,
 
         /// Label to remove. Must be non-empty (same rule as `add`).
@@ -422,7 +427,7 @@ enum CliError {
     #[error("could not determine current working directory: {0}")]
     Cwd(std::io::Error),
 
-    /// Reading the bug body from `-F <path>` (or `-F -`) failed.
+    /// Reading the issue body from `-F <path>` (or `-F -`) failed.
     /// Preflight failure: the user gave us a path we couldn't open
     /// (or stdin closed in a way we couldn't drain).
     #[error("could not read body from {from}: {error}")]
@@ -431,27 +436,27 @@ enum CliError {
         error: std::io::Error,
     },
 
-    /// A `-d / --dep` value didn't parse as a valid `BugId`.
+    /// A `-d / --dep` value didn't parse as a valid `IssueId`.
     /// Preflight failure (exit 2) — the user typed something wrong;
     /// no point in starting the dance only to fail mid-write.
-    #[error("invalid bug id for --dep {value:?}: {error}")]
+    #[error("invalid issue id for --dep {value:?}: {error}")]
     BadDepId { value: String, error: IdError },
 
-    /// A positional bug id (e.g. `jjf show <id>`) didn't parse as
-    /// a valid `BugId`. Preflight failure (exit 2) — the user typed
+    /// A positional issue id (e.g. `jjf show <id>`) didn't parse as
+    /// a valid `IssueId`. Preflight failure (exit 2) — the user typed
     /// something the storage layer can never resolve.
-    #[error("invalid bug id {value:?}: {error}")]
-    BadBugId { value: String, error: IdError },
+    #[error("invalid issue id {value:?}: {error}")]
+    BadIssueId { value: String, error: IdError },
 
-    /// We're inside a jj repo, but the `bugs` bookmark doesn't
+    /// We're inside a jj repo, but the `issues` bookmark doesn't
     /// exist yet. Surfaced as a preflight (exit 2) so the user gets
     /// a typed signal that they need to run `jjf init` rather than
     /// the raw jj-stderr we'd get from trying to write against an
-    /// empty `bookmarks(bugs)` revset.
-    #[error("the `bugs` bookmark does not exist in {0}; run `jjf init` first")]
-    MissingBugsBookmark(PathBuf),
+    /// empty `bookmarks(issues)` revset.
+    #[error("the `issues` bookmark does not exist in {0}; run `jjf init` first")]
+    MissingIssuesBookmark(PathBuf),
 
-    /// Probing for the `bugs` bookmark (or for jj-repo-presence)
+    /// Probing for the `issues` bookmark (or for jj-repo-presence)
     /// failed for a reason other than absence — e.g. the `jj`
     /// binary isn't on PATH, or returned an unexpected error. This
     /// is a runtime failure, not a preflight one.
@@ -572,7 +577,7 @@ enum CliError {
         markers: Vec<String>,
     },
 
-    /// Legacy v1 file-bytes merge driver failure: the bug record's
+    /// Legacy v1 file-bytes merge driver failure: the issue record's
     /// body field had free-text conflicts the LWW/union policy
     /// couldn't dispatch. Runtime (exit 1). **As of the
     /// `sync-conflict-fallback` switch (`bfc732b`), this variant is
@@ -583,11 +588,11 @@ enum CliError {
     /// external caller of `jjf_merge::resolve` still see a stable
     /// shape. See `docs/cli-json.md` `pull` section for the contract.
     #[allow(dead_code)]
-    #[error("merge driver could not auto-resolve bug {bug_id}: {detail}\nworking copy left with conflict markers for manual resolution")]
-    Unmergeable { bug_id: String, detail: String },
+    #[error("merge driver could not auto-resolve issue {issue_id}: {detail}\nworking copy left with conflict markers for manual resolution")]
+    Unmergeable { issue_id: String, detail: String },
 
-    /// Legacy v1 file-bytes merge driver failure: a
-    /// `bugs/<id>.comments.jsonl` file had conflict markers the v1
+    /// Legacy v1 file-bytes merge driver failure: an
+    /// `issues/<id>.comments.jsonl` file had conflict markers the v1
     /// driver couldn't handle. Runtime (exit 1). **As of
     /// `sync-conflict-fallback` (`bfc732b`), this variant is
     /// unreachable from `jjf pull`** — the op-space resolver builds
@@ -597,8 +602,8 @@ enum CliError {
     /// the operator path. Same rationale as `Unmergeable` above for
     /// keeping the variant defined.
     #[allow(dead_code)]
-    #[error("merge driver does not handle conflicted comment file for bug {bug_id} (v1 limitation)\nworking copy left with conflict markers for manual resolution")]
-    CommentFileConflict { bug_id: String },
+    #[error("merge driver does not handle conflicted comment file for issue {issue_id} (v1 limitation)\nworking copy left with conflict markers for manual resolution")]
+    CommentFileConflict { issue_id: String },
 }
 
 impl CliError {
@@ -613,8 +618,8 @@ impl CliError {
             CliError::Cwd(_) => 2,
             CliError::BodyRead { .. } => 2,
             CliError::BadDepId { .. } => 2,
-            CliError::BadBugId { .. } => 2,
-            CliError::MissingBugsBookmark(_) => 2,
+            CliError::BadIssueId { .. } => 2,
+            CliError::MissingIssuesBookmark(_) => 2,
             CliError::EmptyCommentBody => 2,
             CliError::EmptyLabel => 2,
             CliError::MissingAuthor => 2,
@@ -636,7 +641,7 @@ impl CliError {
             CliError::JjGitFetch(_) => 1,
             CliError::Unmergeable { .. } => 1,
             CliError::CommentFileConflict { .. } => 1,
-            // `BugNotFound` is the user typing a valid id that just
+            // `IssueNotFound` is the user typing a valid id that just
             // doesn't exist — runtime failure, not preflight (the input
             // was well-formed; we tried to honor it and it wasn't there).
             CliError::Storage(_) => 1,
@@ -652,7 +657,7 @@ impl CliError {
     fn kind(&self) -> &'static str {
         match self {
             CliError::Storage(StorageError::NotAJjRepo(_)) => "not_a_jj_repo",
-            CliError::Storage(StorageError::BugNotFound(_)) => "bug_not_found",
+            CliError::Storage(StorageError::IssueNotFound(_)) => "issue_not_found",
             CliError::Storage(StorageError::Invalid(_)) => "invalid_input",
             CliError::Storage(StorageError::Clock(_)) => "clock_error",
             CliError::Storage(StorageError::Io(_)) => "io_error",
@@ -661,8 +666,8 @@ impl CliError {
             CliError::Cwd(_) => "cwd_error",
             CliError::BodyRead { .. } => "body_read_error",
             CliError::BadDepId { .. } => "bad_id",
-            CliError::BadBugId { .. } => "bad_id",
-            CliError::MissingBugsBookmark(_) => "missing_bugs_bookmark",
+            CliError::BadIssueId { .. } => "bad_id",
+            CliError::MissingIssuesBookmark(_) => "missing_issues_bookmark",
             CliError::EmptyCommentBody => "empty_body",
             CliError::EmptyLabel => "empty_label",
             CliError::MissingAuthor => "missing_author",
@@ -691,7 +696,7 @@ impl CliError {
     /// a meaningful payload.
     ///
     /// Fields are chosen for what an automated caller can act on: the
-    /// bug id it asked about, the path it tried to read, the bad
+    /// issue id it asked about, the path it tried to read, the bad
     /// argument value. Free-form strings live in `message`.
     fn details(&self) -> serde_json::Value {
         use serde_json::json;
@@ -699,13 +704,13 @@ impl CliError {
             CliError::Storage(StorageError::NotAJjRepo(path)) => {
                 json!({ "path": path.display().to_string() })
             }
-            CliError::Storage(StorageError::BugNotFound(id)) => {
+            CliError::Storage(StorageError::IssueNotFound(id)) => {
                 json!({ "id": id.as_str() })
             }
             CliError::BodyRead { from, .. } => json!({ "from": from }),
             CliError::BadDepId { value, .. } => json!({ "value": value, "field": "dep" }),
-            CliError::BadBugId { value, .. } => json!({ "value": value, "field": "id" }),
-            CliError::MissingBugsBookmark(path) => {
+            CliError::BadIssueId { value, .. } => json!({ "value": value, "field": "id" }),
+            CliError::MissingIssuesBookmark(path) => {
                 json!({ "path": path.display().to_string() })
             }
             CliError::RemoteAlreadyExists(name) => json!({ "name": name }),
@@ -719,10 +724,10 @@ impl CliError {
             | CliError::PushRejected { remote, .. }
             | CliError::PullNetworkFailure { remote, .. }
             | CliError::PullAuthFailure { remote, .. } => json!({ "remote": remote }),
-            CliError::Unmergeable { bug_id, detail } => {
-                json!({ "bug_id": bug_id, "detail": detail })
+            CliError::Unmergeable { issue_id, detail } => {
+                json!({ "issue_id": issue_id, "detail": detail })
             }
-            CliError::CommentFileConflict { bug_id } => json!({ "bug_id": bug_id }),
+            CliError::CommentFileConflict { issue_id } => json!({ "issue_id": issue_id }),
             _ => serde_json::Value::Null,
         }
     }
@@ -847,7 +852,7 @@ enum LabelOp {
 
 /// `jjf init` — wrap `Storage::init` against the cwd. Idempotent;
 /// emits either a one-line success message or, with `--json`, the
-/// ticket-spec `{"ok": true, "bookmark": "bugs"}`.
+/// ticket-spec `{"ok": true, "bookmark": "issues"}`.
 fn run_init(json: bool) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     // Refuse to run from inside the jjforge source repo (colocate
@@ -865,25 +870,25 @@ fn run_init(json: bool) -> Result<(), CliError> {
         // is fixed by the ticket: `ok` first, `bookmark` second.
         let out = serde_json::json!({
             "ok": true,
-            "bookmark": BUGS_BOOKMARK,
+            "bookmark": ISSUES_BOOKMARK,
         });
         println!("{out}");
     } else {
-        println!("jjf: initialized bookmark `{BUGS_BOOKMARK}`");
+        println!("jjf: initialized bookmark `{ISSUES_BOOKMARK}`");
     }
     Ok(())
 }
 
 /// `jjf new -t <title> [-F <path|->] [-l <label>...] [-d <id>...] [-a <name>]`
-/// — create one bug on the `bugs` bookmark via the storage write path
-/// and emit its id.
+/// — create one issue on the `issues` bookmark via the storage write
+/// path and emit its id.
 ///
 /// The preflight order matters: we parse the dep ids and read the body
 /// BEFORE shelling out to jj, so user-typo / stdin-empty failures don't
 /// land any half-state on the bookmark. The bookmark-presence probe
 /// then runs against the cwd; if the bookmark is missing we surface a
 /// `run jjf init first` message rather than letting the storage layer
-/// fail mid-write on an empty `bookmarks(bugs)` revset.
+/// fail mid-write on an empty `bookmarks(issues)` revset.
 fn run_new(
     json: bool,
     title: String,
@@ -893,10 +898,10 @@ fn run_new(
     assignee: Option<String>,
 ) -> Result<(), CliError> {
     // 1. Parse dep ids first — purely-local validation, no IO.
-    let deps: Vec<BugId> = deps
+    let deps: Vec<IssueId> = deps
         .into_iter()
         .map(|raw| {
-            BugId::parse(&raw).map_err(|error| CliError::BadDepId { value: raw, error })
+            IssueId::parse(&raw).map_err(|error| CliError::BadDepId { value: raw, error })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -914,29 +919,29 @@ fn run_new(
     // (colocate drift guard — see `preflight::refuse_self_hosted_write`).
     // Runs FIRST among the preflights so an operator inside the source
     // tree gets the actionable "use a sibling working dir" message
-    // rather than a generic `MissingBugsBookmark` (when they haven't
+    // rather than a generic `MissingIssuesBookmark` (when they haven't
     // run `jjf init` in that scratch dir yet, which is the common case
     // since `jjf init` is also guarded).
     preflight::refuse_self_hosted_write(&cwd, json)?;
 
-    // 5. Preflight: we're inside a jj repo AND the `bugs` bookmark
+    // 5. Preflight: we're inside a jj repo AND the `issues` bookmark
     // exists. The storage layer doesn't distinguish missing-bookmark
     // today (see follow-ups in the cli-new/cli-show closing comments);
     // doing the probe here keeps the user-facing error precise without
     // expanding the storage API. Implementation lives in `preflight`
     // so the read verbs share the same code.
-    preflight::bugs_bookmark(&cwd)?;
+    preflight::issues_bookmark(&cwd)?;
 
     // 6. Hand the draft to storage.
     let storage = Storage::open(&cwd)?;
-    let draft = BugDraft {
+    let draft = IssueDraft {
         title,
         body,
         labels,
         dependencies: deps,
         assignee,
     };
-    let id = storage.create_bug(&draft)?;
+    let id = storage.create_issue(&draft)?;
 
     // 6. Emit. Plain text is just the id, one line; --json matches
     // init's `{"ok": true, ...}` shape.
@@ -952,13 +957,13 @@ fn run_new(
     Ok(())
 }
 
-/// Read the bug body per the `-F` flag's contract.
+/// Read the issue body per the `-F` flag's contract.
 ///
 /// - `None` — empty body. The epic's "no prompts ever" rule means we do
 ///   NOT launch an editor when `-F` is omitted; users who want one can
 ///   pipe it in.
 /// - `Some("-")` — read all of stdin, raw bytes. UTF-8 enforced because
-///   bug bodies are serialized into a JSON string field.
+///   issue bodies are serialized into a JSON string field.
 /// - `Some(<path>)` — read the file, same UTF-8 rule.
 fn read_body(file: Option<&Path>) -> Result<String, CliError> {
     let Some(path) = file else {
@@ -980,20 +985,20 @@ fn read_body(file: Option<&Path>) -> Result<String, CliError> {
     })
 }
 
-/// `jjf show <id> [--json]` — fetch one bug's structured record from
-/// the `bugs` bookmark via `Storage::read` and render it.
+/// `jjf show <id> [--json]` — fetch one issue's structured record from
+/// the `issues` bookmark via `Storage::read` and render it.
 ///
 /// The preflight order matches `run_new`: parse the id, resolve the
-/// cwd, probe for the jj repo + `bugs` bookmark, then hand off to the
-/// storage layer. Bug-not-found is a runtime failure (exit 1) — the
-/// user typed something well-formed, we tried to honor it, and the
-/// answer is "no such bug at the bookmark tip."
+/// cwd, probe for the jj repo + `issues` bookmark, then hand off to
+/// the storage layer. Issue-not-found is a runtime failure (exit 1) —
+/// the user typed something well-formed, we tried to honor it, and
+/// the answer is "no such issue at the bookmark tip."
 fn run_show(json: bool, id: String) -> Result<(), CliError> {
     // 1. Parse the id — purely-local validation, no IO. A typo here
     // is a preflight failure (exit 2), distinct from "valid id that
     // doesn't exist" (exit 1).
-    let bug_id =
-        BugId::parse(&id).map_err(|error| CliError::BadBugId { value: id, error })?;
+    let issue_id =
+        IssueId::parse(&id).map_err(|error| CliError::BadIssueId { value: id, error })?;
 
     // 2. Resolve the cwd. `Storage::open` wants an absolute path;
     // canonicalize so symlinks don't bite.
@@ -1003,50 +1008,51 @@ fn run_show(json: bool, id: String) -> Result<(), CliError> {
     // 3. Preflight the same checks the write path runs. `run jjf
     // init first` is the right error when the bookmark is missing,
     // not a raw jj-stderr.
-    preflight::bugs_bookmark(&cwd)?;
+    preflight::issues_bookmark(&cwd)?;
 
-    // 4. Hand off to storage. `BugNotFound` flows out as a `Storage`
+    // 4. Hand off to storage. `IssueNotFound` flows out as a `Storage`
     // variant of `CliError`, which `exit_code` maps to 1.
     let storage = Storage::open(&cwd)?;
-    let bug = storage.read(&bug_id)?;
+    let issue = storage.read(&issue_id)?;
 
     // 5. Render.
     if json {
-        // The `Bug` struct IS the structured payload — emit it
+        // The `Issue` struct IS the structured payload — emit it
         // verbatim, no `{"ok": true, ...}` envelope. (`init` and `new`
         // use the envelope because they have no payload beyond a
         // success signal; `show`'s whole job is to expose the record.)
-        let s = serde_json::to_string_pretty(&bug)
+        let s = serde_json::to_string_pretty(&issue)
             .map_err(|e| CliError::Storage(StorageError::Json(e)))?;
         println!("{s}");
     } else {
-        print_bug_plain(&bug);
+        print_issue_plain(&issue);
     }
     Ok(())
 }
 
-/// Render a bug as human-readable plain text. v1 shape per the
+/// Render an issue as human-readable plain text. v1 shape per the
 /// `cli-show` ticket — readable and stable, not a contract. If a
 /// caller wants machine parsing they should pass `--json`.
-fn print_bug_plain(bug: &Bug) {
-    let status = match bug.status {
+fn print_issue_plain(issue: &Issue) {
+    let status = match issue.status {
         jjf_storage::Status::Open => "open",
         jjf_storage::Status::Closed => "closed",
     };
-    println!("{}  [{}]", bug.id, status);
-    println!("{}", bug.title);
-    let labels = if bug.labels.is_empty() {
+    println!("{}  [{}]", issue.id, status);
+    println!("{}", issue.title);
+    let labels = if issue.labels.is_empty() {
         "(none)".to_owned()
     } else {
-        bug.labels.join(", ")
+        issue.labels.join(", ")
     };
     println!("labels: {labels}");
-    let assignee = bug.assignee.as_deref().unwrap_or("(none)");
+    let assignee = issue.assignee.as_deref().unwrap_or("(none)");
     println!("assignee: {assignee}");
-    let deps = if bug.dependencies.is_empty() {
+    let deps = if issue.dependencies.is_empty() {
         "(none)".to_owned()
     } else {
-        bug.dependencies
+        issue
+            .dependencies
             .iter()
             .map(|d| d.as_str().to_owned())
             .collect::<Vec<_>>()
@@ -1055,23 +1061,23 @@ fn print_bug_plain(bug: &Bug) {
     println!("dependencies: {deps}");
     println!(
         "created: {}   updated: {}",
-        bug.created_at, bug.updated_at
+        issue.created_at, issue.updated_at
     );
     println!();
     // Body verbatim, no rewrap — the writer preserves bytes exactly,
     // and the reader's job is to show them. Add a trailing newline
     // only if the body doesn't already end with one, so two bodies
     // that differ only in trailing newline still render distinctly.
-    if !bug.body.is_empty() {
-        print!("{}", bug.body);
-        if !bug.body.ends_with('\n') {
+    if !issue.body.is_empty() {
+        print!("{}", issue.body);
+        if !issue.body.ends_with('\n') {
             println!();
         }
         println!();
     }
-    let n = bug.comments.len();
+    let n = issue.comments.len();
     println!("--- comments ({n}) ---");
-    for c in &bug.comments {
+    for c in &issue.comments {
         println!("[{}] {}:", c.created_at, c.author);
         print!("{}", c.body);
         if !c.body.ends_with('\n') {
@@ -1081,26 +1087,26 @@ fn print_bug_plain(bug: &Bug) {
     }
 }
 
-/// `jjf close <id>` / `jjf open <id>` — flip a bug's status via the
+/// `jjf close <id>` / `jjf open <id>` — flip an issue's status via the
 /// storage write path. Both verbs differ only in the `Status` value
 /// they pass to `Storage::set_status`, so they share one helper.
 ///
 /// Per the spec (and the `cli-status` ticket): closing an
-/// already-closed bug (or opening an already-open one) is NOT a no-op
-/// — it lands a fresh `set-status` trailer on a new commit. The
+/// already-closed issue (or opening an already-open one) is NOT a
+/// no-op — it lands a fresh `set-status` trailer on a new commit. The
 /// storage layer enforces this by always calling `mutate` regardless
 /// of whether the record actually changed; we just pass the request
 /// through.
 ///
 /// Preflight order matches `run_show`: parse the id (exit 2 on bad
-/// shape), resolve the cwd, probe for the jj repo + `bugs` bookmark
+/// shape), resolve the cwd, probe for the jj repo + `issues` bookmark
 /// (exit 2 with `run jjf init first` if absent), then hand off to
 /// storage. A well-formed id that doesn't exist on the bookmark
-/// surfaces as `BugNotFound` and exits 1.
+/// surfaces as `IssueNotFound` and exits 1.
 fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError> {
     // 1. Parse the id. Same exit-2 rule as `show`.
-    let bug_id =
-        BugId::parse(&id).map_err(|error| CliError::BadBugId { value: id, error })?;
+    let issue_id =
+        IssueId::parse(&id).map_err(|error| CliError::BadIssueId { value: id, error })?;
 
     // 2. Resolve + canonicalize cwd.
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
@@ -1110,12 +1116,12 @@ fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError
     // (colocate drift guard). See `preflight::refuse_self_hosted_write`.
     preflight::refuse_self_hosted_write(&cwd, json)?;
 
-    // 4. Preflight: jj repo + `bugs` bookmark present.
-    preflight::bugs_bookmark(&cwd)?;
+    // 4. Preflight: jj repo + `issues` bookmark present.
+    preflight::issues_bookmark(&cwd)?;
 
     // 5. Hand off to storage.
     let storage = Storage::open(&cwd)?;
-    storage.set_status(&bug_id, status)?;
+    storage.set_status(&issue_id, status)?;
 
     // 5. Render. The plain-text shape (`closed <id>` / `opened <id>`)
     // is intentionally minimal — one line, no decoration — so it slots
@@ -1129,7 +1135,7 @@ fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError
     if json {
         let out = serde_json::json!({
             "ok": true,
-            "id": bug_id.as_str(),
+            "id": issue_id.as_str(),
             "status": status_word,
         });
         println!("{out}");
@@ -1141,13 +1147,13 @@ fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError
             Status::Open => "opened",
             Status::Closed => "closed",
         };
-        println!("{verb} {bug_id}");
+        println!("{verb} {issue_id}");
     }
     Ok(())
 }
 
-/// `jjf label add|rm <id> <label>` — flip one label on a bug via the
-/// storage write path. Both arms differ only in which `Storage`
+/// `jjf label add|rm <id> <label>` — flip one label on an issue via
+/// the storage write path. Both arms differ only in which `Storage`
 /// mutator they call (`add_label` vs `remove_label`) and which
 /// past-tense verb they render, so they share one helper.
 ///
@@ -1159,13 +1165,13 @@ fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError
 ///
 /// Preflight order mirrors `run_set_status`: parse the id (exit 2),
 /// reject an empty label (exit 2), canonicalize cwd, probe for the jj
-/// repo + `bugs` bookmark (exit 2 with `run jjf init first` if
+/// repo + `issues` bookmark (exit 2 with `run jjf init first` if
 /// absent), then hand off to storage. A well-formed id that doesn't
-/// exist on the bookmark surfaces as `BugNotFound` and exits 1.
+/// exist on the bookmark surfaces as `IssueNotFound` and exits 1.
 fn run_label(json: bool, id: String, label: String, op: LabelOp) -> Result<(), CliError> {
     // 1. Parse the id. Same exit-2 rule as `show` / `close`.
-    let bug_id =
-        BugId::parse(&id).map_err(|error| CliError::BadBugId { value: id, error })?;
+    let issue_id =
+        IssueId::parse(&id).map_err(|error| CliError::BadIssueId { value: id, error })?;
 
     // 2. Reject empty labels at the CLI layer — storage doesn't
     // validate. We trim before the check because a whitespace-only
@@ -1183,15 +1189,15 @@ fn run_label(json: bool, id: String, label: String, op: LabelOp) -> Result<(), C
     // (colocate drift guard). See `preflight::refuse_self_hosted_write`.
     preflight::refuse_self_hosted_write(&cwd, json)?;
 
-    // 5. Preflight: jj repo + `bugs` bookmark present.
-    preflight::bugs_bookmark(&cwd)?;
+    // 5. Preflight: jj repo + `issues` bookmark present.
+    preflight::issues_bookmark(&cwd)?;
 
     // 6. Hand off to storage. The two mutators have the same signature
-    // (`&BugId, &str -> Result<()>`); branch on the action enum.
+    // (`&IssueId, &str -> Result<()>`); branch on the action enum.
     let storage = Storage::open(&cwd)?;
     match op {
-        LabelOp::Add => storage.add_label(&bug_id, &label)?,
-        LabelOp::Rm => storage.remove_label(&bug_id, &label)?,
+        LabelOp::Add => storage.add_label(&issue_id, &label)?,
+        LabelOp::Rm => storage.remove_label(&issue_id, &label)?,
     }
 
     // 6. Render. Plain-text shape is `label added: <label> -> <id>` /
@@ -1206,13 +1212,13 @@ fn run_label(json: bool, id: String, label: String, op: LabelOp) -> Result<(), C
     if json {
         let out = serde_json::json!({
             "ok": true,
-            "id": bug_id.as_str(),
+            "id": issue_id.as_str(),
             "label": &label,
             "action": action_word,
         });
         println!("{out}");
     } else {
-        println!("label {action_word}: {label} -> {bug_id}");
+        println!("label {action_word}: {label} -> {issue_id}");
     }
     Ok(())
 }
@@ -1226,7 +1232,7 @@ fn run_label(json: bool, id: String, label: String, op: LabelOp) -> Result<(), C
 /// validation is jj's responsibility — we accept what it accepts and
 /// surface its rejection unchanged.
 ///
-/// Preflight is jj-repo-only (no `bugs` bookmark required), because
+/// Preflight is jj-repo-only (no `issues` bookmark required), because
 /// adding a remote is meaningful before `jjf init` runs.
 fn run_remote_add(json: bool, name: String, url: String) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
@@ -1371,10 +1377,10 @@ fn run_remote_rm(json: bool, name: String) -> Result<(), CliError> {
 
 /// `jjf update <id> [--title T] [--status S] [--body-file PATH|-]
 /// [--assignee NAME] [--unset-assignee] [--json]` — mutate one or more
-/// scalar fields of a bug in a single commit.
+/// scalar fields of an issue in a single commit.
 ///
 /// All populated field flags bundle into ONE `Storage::update` call,
-/// which lands ONE new commit on the `bugs` bookmark carrying N
+/// which lands ONE new commit on the `issues` bookmark carrying N
 /// `Jjf-Op:` trailers (one per field that changed). This is the
 /// multi-op-per-commit dividend the spec §5.5 gives us — running three
 /// sibling verbs (e.g. `set-title` + `close` + a separate body update)
@@ -1383,10 +1389,10 @@ fn run_remote_rm(json: bool, name: String) -> Result<(), CliError> {
 /// Preflight order matches the other write verbs (`run_set_status`,
 /// `run_label`, `run_comment`): purely-local validation first
 /// (id parse, at-least-one-flag rule, body-file read), then
-/// canonicalize cwd, then probe for the jj repo + `bugs` bookmark.
-/// Bug-not-found surfaces from `Storage::update` as a `BugNotFound`
-/// (exit 1) because the user typed a well-formed id; everything else
-/// the user can mistype is exit 2.
+/// canonicalize cwd, then probe for the jj repo + `issues` bookmark.
+/// Issue-not-found surfaces from `Storage::update` as an
+/// `IssueNotFound` (exit 1) because the user typed a well-formed id;
+/// everything else the user can mistype is exit 2.
 ///
 /// `--assignee` / `--unset-assignee` mutual exclusion is enforced by
 /// clap via `conflicts_with`. The at-least-one-flag rule has no clap
@@ -1402,8 +1408,8 @@ fn run_update(
     unset_assignee: bool,
 ) -> Result<(), CliError> {
     // 1. Parse the id. Same exit-2 rule as `show` / `close` / `label`.
-    let bug_id =
-        BugId::parse(&id).map_err(|error| CliError::BadBugId { value: id, error })?;
+    let issue_id =
+        IssueId::parse(&id).map_err(|error| CliError::BadIssueId { value: id, error })?;
 
     // 2. Build the `UpdateFields` bundle from the flag matrix. The
     // body-file read is done UP FRONT (before the at-least-one check,
@@ -1447,13 +1453,13 @@ fn run_update(
     // (colocate drift guard). See `preflight::refuse_self_hosted_write`.
     preflight::refuse_self_hosted_write(&cwd, json)?;
 
-    // 6. Preflight: jj repo + `bugs` bookmark present.
-    preflight::bugs_bookmark(&cwd)?;
+    // 6. Preflight: jj repo + `issues` bookmark present.
+    preflight::issues_bookmark(&cwd)?;
 
     // 7. Hand off to storage. One call lands one commit with N
     // trailers.
     let storage = Storage::open(&cwd)?;
-    storage.update(&bug_id, fields.clone())?;
+    storage.update(&issue_id, fields.clone())?;
 
     // 7. Render. The list of field names mirrors the populated fields
     // in field-declaration order (matching the trailer order the
@@ -1463,12 +1469,12 @@ fn run_update(
     if json {
         let out = serde_json::json!({
             "ok": true,
-            "id": bug_id.as_str(),
+            "id": issue_id.as_str(),
             "fields": changed,
         });
         println!("{out}");
     } else {
-        println!("updated {bug_id}: {}", changed.join(", "));
+        println!("updated {issue_id}: {}", changed.join(", "));
     }
     Ok(())
 }
@@ -1496,11 +1502,11 @@ fn changed_field_names(fields: &UpdateFields) -> Vec<&'static str> {
 }
 
 /// `jjf comment <id> -F <path|-> [--author <NAME>] [--json]` — append
-/// one comment to an existing bug via the storage write path.
+/// one comment to an existing issue via the storage write path.
 ///
 /// Preflight order mirrors `run_set_status`: parse the id, read the
 /// body, resolve the author, canonicalize cwd, probe for the jj repo +
-/// `bugs` bookmark, then hand off to storage. We deliberately do the
+/// `issues` bookmark, then hand off to storage. We deliberately do the
 /// purely-local checks (id parse, body read, author resolve) BEFORE
 /// shelling out for the bookmark probe so a user typo doesn't kick off
 /// a `jj` subprocess that we'd just throw away.
@@ -1516,8 +1522,8 @@ fn run_comment(
     author: Option<String>,
 ) -> Result<(), CliError> {
     // 1. Parse the id. Bad shape → exit 2.
-    let bug_id =
-        BugId::parse(&id).map_err(|error| CliError::BadBugId { value: id, error })?;
+    let issue_id =
+        IssueId::parse(&id).map_err(|error| CliError::BadIssueId { value: id, error })?;
 
     // 2. Read the body. `-F -` is stdin; `-F <path>` is the file.
     // Reuse the same helper `run_new` uses so the contract stays
@@ -1535,12 +1541,12 @@ fn run_comment(
     // (colocate drift guard). See `preflight::refuse_self_hosted_write`.
     preflight::refuse_self_hosted_write(&cwd, json)?;
 
-    // 5. Preflight: jj repo + `bugs` bookmark present. We run this
+    // 5. Preflight: jj repo + `issues` bookmark present. We run this
     // BEFORE author resolution so a non-jj cwd surfaces the typed
     // "not a jj repo" error rather than the (correct but less useful)
     // "no comment author available" — the user almost always wants to
     // hear about the repo problem first.
-    preflight::bugs_bookmark(&cwd)?;
+    preflight::issues_bookmark(&cwd)?;
 
     // 6. Resolve the author. CLI override wins; otherwise we synthesize
     // `Name <email>` from jj's user config. If neither path yields a
@@ -1549,20 +1555,20 @@ fn run_comment(
     let author = resolve_author(author)?;
 
     // 6. Hand off to storage. `add_comment` returns the freshly-minted
-    // comment id (a 7-hex `BugId`) for the JSON envelope.
+    // comment id (a 7-hex `IssueId`) for the JSON envelope.
     let storage = Storage::open(&cwd)?;
-    let comment_id = storage.add_comment(&bug_id, &body, &author)?;
+    let comment_id = storage.add_comment(&issue_id, &body, &author)?;
 
     // 7. Render.
     if json {
         let out = serde_json::json!({
             "ok": true,
-            "id": bug_id.as_str(),
+            "id": issue_id.as_str(),
             "comment_id": comment_id.as_str(),
         });
         println!("{out}");
     } else {
-        println!("comment added to {bug_id}");
+        println!("comment added to {issue_id}");
     }
     Ok(())
 }
@@ -1629,58 +1635,59 @@ fn jj_config_get(key: &str) -> Result<Option<String>, CliError> {
 }
 
 /// `jjf ls [--status <S>] [--label <L>...] [--json]` — enumerate every
-/// bug on the `bugs` bookmark, filter by status and labels (AND across
-/// labels), render newest-first.
+/// issue on the `issues` bookmark, filter by status and labels (AND
+/// across labels), render newest-first.
 ///
 /// Implementation strategy is the v1 "read all, filter in memory" path
 /// the ticket calls out: `Storage::list_ids()` returns every id, then
 /// we `Storage::read()` each one and apply the predicates. For repos
-/// with a handful of bugs this is fine; once N gets meaningfully large
-/// the storage layer will grow either a filtered enumeration primitive
-/// or a per-bug metadata cache (separate ticket). The closing comment
-/// on this issue calls out the perf feel.
+/// with a handful of issues this is fine; once N gets meaningfully
+/// large the storage layer will grow either a filtered enumeration
+/// primitive or a per-issue metadata cache (separate ticket). The
+/// closing comment on this issue calls out the perf feel.
 fn run_ls(
     json: bool,
     status: StatusFilter,
     labels: Vec<String>,
 ) -> Result<(), CliError> {
-    // Preflight: cwd is a jj repo AND `bugs` bookmark exists. Same
+    // Preflight: cwd is a jj repo AND `issues` bookmark exists. Same
     // order as `run_show` — typed `run jjf init first` message rather
     // than raw jj stderr if the bookmark is missing.
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
-    preflight::bugs_bookmark(&cwd)?;
+    preflight::issues_bookmark(&cwd)?;
 
     let storage = Storage::open(&cwd)?;
     let ids = storage.list_ids()?;
 
-    // Read every bug, filter. v1 is read-all; see the doc-comment.
-    let mut bugs: Vec<Bug> = Vec::with_capacity(ids.len());
+    // Read every issue, filter. v1 is read-all; see the doc-comment.
+    let mut issues: Vec<Issue> = Vec::with_capacity(ids.len());
     for id in &ids {
-        let bug = storage.read(id)?;
-        if !status_matches(&bug, status) {
+        let issue = storage.read(id)?;
+        if !status_matches(&issue, status) {
             continue;
         }
-        if !labels_match(&bug, &labels) {
+        if !labels_match(&issue, &labels) {
             continue;
         }
-        bugs.push(bug);
+        issues.push(issue);
     }
 
     // Newest-first by created_at. RFC 3339 second-resolution stamps
     // sort lexicographically — same trick the read path uses for
     // comments. `created_at` is set once at create and never bumped,
     // so the ordering is stable across mutation traffic.
-    bugs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    issues.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
     if json {
-        // Array of `Bug` records, pretty-printed. Same per-element
+        // Array of `Issue` records, pretty-printed. Same per-element
         // shape `show --json` emits — callers parsing one parse the
         // other. Empty result is a valid empty array `[]`, not silence,
         // because a script expecting JSON wants something it can
-        // `jq length` against. (Plain text uses silence-on-empty because
-        // grep / awk pipelines want zero lines, not a JSON literal.)
-        let s = serde_json::to_string_pretty(&bugs)
+        // `jq length` against. (Plain text uses silence-on-empty
+        // because grep / awk pipelines want zero lines, not a JSON
+        // literal.)
+        let s = serde_json::to_string_pretty(&issues)
             .map_err(|e| CliError::Storage(StorageError::Json(e)))?;
         println!("{s}");
     } else {
@@ -1689,17 +1696,17 @@ fn run_ls(
         // (CLAUDE.md). label-count is rendered with a trailing `L` so
         // an eyeball can tell `3L` (three labels) apart from a numeric
         // column that might mean comments or something else later.
-        for bug in &bugs {
-            let status_s = match bug.status {
+        for issue in &issues {
+            let status_s = match issue.status {
                 Status::Open => "open",
                 Status::Closed => "closed",
             };
             println!(
                 "{id}\t{status}\t{n}L\t{title}",
-                id = bug.id,
+                id = issue.id,
                 status = status_s,
-                n = bug.labels.len(),
-                title = bug.title,
+                n = issue.labels.len(),
+                title = issue.title,
             );
         }
     }
@@ -1707,21 +1714,21 @@ fn run_ls(
 }
 
 /// `--status` predicate. `All` matches everything.
-fn status_matches(bug: &Bug, filter: StatusFilter) -> bool {
+fn status_matches(issue: &Issue, filter: StatusFilter) -> bool {
     match filter {
         StatusFilter::All => true,
-        StatusFilter::Open => bug.status == Status::Open,
-        StatusFilter::Closed => bug.status == Status::Closed,
+        StatusFilter::Open => issue.status == Status::Open,
+        StatusFilter::Closed => issue.status == Status::Closed,
     }
 }
 
-/// `--label` predicate. Empty filter matches every bug. A non-empty
-/// filter requires the bug to carry EVERY listed label (intersection).
-fn labels_match(bug: &Bug, wanted: &[String]) -> bool {
-    wanted.iter().all(|w| bug.labels.iter().any(|l| l == w))
+/// `--label` predicate. Empty filter matches every issue. A non-empty
+/// filter requires the issue to carry EVERY listed label (intersection).
+fn labels_match(issue: &Issue, wanted: &[String]) -> bool {
+    wanted.iter().all(|w| issue.labels.iter().any(|l| l == w))
 }
 
-/// `jjf push <remote>` — shell out to `jj git push --bookmark bugs
+/// `jjf push <remote>` — shell out to `jj git push --bookmark issues
 /// --remote <remote>` and translate known failure modes to typed
 /// errors.
 ///
@@ -1738,7 +1745,7 @@ fn labels_match(bug: &Bug, wanted: &[String]) -> bool {
 /// Anything else falls through to `jj_git_push_error` with jj's
 /// stderr verbatim in the message so the operator can diagnose.
 ///
-/// Preflight: full `bugs_bookmark` probe — the bookmark must exist
+/// Preflight: full `issues_bookmark` probe — the bookmark must exist
 /// locally for there to be anything to push.
 fn run_push(json: bool, remote: String) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
@@ -1749,12 +1756,12 @@ fn run_push(json: bool, remote: String) -> Result<(), CliError> {
     // future jj release could move `@` during push (jj has changed
     // working-copy-touching semantics across versions before).
     preflight::refuse_self_hosted_write(&cwd, json)?;
-    preflight::bugs_bookmark(&cwd)?;
+    preflight::issues_bookmark(&cwd)?;
 
     let out = std::process::Command::new("jj")
         .arg("--repository")
         .arg(&cwd)
-        .args(["git", "push", "--bookmark", "bugs", "--remote", &remote])
+        .args(["git", "push", "--bookmark", "issues", "--remote", &remote])
         .output()
         .map_err(CliError::Probe)?;
     if !out.status.success() {
@@ -1766,11 +1773,11 @@ fn run_push(json: bool, remote: String) -> Result<(), CliError> {
         let out = serde_json::json!({
             "ok": true,
             "remote": &remote,
-            "bookmark": jjf_storage::BUGS_BOOKMARK,
+            "bookmark": jjf_storage::ISSUES_BOOKMARK,
         });
         println!("{out}");
     } else {
-        println!("pushed bugs -> {remote}");
+        println!("pushed issues -> {remote}");
     }
     Ok(())
 }
@@ -1827,7 +1834,7 @@ fn classify_push_error(remote: &str, stderr: String) -> CliError {
     CliError::JjGitPush(stderr.trim().to_owned())
 }
 
-/// `jjf pull <remote>` — fetch the remote, track the `bugs@<remote>`
+/// `jjf pull <remote>` — fetch the remote, track the `issues@<remote>`
 /// bookmark if needed, then resolve any divergence in op-space.
 ///
 /// See the verb's doc-comment on `Commands::Pull` for the high-level
@@ -1849,12 +1856,12 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
     // `pull` uses the jj-repo-only preflight: a fresh clone has
-    // `bugs@<remote>` but no local `bugs` yet, and `pull` is precisely
-    // the verb that materializes the local bookmark via
-    // `jj bookmark track`. Requiring the bookmark up front would force
-    // an awkward `jjf init` on a clone that already has the bookmark
-    // server-side. `push`, by contrast, requires the local bookmark
-    // (there's nothing to push without it).
+    // `issues@<remote>` but no local `issues` yet, and `pull` is
+    // precisely the verb that materializes the local bookmark via
+    // `jj bookmark track`. Requiring the bookmark up front would
+    // force an awkward `jjf init` on a clone that already has the
+    // bookmark server-side. `push`, by contrast, requires the local
+    // bookmark (there's nothing to push without it).
     //
     // Refuse to run from the jjforge source repo (colocate drift guard).
     // Pull can land a merge commit via the 4-CLI dance on divergence;
@@ -1875,9 +1882,9 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
     }
 
     // 2. Probe for remote-bookmark presence. `jj bookmark list
-    // --all-remotes -T 'name ++ "@" ++ remote ++ "\n"' bugs` lists one
-    // line per (local + each remote) view of the bookmark. If
-    // `bugs@<remote>` is absent, the other side hasn't pushed yet —
+    // --all-remotes -T 'name ++ "@" ++ remote ++ "\n"' issues` lists
+    // one line per (local + each remote) view of the bookmark. If
+    // `issues@<remote>` is absent, the other side hasn't pushed yet —
     // not an error.
     let bm_out = std::process::Command::new("jj")
         .arg("--repository")
@@ -1888,7 +1895,7 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
             "--all-remotes",
             "-T",
             "name ++ \"@\" ++ remote ++ \"\\n\"",
-            "bugs",
+            "issues",
         ])
         .output()
         .map_err(CliError::Probe)?;
@@ -1899,7 +1906,7 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
         ))));
     }
     let bm_text = String::from_utf8_lossy(&bm_out.stdout);
-    let remote_marker = format!("bugs@{remote}");
+    let remote_marker = format!("issues@{remote}");
     let remote_present = bm_text.lines().any(|l| l.trim() == remote_marker);
 
     if !remote_present {
@@ -1912,7 +1919,7 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
     }
 
     // 3. Track-if-absent. The first fetch on a fresh clone leaves
-    // `bugs@<remote>` untracked; subsequent fetches see the bookmark
+    // `issues@<remote>` untracked; subsequent fetches see the bookmark
     // as new remote bookmarks every time. We want it tracked so a
     // divergent edit shows up as the conflicted-bookmark state we're
     // here to resolve. `jj bookmark track` is idempotent in spirit —
@@ -1937,11 +1944,11 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
         }
     }
 
-    // 4. Probe for divergence. `heads(bookmarks(bugs))` returns one
+    // 4. Probe for divergence. `heads(bookmarks(issues))` returns one
     // change per head; >1 means the bookmark is in the "conflicted"
     // state our investigation in `experiments/sync-remote/` documented.
     let storage = Storage::open(&cwd)?;
-    let heads = storage.bugs_heads()?;
+    let heads = storage.issues_heads()?;
     if heads.len() < 2 {
         // Clean fetch — either nothing changed remotely (fast-forward
         // already done) or there was no local divergence to resolve.
@@ -1949,7 +1956,7 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
         return Ok(());
     }
 
-    // 5. Op-space resolution. Walk each head's op chain per bug,
+    // 5. Op-space resolution. Walk each head's op chain per issue,
     // reduce field-by-field per spec §6's LWW ordering tuple, and
     // render the merged record + comments. No probe-merge commit is
     // needed: the op-space driver reads pristine bytes from each head
@@ -1960,20 +1967,20 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
     // body-hash join).
     let report = storage.resolve_divergence()?;
 
-    if report.bugs.is_empty() {
-        // bugs_heads said >=2 heads but no head touched any bug file
-        // we recognized. Defensive: in v1 storage every head exists
-        // because of a bug-mutating commit, so this branch is mostly
-        // unreachable. We still need to pin the bookmark so it stops
-        // being conflicted. Mirror the old clean-merge dance: jj-new
-        // across the heads, set the bookmark, step off.
+    if report.issues.is_empty() {
+        // issues_heads said >=2 heads but no head touched any issue
+        // file we recognized. Defensive: in v1 storage every head
+        // exists because of an issue-mutating commit, so this branch
+        // is mostly unreachable. We still need to pin the bookmark so
+        // it stops being conflicted. Mirror the old clean-merge dance:
+        // jj-new across the heads, set the bookmark, step off.
         let merge_args = {
             let mut v: Vec<&str> = vec!["new"];
             for h in &heads {
                 v.push(h.as_str());
             }
             v.push("-m");
-            v.push("jjf: empty merge (no bug files touched)");
+            v.push("jjf: empty merge (no issue files touched)");
             v
         };
         let merge_out = std::process::Command::new("jj")
@@ -1994,7 +2001,7 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
             .args([
                 "bookmark",
                 "set",
-                "bugs",
+                "issues",
                 "-r",
                 "@",
                 "--allow-backwards",
@@ -2024,10 +2031,10 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
     }
 
     // Non-empty report: land the multi-parent merge commit with one
-    // `Jjf-Op: merge` trailer per resolved bug (spec §5.7) and write
+    // `Jjf-Op: merge` trailer per resolved issue (spec §5.7) and write
     // the merged record + comments files. The storage primitive owns
     // the 4-CLI dance.
-    let count = report.bugs.len();
+    let count = report.issues.len();
     storage.record_merge_op_space(&heads, &report)?;
     emit_pull_success(json, &remote, true, count);
     Ok(())
@@ -2079,19 +2086,19 @@ fn classify_fetch_error(remote: &str, stderr: String) -> CliError {
 /// clean-merge-no-resolution, real-merge-with-resolution) render the
 /// same envelope shape with one shared call site.
 ///
-/// The `resolved_bugs` field replaces the older `merged_files` (the
+/// The `resolved_issues` field replaces the older `merged_files` (the
 /// shape difference reflects the v1→v2 switch from a file-bytes driver
-/// to an op-space resolver, where the unit of resolution is a bug, not
-/// a file). The `merge_strategy` field pins which driver ran so
+/// to an op-space resolver, where the unit of resolution is an issue,
+/// not a file). The `merge_strategy` field pins which driver ran so
 /// downstream consumers can branch on the contract.
-fn emit_pull_success(json: bool, remote: &str, remote_present: bool, resolved_bugs: usize) {
+fn emit_pull_success(json: bool, remote: &str, remote_present: bool, resolved_issues: usize) {
     if json {
         let mut obj = serde_json::Map::new();
         obj.insert("ok".into(), serde_json::Value::Bool(true));
         obj.insert("remote".into(), serde_json::Value::String(remote.to_owned()));
         obj.insert(
             "bookmark".into(),
-            serde_json::Value::String(jjf_storage::BUGS_BOOKMARK.to_owned()),
+            serde_json::Value::String(jjf_storage::ISSUES_BOOKMARK.to_owned()),
         );
         obj.insert(
             "remote_present".into(),
@@ -2102,18 +2109,18 @@ fn emit_pull_success(json: bool, remote: &str, remote_present: bool, resolved_bu
             serde_json::Value::String("op_space".into()),
         );
         obj.insert(
-            "resolved_bugs".into(),
-            serde_json::Value::from(resolved_bugs),
+            "resolved_issues".into(),
+            serde_json::Value::from(resolved_issues),
         );
         let envelope = serde_json::Value::Object(obj);
         println!("{envelope}");
     } else if !remote_present {
-        println!("pulled {remote}: no bugs bookmark on remote yet");
-    } else if resolved_bugs == 0 {
-        println!("pulled bugs <- {remote}");
+        println!("pulled {remote}: no issues bookmark on remote yet");
+    } else if resolved_issues == 0 {
+        println!("pulled issues <- {remote}");
     } else {
         println!(
-            "pulled bugs <- {remote}; resolved {resolved_bugs} bug(s) op-space"
+            "pulled issues <- {remote}; resolved {resolved_issues} issue(s) op-space"
         );
     }
 }

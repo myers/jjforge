@@ -225,8 +225,8 @@ fn init_bypassed_when_jjf_allow_self_host_env_set() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("bugs"),
-        "init should still mention the bugs bookmark, got: {stdout}"
+        stdout.contains("issues"),
+        "init should still mention the issues bookmark, got: {stdout}"
     );
 }
 
@@ -275,14 +275,14 @@ fn read_verbs_pass_through_even_inside_source_repo() {
     // (or a curious operator) can inspect bug state without bypassing.
     //
     // We use `ls` because it doesn't need a bug id; success is the
-    // empty array (since the fixture has no `bugs` bookmark yet, but
-    // the preflight will fail with `missing_bugs_bookmark` — which is
+    // empty array (since the fixture has no `issues` bookmark yet, but
+    // the preflight will fail with `missing_issues_bookmark` — which is
     // exit 2, not the `self_hosted_write_refused` exit 2 we'd see if
     // the guard fired). We assert the kind specifically.
     let dir = make_fake_source_repo("guard_ls_passthrough");
 
     let out = run_jjf_no_bypass(&dir, &["--json", "ls"]);
-    // Either succeeds (no bugs) or fails with missing_bugs_bookmark —
+    // Either succeeds (no bugs) or fails with missing_issues_bookmark —
     // both are acceptable. What MUST NOT happen is self_hosted_write_refused.
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);

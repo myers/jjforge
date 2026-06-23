@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use jjf_storage::{BugId, Storage};
+use jjf_storage::{IssueId, Storage};
 
 /// Path to the compiled `jjf` binary. Cargo sets this env var for every
 /// integration test in the same package as the `[[bin]]` target.
@@ -31,7 +31,7 @@ fn scratch(name: &str) -> PathBuf {
     fs::canonicalize(&dir).unwrap()
 }
 
-/// Make a directory that's a fresh jj repo with no `bugs` bookmark.
+/// Make a directory that's a fresh jj repo with no `issues` bookmark.
 fn make_jj_repo(name: &str) -> PathBuf {
     let dir = scratch(name);
     let out = Command::new("jj")
@@ -47,7 +47,7 @@ fn make_jj_repo(name: &str) -> PathBuf {
     dir
 }
 
-/// Make a directory that's a fresh jj repo AND has `bugs` bookmarked
+/// Make a directory that's a fresh jj repo AND has `issues` bookmarked
 /// (so subsequent `jjf new` calls pass the preflight). The pattern most
 /// of these tests want.
 fn make_initialized_repo(name: &str) -> PathBuf {
@@ -98,12 +98,12 @@ fn run_jjf_with_stdin(cwd: &Path, args: &[&str], stdin_bytes: &[u8]) -> Output {
 }
 
 /// Parse the stdout of a successful `jjf new` invocation (plain-text
-/// mode: a single line containing the new bug's id) into a `BugId`.
-fn parse_id_from_stdout(stdout: &[u8]) -> BugId {
+/// mode: a single line containing the new bug's id) into a `IssueId`.
+fn parse_id_from_stdout(stdout: &[u8]) -> IssueId {
     let line = String::from_utf8_lossy(stdout);
     let trimmed = line.trim();
-    BugId::parse(trimmed)
-        .unwrap_or_else(|e| panic!("stdout {:?} is not a valid BugId: {e}", trimmed))
+    IssueId::parse(trimmed)
+        .unwrap_or_else(|e| panic!("stdout {:?} is not a valid IssueId: {e}", trimmed))
 }
 
 // --- tests ---------------------------------------------------------
@@ -159,7 +159,7 @@ fn new_json_emits_expected_object_and_id_parses() {
     let id_str = v["id"]
         .as_str()
         .expect("`id` field must be a string");
-    let id = BugId::parse(id_str).expect("`id` should be a valid BugId");
+    let id = IssueId::parse(id_str).expect("`id` should be a valid IssueId");
 
     // Sanity: the id should be readable via the storage crate.
     let storage = Storage::open(&repo).expect("open storage");
@@ -170,7 +170,7 @@ fn new_json_emits_expected_object_and_id_parses() {
 #[test]
 fn new_json_error_envelope_on_missing_bookmark() {
     // Fresh jj repo, no `jjf init` yet. With `--json` we expect the
-    // documented `missing_bugs_bookmark` envelope on stderr — the same
+    // documented `missing_issues_bookmark` envelope on stderr — the same
     // contract a script wrapping `jjf new` to file bugs would parse.
     let repo = make_jj_repo("new_json_err_no_bookmark");
 
@@ -192,7 +192,7 @@ fn new_json_error_envelope_on_missing_bookmark() {
     assert_eq!(v["ok"], serde_json::Value::Bool(false));
     assert_eq!(
         v["error"]["kind"].as_str(),
-        Some("missing_bugs_bookmark"),
+        Some("missing_issues_bookmark"),
         "kind wrong: {stderr}"
     );
     // details.path should echo the repo dir so a caller can confirm
@@ -206,9 +206,9 @@ fn new_json_error_envelope_on_missing_bookmark() {
 
 #[test]
 fn new_without_jjf_init_first_exits_two_with_run_jjf_init_first_message() {
-    // Fresh jj repo, but no `bugs` bookmark — we expect a typed
+    // Fresh jj repo, but no `issues` bookmark — we expect a typed
     // preflight error, NOT the raw jj stderr we'd get from trying to
-    // write against an empty `bookmarks(bugs)` revset.
+    // write against an empty `bookmarks(issues)` revset.
     let repo = make_jj_repo("new_no_bookmark");
 
     let out = run_jjf_with_stdin(
@@ -226,7 +226,7 @@ fn new_without_jjf_init_first_exits_two_with_run_jjf_init_first_message() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`bugs` bookmark") && stderr.contains("jjf init"),
+        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
         "stderr should tell the user to run `jjf init` first, got: {stderr}"
     );
 }
@@ -293,7 +293,7 @@ fn new_with_bogus_dep_id_exits_two_and_does_not_write() {
     let bookmark_after = bookmark_tip_commit(&repo);
     assert_eq!(
         bookmark_before, bookmark_after,
-        "preflight failure must NOT advance the `bugs` bookmark"
+        "preflight failure must NOT advance the `issues` bookmark"
     );
 }
 
@@ -415,13 +415,13 @@ fn new_with_file_flag_reads_path_not_stdin() {
 
 // --- helpers -------------------------------------------------------
 
-/// Capture the commit id of the `bugs` bookmark tip. Used by tests
+/// Capture the commit id of the `issues` bookmark tip. Used by tests
 /// that assert preflight failures don't advance the bookmark.
 fn bookmark_tip_commit(repo: &Path) -> String {
     let out = Command::new("jj")
         .arg("--repository")
         .arg(repo)
-        .args(["log", "-r", "bookmarks(bugs)", "-T", "commit_id ++ \"\\n\"", "--no-graph"])
+        .args(["log", "-r", "bookmarks(issues)", "-T", "commit_id ++ \"\\n\"", "--no-graph"])
         .output()
         .expect("spawn jj log");
     assert!(

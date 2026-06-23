@@ -9,10 +9,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use jjf_storage::{BugDraft, BugId, Op, Status, Storage};
+use jjf_storage::{IssueDraft, IssueId, Op, Status, Storage};
 use serde::Serialize;
 
-/// Build a scratch jj repo with a seeded `bugs` bookmark. Returns the
+/// Build a scratch jj repo with a seeded `issues` bookmark. Returns the
 /// absolute path to the repo root.
 ///
 /// Bootstrap is delegated to `Storage::init` — that's the function
@@ -22,7 +22,7 @@ fn make_scratch_repo(name: &str) -> PathBuf {
     let abs = make_empty_jj_repo(name);
     // `init` is idempotent and produces the seed commit + `bugs`
     // bookmark in one call; the storage crate's first `jj new
-    // bookmarks(bugs)` then branches from that seed cleanly.
+    // bookmarks(issues)` then branches from that seed cleanly.
     Storage::init(&abs).expect("Storage::init on fresh repo");
     abs
 }
@@ -70,14 +70,14 @@ fn sh(prog: &str, args: &[&str], cwd: &Path) {
     );
 }
 
-/// Read a file's contents from the `bugs` bookmark tip.
+/// Read a file's contents from the `issues` bookmark tip.
 fn read_at_bookmark(repo: &Path, relpath: &str) -> String {
     jj_capture(
         &[
             "file",
             "show",
             "-r",
-            "bookmarks(bugs)",
+            "bookmarks(issues)",
             &format!("root:{}", relpath),
         ],
         repo,
@@ -101,14 +101,14 @@ fn create_then_set_status_lands_two_commits_on_bookmark() {
     let repo = make_scratch_repo("create_then_set_status");
     let storage = Storage::open(&repo).expect("Storage::open");
 
-    let draft = BugDraft {
+    let draft = IssueDraft {
         title: "segfault on empty input".into(),
         body: "Running `./app` with no arguments crashes.".into(),
         labels: vec!["bug".into(), "p1".into()],
         dependencies: vec![],
         assignee: Some("alice".into()),
     };
-    let id = storage.create_bug(&draft).expect("create_bug");
+    let id = storage.create_issue(&draft).expect("create_issue");
     let id_s = id.to_string();
     assert_eq!(id_s.len(), 7);
 
@@ -116,9 +116,9 @@ fn create_then_set_status_lands_two_commits_on_bookmark() {
     // (The dance's step 4 — `jj new root()` — moves @ off the bookmark,
     // so the file is not in the working copy. The authoritative copy
     // lives at the bookmark; read via `jj file show`.)
-    let json_text = read_at_bookmark(&repo, &format!("bugs/{}.json", id_s));
+    let json_text = read_at_bookmark(&repo, &format!("issues/{}.json", id_s));
     let v: serde_json::Value = serde_json::from_str(&json_text).unwrap();
-    assert_eq!(v["version"], 1);
+    assert_eq!(v["version"], 2);
     assert_eq!(v["id"], id_s);
     assert_eq!(v["title"], "segfault on empty input");
     assert_eq!(v["status"], "open");
@@ -134,17 +134,17 @@ fn create_then_set_status_lands_two_commits_on_bookmark() {
 
     // Empty comments file exists at the bookmark.
     let comments_text =
-        read_at_bookmark(&repo, &format!("bugs/{}.comments.jsonl", id_s));
+        read_at_bookmark(&repo, &format!("issues/{}.comments.jsonl", id_s));
     assert_eq!(comments_text, "");
 
     // set_status to closed.
     storage.set_status(&id, Status::Closed).expect("set_status");
 
     // bugs/<id>.json at the bookmark reflects the new status.
-    let json_text = read_at_bookmark(&repo, &format!("bugs/{}.json", id_s));
+    let json_text = read_at_bookmark(&repo, &format!("issues/{}.json", id_s));
     let v: serde_json::Value = serde_json::from_str(&json_text).unwrap();
     assert_eq!(v["status"], "closed");
-    assert_eq!(v["version"], 1);
+    assert_eq!(v["version"], 2);
 
     // `jj log` for the file should show two mutating commits on top of
     // the seed commit (which doesn't touch this path). Newest first.
@@ -154,7 +154,7 @@ fn create_then_set_status_lands_two_commits_on_bookmark() {
             "--no-graph",
             "-T",
             "description ++ \"\\n----\\n\"",
-            &format!("root:bugs/{}.json", id_s),
+            &format!("root:issues/{}.json", id_s),
         ],
         &repo,
     );
@@ -162,7 +162,7 @@ fn create_then_set_status_lands_two_commits_on_bookmark() {
     assert_eq!(
         entries.len(),
         2,
-        "expected 2 commits touching bugs/{id_s}.json, got {}:\n{log}",
+        "expected 2 commits touching issues/{id_s}.json, got {}:\n{log}",
         entries.len()
     );
     // Newest first: set-status commit, then create commit.
@@ -174,8 +174,8 @@ fn create_then_set_status_lands_two_commits_on_bookmark() {
         "set-status commit missing trailer:\n{set_status_msg}"
     );
     assert!(
-        set_status_msg.contains(&format!("Jjf-Bug: {}", id_s)),
-        "set-status commit missing Jjf-Bug trailer:\n{set_status_msg}"
+        set_status_msg.contains(&format!("Jjf-Issue: {}", id_s)),
+        "set-status commit missing Jjf-Issue trailer:\n{set_status_msg}"
     );
     assert!(
         set_status_msg.contains("Jjf-Status: closed"),
@@ -187,8 +187,8 @@ fn create_then_set_status_lands_two_commits_on_bookmark() {
         "create commit missing trailer:\n{create_msg}"
     );
     assert!(
-        create_msg.contains(&format!("Jjf-Bug: {}", id_s)),
-        "create commit missing Jjf-Bug trailer:\n{create_msg}"
+        create_msg.contains(&format!("Jjf-Issue: {}", id_s)),
+        "create commit missing Jjf-Issue trailer:\n{create_msg}"
     );
     assert!(
         create_msg.contains("Jjf-Title: segfault on empty input"),
@@ -200,13 +200,13 @@ fn create_then_set_status_lands_two_commits_on_bookmark() {
     );
 
     // The bookmark should now point at the latest mutation. Verify by
-    // checking `jj log -r bookmarks(bugs)` shows the set-status commit.
+    // checking `jj log -r bookmarks(issues)` shows the set-status commit.
     let tip = jj_capture(
         &[
             "log",
             "--no-graph",
             "-r",
-            "bookmarks(bugs)",
+            "bookmarks(issues)",
             "-T",
             "description.first_line() ++ \"\\n\"",
         ],
@@ -214,7 +214,7 @@ fn create_then_set_status_lands_two_commits_on_bookmark() {
     );
     assert!(
         tip.contains("set-status"),
-        "bugs bookmark should point at the set-status commit, got: {tip}"
+        "issues bookmark should point at the set-status commit, got: {tip}"
     );
 
     // @ should not be on the bookmark (step 4 of the dance).
@@ -230,8 +230,8 @@ fn create_then_set_status_lands_two_commits_on_bookmark() {
         &repo,
     );
     assert!(
-        !at_at.contains("bugs"),
-        "@ should not be on the bugs bookmark after a mutation, got: {at_at}"
+        !at_at.contains("issues"),
+        "@ should not be on the issues bookmark after a mutation, got: {at_at}"
     );
 }
 
@@ -239,8 +239,8 @@ fn create_then_set_status_lands_two_commits_on_bookmark() {
 fn add_comment_lands_jsonl_line_and_trailer() {
     let repo = make_scratch_repo("add_comment");
     let storage = Storage::open(&repo).unwrap();
-    let id: BugId = storage
-        .create_bug(&BugDraft {
+    let id: IssueId = storage
+        .create_issue(&IssueDraft {
             title: "needs more info".into(),
             ..Default::default()
         })
@@ -251,7 +251,7 @@ fn add_comment_lands_jsonl_line_and_trailer() {
         .add_comment(&id, "first thought", "alice <alice@example.com>")
         .unwrap();
 
-    let body = read_at_bookmark(&repo, &format!("bugs/{}.comments.jsonl", id_s));
+    let body = read_at_bookmark(&repo, &format!("issues/{}.comments.jsonl", id_s));
     let lines: Vec<&str> = body.lines().collect();
     assert_eq!(lines.len(), 1, "exactly one comment line: {body:?}");
     let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
@@ -269,7 +269,7 @@ fn add_comment_lands_jsonl_line_and_trailer() {
             "log",
             "--no-graph",
             "-r",
-            "bookmarks(bugs)",
+            "bookmarks(issues)",
             "-T",
             "description ++ \"\\n\"",
         ],
@@ -302,7 +302,7 @@ fn read_roundtrip_after_multiple_mutations() {
 
     // 1. Create.
     let id = storage
-        .create_bug(&BugDraft {
+        .create_issue(&IssueDraft {
             title: "initial title".into(),
             body: "first body".into(),
             labels: vec!["bug".into()],
@@ -332,7 +332,7 @@ fn read_roundtrip_after_multiple_mutations() {
     assert_eq!(bug.status, Status::Closed);
     // Labels are sorted alphabetically per spec §3.1.
     assert_eq!(bug.labels, vec!["bug".to_string(), "p1".to_string()]);
-    assert_eq!(bug.dependencies, Vec::<BugId>::new());
+    assert_eq!(bug.dependencies, Vec::<IssueId>::new());
     assert_eq!(bug.assignee, None);
 
     // Two comments, chronological. The first add gets created_at
@@ -363,13 +363,13 @@ fn read_roundtrip_after_multiple_mutations() {
 }
 
 #[test]
-fn read_missing_bug_returns_bug_not_found() {
+fn read_missing_bug_returns_issue_not_found() {
     let repo = make_scratch_repo("read_missing");
     let storage = Storage::open(&repo).unwrap();
-    let missing = BugId::parse("deadbee").unwrap();
+    let missing = IssueId::parse("deadbee").unwrap();
     match storage.read(&missing) {
-        Err(jjf_storage::Error::BugNotFound(got)) => assert_eq!(got, missing),
-        other => panic!("expected BugNotFound, got {:?}", other),
+        Err(jjf_storage::Error::IssueNotFound(got)) => assert_eq!(got, missing),
+        other => panic!("expected IssueNotFound, got {:?}", other),
     }
 }
 
@@ -385,7 +385,7 @@ fn read_then_serialize_byte_equals_on_disk_record() {
     let storage = Storage::open(&repo).unwrap();
 
     let id = storage
-        .create_bug(&BugDraft {
+        .create_issue(&IssueDraft {
             title: "round-trip me".into(),
             body: "body line 1\nbody line 2".into(),
             labels: vec!["needs-info".into(), "bug".into()],
@@ -397,30 +397,30 @@ fn read_then_serialize_byte_equals_on_disk_record() {
     storage.add_comment(&id, "hi", "alice <a@x>").unwrap();
 
     let id_s = id.to_string();
-    let on_disk = read_at_bookmark(&repo, &format!("bugs/{}.json", id_s));
+    let on_disk = read_at_bookmark(&repo, &format!("issues/{}.json", id_s));
 
     // Re-serialize the Bug back through the same writer convention
     // (pretty-printed, 2-space indent, trailing newline) and the
     // bytes must match. The shape used here mirrors the writer's
-    // private `BugRecord` exactly — that's the contract.
+    // private `IssueRecord` exactly — that's the contract.
     let bug = storage.read(&id).expect("read");
 
     #[derive(Serialize)]
     struct CanonicalRecord<'a> {
         version: u32,
-        id: &'a BugId,
+        id: &'a IssueId,
         title: &'a str,
         body: &'a str,
         status: &'a str,
         labels: &'a [String],
-        dependencies: &'a [BugId],
+        dependencies: &'a [IssueId],
         assignee: Option<&'a str>,
         created_at: &'a str,
         updated_at: &'a str,
     }
 
     let canonical = CanonicalRecord {
-        version: 1,
+        version: 2,
         id: &bug.id,
         title: &bug.title,
         body: &bug.body,
@@ -445,7 +445,7 @@ fn read_then_serialize_byte_equals_on_disk_record() {
     // Same byte-equality contract for the comments file: each line is
     // a Comment serialized as compact JSON, terminated by `\n`.
     let on_disk_comments =
-        read_at_bookmark(&repo, &format!("bugs/{}.comments.jsonl", id_s));
+        read_at_bookmark(&repo, &format!("issues/{}.comments.jsonl", id_s));
     let mut reserialized_comments = String::new();
     for c in &bug.comments {
         reserialized_comments.push_str(&serde_json::to_string(c).unwrap());
@@ -466,7 +466,7 @@ fn read_after_add_then_remove_label_observes_neither() {
     let repo = make_scratch_repo("read_label_lifecycle");
     let storage = Storage::open(&repo).unwrap();
     let id = storage
-        .create_bug(&BugDraft {
+        .create_issue(&IssueDraft {
             title: "label lifecycle".into(),
             ..Default::default()
         })
@@ -499,7 +499,7 @@ fn read_history_returns_op_per_trailer_in_chronological_order() {
     // `dep-add` × N (sorted), `set-assignee`. With body + 2 labels +
     // assignee that's 5 ops in one commit.
     let id = storage
-        .create_bug(&BugDraft {
+        .create_issue(&IssueDraft {
             title: "first title".into(),
             body: "initial body".into(),
             labels: vec!["bug".into(), "p1".into()],
@@ -537,37 +537,37 @@ fn read_history_returns_op_per_trailer_in_chronological_order() {
     // Per-op assertions, oldest first.
     // ---- create commit (multi-op stanza per spec §5.7) ----
     match &history[0].op {
-        Op::Create { bug_id, title, status } => {
-            assert_eq!(bug_id, &id);
+        Op::Create { issue_id, title, status } => {
+            assert_eq!(issue_id, &id);
             assert_eq!(title, "first title");
             assert_eq!(*status, Status::Open);
         }
         other => panic!("history[0] expected Create, got {:?}", other),
     }
     match &history[1].op {
-        Op::SetBody { bug_id, body_hash } => {
-            assert_eq!(bug_id, &id);
+        Op::SetBody { issue_id, body_hash } => {
+            assert_eq!(issue_id, &id);
             assert_eq!(body_hash.len(), 64, "sha-256 hex is 64 chars");
         }
         other => panic!("history[1] expected SetBody, got {:?}", other),
     }
     match &history[2].op {
-        Op::LabelAdd { bug_id, label } => {
-            assert_eq!(bug_id, &id);
+        Op::LabelAdd { issue_id, label } => {
+            assert_eq!(issue_id, &id);
             assert_eq!(label, "bug"); // labels sorted alphabetically
         }
         other => panic!("history[2] expected LabelAdd(bug), got {:?}", other),
     }
     match &history[3].op {
-        Op::LabelAdd { bug_id, label } => {
-            assert_eq!(bug_id, &id);
+        Op::LabelAdd { issue_id, label } => {
+            assert_eq!(issue_id, &id);
             assert_eq!(label, "p1");
         }
         other => panic!("history[3] expected LabelAdd(p1), got {:?}", other),
     }
     match &history[4].op {
-        Op::SetAssignee { bug_id, assignee } => {
-            assert_eq!(bug_id, &id);
+        Op::SetAssignee { issue_id, assignee } => {
+            assert_eq!(issue_id, &id);
             assert_eq!(assignee.as_deref(), Some("alice"));
         }
         other => panic!("history[4] expected SetAssignee, got {:?}", other),
@@ -588,8 +588,8 @@ fn read_history_returns_op_per_trailer_in_chronological_order() {
 
     // ---- set-title commit ----
     match &history[5].op {
-        Op::SetTitle { bug_id, title } => {
-            assert_eq!(bug_id, &id);
+        Op::SetTitle { issue_id, title } => {
+            assert_eq!(issue_id, &id);
             assert_eq!(title, "second title");
         }
         other => panic!("history[5] expected SetTitle, got {:?}", other),
@@ -601,8 +601,8 @@ fn read_history_returns_op_per_trailer_in_chronological_order() {
 
     // ---- set-status commit ----
     match &history[6].op {
-        Op::SetStatus { bug_id, status } => {
-            assert_eq!(bug_id, &id);
+        Op::SetStatus { issue_id, status } => {
+            assert_eq!(issue_id, &id);
             assert_eq!(*status, Status::Closed);
         }
         other => panic!("history[6] expected SetStatus, got {:?}", other),
@@ -610,8 +610,8 @@ fn read_history_returns_op_per_trailer_in_chronological_order() {
 
     // ---- comment-add commit ----
     match &history[7].op {
-        Op::CommentAdd { bug_id, comment_id } => {
-            assert_eq!(bug_id, &id);
+        Op::CommentAdd { issue_id, comment_id } => {
+            assert_eq!(issue_id, &id);
             // Comment id should match the one in the comments file.
             let bug = storage.read(&id).unwrap();
             assert_eq!(bug.comments.len(), 1);
@@ -622,8 +622,8 @@ fn read_history_returns_op_per_trailer_in_chronological_order() {
 
     // ---- label-rm commit ----
     match &history[8].op {
-        Op::LabelRm { bug_id, label } => {
-            assert_eq!(bug_id, &id);
+        Op::LabelRm { issue_id, label } => {
+            assert_eq!(issue_id, &id);
             assert_eq!(label, "bug");
         }
         other => panic!("history[8] expected LabelRm, got {:?}", other),
@@ -659,13 +659,13 @@ fn read_history_returns_op_per_trailer_in_chronological_order() {
 }
 
 #[test]
-fn read_history_missing_bug_returns_bug_not_found() {
+fn read_history_missing_bug_returns_issue_not_found() {
     let repo = make_scratch_repo("read_history_missing");
     let storage = Storage::open(&repo).unwrap();
-    let missing = BugId::parse("deadbee").unwrap();
+    let missing = IssueId::parse("deadbee").unwrap();
     match storage.read_history(&missing) {
-        Err(jjf_storage::Error::BugNotFound(got)) => assert_eq!(got, missing),
-        other => panic!("expected BugNotFound, got {:?}", other),
+        Err(jjf_storage::Error::IssueNotFound(got)) => assert_eq!(got, missing),
+        other => panic!("expected IssueNotFound, got {:?}", other),
     }
 }
 
@@ -688,7 +688,7 @@ fn update_lands_one_commit_with_one_trailer_per_populated_field() {
 
     // Seed a bug.
     let id = storage
-        .create_bug(&BugDraft {
+        .create_issue(&IssueDraft {
             title: "before".into(),
             body: "before body".into(),
             labels: vec![],
@@ -765,7 +765,7 @@ fn update_assignee_double_option_distinguishes_set_from_unset() {
     let repo = make_scratch_repo("update_assignee_double_option");
     let storage = Storage::open(&repo).unwrap();
     let id = storage
-        .create_bug(&BugDraft {
+        .create_issue(&IssueDraft {
             title: "assign me".into(),
             body: String::new(),
             labels: vec![],
@@ -808,7 +808,7 @@ fn update_with_no_fields_is_an_error() {
     let repo = make_scratch_repo("update_no_fields");
     let storage = Storage::open(&repo).unwrap();
     let id = storage
-        .create_bug(&BugDraft {
+        .create_issue(&IssueDraft {
             title: "noop".into(),
             body: String::new(),
             labels: vec![],
@@ -831,7 +831,7 @@ fn update_with_no_fields_is_an_error() {
 // ---------------------------------------------------------------------
 // Bootstrap-path tests (issue 8b12f9d).
 //
-// `Storage::init` bootstraps the `bugs` bookmark idempotently. Spec
+// `Storage::init` bootstraps the `issues` bookmark idempotently. Spec
 // §1.1 pins the seed-commit description; the three distinct failure
 // shapes (not-a-jj-repo, bookmark-missing, bookmark-present) all need
 // coverage.
@@ -841,10 +841,10 @@ fn update_with_no_fields_is_an_error() {
 fn init_on_fresh_jj_repo_creates_bookmark_with_seed_commit() {
     let repo = make_empty_jj_repo("init_fresh");
 
-    // Pre-condition: no `bugs` bookmark.
+    // Pre-condition: no `issues` bookmark.
     let pre = jj_capture(&["bookmark", "list", "-T", "name ++ \"\\n\""], &repo);
     assert!(
-        !pre.lines().any(|l| l.trim() == "bugs"),
+        !pre.lines().any(|l| l.trim() == "issues"),
         "pre-condition: bookmark should not exist yet, got: {pre}"
     );
 
@@ -854,7 +854,7 @@ fn init_on_fresh_jj_repo_creates_bookmark_with_seed_commit() {
     // description matches the spec.
     let post = jj_capture(&["bookmark", "list", "-T", "name ++ \"\\n\""], &repo);
     assert!(
-        post.lines().any(|l| l.trim() == "bugs"),
+        post.lines().any(|l| l.trim() == "issues"),
         "post-condition: bookmark should exist, got: {post}"
     );
 
@@ -863,7 +863,7 @@ fn init_on_fresh_jj_repo_creates_bookmark_with_seed_commit() {
             "log",
             "--no-graph",
             "-r",
-            "bookmarks(bugs)",
+            "bookmarks(issues)",
             "-T",
             "description.first_line() ++ \"\\n\"",
         ],
@@ -871,7 +871,7 @@ fn init_on_fresh_jj_repo_creates_bookmark_with_seed_commit() {
     );
     assert_eq!(
         seed_desc.trim(),
-        "jjf: seed bugs bookmark",
+        "jjf: seed issues bookmark",
         "seed commit description must match spec §1.1, got: {seed_desc:?}"
     );
 
@@ -882,7 +882,7 @@ fn init_on_fresh_jj_repo_creates_bookmark_with_seed_commit() {
             "log",
             "--no-graph",
             "-r",
-            "bookmarks(bugs) ~ root()",
+            "bookmarks(issues) ~ root()",
             "-T",
             "\"x\"",
         ],
@@ -900,8 +900,8 @@ fn init_on_fresh_jj_repo_creates_bookmark_with_seed_commit() {
         &repo,
     );
     assert!(
-        !at_bookmarks.contains("bugs"),
-        "@ should not be on the bugs bookmark after init, got: {at_bookmarks:?}"
+        !at_bookmarks.contains("issues"),
+        "@ should not be on the issues bookmark after init, got: {at_bookmarks:?}"
     );
 }
 
@@ -918,7 +918,7 @@ fn init_is_idempotent_when_called_twice() {
             "log",
             "--no-graph",
             "-r",
-            "bookmarks(bugs)",
+            "bookmarks(issues)",
             "-T",
             "commit_id ++ \"\\n\"",
         ],
@@ -936,7 +936,7 @@ fn init_is_idempotent_when_called_twice() {
             "log",
             "--no-graph",
             "-r",
-            "bookmarks(bugs)",
+            "bookmarks(issues)",
             "-T",
             "commit_id ++ \"\\n\"",
         ],
@@ -954,7 +954,7 @@ fn init_is_idempotent_when_called_twice() {
             "log",
             "--no-graph",
             "-r",
-            "ancestors(bookmarks(bugs)) ~ root()",
+            "ancestors(bookmarks(issues)) ~ root()",
             "-T",
             "\"x\\n\"",
         ],
@@ -977,19 +977,19 @@ fn init_outside_any_jj_repo_returns_typed_error() {
 }
 
 #[test]
-fn init_then_create_bug_lands_on_top_of_seed() {
-    // End-to-end: init bootstraps, then create_bug uses the bookmark
+fn init_then_create_issue_lands_on_top_of_seed() {
+    // End-to-end: init bootstraps, then create_issue uses the bookmark
     // just like every other test does. Confirms the seed commit is a
     // viable parent for the first mutation.
     let repo = make_empty_jj_repo("init_then_create");
     let storage = Storage::init(&repo).unwrap();
 
     let id = storage
-        .create_bug(&BugDraft {
+        .create_issue(&IssueDraft {
             title: "first ever bug".into(),
             ..Default::default()
         })
-        .expect("create_bug on freshly-init'd repo");
+        .expect("create_issue on freshly-init'd repo");
 
     let bug = storage.read(&id).expect("read after create");
     assert_eq!(bug.title, "first ever bug");
@@ -1001,7 +1001,7 @@ fn init_then_create_bug_lands_on_top_of_seed() {
             "log",
             "--no-graph",
             "-r",
-            "ancestors(bookmarks(bugs)) ~ root()",
+            "ancestors(bookmarks(issues)) ~ root()",
             "-T",
             "description.first_line() ++ \"\\n\"",
         ],
@@ -1014,11 +1014,11 @@ fn init_then_create_bug_lands_on_top_of_seed() {
         "expected seed + 1 mutation on the chain, got: {chain:?}"
     );
     assert!(
-        descs[0].contains(&format!("bug {}", id)),
+        descs[0].contains(&format!("issue {}", id)),
         "newest commit should be the create, got: {chain:?}"
     );
     assert_eq!(
-        descs[1], "jjf: seed bugs bookmark",
+        descs[1], "jjf: seed issues bookmark",
         "oldest commit should be the seed, got: {chain:?}"
     );
 }
@@ -1048,17 +1048,17 @@ fn list_ids_returns_three_bugs_sorted_with_no_duplicates() {
     let repo = make_scratch_repo("list_ids_three");
     let storage = Storage::open(&repo).unwrap();
 
-    // Three bugs. Each one's create lands both `bugs/<id>.json` AND
-    // `bugs/<id>.comments.jsonl` at the bookmark tip — the latter is
+    // Three bugs. Each one's create lands both `issues/<id>.json` AND
+    // `issues/<id>.comments.jsonl` at the bookmark tip — the latter is
     // the regression we're guarding against (no double-counting).
-    let mut created: Vec<BugId> = Vec::with_capacity(3);
+    let mut created: Vec<IssueId> = Vec::with_capacity(3);
     for title in ["first", "second", "third"] {
         let id = storage
-            .create_bug(&BugDraft {
+            .create_issue(&IssueDraft {
                 title: (*title).into(),
                 ..Default::default()
             })
-            .expect("create_bug");
+            .expect("create_issue");
         created.push(id);
     }
 

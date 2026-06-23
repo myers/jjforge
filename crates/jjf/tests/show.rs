@@ -6,7 +6,7 @@
 //! - bug not found at the bookmark tip → exit 1,
 //! - bad id parse → exit 2,
 //! - non-jj repo → exit 2,
-//! - jj repo without `bugs` bookmark → exit 2 (run `jjf init` first).
+//! - jj repo without `issues` bookmark → exit 2 (run `jjf init` first).
 //!
 //! End-to-end: each happy-path test chains `jjf new` → `jjf show`, so
 //! we exercise the full write-then-read cycle through the binary
@@ -37,7 +37,7 @@ fn scratch(name: &str) -> PathBuf {
     fs::canonicalize(&dir).unwrap()
 }
 
-/// Make a directory that's a fresh jj repo with no `bugs` bookmark.
+/// Make a directory that's a fresh jj repo with no `issues` bookmark.
 fn make_jj_repo(name: &str) -> PathBuf {
     let dir = scratch(name);
     let out = Command::new("jj")
@@ -53,7 +53,7 @@ fn make_jj_repo(name: &str) -> PathBuf {
     dir
 }
 
-/// Make a directory that's a fresh jj repo AND has `bugs` bookmarked.
+/// Make a directory that's a fresh jj repo AND has `issues` bookmarked.
 fn make_initialized_repo(name: &str) -> PathBuf {
     let repo = make_jj_repo(name);
     let out = Command::new(JJF_BIN)
@@ -104,7 +104,7 @@ fn run_jjf_with_stdin(cwd: &Path, args: &[&str], stdin_bytes: &[u8]) -> Output {
 /// Create a bug with the given title/body via `jjf new` and return its
 /// freshly-minted id. Centralized so each `show` test reads one line
 /// for the setup step and the test body focuses on the assertion.
-fn create_bug(
+fn create_issue(
     repo: &Path,
     title: &str,
     body: &[u8],
@@ -128,7 +128,7 @@ fn create_bug(
 fn show_plain_text_includes_every_scalar_field() {
     let repo = make_initialized_repo("show_plain");
     let body = "Steps to reproduce:\n1. open thing\n2. break thing\n";
-    let id = create_bug(
+    let id = create_issue(
         &repo,
         "kernel panic on boot",
         body.as_bytes(),
@@ -181,7 +181,7 @@ fn show_plain_text_renders_none_for_unset_optionals() {
     // should print `(none)` for the optional fields rather than going
     // blank or eliding the line entirely.
     let repo = make_initialized_repo("show_none");
-    let id = create_bug(&repo, "bare bug", b"", &[]);
+    let id = create_issue(&repo, "bare bug", b"", &[]);
 
     let out = run_jjf(&repo, &["show", &id]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -205,7 +205,7 @@ fn show_plain_text_renders_none_for_unset_optionals() {
 fn show_json_emits_bug_record_verbatim() {
     let repo = make_initialized_repo("show_json");
     let body = "json body\nwith\nnewlines\n";
-    let id = create_bug(
+    let id = create_issue(
         &repo,
         "json shape",
         body.as_bytes(),
@@ -279,7 +279,7 @@ fn show_json_error_envelope_on_nonexistent_id() {
     assert_eq!(v["ok"], serde_json::Value::Bool(false));
     assert_eq!(
         v["error"]["kind"].as_str(),
-        Some("bug_not_found"),
+        Some("issue_not_found"),
         "kind wrong: {stderr}"
     );
     assert_eq!(
@@ -344,7 +344,7 @@ fn show_in_non_jj_directory_exits_two() {
     let dir = scratch("show_non_jj");
 
     // Use a well-formed id so we get past the parse step and exercise
-    // the preflight, not the BadBugId branch.
+    // the preflight, not the BadIssueId branch.
     let out = run_jjf(&dir, &["show", "abcdef0"]);
     assert!(!out.status.success(), "show in non-jj dir should fail");
     assert_eq!(out.status.code(), Some(2));
@@ -373,7 +373,7 @@ fn show_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`bugs` bookmark") && stderr.contains("jjf init"),
+        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
         "stderr should tell the user to run `jjf init` first, got: {stderr}"
     );
 }

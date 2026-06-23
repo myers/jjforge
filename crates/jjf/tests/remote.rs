@@ -11,7 +11,7 @@
 //! - `add` a name that already exists → exit 2 + `remote_already_exists`,
 //! - `rm` a name that doesn't exist → exit 2 + `remote_not_found`,
 //! - non-jj cwd → exit 2 + `not_a_jj_repo` (covers all three arms),
-//! - `ls` works in a jj repo with NO `bugs` bookmark (preflight is
+//! - `ls` works in a jj repo with NO `issues` bookmark (preflight is
 //!   jj-repo-only, not the full bugs probe),
 //! - `--help` documents the three subcommands.
 //!
@@ -319,7 +319,7 @@ fn remote_verbs_do_not_require_bugs_bookmark() {
     // The whole point of using the `jj_repo`-only preflight (instead
     // of the full `bugs_bookmark` probe): `jjf remote *` must work in
     // a jj repo BEFORE `jjf init` has been run. Without this, you'd
-    // have to init a bugs bookmark before you could even configure a
+    // have to init a issues bookmark before you could even configure a
     // remote, which is backwards (`jjf push` is what first sends the
     // bookmark to a remote).
     let repo = make_jj_repo("remote_no_bugs_bookmark");
@@ -328,7 +328,7 @@ fn remote_verbs_do_not_require_bugs_bookmark() {
     let out = run_jjf(&repo, &["remote", "ls"]);
     assert!(
         out.status.success(),
-        "remote ls must work without `bugs` bookmark: stderr={}",
+        "remote ls must work without `issues` bookmark: stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -336,7 +336,7 @@ fn remote_verbs_do_not_require_bugs_bookmark() {
     let out = run_jjf(&repo, &["remote", "add", "origin", "https://example.com/x.git"]);
     assert!(
         out.status.success(),
-        "remote add must work without `bugs` bookmark: stderr={}",
+        "remote add must work without `issues` bookmark: stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -344,7 +344,7 @@ fn remote_verbs_do_not_require_bugs_bookmark() {
     let out = run_jjf(&repo, &["remote", "rm", "origin"]);
     assert!(
         out.status.success(),
-        "remote rm must work without `bugs` bookmark: stderr={}",
+        "remote rm must work without `issues` bookmark: stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
 }

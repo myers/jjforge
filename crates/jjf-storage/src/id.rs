@@ -1,4 +1,4 @@
-//! 7-character lowercase-hex bug IDs per `docs/storage-format.md` §2.
+//! 7-character lowercase-hex issue IDs per `docs/storage-format.md` §2.
 //!
 //! Generation uses OS entropy via `getrandom(2)` on Linux and
 //! `getentropy(3)` on macOS, surfaced through the stdlib-provided
@@ -16,25 +16,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-/// A 7-character lowercase hex bug id.
+/// A 7-character lowercase hex issue id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct BugId(String);
+pub struct IssueId(String);
 
-impl BugId {
+impl IssueId {
     /// Mint a fresh random id. 28 random bits rendered as 7 hex chars.
     /// The space is ~268M; the writer re-rolls on collision with an
     /// existing file. Suitable for non-adversarial workloads (a single
-    /// repo's bugs).
+    /// repo's issues).
     pub fn random() -> Self {
         let bits = next_28_bits();
         let s = format!("{:07x}", bits & 0x0fff_ffff);
-        BugId(s)
+        IssueId(s)
     }
 
     /// Parse from a string. Must be exactly 7 chars of `[0-9a-f]`.
     ///
-    /// Prefer the `FromStr` impl (`"abc1234".parse::<BugId>()`); this
+    /// Prefer the `FromStr` impl (`"abc1234".parse::<IssueId>()`); this
     /// inherent method exists so callers don't need to import the trait.
     pub fn parse(s: &str) -> Result<Self, IdError> {
         if s.len() != 7 {
@@ -43,7 +43,7 @@ impl BugId {
         if !s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
             return Err(IdError::Charset);
         }
-        Ok(BugId(s.to_owned()))
+        Ok(IssueId(s.to_owned()))
     }
 
     /// Borrow as `&str`.
@@ -52,14 +52,14 @@ impl BugId {
     }
 }
 
-impl FromStr for BugId {
+impl FromStr for IssueId {
     type Err = IdError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        BugId::parse(s)
+        IssueId::parse(s)
     }
 }
 
-impl fmt::Display for BugId {
+impl fmt::Display for IssueId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
@@ -67,9 +67,9 @@ impl fmt::Display for BugId {
 
 #[derive(Debug, thiserror::Error)]
 pub enum IdError {
-    #[error("bug id must be 7 chars, got {0}")]
+    #[error("issue id must be 7 chars, got {0}")]
     Length(usize),
-    #[error("bug id must be lowercase hex [0-9a-f]")]
+    #[error("issue id must be lowercase hex [0-9a-f]")]
     Charset,
 }
 
@@ -140,7 +140,7 @@ mod tests {
         // pathologically biased.
         let mut seen = HashSet::new();
         for _ in 0..1_000 {
-            let id = BugId::random();
+            let id = IssueId::random();
             assert!(
                 seen.insert(id.0.clone()),
                 "id collision in 1k samples: {}",
@@ -151,12 +151,12 @@ mod tests {
 
     #[test]
     fn parse_rejects_uppercase_hex() {
-        assert!(BugId::parse("ABCDEF0").is_err());
+        assert!(IssueId::parse("ABCDEF0").is_err());
     }
 
     #[test]
     fn display_round_trip() {
-        let id = BugId::parse("0123456").unwrap();
+        let id = IssueId::parse("0123456").unwrap();
         assert_eq!(format!("{}", id), "0123456");
     }
 }

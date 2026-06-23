@@ -10,7 +10,7 @@
 //! - nonexistent id → exit 1,
 //! - bad id → exit 2,
 //! - non-jj cwd → exit 2,
-//! - jj repo without `bugs` bookmark → exit 2 + init hint,
+//! - jj repo without `issues` bookmark → exit 2 + init hint,
 //! - `--help` documents positional + `-F` + `--author` + `--json`.
 //!
 //! Same hermetic-scratch / no-`assert_cmd` discipline as the other test
@@ -123,7 +123,7 @@ fn run_jjf_with_stdin(cwd: &Path, args: &[&str], stdin_bytes: &[u8]) -> Output {
 }
 
 /// Create a bug via `jjf new`, return its id.
-fn create_bug(repo: &Path, title: &str) -> String {
+fn create_issue(repo: &Path, title: &str) -> String {
     let out = run_jjf_with_stdin(repo, &["new", "-t", title, "-F", "-"], b"");
     assert!(
         out.status.success(),
@@ -139,7 +139,7 @@ fn create_bug(repo: &Path, title: &str) -> String {
 #[test]
 fn comment_happy_path_show_reports_comment() {
     let repo = make_initialized_repo("comment_happy");
-    let id = create_bug(&repo, "needs a comment");
+    let id = create_issue(&repo, "needs a comment");
 
     let out = run_jjf_with_stdin(
         &repo,
@@ -181,7 +181,7 @@ fn comment_happy_path_show_reports_comment() {
 #[test]
 fn comment_json_envelope_shape() {
     let repo = make_initialized_repo("comment_json");
-    let id = create_bug(&repo, "json comment");
+    let id = create_issue(&repo, "json comment");
 
     let out = run_jjf_with_stdin(
         &repo,
@@ -220,7 +220,7 @@ fn comment_json_envelope_shape() {
 #[test]
 fn comment_author_override_appears_in_show() {
     let repo = make_initialized_repo("comment_author_override");
-    let id = create_bug(&repo, "override the author");
+    let id = create_issue(&repo, "override the author");
 
     let out = run_jjf_with_stdin(
         &repo,
@@ -250,7 +250,7 @@ fn comment_author_override_appears_in_show() {
 #[test]
 fn comment_two_in_a_row_chronological_order() {
     let repo = make_initialized_repo("comment_two_in_a_row");
-    let id = create_bug(&repo, "two-comment thread");
+    let id = create_issue(&repo, "two-comment thread");
 
     let out =
         run_jjf_with_stdin(&repo, &["comment", &id, "-F", "-"], b"FIRST in time");
@@ -294,7 +294,7 @@ fn comment_json_error_envelope_on_empty_body() {
     // stderr. The `details` field is absent for this kind — message
     // carries enough context (the flag hint).
     let repo = make_initialized_repo("comment_json_err_empty");
-    let id = create_bug(&repo, "no empty allowed via json");
+    let id = create_issue(&repo, "no empty allowed via json");
 
     let out = run_jjf_with_stdin(
         &repo,
@@ -330,7 +330,7 @@ fn comment_json_error_envelope_on_empty_body() {
 #[test]
 fn comment_empty_body_exits_two() {
     let repo = make_initialized_repo("comment_empty");
-    let id = create_bug(&repo, "no empty allowed");
+    let id = create_issue(&repo, "no empty allowed");
 
     // Closed-stdin / zero-byte body — the CLI must reject before the
     // storage layer ever sees the call.
@@ -437,7 +437,7 @@ fn comment_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`bugs` bookmark") && stderr.contains("jjf init"),
+        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
         "stderr should tell the user to run `jjf init` first, got: {stderr}"
     );
 }
@@ -445,7 +445,7 @@ fn comment_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
 #[test]
 fn comment_unreadable_file_exits_two() {
     let repo = make_initialized_repo("comment_unreadable_file");
-    let id = create_bug(&repo, "file-not-found");
+    let id = create_issue(&repo, "file-not-found");
 
     let bogus = repo.join("does-not-exist.md");
     let out = run_jjf(

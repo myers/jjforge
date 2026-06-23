@@ -1,8 +1,8 @@
-//! Read path for the `bugs` bookmark.
+//! Read path for the `issues` bookmark.
 //!
-//! Given a repo and a bug id, returns the structured `Bug` view: the
-//! latest scalar field values from `bugs/<id>.json` plus the full
-//! chronological comment thread from `bugs/<id>.comments.jsonl`.
+//! Given a repo and an issue id, returns the structured `Issue` view: the
+//! latest scalar field values from `issues/<id>.json` plus the full
+//! chronological comment thread from `issues/<id>.comments.jsonl`.
 //!
 //! # Two implementations, asserted equal
 //!
@@ -10,14 +10,15 @@
 //! result two ways and (in debug builds) asserts they agree on
 //! structural fields:
 //!
-//! 1. **File-read.** Pull `bugs/<id>.json` and `bugs/<id>.comments.jsonl`
-//!    straight off the bookmark tip via `jj file show`.
-//! 2. **Op-replay.** Walk `ancestors(bookmarks(bugs))` filtered to
-//!    `root:bugs/<id>.json`, parse the `Jjf-Op:` trailers out of each
+//! 1. **File-read.** Pull `issues/<id>.json` and
+//!    `issues/<id>.comments.jsonl` straight off the bookmark tip via
+//!    `jj file show`.
+//! 2. **Op-replay.** Walk `ancestors(bookmarks(issues))` filtered to
+//!    `root:issues/<id>.json`, parse the `Jjf-Op:` trailers out of each
 //!    commit description (oldest first), and fold them into a record.
 //!
 //! When file-read and op-replay disagree on a structural field, that's
-//! a violation of the v1 storage contract — either the writer didn't
+//! a violation of the storage contract — either the writer didn't
 //! record an op for a mutation, or the writer wrote the file without a
 //! corresponding op. Crashing in debug builds is the cheapest way to
 //! catch a regression in the write path. Release builds trust the
@@ -33,25 +34,25 @@
 //! op-replay timestamps are validated for monotonicity instead (see
 //! `verify_timestamp_ordering`).
 
-use crate::id::BugId;
+use crate::id::IssueId;
 use crate::jj::JjRepo;
 #[cfg(any(debug_assertions, test))]
 use crate::op::Op;
 #[cfg(any(debug_assertions, test))]
 use crate::record::Status;
-use crate::record::{Bug, BugRecord, Comment};
+use crate::record::{Comment, Issue, IssueRecord};
 #[cfg(debug_assertions)]
 use crate::trailer::parse_ops;
-use crate::{bug_comments_relpath, bug_json_relpath, Error, Result, BUGS_BOOKMARK_REVSET};
+use crate::{issue_comments_relpath, issue_json_relpath, Error, Result, ISSUES_BOOKMARK_REVSET};
 
-/// Read a single bug from the `bugs` bookmark tip.
+/// Read a single issue from the `issues` bookmark tip.
 ///
 /// Errors:
-/// - `BugNotFound` if `bugs/<id>.json` is absent at the bookmark.
+/// - `IssueNotFound` if `issues/<id>.json` is absent at the bookmark.
 /// - `Json` if the on-disk record or any comment line is malformed.
 /// - `Jj` if the underlying `jj` shell-out fails for any non-missing-file
 ///   reason.
-pub(crate) fn read(repo: &JjRepo, id: &BugId) -> Result<Bug> {
+pub(crate) fn read(repo: &JjRepo, id: &IssueId) -> Result<Issue> {
     let record = read_record(repo, id)?;
     let comments = read_comments(repo, id)?;
 
@@ -66,7 +67,7 @@ pub(crate) fn read(repo: &JjRepo, id: &BugId) -> Result<Bug> {
     {
         let op_view = replay_ops(repo, id)?;
         // Skip the cross-check whenever the chain has been through a
-        // merge commit. The v1 `Jjf-Op: merge` trailer carries no
+        // merge commit. The `Jjf-Op: merge` trailer carries no
         // payload (spec §5.2): "the merge driver records the
         // resolution itself in the file diff." Op-replay can therefore
         // walk both branches of the merge, fold their `set-*` ops in
@@ -83,7 +84,7 @@ pub(crate) fn read(repo: &JjRepo, id: &BugId) -> Result<Bug> {
         }
     }
 
-    Ok(Bug {
+    Ok(Issue {
         id: record.id,
         title: record.title,
         body: record.body,
@@ -110,33 +111,33 @@ pub(crate) fn read(repo: &JjRepo, id: &BugId) -> Result<Bug> {
 }
 
 /// Read the JSON record straight off the bookmark tip. Returns
-/// `BugNotFound` if the file is absent at that revision.
-fn read_record(repo: &JjRepo, id: &BugId) -> Result<BugRecord> {
-    let relpath = bug_json_relpath(id);
+/// `IssueNotFound` if the file is absent at that revision.
+fn read_record(repo: &JjRepo, id: &IssueId) -> Result<IssueRecord> {
+    let relpath = issue_json_relpath(id);
     let text = match repo.run(&[
         "file",
         "show",
         "-r",
-        BUGS_BOOKMARK_REVSET,
+        ISSUES_BOOKMARK_REVSET,
         &format!("root:{}", relpath.display()),
     ]) {
         Ok(s) => s,
-        Err(_) => return Err(Error::BugNotFound(id.clone())),
+        Err(_) => return Err(Error::IssueNotFound(id.clone())),
     };
     Ok(serde_json::from_str(&text)?)
 }
 
 /// Read the comments JSONL straight off the bookmark tip. A missing
-/// file means "no comments" — the v1 writer creates an empty file on
-/// bug creation, but tolerating absence keeps the read path resilient
+/// file means "no comments" — the writer creates an empty file on
+/// issue creation, but tolerating absence keeps the read path resilient
 /// to repos created by future bootstrap paths that might not.
-fn read_comments(repo: &JjRepo, id: &BugId) -> Result<Vec<Comment>> {
-    let relpath = bug_comments_relpath(id);
+fn read_comments(repo: &JjRepo, id: &IssueId) -> Result<Vec<Comment>> {
+    let relpath = issue_comments_relpath(id);
     let text = match repo.run(&[
         "file",
         "show",
         "-r",
-        BUGS_BOOKMARK_REVSET,
+        ISSUES_BOOKMARK_REVSET,
         &format!("root:{}", relpath.display()),
     ]) {
         Ok(s) => s,
@@ -166,9 +167,9 @@ fn read_comments(repo: &JjRepo, id: &BugId) -> Result<Vec<Comment>> {
 /// the `set-body` trailer either (only its sha-256 hash is).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OpView {
-    id: BugId,
+    id: IssueId,
     title: String,
-    /// `Some(hash)` if a `set-body` op was applied; `None` if the bug
+    /// `Some(hash)` if a `set-body` op was applied; `None` if the issue
     /// was only ever touched by `create` (whose op chain has no body
     /// hash — the create-time body is in the JSON record). We use this
     /// to validate the on-disk body when a hash is available, and skip
@@ -176,27 +177,27 @@ struct OpView {
     body_hash: Option<String>,
     status: Status,
     labels: Vec<String>,
-    dependencies: Vec<BugId>,
+    dependencies: Vec<IssueId>,
     assignee: Option<String>,
     /// Comment IDs in the order they were added (op chain order, oldest
     /// first). Used to validate that the JSONL file matches.
-    comment_ids: Vec<BugId>,
+    comment_ids: Vec<IssueId>,
     /// `true` once a `Jjf-Op: merge` trailer has been seen anywhere in
     /// the chain. The cross-check honors this by skipping — see the
     /// rationale at the call-site in `read`.
     touched_by_merge: bool,
 }
 
-/// Walk the per-bug op chain and fold it into a structural view.
+/// Walk the per-issue op chain and fold it into a structural view.
 ///
-/// Uses `ancestors(bookmarks(bugs))` filtered by `root:bugs/<id>.json`,
-/// templated to dump the full description so we can parse trailers.
-/// The output is newest-first; we reverse to oldest-first before
-/// folding.
+/// Uses `ancestors(bookmarks(issues))` filtered by
+/// `root:issues/<id>.json`, templated to dump the full description so
+/// we can parse trailers. The output is newest-first; we reverse to
+/// oldest-first before folding.
 #[cfg(debug_assertions)]
-fn replay_ops(repo: &JjRepo, id: &BugId) -> Result<OpView> {
-    let json_relpath = bug_json_relpath(id);
-    let comments_relpath = bug_comments_relpath(id);
+fn replay_ops(repo: &JjRepo, id: &IssueId) -> Result<OpView> {
+    let json_relpath = issue_json_relpath(id);
+    let comments_relpath = issue_comments_relpath(id);
     // Filter on BOTH files. A naïve filter on just the json record
     // misses commits whose only change was an append to the comments
     // jsonl — which happens whenever the writer's `updated_at` lands
@@ -211,7 +212,7 @@ fn replay_ops(repo: &JjRepo, id: &BugId) -> Result<OpView> {
         "log",
         "--no-graph",
         "-r",
-        "ancestors(bookmarks(bugs))",
+        "ancestors(bookmarks(issues))",
         "-T",
         &template,
         &format!("root:{}", json_relpath.display()),
@@ -223,11 +224,11 @@ fn replay_ops(repo: &JjRepo, id: &BugId) -> Result<OpView> {
     descs.reverse();
 
     if descs.is_empty() {
-        return Err(Error::BugNotFound(id.clone()));
+        return Err(Error::IssueNotFound(id.clone()));
     }
 
     // Fold ops left-to-right. The first commit MUST carry a `create`
-    // for this bug; we initialize the view from it.
+    // for this issue; we initialize the view from it.
     let mut view: Option<OpView> = None;
     for desc in descs {
         for op in parse_ops(desc, id) {
@@ -237,7 +238,7 @@ fn replay_ops(repo: &JjRepo, id: &BugId) -> Result<OpView> {
 
     view.ok_or_else(|| {
         Error::Invalid(format!(
-            "no `create` op found in chain for bug {}",
+            "no `create` op found in chain for issue {}",
             id
         ))
     })
@@ -247,7 +248,7 @@ fn replay_ops(repo: &JjRepo, id: &BugId) -> Result<OpView> {
 fn apply_op(view: &mut Option<OpView>, op: Op) {
     match op {
         Op::Create {
-            bug_id,
+            issue_id,
             title,
             status,
         } => {
@@ -256,7 +257,7 @@ fn apply_op(view: &mut Option<OpView>, op: Op) {
             // overwrite (defensive; the merge driver shouldn't produce
             // this).
             *view = Some(OpView {
-                id: bug_id,
+                id: issue_id,
                 title,
                 body_hash: None,
                 status,
@@ -316,10 +317,10 @@ fn apply_op(view: &mut Option<OpView>, op: Op) {
 /// write-path bug, not user error. Release builds skip this check (the
 /// file is authoritative).
 #[cfg(debug_assertions)]
-fn cross_check(record: &BugRecord, comments: &[Comment], op_view: &OpView) {
+fn cross_check(record: &IssueRecord, comments: &[Comment], op_view: &OpView) {
     let mismatch = |field: &str, file: String, ops: String| -> String {
         format!(
-            "v1 contract violation: file-read disagrees with op-replay for bug {}: {} differs (file={:?}, ops={:?})",
+            "storage contract violation: file-read disagrees with op-replay for issue {}: {} differs (file={:?}, ops={:?})",
             record.id, field, file, ops
         )
     };
@@ -398,7 +399,7 @@ fn cross_check(record: &BugRecord, comments: &[Comment], op_view: &OpView) {
         let actual = sha256_hex(record.body.as_bytes());
         assert_eq!(
             &actual, expected_hash,
-            "v1 contract violation: bug {} body sha-256 differs from latest set-body op hash (file={}, op={})",
+            "storage contract violation: issue {} body sha-256 differs from latest set-body op hash (file={}, op={})",
             record.id, actual, expected_hash
         );
     }
@@ -410,12 +411,12 @@ fn cross_check(record: &BugRecord, comments: &[Comment], op_view: &OpView) {
     // stamps created_at from the same wall clock as the commit, so the
     // two orderings should agree. If they don't, the file was edited
     // outside the write path.
-    let file_ids: Vec<&BugId> = comments.iter().map(|c| &c.id).collect();
-    let op_ids: Vec<&BugId> = op_view.comment_ids.iter().collect();
+    let file_ids: Vec<&IssueId> = comments.iter().map(|c| &c.id).collect();
+    let op_ids: Vec<&IssueId> = op_view.comment_ids.iter().collect();
     assert_eq!(
         file_ids.len(),
         op_ids.len(),
-        "v1 contract violation: bug {} comment count differs (file={}, ops={})",
+        "storage contract violation: issue {} comment count differs (file={}, ops={})",
         record.id,
         file_ids.len(),
         op_ids.len()
@@ -423,7 +424,7 @@ fn cross_check(record: &BugRecord, comments: &[Comment], op_view: &OpView) {
     for (i, (f, o)) in file_ids.iter().zip(op_ids.iter()).enumerate() {
         assert_eq!(
             f, o,
-            "v1 contract violation: bug {} comment[{}] id differs (file={}, op={})",
+            "storage contract violation: issue {} comment[{}] id differs (file={}, op={})",
             record.id, i, f, o
         );
     }
@@ -439,13 +440,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     // Trailer-parser unit tests (single-op, multi-op, unknown-op,
-    // cross-bug) live in `trailer.rs` next to the parser. The tests
+    // cross-issue) live in `trailer.rs` next to the parser. The tests
     // below cover the cross-check's own structural fold — `apply_op` /
     // `OpView` — which is specific to this module.
     use super::*;
 
-    fn id(s: &str) -> BugId {
-        BugId::parse(s).unwrap()
+    fn id(s: &str) -> IssueId {
+        IssueId::parse(s).unwrap()
     }
 
     #[test]
@@ -454,7 +455,7 @@ mod tests {
         apply_op(
             &mut view,
             Op::Create {
-                bug_id: id("aa6600b"),
+                issue_id: id("aa6600b"),
                 title: "t".into(),
                 status: Status::Open,
             },
@@ -462,7 +463,7 @@ mod tests {
         apply_op(
             &mut view,
             Op::SetStatus {
-                bug_id: id("aa6600b"),
+                issue_id: id("aa6600b"),
                 status: Status::Closed,
             },
         );
@@ -487,14 +488,14 @@ mod tests {
         apply_op(
             &mut view,
             Op::LabelAdd {
-                bug_id: id("aa6600b"),
+                issue_id: id("aa6600b"),
                 label: "p1".into(),
             },
         );
         apply_op(
             &mut view,
             Op::LabelAdd {
-                bug_id: id("aa6600b"),
+                issue_id: id("aa6600b"),
                 label: "bug".into(),
             },
         );
@@ -502,14 +503,14 @@ mod tests {
         apply_op(
             &mut view,
             Op::LabelAdd {
-                bug_id: id("aa6600b"),
+                issue_id: id("aa6600b"),
                 label: "bug".into(),
             },
         );
         apply_op(
             &mut view,
             Op::LabelRm {
-                bug_id: id("aa6600b"),
+                issue_id: id("aa6600b"),
                 label: "bug".into(),
             },
         );

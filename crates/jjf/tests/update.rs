@@ -12,10 +12,10 @@
 //!   actually changed, in field-declaration order),
 //! - no field flags → exit 2 with the at-least-one hint,
 //! - `--assignee` + `--unset-assignee` → exit 2 (clap conflicts_with),
-//! - nonexistent bug id → exit 1 (runtime, via `BugNotFound`),
+//! - nonexistent bug id → exit 1 (runtime, via `IssueNotFound`),
 //! - bad id parse → exit 2,
 //! - non-jj cwd → exit 2 with `not a jj repo`,
-//! - jj repo without `bugs` bookmark → exit 2 with init hint,
+//! - jj repo without `issues` bookmark → exit 2 with init hint,
 //! - unreadable `--body-file` path → exit 2,
 //! - `--help` documents every field flag + `--json`.
 //!
@@ -106,7 +106,7 @@ fn run_jjf_with_stdin(cwd: &Path, args: &[&str], stdin_bytes: &[u8]) -> Output {
 }
 
 /// Create a bug via `jjf new`, return its id.
-fn create_bug(repo: &Path, title: &str) -> String {
+fn create_issue(repo: &Path, title: &str) -> String {
     let out = run_jjf_with_stdin(repo, &["new", "-t", title, "-F", "-"], b"");
     assert!(
         out.status.success(),
@@ -122,7 +122,7 @@ fn create_bug(repo: &Path, title: &str) -> String {
 #[test]
 fn update_title_only_show_reports_new_title() {
     let repo = make_initialized_repo("update_title_only");
-    let id = create_bug(&repo, "before");
+    let id = create_issue(&repo, "before");
 
     let out = run_jjf(&repo, &["update", &id, "--title", "after"]);
     assert!(
@@ -160,15 +160,15 @@ fn update_three_fields_lands_one_commit_with_three_trailers() {
     // carrying THREE `Jjf-Op:` trailers. We verify via
     // `Storage::read_history`: three new entries appear, all sharing
     // the same `commit` id.
-    use jjf_storage::{BugId, Op, Storage};
+    use jjf_storage::{IssueId, Op, Storage};
 
     let repo = make_initialized_repo("update_three_fields_one_commit");
-    let id = create_bug(&repo, "initial title");
+    let id = create_issue(&repo, "initial title");
 
     let storage = Storage::open(&repo).expect("Storage::open");
-    let bug_id = BugId::parse(&id).expect("parse id");
+    let issue_id = IssueId::parse(&id).expect("parse id");
     let baseline_count = storage
-        .read_history(&bug_id)
+        .read_history(&issue_id)
         .expect("read_history baseline")
         .len();
 
@@ -203,7 +203,7 @@ fn update_three_fields_lands_one_commit_with_three_trailers() {
 
     // Read history. New entries = three (set-title, set-status,
     // set-body), all sharing one `commit` id.
-    let history = storage.read_history(&bug_id).expect("read_history after");
+    let history = storage.read_history(&issue_id).expect("read_history after");
     let new = &history[baseline_count..];
     assert_eq!(
         new.len(),
@@ -236,7 +236,7 @@ fn update_three_fields_lands_one_commit_with_three_trailers() {
     );
 
     // And the record reflects every change.
-    let bug = storage.read(&bug_id).expect("read");
+    let bug = storage.read(&issue_id).expect("read");
     assert_eq!(bug.title, "new title");
     assert_eq!(bug.body, "new body from stdin");
     assert!(matches!(bug.status, jjf_storage::Status::Closed));
@@ -245,7 +245,7 @@ fn update_three_fields_lands_one_commit_with_three_trailers() {
 #[test]
 fn update_assignee_set_then_unset_round_trip() {
     let repo = make_initialized_repo("update_assignee_round_trip");
-    let id = create_bug(&repo, "assign me");
+    let id = create_issue(&repo, "assign me");
 
     // Set.
     let out = run_jjf(&repo, &["update", &id, "--assignee", "alice"]);
@@ -278,17 +278,17 @@ fn update_assignee_set_then_unset_round_trip() {
     );
 
     // And the storage-side read returns `None` (not `Some("")`).
-    use jjf_storage::{BugId, Storage};
+    use jjf_storage::{IssueId, Storage};
     let storage = Storage::open(&repo).expect("Storage::open");
-    let bug_id = BugId::parse(&id).expect("parse id");
-    let bug = storage.read(&bug_id).expect("read");
+    let issue_id = IssueId::parse(&id).expect("parse id");
+    let bug = storage.read(&issue_id).expect("read");
     assert_eq!(bug.assignee, None);
 }
 
 #[test]
 fn update_json_envelope_shape() {
     let repo = make_initialized_repo("update_json");
-    let id = create_bug(&repo, "json me");
+    let id = create_issue(&repo, "json me");
 
     let out = run_jjf(
         &repo,
@@ -327,7 +327,7 @@ fn update_json_envelope_shape() {
 #[test]
 fn update_no_field_flags_exits_two_with_hint() {
     let repo = make_initialized_repo("update_no_flags");
-    let id = create_bug(&repo, "needs flags");
+    let id = create_issue(&repo, "needs flags");
 
     let out = run_jjf(&repo, &["update", &id]);
     assert!(!out.status.success(), "no-flag update must fail");
@@ -357,7 +357,7 @@ fn update_no_field_flags_exits_two_with_hint() {
 #[test]
 fn update_assignee_and_unset_assignee_are_mutually_exclusive() {
     let repo = make_initialized_repo("update_assignee_conflict");
-    let id = create_bug(&repo, "conflict");
+    let id = create_issue(&repo, "conflict");
 
     let out = run_jjf(
         &repo,
@@ -381,7 +381,7 @@ fn update_assignee_and_unset_assignee_are_mutually_exclusive() {
 
 #[test]
 fn update_json_error_envelope_on_nonexistent_id() {
-    // `--json` plus a missing id: the documented `bug_not_found` envelope
+    // `--json` plus a missing id: the documented `issue_not_found` envelope
     // shows up on stderr. Mirrors the contract pinned for the other
     // bug-id-taking mutators (`close`, `open`, `comment`, `label add/rm`).
     let repo = make_initialized_repo("update_json_err_missing");
@@ -404,7 +404,7 @@ fn update_json_error_envelope_on_nonexistent_id() {
     assert_eq!(v["ok"], serde_json::Value::Bool(false));
     assert_eq!(
         v["error"]["kind"].as_str(),
-        Some("bug_not_found"),
+        Some("issue_not_found"),
         "kind wrong: {stderr}"
     );
     assert_eq!(
@@ -487,7 +487,7 @@ fn update_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`bugs` bookmark") && stderr.contains("jjf init"),
+        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
         "stderr should tell the user to run `jjf init` first, got: {stderr}"
     );
 }
@@ -495,7 +495,7 @@ fn update_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
 #[test]
 fn update_unreadable_body_file_exits_two() {
     let repo = make_initialized_repo("update_unreadable_body_file");
-    let id = create_bug(&repo, "file-not-found");
+    let id = create_issue(&repo, "file-not-found");
 
     let bogus = repo.join("does-not-exist.md");
     let out = run_jjf(

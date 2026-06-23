@@ -1,18 +1,18 @@
 //! Pre-storage probes the binary runs before handing off to
-//! `jjf-storage`. Today there's exactly one — [`bugs_bookmark`] — but
-//! it lives in its own module so every read/write verb calls the same
-//! implementation rather than each open-coding the same two `jj`
+//! `jjf-storage`. Today there's exactly one — [`issues_bookmark`] —
+//! but it lives in its own module so every read/write verb calls the
+//! same implementation rather than each open-coding the same two `jj`
 //! shell-outs.
 //!
 //! # Why this is in the binary, not the storage crate
 //!
-//! `jjf-storage` deliberately does NOT check for the `bugs` bookmark
-//! in `Storage::open` — the storage layer treats "bookmark exists" as
-//! a precondition the caller is responsible for. The CLI wants a
-//! distinct, typed "run `jjf init` first" signal (exit 2, message
-//! pointing at the fix) rather than the raw jj-stderr that would
-//! bubble up from a first storage write against an empty
-//! `bookmarks(bugs)` revset, so it runs the probe itself.
+//! `jjf-storage` deliberately does NOT check for the `issues`
+//! bookmark in `Storage::open` — the storage layer treats
+//! "bookmark exists" as a precondition the caller is responsible for.
+//! The CLI wants a distinct, typed "run `jjf init` first" signal
+//! (exit 2, message pointing at the fix) rather than the raw
+//! jj-stderr that would bubble up from a first storage write against
+//! an empty `bookmarks(issues)` revset, so it runs the probe itself.
 //!
 //! If a future ticket lifts this check into `Storage::open_strict`
 //! (or extends the `StorageError` enum), this module can shrink to
@@ -22,7 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use jjf_storage::{BUGS_BOOKMARK, Error as StorageError};
+use jjf_storage::{Error as StorageError, ISSUES_BOOKMARK};
 
 use crate::CliError;
 
@@ -30,11 +30,11 @@ use crate::CliError;
 /// root` and translates the one specific "not a jj repo" stderr into
 /// `NotAJjRepo`; everything else becomes a generic `Probe` failure.
 ///
-/// Callers that ALSO need the `bugs` bookmark (every read/write verb
-/// that touches an existing bug) should use [`bugs_bookmark`]
-/// instead — it composes this probe with the bookmark check. Callers
-/// that meaningfully run before `jjf init` (today: `jjf remote
-/// add|ls|rm`) call this one directly.
+/// Callers that ALSO need the `issues` bookmark (every read/write
+/// verb that touches an existing issue) should use
+/// [`issues_bookmark`] instead — it composes this probe with the
+/// bookmark check. Callers that meaningfully run before `jjf init`
+/// (today: `jjf remote add|ls|rm`) call this one directly.
 pub(crate) fn jj_repo(cwd: &Path) -> Result<(), CliError> {
     let out = Command::new("jj")
         .arg("--repository")
@@ -56,7 +56,7 @@ pub(crate) fn jj_repo(cwd: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Probe that (a) `cwd` is inside a jj repo and (b) the `bugs`
+/// Probe that (a) `cwd` is inside a jj repo and (b) the `issues`
 /// bookmark exists on it. Both checks shell out to `jj` directly
 /// (mirroring what `Storage::init` does internally) so we can surface
 /// distinct preflight-error variants rather than the storage layer's
@@ -65,17 +65,17 @@ pub(crate) fn jj_repo(cwd: &Path) -> Result<(), CliError> {
 /// Most read/write verbs (`jjf new`, `jjf show`, `jjf ls`, etc.) call
 /// this. The `jjf remote *` verbs use the simpler [`jj_repo`] probe
 /// because remote setup is meaningful before `jjf init`.
-pub(crate) fn bugs_bookmark(cwd: &Path) -> Result<(), CliError> {
+pub(crate) fn issues_bookmark(cwd: &Path) -> Result<(), CliError> {
     // Check 1: is this a jj repo at all? Same logic as `jj_repo` —
     // reuse it so the two probes stay in sync.
     jj_repo(cwd)?;
 
-    // Check 2: does `bugs` bookmark exist? `jj bookmark list`
+    // Check 2: does `issues` bookmark exist? `jj bookmark list`
     // exits 0 either way; we key off stdout content.
     let out = Command::new("jj")
         .arg("--repository")
         .arg(cwd)
-        .args(["bookmark", "list", "-T", "name ++ \"\\n\"", BUGS_BOOKMARK])
+        .args(["bookmark", "list", "-T", "name ++ \"\\n\"", ISSUES_BOOKMARK])
         .output()
         .map_err(CliError::Probe)?;
     if !out.status.success() {
@@ -85,8 +85,8 @@ pub(crate) fn bugs_bookmark(cwd: &Path) -> Result<(), CliError> {
         ))));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    if !stdout.lines().any(|l| l.trim() == BUGS_BOOKMARK) {
-        return Err(CliError::MissingBugsBookmark(cwd.to_owned()));
+    if !stdout.lines().any(|l| l.trim() == ISSUES_BOOKMARK) {
+        return Err(CliError::MissingIssuesBookmark(cwd.to_owned()));
     }
     Ok(())
 }
@@ -119,16 +119,17 @@ const SELF_HOST_MARKERS: &[&str] = &["crates/jjf/Cargo.toml", "docs/storage-form
 /// # Why this exists
 ///
 /// jjforge is colocated jj+git: the storage layer's 4-CLI write dance
-/// (`jj new bookmarks(bugs)` → edit working copy → `jj describe` →
+/// (`jj new bookmarks(issues)` → edit working copy → `jj describe` →
 /// `jj bookmark set` → `jj new root()`) moves the jj working copy
-/// onto the `bugs` bookmark and back. In a colocated repo, this drag
-/// also moves git HEAD — jj writes `refs/jj/root` into `.git/HEAD`
-/// during the final `jj new root()` step. The result: after running
-/// any mutating `jjf` verb from inside the source repo, `git status`
-/// reports the whole tree as new-against-empty, and `git commit`
-/// lands on a phantom root commit instead of on top of `main`. The
-/// recovery is destructive (`git symbolic-ref HEAD refs/heads/main &&
-/// git reset --hard main`) and requires operator intervention.
+/// onto the `issues` bookmark and back. In a colocated repo, this
+/// drag also moves git HEAD — jj writes `refs/jj/root` into
+/// `.git/HEAD` during the final `jj new root()` step. The result:
+/// after running any mutating `jjf` verb from inside the source
+/// repo, `git status` reports the whole tree as new-against-empty,
+/// and `git commit` lands on a phantom root commit instead of on top
+/// of `main`. The recovery is destructive
+/// (`git symbolic-ref HEAD refs/heads/main && git reset --hard main`)
+/// and requires operator intervention.
 ///
 /// `--ignore-working-copy` on the underlying jj calls was investigated
 /// (see issue `08cf14b`) and does NOT prevent the drift — jj still
