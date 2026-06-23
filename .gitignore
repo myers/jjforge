@@ -20,3 +20,7 @@ experiments/**/test-repo/.git/
 /target/
 
 blog/public/
+
+# Read-only reference clones (e.g. ./reference/beads). Not part
+# of jjforge; cloned in-tree for grep/cross-reference.
+/reference/
