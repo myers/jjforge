@@ -23,7 +23,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::id::IssueId;
-use crate::record::{IssueType, Status};
+use crate::record::{DepKind, IssueType, Status};
 
 /// The op vocabulary per spec §5.2.
 ///
@@ -58,13 +58,33 @@ pub enum Op {
         issue_id: IssueId,
         label: String,
     },
+    /// Add a typed dependency edge. v2.4 (`agent-dep-types`) extended
+    /// the v1 `dep-add` op with a `kind` field. The wire stanza is:
+    ///
+    /// ```text
+    /// Jjf-Op: dep-add
+    /// Jjf-Issue: <owner>
+    /// Jjf-Dep: <target>
+    /// Jjf-Dep-Kind: <blocks|parent-child|related|discovered-from>
+    /// ```
+    ///
+    /// Backward compat: a v1 stanza with no `Jjf-Dep-Kind:` line
+    /// reads as `kind: Blocks` (the only kind the v1 model had).
     DepAdd {
         issue_id: IssueId,
         dep: IssueId,
+        #[serde(default)]
+        kind: DepKind,
     },
+    /// Remove a typed dependency edge. Symmetric to [`Op::DepAdd`] —
+    /// the `kind` field is required to disambiguate when multiple
+    /// kinds point at the same target. v1 stanzas without
+    /// `Jjf-Dep-Kind:` read as `kind: Blocks`.
     DepRm {
         issue_id: IssueId,
         dep: IssueId,
+        #[serde(default)]
+        kind: DepKind,
     },
     SetAssignee {
         issue_id: IssueId,
@@ -181,9 +201,12 @@ impl Op {
                 s.push_str(label);
                 s.push('\n');
             }
-            Op::DepAdd { dep, .. } | Op::DepRm { dep, .. } => {
+            Op::DepAdd { dep, kind, .. } | Op::DepRm { dep, kind, .. } => {
                 s.push_str("Jjf-Dep: ");
                 s.push_str(dep.as_str());
+                s.push('\n');
+                s.push_str("Jjf-Dep-Kind: ");
+                s.push_str(kind.as_str());
                 s.push('\n');
             }
             Op::SetAssignee { assignee, .. } => {

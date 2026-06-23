@@ -78,7 +78,9 @@ pub use jj::JjError;
 pub use memory::slugify;
 pub use merge_ops::{MergeReport, MergedIssue};
 pub use op::Op;
-pub use record::{Comment, Issue, IssueDraft, IssueRecord, IssueType, Memory, Status};
+pub use record::{
+    Comment, DepEdge, DepKind, Issue, IssueDraft, IssueRecord, IssueType, Memory, Status,
+};
 
 // `ReadyFilter` is declared below alongside its helpers, but we
 // re-state the export here for discoverability. Public types live
@@ -243,6 +245,90 @@ fn labels_match_all(issue_labels: &[String], wanted: &[String]) -> bool {
     wanted.iter().all(|w| issue_labels.iter().any(|l| l == w))
 }
 
+/// Compute the blocked set across all issues — the fixpoint
+/// implementation for the v2.4 dep-edge model
+/// (`agent-dep-types`). An issue X is blocked iff at least one of:
+///
+/// - X has a `blocks`-kind dep edge whose target is an OPEN or
+///   IN-PROGRESS issue (closed and dangling targets don't block).
+/// - X has a `parent-child`-kind dep edge whose target is OPEN/
+///   IN-PROGRESS AND target itself is BLOCKED. (Closed parents
+///   don't cascade; the cascade follows the parent's blocked-ness,
+///   not just its status. An open-and-not-blocked parent does NOT
+///   block its children.)
+///
+/// `related` and `discovered-from` edges are ignored entirely.
+///
+/// Cycle handling: a `parent-child` cycle (e.g. A→B and B→A where
+/// neither is closed) treats every node in the cycle as NOT BLOCKED
+/// via the cascade — the cascade rule "X is blocked iff parent is
+/// blocked" only fires when the parent is independently blocked
+/// (typically by a `blocks` edge). A pure cycle with no external
+/// blocker has nothing to propagate; the fixpoint converges with
+/// every node out of the cascade. Each node can still be blocked
+/// independently via its own `blocks` edges. Documented in the
+/// commit message and in `docs/storage-format.md` §3.x.
+///
+/// Returns the set of issue ids that are blocked.
+fn compute_blocked_set(all: &[Issue]) -> std::collections::HashSet<IssueId> {
+    use std::collections::{HashMap, HashSet};
+
+    let by_id: HashMap<IssueId, &Issue> = all.iter().map(|i| (i.id.clone(), i)).collect();
+
+    // Helper: is `target` active (open or in-progress)? Closed and
+    // dangling targets are NOT active and never block.
+    let is_active = |target: &IssueId| -> bool {
+        match by_id.get(target) {
+            Some(i) => match i.status {
+                Status::Open | Status::InProgress => true,
+                Status::Closed => false,
+            },
+            None => false, // dangling
+        }
+    };
+
+    let mut blocked: HashSet<IssueId> = HashSet::new();
+
+    // Seed: every issue with a `blocks` edge pointing at an active
+    // target is blocked. (The `blocks`-edge rule is non-cascading;
+    // we can resolve it in one pass.)
+    for issue in all {
+        for edge in &issue.dependencies {
+            if edge.kind == DepKind::Blocks && is_active(&edge.target) {
+                blocked.insert(issue.id.clone());
+                break;
+            }
+        }
+    }
+
+    // Fixpoint: propagate via `parent-child` edges. X is blocked if
+    // any parent (target of a `parent-child` edge) is BLOCKED and
+    // active. Iterate until no changes — bounded by issue count.
+    loop {
+        let mut changed = false;
+        for issue in all {
+            if blocked.contains(&issue.id) {
+                continue;
+            }
+            for edge in &issue.dependencies {
+                if edge.kind == DepKind::ParentChild
+                    && is_active(&edge.target)
+                    && blocked.contains(&edge.target)
+                {
+                    blocked.insert(issue.id.clone());
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    blocked
+}
+
 /// Type union helper. Empty wanted = match every type.
 fn types_match_any(issue_type: IssueType, wanted: &[IssueType]) -> bool {
     wanted.is_empty() || wanted.iter().any(|t| *t == issue_type)
@@ -370,6 +456,33 @@ pub const ISSUES_SEED_DESCRIPTION: &str = "jjf: seed issues bookmark";
 /// Storage never *writes* to this bookmark; it only checks for its
 /// presence so the migration knows when to run.
 const V1_BUGS_BOOKMARK: &str = "bugs";
+
+/// One node in a `parent-child` dependency tree (spec v2.4 §3.x).
+/// Returned by [`Storage::dep_tree`]; rendered by the CLI's
+/// `jjf dep tree` verb. The `children` list is sorted by id for
+/// determinism. The `cycle` flag is `true` if the node was reached
+/// via a cycle (the second time through), in which case recursion
+/// stops and `children` is empty.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DepTreeNode {
+    pub id: IssueId,
+    pub title: String,
+    pub status: Status,
+    pub children: Vec<DepTreeNode>,
+    /// `true` if this node was encountered a second time during the
+    /// DFS walk — the parent-child edges form a cycle here. The
+    /// renderer surfaces this in plain-text output ("(cycle)") and
+    /// the JSON envelope carries the same flag.
+    pub cycle: bool,
+}
+
+/// The `parent-child` tree returned by [`Storage::dep_tree`]. Rooted
+/// at a single issue id; depth-first walk through every node
+/// reachable via the parent-child edges in their CHILD direction.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DepTree {
+    pub root: DepTreeNode,
+}
 
 /// A handle to a repo whose `issues` bookmark exists. Use
 /// [`Storage::init`] to create the bookmark (idempotent) in a fresh
@@ -678,7 +791,7 @@ impl Storage {
             status: Status::Open,
             type_,
             labels: sorted_dedup(&draft.labels),
-            dependencies: sorted_dedup_ids(&draft.dependencies),
+            dependencies: sorted_dedup_edges(&draft.dependencies),
             assignee: draft.assignee.clone(),
             created_at: now.clone(),
             updated_at: now,
@@ -730,7 +843,8 @@ impl Storage {
         for dep in &record.dependencies {
             ops.push(Op::DepAdd {
                 issue_id: id.clone(),
-                dep: dep.clone(),
+                dep: dep.target.clone(),
+                kind: dep.kind,
             });
         }
         if let Some(assignee) = &record.assignee {
@@ -1062,31 +1176,170 @@ impl Storage {
         })
     }
 
-    /// Add a dependency.
+    /// Add a `blocks`-kind dependency. Convenience wrapper around
+    /// [`Storage::add_dep_edge`] with `kind = DepKind::Blocks`. Kept
+    /// stable across the v2.4 schema bump so existing callers keep
+    /// working.
     pub fn add_dependency(&self, id: &IssueId, dep: &IssueId) -> Result<()> {
-        let dep = dep.clone();
+        self.add_dep_edge(id, dep, DepKind::Blocks)
+    }
+
+    /// Remove a `blocks`-kind dependency. Convenience wrapper around
+    /// [`Storage::remove_dep_edge`] with `kind = DepKind::Blocks`.
+    pub fn remove_dependency(&self, id: &IssueId, dep: &IssueId) -> Result<()> {
+        self.remove_dep_edge(id, dep, DepKind::Blocks)
+    }
+
+    /// Add a typed dependency edge. Lands one `dep-add` op with the
+    /// `Jjf-Dep-Kind:` trailer carrying `kind`. The same `(target,
+    /// kind)` pair can't appear twice — the in-memory record dedupes —
+    /// but a fresh `dep-add` op still lands so the audit log records
+    /// intent. v2.4 (`agent-dep-types`).
+    pub fn add_dep_edge(
+        &self,
+        id: &IssueId,
+        target: &IssueId,
+        kind: DepKind,
+    ) -> Result<()> {
+        let target = target.clone();
         self.mutate(id, &format!("jjf: issue {} - dep-add", id), |rec| {
-            if !rec.dependencies.iter().any(|d| d == &dep) {
-                rec.dependencies.push(dep.clone());
+            let edge = DepEdge {
+                target: target.clone(),
+                kind,
+            };
+            if !rec
+                .dependencies
+                .iter()
+                .any(|d| d.target == edge.target && d.kind == edge.kind)
+            {
+                rec.dependencies.push(edge);
                 rec.dependencies.sort();
             }
             Ok(vec![Op::DepAdd {
                 issue_id: rec.id.clone(),
-                dep: dep.clone(),
+                dep: target.clone(),
+                kind,
             }])
         })
     }
 
-    /// Remove a dependency.
-    pub fn remove_dependency(&self, id: &IssueId, dep: &IssueId) -> Result<()> {
-        let dep = dep.clone();
+    /// Remove a typed dependency edge. Symmetric to
+    /// [`Storage::add_dep_edge`]; only edges with the matching
+    /// `(target, kind)` are removed, leaving other-kind edges to the
+    /// same target intact. v2.4 (`agent-dep-types`).
+    pub fn remove_dep_edge(
+        &self,
+        id: &IssueId,
+        target: &IssueId,
+        kind: DepKind,
+    ) -> Result<()> {
+        let target = target.clone();
         self.mutate(id, &format!("jjf: issue {} - dep-rm", id), |rec| {
-            rec.dependencies.retain(|d| d != &dep);
+            rec.dependencies
+                .retain(|d| !(d.target == target && d.kind == kind));
             Ok(vec![Op::DepRm {
                 issue_id: rec.id.clone(),
-                dep: dep.clone(),
+                dep: target.clone(),
+                kind,
             }])
         })
+    }
+
+    /// Build the parent-child tree rooted at `root_id`. Walks the
+    /// dependency edges in the OPPOSITE direction of how they're
+    /// stored: for each issue X with `parent-child` edge pointing at
+    /// `root_id`, X is a CHILD of `root_id`. We recurse depth-first
+    /// from the root, collecting children at each level.
+    ///
+    /// Returns a [`DepTree`] whose nodes are issues and whose edges
+    /// follow the parent-child relation. Cycles are detected via a
+    /// visited set; a cycled node appears once in the tree, then
+    /// recursion stops. Issues unreachable from `root_id` via the
+    /// parent-child relation are NOT included.
+    ///
+    /// v2.4 (`agent-dep-types`). Implementation: O(N) over every
+    /// issue on the bookmark per recursion level (we re-scan the
+    /// dependency list of each candidate to find children). For the
+    /// live planner's small N this is fine; if it gets slow, build
+    /// the reverse-index map once.
+    pub fn dep_tree(&self, root_id: &IssueId) -> Result<DepTree> {
+        // Load every issue once. The tree we return only carries
+        // (id, title, status) — the tree consumer can `read` for
+        // more — but we need the full deps field of every candidate
+        // to find children.
+        let ids = self.list_ids()?;
+        let mut all: Vec<Issue> = Vec::with_capacity(ids.len());
+        for id in &ids {
+            all.push(self.read(id)?);
+        }
+
+        // Build a child index: for each `parent-child` edge X →
+        // target, register X as a child of `target`. Iterating the
+        // map gives a deterministic child order if we sort by
+        // child-id before insert; we accumulate into a Vec keyed
+        // by parent id and sort within each parent's child list.
+        let mut children_of: std::collections::BTreeMap<IssueId, Vec<IssueId>> =
+            std::collections::BTreeMap::new();
+        for issue in &all {
+            for edge in &issue.dependencies {
+                if edge.kind == DepKind::ParentChild {
+                    children_of
+                        .entry(edge.target.clone())
+                        .or_default()
+                        .push(issue.id.clone());
+                }
+            }
+        }
+        for v in children_of.values_mut() {
+            v.sort();
+        }
+
+        let issue_by_id: std::collections::HashMap<IssueId, &Issue> =
+            all.iter().map(|i| (i.id.clone(), i)).collect();
+
+        // DFS walk. The root is included even if it's not in
+        // `issue_by_id` (defensive — a dangling id) but its children
+        // will be empty.
+        fn walk(
+            root: &IssueId,
+            issue_by_id: &std::collections::HashMap<IssueId, &Issue>,
+            children_of: &std::collections::BTreeMap<IssueId, Vec<IssueId>>,
+            visited: &mut std::collections::HashSet<IssueId>,
+        ) -> DepTreeNode {
+            let already_seen = !visited.insert(root.clone());
+            let (title, status) = match issue_by_id.get(root) {
+                Some(i) => (i.title.clone(), i.status),
+                None => (String::new(), Status::Open),
+            };
+            if already_seen {
+                // Cycle — don't recurse, but include the node so
+                // the cycle is visible in the rendered tree.
+                return DepTreeNode {
+                    id: root.clone(),
+                    title,
+                    status,
+                    children: Vec::new(),
+                    cycle: true,
+                };
+            }
+            let mut children_nodes: Vec<DepTreeNode> = Vec::new();
+            if let Some(child_ids) = children_of.get(root) {
+                for cid in child_ids {
+                    children_nodes.push(walk(cid, issue_by_id, children_of, visited));
+                }
+            }
+            DepTreeNode {
+                id: root.clone(),
+                title,
+                status,
+                children: children_nodes,
+                cycle: false,
+            }
+        }
+
+        let mut visited = std::collections::HashSet::new();
+        let root = walk(root_id, &issue_by_id, &children_of, &mut visited);
+        Ok(DepTree { root })
     }
 
     /// Append a comment. Generates a fresh 7-hex comment id and updates
@@ -1426,22 +1679,7 @@ impl Storage {
             all.push(self.read(id)?);
         }
 
-        // Build the closed-id set from the SAME read pass — no
-        // second IO round-trip. An open issue that depends on an id
-        // NOT in `all` (dangling) is treated as unblocked: the dep
-        // can't ever close (it doesn't exist), so we don't want to
-        // wedge progress on an editing typo.
-        //
-        // The sets own clones of the ids so the subsequent
-        // `all.into_iter().filter(...)` can move issues out of `all`
-        // without a borrow conflict.
-        let known: std::collections::HashSet<IssueId> =
-            all.iter().map(|i| i.id.clone()).collect();
-        let closed: std::collections::HashSet<IssueId> = all
-            .iter()
-            .filter(|i| i.status == Status::Closed)
-            .map(|i| i.id.clone())
-            .collect();
+        let blocked = compute_blocked_set(&all);
 
         // Roadmap-type issues are never returned. They're never work
         // to do; they're the planning surface itself. The ticket and
@@ -1451,6 +1689,11 @@ impl Storage {
         // by default — they're claimed by another agent. The
         // `include_claimed` flag flips them back in for "what's in
         // flight" views.
+        //
+        // v2.4 (`agent-dep-types`): "blocked" is now computed via
+        // [`compute_blocked_set`] — a fixpoint over `blocks` (hard
+        // prereq) and `parent-child` (cascade-via-parent) edges.
+        // `related` and `discovered-from` never affect blocked.
         let include_claimed = filter.include_claimed;
         let mut ready: Vec<Issue> = all
             .into_iter()
@@ -1460,13 +1703,7 @@ impl Storage {
                 Status::Closed => false,
             })
             .filter(|i| i.type_ != IssueType::Roadmap)
-            .filter(|i| {
-                // Every dep is either closed or dangling. An open or
-                // in-progress, existing dep blocks.
-                i.dependencies
-                    .iter()
-                    .all(|d| !known.contains(d) || closed.contains(d))
-            })
+            .filter(|i| !blocked.contains(&i.id))
             .filter(|i| labels_match_all(&i.labels, &filter.labels))
             .filter(|i| types_match_any(i.type_, &filter.types))
             .collect();
@@ -2088,8 +2325,10 @@ fn sorted_dedup(xs: &[String]) -> Vec<String> {
     v
 }
 
-fn sorted_dedup_ids(xs: &[IssueId]) -> Vec<IssueId> {
-    let mut v: Vec<IssueId> = xs.to_vec();
+/// Sort + dedup a slice of typed dep edges by `(target, kind)`.
+/// Mirrors [`sorted_dedup`]'s contract for the v2.4 edge shape.
+fn sorted_dedup_edges(xs: &[DepEdge]) -> Vec<DepEdge> {
+    let mut v: Vec<DepEdge> = xs.to_vec();
     v.sort();
     v.dedup();
     v
@@ -2520,5 +2759,465 @@ Jjf-Label: fixed
             s,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    // ---- v2.4 (agent-dep-types) tests ----------------------------------
+
+    /// v1 → v2.4 back-compat: an IssueRecord written by a pre-v2.4
+    /// writer carries `dependencies: ["abc1234", "def5678"]` (bare
+    /// string ids). The v2.4 reader materializes each string as a
+    /// `DepEdge { kind: Blocks }`, preserving the v1 default
+    /// semantics transparently. No backfill needed.
+    #[test]
+    fn v1_dependencies_read_as_blocks_edges() {
+        let v1_json = r#"{
+            "version": 2,
+            "id": "aa6600b",
+            "title": "v1 record",
+            "slug": null,
+            "body": "",
+            "status": "open",
+            "type": "unspecified",
+            "labels": [],
+            "dependencies": ["abc1234", "def5678"],
+            "assignee": null,
+            "created_at": "2026-06-22T12:00:00Z",
+            "updated_at": "2026-06-22T12:00:00Z"
+        }"#;
+        let rec: IssueRecord = serde_json::from_str(v1_json).unwrap();
+        assert_eq!(
+            rec.dependencies,
+            vec![
+                DepEdge {
+                    target: IssueId::parse("abc1234").unwrap(),
+                    kind: DepKind::Blocks,
+                },
+                DepEdge {
+                    target: IssueId::parse("def5678").unwrap(),
+                    kind: DepKind::Blocks,
+                },
+            ],
+        );
+    }
+
+    /// v2.4 round-trip: a record with mixed-kind edges serializes to
+    /// the tagged shape `{"target": "...", "kind": "..."}` and reads
+    /// back as the same edges.
+    #[test]
+    fn v24_tagged_edges_round_trip() {
+        let rec = IssueRecord {
+            version: 2,
+            id: IssueId::parse("aa6600b").unwrap(),
+            title: "v2.4 record".into(),
+            slug: None,
+            body: String::new(),
+            status: Status::Open,
+            type_: IssueType::Feature,
+            labels: vec![],
+            dependencies: vec![
+                DepEdge {
+                    target: IssueId::parse("abc1234").unwrap(),
+                    kind: DepKind::Blocks,
+                },
+                DepEdge {
+                    target: IssueId::parse("def5678").unwrap(),
+                    kind: DepKind::ParentChild,
+                },
+                DepEdge {
+                    target: IssueId::parse("1111111").unwrap(),
+                    kind: DepKind::Related,
+                },
+                DepEdge {
+                    target: IssueId::parse("2222222").unwrap(),
+                    kind: DepKind::DiscoveredFrom,
+                },
+            ],
+            assignee: None,
+            created_at: "2026-06-22T12:00:00Z".into(),
+            updated_at: "2026-06-22T12:00:00Z".into(),
+        };
+        let s = serde_json::to_string(&rec).unwrap();
+        // Spot-check: tagged form is present.
+        assert!(s.contains(r#""kind":"parent-child""#), "got: {s}");
+        assert!(s.contains(r#""kind":"discovered-from""#), "got: {s}");
+        let back: IssueRecord = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, rec);
+    }
+
+    /// Mixed v1/v2.4 entries in the same array (defensive — a
+    /// hand-edited record might mix shapes; the reader should
+    /// tolerate). v1 entries become `Blocks`; v2.4 entries keep
+    /// their kind.
+    #[test]
+    fn mixed_v1_and_v24_entries_deserialize() {
+        let json = r#"{
+            "version": 2,
+            "id": "aa6600b",
+            "title": "mixed",
+            "slug": null,
+            "body": "",
+            "status": "open",
+            "type": "unspecified",
+            "labels": [],
+            "dependencies": [
+                "abc1234",
+                {"target": "def5678", "kind": "parent-child"}
+            ],
+            "assignee": null,
+            "created_at": "2026-06-22T12:00:00Z",
+            "updated_at": "2026-06-22T12:00:00Z"
+        }"#;
+        let rec: IssueRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            rec.dependencies,
+            vec![
+                DepEdge {
+                    target: IssueId::parse("abc1234").unwrap(),
+                    kind: DepKind::Blocks,
+                },
+                DepEdge {
+                    target: IssueId::parse("def5678").unwrap(),
+                    kind: DepKind::ParentChild,
+                },
+            ],
+        );
+    }
+
+    /// `DepKind::parse_wire` round-trips for every variant.
+    #[test]
+    fn dep_kind_wire_round_trip() {
+        for k in [
+            DepKind::Blocks,
+            DepKind::ParentChild,
+            DepKind::Related,
+            DepKind::DiscoveredFrom,
+        ] {
+            assert_eq!(DepKind::parse_wire(k.as_str()), Some(k));
+        }
+        assert_eq!(DepKind::parse_wire("nope"), None);
+    }
+
+    /// Op trailer rendering carries `Jjf-Dep-Kind:` for each of the
+    /// four kinds. A `dep-add` op's stanza:
+    /// ```text
+    /// Jjf-Op: dep-add
+    /// Jjf-Issue: <owner>
+    /// Jjf-At: <stamp>
+    /// Jjf-Dep: <target>
+    /// Jjf-Dep-Kind: <kind>
+    /// ```
+    #[test]
+    fn dep_add_trailer_carries_dep_kind() {
+        let op = Op::DepAdd {
+            issue_id: IssueId::parse("aa6600b").unwrap(),
+            dep: IssueId::parse("def5678").unwrap(),
+            kind: DepKind::ParentChild,
+        };
+        let stanza = op.to_trailer_block("2026-06-22T12:00:00.000000000Z");
+        assert!(stanza.contains("Jjf-Op: dep-add"), "got: {stanza}");
+        assert!(stanza.contains("Jjf-Dep: def5678"), "got: {stanza}");
+        assert!(
+            stanza.contains("Jjf-Dep-Kind: parent-child"),
+            "got: {stanza}"
+        );
+    }
+
+    // ---- list_ready fixpoint cascade tests ------------------------------
+
+    /// Helper: build an `Issue` projection for the in-memory
+    /// `compute_blocked_set` tests. The function only inspects
+    /// `id`, `status`, `dependencies`, so we leave the other fields
+    /// at default-ish values.
+    fn mk_issue(id: &str, status: Status, deps: Vec<DepEdge>) -> Issue {
+        Issue {
+            id: IssueId::parse(id).unwrap(),
+            title: String::new(),
+            slug: None,
+            body: String::new(),
+            status,
+            type_: IssueType::Unspecified,
+            labels: vec![],
+            dependencies: deps,
+            assignee: None,
+            comments: vec![],
+            created_at: "2026-06-22T12:00:00Z".into(),
+            updated_at: "2026-06-22T12:00:00Z".into(),
+        }
+    }
+
+    fn iid(s: &str) -> IssueId {
+        IssueId::parse(s).unwrap()
+    }
+
+    /// Blocks-edge to an open target blocks the owner.
+    #[test]
+    fn blocks_edge_to_open_target_blocks_owner() {
+        let all = vec![
+            mk_issue("aaaaaa1", Status::Open, vec![]),
+            mk_issue(
+                "bbbbbb1",
+                Status::Open,
+                vec![DepEdge {
+                    target: iid("aaaaaa1"),
+                    kind: DepKind::Blocks,
+                }],
+            ),
+        ];
+        let blocked = compute_blocked_set(&all);
+        assert!(blocked.contains(&iid("bbbbbb1")));
+        assert!(!blocked.contains(&iid("aaaaaa1")));
+    }
+
+    /// Blocks-edge to a closed target does NOT block the owner.
+    #[test]
+    fn blocks_edge_to_closed_target_unblocks_owner() {
+        let all = vec![
+            mk_issue("aaaaaa2", Status::Closed, vec![]),
+            mk_issue(
+                "bbbbbb2",
+                Status::Open,
+                vec![DepEdge {
+                    target: iid("aaaaaa2"),
+                    kind: DepKind::Blocks,
+                }],
+            ),
+        ];
+        let blocked = compute_blocked_set(&all);
+        assert!(!blocked.contains(&iid("bbbbbb2")));
+    }
+
+    /// Related and DiscoveredFrom edges to an open target do NOT
+    /// block the owner.
+    #[test]
+    fn related_and_discovered_from_edges_do_not_block() {
+        let all = vec![
+            mk_issue("aaaaaa3", Status::Open, vec![]),
+            mk_issue(
+                "bbbbbb3",
+                Status::Open,
+                vec![DepEdge {
+                    target: iid("aaaaaa3"),
+                    kind: DepKind::Related,
+                }],
+            ),
+            mk_issue(
+                "ccccc03",
+                Status::Open,
+                vec![DepEdge {
+                    target: iid("aaaaaa3"),
+                    kind: DepKind::DiscoveredFrom,
+                }],
+            ),
+        ];
+        let blocked = compute_blocked_set(&all);
+        assert!(!blocked.contains(&iid("bbbbbb3")));
+        assert!(!blocked.contains(&iid("ccccc03")));
+    }
+
+    /// Parent-child cascade: A → B → C via parent-child. A is open
+    /// and blocked (by a `blocks` edge to D). Both B and C are
+    /// blocked via the cascade.
+    #[test]
+    fn parent_child_cascade_open_blocked_parent_blocks_children() {
+        let d = iid("ddddddd");
+        let a = iid("aaaaaa4");
+        let b = iid("bbbbbb4");
+        let c = iid("ccccc04");
+        let all = vec![
+            mk_issue("ddddddd", Status::Open, vec![]),
+            mk_issue(
+                "aaaaaa4",
+                Status::Open,
+                vec![DepEdge {
+                    target: d.clone(),
+                    kind: DepKind::Blocks,
+                }],
+            ),
+            mk_issue(
+                "bbbbbb4",
+                Status::Open,
+                vec![DepEdge {
+                    target: a.clone(),
+                    kind: DepKind::ParentChild,
+                }],
+            ),
+            mk_issue(
+                "ccccc04",
+                Status::Open,
+                vec![DepEdge {
+                    target: b.clone(),
+                    kind: DepKind::ParentChild,
+                }],
+            ),
+        ];
+        let blocked = compute_blocked_set(&all);
+        // A is blocked by the blocks edge.
+        assert!(blocked.contains(&a));
+        // B and C inherit via the parent-child cascade.
+        assert!(blocked.contains(&b));
+        assert!(blocked.contains(&c));
+        // D is not blocked.
+        assert!(!blocked.contains(&d));
+    }
+
+    /// Parent-child cascade: same A → B → C chain, but A is CLOSED.
+    /// Closed parents do NOT block children (closed deps don't
+    /// participate). B and C are NOT blocked.
+    #[test]
+    fn parent_child_cascade_closed_parent_does_not_block_children() {
+        let a = iid("aaaaaa5");
+        let b = iid("bbbbbb5");
+        let c = iid("ccccc05");
+        let all = vec![
+            mk_issue("aaaaaa5", Status::Closed, vec![]),
+            mk_issue(
+                "bbbbbb5",
+                Status::Open,
+                vec![DepEdge {
+                    target: a.clone(),
+                    kind: DepKind::ParentChild,
+                }],
+            ),
+            mk_issue(
+                "ccccc05",
+                Status::Open,
+                vec![DepEdge {
+                    target: b.clone(),
+                    kind: DepKind::ParentChild,
+                }],
+            ),
+        ];
+        let blocked = compute_blocked_set(&all);
+        assert!(!blocked.contains(&b));
+        assert!(!blocked.contains(&c));
+    }
+
+    /// Parent-child cascade: A is open and NOT blocked (no blocks
+    /// edge, no blocked parent). B and C are NOT blocked via the
+    /// cascade — the cascade only fires when the parent is BLOCKED,
+    /// not merely open.
+    #[test]
+    fn parent_child_cascade_open_but_unblocked_parent_does_not_block_children() {
+        let a = iid("aaaaaa6");
+        let b = iid("bbbbbb6");
+        let c = iid("ccccc06");
+        let all = vec![
+            mk_issue("aaaaaa6", Status::Open, vec![]),
+            mk_issue(
+                "bbbbbb6",
+                Status::Open,
+                vec![DepEdge {
+                    target: a.clone(),
+                    kind: DepKind::ParentChild,
+                }],
+            ),
+            mk_issue(
+                "ccccc06",
+                Status::Open,
+                vec![DepEdge {
+                    target: b.clone(),
+                    kind: DepKind::ParentChild,
+                }],
+            ),
+        ];
+        let blocked = compute_blocked_set(&all);
+        assert!(!blocked.contains(&a));
+        assert!(!blocked.contains(&b));
+        assert!(!blocked.contains(&c));
+    }
+
+    /// Cycle handling: A → B and B → A via parent-child, neither
+    /// closed, neither has a blocks edge. The fixpoint terminates
+    /// (bounded by issue count) and treats both as NOT BLOCKED.
+    /// Documented policy: a pure parent-child cycle with no external
+    /// blocker doesn't propagate — there's nothing to cascade.
+    #[test]
+    fn parent_child_cycle_without_external_blocker_terminates_and_unblocks() {
+        let a = iid("aaaaaa7");
+        let b = iid("bbbbbb7");
+        let all = vec![
+            mk_issue(
+                "aaaaaa7",
+                Status::Open,
+                vec![DepEdge {
+                    target: b.clone(),
+                    kind: DepKind::ParentChild,
+                }],
+            ),
+            mk_issue(
+                "bbbbbb7",
+                Status::Open,
+                vec![DepEdge {
+                    target: a.clone(),
+                    kind: DepKind::ParentChild,
+                }],
+            ),
+        ];
+        // The fixpoint must terminate. If the loop runs forever the
+        // test hangs — which is the assertion, in effect.
+        let blocked = compute_blocked_set(&all);
+        assert!(!blocked.contains(&a));
+        assert!(!blocked.contains(&b));
+    }
+
+    /// Cycle handling with external blocker: A → B and B → A via
+    /// parent-child, AND A has a blocks-edge to C (open). The
+    /// cascade now propagates: A is blocked → B is blocked (B is
+    /// child of A) → A is already blocked (idempotent). The fixpoint
+    /// terminates with BOTH blocked.
+    #[test]
+    fn parent_child_cycle_with_external_blocker_propagates_to_both() {
+        let a = iid("aaaaaa8");
+        let b = iid("bbbbbb8");
+        let c = iid("ccccc08");
+        let all = vec![
+            mk_issue("ccccc08", Status::Open, vec![]),
+            mk_issue(
+                "aaaaaa8",
+                Status::Open,
+                vec![
+                    DepEdge {
+                        target: b.clone(),
+                        kind: DepKind::ParentChild,
+                    },
+                    DepEdge {
+                        target: c.clone(),
+                        kind: DepKind::Blocks,
+                    },
+                ],
+            ),
+            mk_issue(
+                "bbbbbb8",
+                Status::Open,
+                vec![DepEdge {
+                    target: a.clone(),
+                    kind: DepKind::ParentChild,
+                }],
+            ),
+        ];
+        let blocked = compute_blocked_set(&all);
+        assert!(blocked.contains(&a));
+        assert!(blocked.contains(&b));
+        assert!(!blocked.contains(&c));
+    }
+
+    /// A dangling parent-child target (non-existent issue id) does
+    /// NOT block the owner — same policy as the v1 blocks-on-
+    /// dangling rule. Defensive: a typo in a dep id shouldn't wedge
+    /// progress on the owner.
+    #[test]
+    fn dangling_parent_child_target_does_not_block() {
+        let phantom = iid("fffffff");
+        let b = iid("bbbbbb9");
+        let all = vec![mk_issue(
+            "bbbbbb9",
+            Status::Open,
+            vec![DepEdge {
+                target: phantom.clone(),
+                kind: DepKind::ParentChild,
+            }],
+        )];
+        let blocked = compute_blocked_set(&all);
+        assert!(!blocked.contains(&b));
     }
 }

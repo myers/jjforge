@@ -47,7 +47,7 @@ use crate::jj::JjRepo;
 #[cfg(any(debug_assertions, test))]
 use crate::op::Op;
 #[cfg(any(debug_assertions, test))]
-use crate::record::{IssueType, Status};
+use crate::record::{DepEdge, IssueType, Status};
 use crate::record::{Comment, Issue, IssueRecord};
 use crate::{issue_comments_relpath, issue_json_relpath, Error, Result, ISSUES_BOOKMARK_REVSET};
 
@@ -188,7 +188,11 @@ struct OpView {
     /// predates the new field).
     type_: IssueType,
     labels: Vec<String>,
-    dependencies: Vec<IssueId>,
+    /// Typed dependency edges. v2.4 — same shape as
+    /// [`IssueRecord::dependencies`]; the read path cross-check
+    /// compares the file's edge list (sorted by `(target, kind)`)
+    /// against the op-replay projection.
+    dependencies: Vec<DepEdge>,
     assignee: Option<String>,
     /// Comment IDs in the order they were added (op chain order, oldest
     /// first). Used to validate that the JSONL file matches.
@@ -284,13 +288,17 @@ fn apply_op(view: &mut Option<OpView>, op: Op) {
                     }
                 }
                 Op::LabelRm { label, .. } => v.labels.retain(|l| l != &label),
-                Op::DepAdd { dep, .. } => {
-                    if !v.dependencies.iter().any(|d| d == &dep) {
-                        v.dependencies.push(dep);
+                Op::DepAdd { dep, kind, .. } => {
+                    let edge = DepEdge { target: dep, kind };
+                    if !v.dependencies.iter().any(|d| d == &edge) {
+                        v.dependencies.push(edge);
                         v.dependencies.sort();
                     }
                 }
-                Op::DepRm { dep, .. } => v.dependencies.retain(|d| d != &dep),
+                Op::DepRm { dep, kind, .. } => {
+                    v.dependencies
+                        .retain(|d| !(d.target == dep && d.kind == kind))
+                }
                 Op::SetAssignee { assignee, .. } => v.assignee = assignee,
                 Op::SetType { kind, .. } => v.type_ = kind,
                 Op::SetSlug { slug, .. } => v.slug = slug,

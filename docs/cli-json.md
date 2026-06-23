@@ -1,5 +1,44 @@
 # `jjf --json` output contract
 
+## v2.3 → v2.4 changelog
+
+Backwards-compatible additions, landed in the `agent-dep-types`
+ticket (`b6d066b`).
+
+- **New subcommand family `jjf dep add|rm|tree`** — manage
+  typed dependency edges between issues. Four edge kinds:
+  `blocks`, `parent-child`, `related`, `discovered-from`.
+  See "Dep verbs" below for envelope shapes.
+- **`jjf new -d` accepts `<kind>:<id>` inline** in addition
+  to the v1 bare-id shape. The bare-id form keeps the v1
+  default (`blocks`); the typed form lets you say
+  `-d parent-child:abc1234`. Bad kind → `bad_dep_kind`
+  (preflight, exit 2).
+- **`jjf show` plain-text dependency section** changes from
+  a single `dependencies: <id1>, <id2>` line to a typed
+  section:
+
+  ```text
+  dependencies:
+    blocks: abc1234, def5678
+    parent-child: ghi9012
+  ```
+
+  An empty dep set still renders `dependencies: (none)`.
+  `--json` output of `show` carries the new
+  `[{target, kind}, ...]` array shape under `dependencies`
+  (v2.4 spec §3).
+
+- **`jjf ready` cascade.** With v2.4 edge kinds, an issue is
+  blocked if any `blocks`-kind dep target is active, OR any
+  `parent-child` target is itself blocked (fixpoint cascade).
+  `related` and `discovered-from` edges are ignored.
+  `jjf ready` continues to return JSON-array-of-Issue.
+- **New error kind `bad_dep_kind`** (preflight, exit 2):
+  `--dep <kind>:<id>` carried an unknown kind token.
+  `details.value` is the raw spec; `details.kind` is the bad
+  kind token; `details.field` is `"dep"`.
+
 ## v2.2 → v2.3 changelog
 
 Backwards-compatible additions, landed in the
@@ -74,6 +113,59 @@ ticket (`81db913`).
   (preflight, exit 2), `empty_memory_key` (preflight, exit 2,
   with `details.value`), `memory_not_found` (runtime, exit 1,
   with `details.key`).
+
+## Dep verbs (v2.4)
+
+### `jjf dep add <child> <parent> [--kind <kind>]`
+
+Mutating envelope:
+
+```json
+{"ok": true, "child": "abc1234", "parent": "def5678", "kind": "blocks", "action": "added"}
+```
+
+- `child` / `parent`: the resolved 7-hex ids.
+- `kind`: one of `blocks` / `parent-child` / `related` /
+  `discovered-from`. Defaults to `blocks` if `--kind` is
+  omitted.
+- `action`: `"added"`.
+
+### `jjf dep rm <child> <parent> [--kind <kind>]`
+
+Same envelope shape as `dep add`, but `action: "removed"`.
+Only edges with the matching `(target, kind)` are removed;
+other-kind edges to the same target stay.
+
+### `jjf dep tree <id>`
+
+Read verb. Plain-text output is an indented tree:
+
+```text
+abc1234 [open] epic A
+  def5678 [open] child B
+    ghi9012 [closed] grandchild C
+```
+
+`--json` envelope is the structured `DepTree`:
+
+```json
+{
+  "root": {
+    "id": "abc1234",
+    "title": "epic A",
+    "status": "open",
+    "children": [
+      {"id": "def5678", "title": "child B", "status": "open",
+       "children": [], "cycle": false}
+    ],
+    "cycle": false
+  }
+}
+```
+
+- `cycle: true` flags a node reached a second time via a
+  cycle; recursion stops there and `children: []` for that
+  node.
 
 ## Memory verbs (v2.2)
 
@@ -286,6 +378,7 @@ from plain-text mode (see the top comment in `main.rs`: `0` success,
 | `missing_issues_bookmark`    | 2    | `MissingIssuesBookmark`       | `path`                   |
 | `issue_not_found`            | 1    | `Storage::IssueNotFound`      | `id`                     |
 | `bad_id`                     | 2    | `BadIssueId` / `BadDepId`     | `value`, `field`         |
+| `bad_dep_kind`               | 2    | `BadDepKind` (v2.4)           | `value`, `kind`, `field` |
 | `empty_body`                 | 2    | `EmptyCommentBody`            | —                        |
 | `empty_label`                | 2    | `EmptyLabel`                  | —                        |
 | `missing_author`             | 2    | `MissingAuthor`               | —                        |

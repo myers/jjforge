@@ -41,8 +41,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use jjf_storage::{
-    ISSUES_BOOKMARK, Error as StorageError, IdError, Issue, IssueDraft, IssueId, IssueType,
-    Memory, ReadyFilter, SlugInvalidReason, Status, Storage, UpdateFields,
+    ISSUES_BOOKMARK, DepEdge, DepKind, DepTreeNode, Error as StorageError, IdError, Issue,
+    IssueDraft, IssueId, IssueType, Memory, ReadyFilter, SlugInvalidReason, Status, Storage,
+    UpdateFields,
 };
 
 /// Top-level CLI shape. Subcommands live on the `Commands` enum; the
@@ -124,6 +125,63 @@ impl From<TypeArg> for IssueType {
             TypeArg::Research => IssueType::Research,
             TypeArg::Roadmap => IssueType::Roadmap,
         }
+    }
+}
+
+/// Clap-side mirror of [`jjf_storage::DepKind`] for the `--kind` flag
+/// on `jjf dep add|rm`. Same crate-isolation rationale as `StatusArg`
+/// / `TypeArg`. Wire spelling matches the storage layer's kebab-case
+/// (`blocks`, `parent-child`, `related`, `discovered-from`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DepKindArg {
+    Blocks,
+    #[value(name = "parent-child")]
+    ParentChild,
+    Related,
+    #[value(name = "discovered-from")]
+    DiscoveredFrom,
+}
+
+impl From<DepKindArg> for DepKind {
+    fn from(k: DepKindArg) -> Self {
+        match k {
+            DepKindArg::Blocks => DepKind::Blocks,
+            DepKindArg::ParentChild => DepKind::ParentChild,
+            DepKindArg::Related => DepKind::Related,
+            DepKindArg::DiscoveredFrom => DepKind::DiscoveredFrom,
+        }
+    }
+}
+
+/// Parse one `-d <spec>` value from the CLI. Accepts:
+///
+/// - A bare 7-char hex id (`abc1234`): interpreted as
+///   `blocks:abc1234` for v1 / pre-v2.4 muscle memory.
+/// - `<kind>:<id>` for explicit kinds, where `<kind>` is one of
+///   `blocks`, `parent-child`, `related`, `discovered-from`.
+///
+/// On parse error returns the appropriate `CliError` variant — bad
+/// kind or bad id surface as `BadDepId` / `BadDepKind`.
+fn parse_dep_spec(raw: String) -> Result<DepEdge, CliError> {
+    if let Some((kind_str, id_str)) = raw.split_once(':') {
+        let kind = DepKind::parse_wire(kind_str).ok_or_else(|| CliError::BadDepKind {
+            value: raw.clone(),
+            kind: kind_str.to_owned(),
+        })?;
+        let target = IssueId::parse(id_str).map_err(|error| CliError::BadDepId {
+            value: raw.clone(),
+            error,
+        })?;
+        Ok(DepEdge { target, kind })
+    } else {
+        let target = IssueId::parse(&raw).map_err(|error| CliError::BadDepId {
+            value: raw.clone(),
+            error,
+        })?;
+        Ok(DepEdge {
+            target,
+            kind: DepKind::Blocks,
+        })
     }
 }
 
@@ -460,6 +518,23 @@ enum Commands {
         action: LabelAction,
     },
 
+    /// Manage typed dependency edges between issues (v2.4
+    /// `agent-dep-types`). Four edge kinds with distinct semantics:
+    ///
+    /// - `blocks`: hard prerequisite. The owning issue is blocked
+    ///   until the target closes; `jjf ready` honors this.
+    /// - `parent-child`: hierarchical. The owning issue is a CHILD
+    ///   of the target; `jjf ready` cascades the parent's blocked
+    ///   state to its children via fixpoint.
+    /// - `related`: soft cross-link. Reference only.
+    /// - `discovered-from`: provenance. "Found while working on X."
+    ///
+    /// Per-verb help: `jjf dep add|rm|tree --help`.
+    Dep {
+        #[command(subcommand)]
+        action: DepAction,
+    },
+
     /// Manage git remotes on the underlying jj repo. Thin wrapper over
     /// `jj git remote add|list|remove` — jj already supports git
     /// transport for bookmarks (and bookmarks ARE the unit `issues`
@@ -621,6 +696,54 @@ enum LabelAction {
     },
 }
 
+/// Inner enum for `jjf dep <action>` — v2.4 (`agent-dep-types`).
+/// Same shape rationale as `LabelAction` (one help page per
+/// subcommand, clean clap-derive output). The three verbs are
+/// `add` / `rm` / `tree`; `add` and `rm` take a `--kind` flag
+/// defaulting to `blocks` for v1 muscle memory.
+#[derive(Debug, Subcommand)]
+enum DepAction {
+    /// Add a typed dependency edge from `<child>` to `<parent>`.
+    /// Default kind is `blocks` (the v1 default). Lands one
+    /// `dep-add` op with the `Jjf-Dep-Kind:` trailer carrying the
+    /// chosen kind. Idempotent at the record level (the edge set
+    /// dedupes on `(target, kind)`) but NOT at the commit level —
+    /// a fresh op lands either way per spec §5.2.
+    ///
+    /// Both arguments accept `id`-or-`slug` per the v2.1 resolver.
+    Add {
+        /// The owning issue (the "child" in parent-child terminology).
+        child: String,
+        /// The target issue (the "parent" in parent-child terminology;
+        /// the blocker in blocks terminology).
+        parent: String,
+        /// Edge kind. Defaults to `blocks` for v1 muscle memory.
+        #[arg(long, value_enum, default_value_t = DepKindArg::Blocks)]
+        kind: DepKindArg,
+    },
+    /// Remove a typed dependency edge of the given kind. Only edges
+    /// with the matching `(target, kind)` are removed, leaving
+    /// other-kind edges to the same target intact.
+    Rm {
+        /// The owning issue (the "child" in parent-child terminology).
+        child: String,
+        /// The target issue.
+        parent: String,
+        /// Edge kind. Defaults to `blocks` for v1 muscle memory.
+        #[arg(long, value_enum, default_value_t = DepKindArg::Blocks)]
+        kind: DepKindArg,
+    },
+    /// Print the parent-child tree rooted at `<id>`. Walks the
+    /// `parent-child` edges in the CHILD direction (X is a child of
+    /// Y iff X carries a `parent-child` edge with target Y).
+    /// Cycles surface as a `(cycle)` marker; depth is unbounded.
+    /// `--json` emits the structured `DepTree` envelope.
+    Tree {
+        /// Root issue (id-or-slug).
+        id: String,
+    },
+}
+
 /// Inner enum for `jjf remote <action>`. Same shape rationale as
 /// `LabelAction` — one help page per subcommand, clean clap-derive
 /// `--help` output, plus distinct positional shapes per arm.
@@ -687,6 +810,13 @@ enum CliError {
     /// no point in starting the dance only to fail mid-write.
     #[error("invalid issue id for --dep {value:?}: {error}")]
     BadDepId { value: String, error: IdError },
+
+    /// A `-d / --dep <kind>:<id>` value carried an unknown kind token
+    /// (i.e. not one of `blocks`, `parent-child`, `related`,
+    /// `discovered-from`). v2.4 (`agent-dep-types`). Preflight failure
+    /// (exit 2).
+    #[error("invalid dep kind {kind:?} in spec {value:?}")]
+    BadDepKind { value: String, kind: String },
 
     /// A positional issue id (e.g. `jjf show <id>`) didn't parse as
     /// a valid `IssueId`. Preflight failure (exit 2) — the user typed
@@ -960,6 +1090,7 @@ impl CliError {
             CliError::Cwd(_) => 2,
             CliError::BodyRead { .. } => 2,
             CliError::BadDepId { .. } => 2,
+            CliError::BadDepKind { .. } => 2,
             CliError::BadIssueId { .. } => 2,
             CliError::MissingIssuesBookmark(_) => 2,
             CliError::EmptyCommentBody => 2,
@@ -1027,6 +1158,7 @@ impl CliError {
             CliError::Cwd(_) => "cwd_error",
             CliError::BodyRead { .. } => "body_read_error",
             CliError::BadDepId { .. } => "bad_id",
+            CliError::BadDepKind { .. } => "bad_dep_kind",
             CliError::BadIssueId { .. } => "bad_id",
             CliError::MissingIssuesBookmark(_) => "missing_issues_bookmark",
             CliError::EmptyCommentBody => "empty_body",
@@ -1073,6 +1205,11 @@ impl CliError {
             }
             CliError::BodyRead { from, .. } => json!({ "from": from }),
             CliError::BadDepId { value, .. } => json!({ "value": value, "field": "dep" }),
+            CliError::BadDepKind { value, kind } => json!({
+                "value": value,
+                "kind": kind,
+                "field": "dep",
+            }),
             CliError::BadIssueId { value, .. } => json!({ "value": value, "field": "id" }),
             CliError::MissingIssuesBookmark(path) => {
                 json!({ "path": path.display().to_string() })
@@ -1216,6 +1353,15 @@ fn run(cli: Cli) -> Result<(), CliError> {
             }
             LabelAction::Rm { id, label } => run_label(cli.json, id, label, LabelOp::Rm),
         },
+        Commands::Dep { action } => match action {
+            DepAction::Add { child, parent, kind } => {
+                run_dep(cli.json, child, parent, kind.into(), DepOp::Add)
+            }
+            DepAction::Rm { child, parent, kind } => {
+                run_dep(cli.json, child, parent, kind.into(), DepOp::Rm)
+            }
+            DepAction::Tree { id } => run_dep_tree(cli.json, id),
+        },
         Commands::Remote { action } => match action {
             RemoteAction::Add { name, url } => run_remote_add(cli.json, name, url),
             RemoteAction::Ls => run_remote_ls(cli.json),
@@ -1258,6 +1404,14 @@ fn run(cli: Cli) -> Result<(), CliError> {
 /// verb (`added` / `removed`) without re-matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LabelOp {
+    Add,
+    Rm,
+}
+
+/// Which storage mutator `run_dep` should call. Same shape rationale
+/// as `LabelOp` — v2.4 (`agent-dep-types`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DepOp {
     Add,
     Rm,
 }
@@ -1311,12 +1465,15 @@ fn run_new(
     type_arg: Option<TypeArg>,
     slug: Option<String>,
 ) -> Result<(), CliError> {
-    // 1. Parse dep ids first — purely-local validation, no IO.
-    let deps: Vec<IssueId> = deps
+    // 1. Parse dep specs first — purely-local validation, no IO.
+    // v2.4 (`agent-dep-types`): each spec is either a bare 7-hex id
+    // (interpreted as `blocks:<id>`) or `<kind>:<id>` for explicit
+    // kinds. The `kind` token is one of
+    // `blocks`/`parent-child`/`related`/`discovered-from`; unknown
+    // kinds are a preflight failure (exit 2).
+    let deps: Vec<DepEdge> = deps
         .into_iter()
-        .map(|raw| {
-            IssueId::parse(&raw).map_err(|error| CliError::BadDepId { value: raw, error })
-        })
+        .map(parse_dep_spec)
         .collect::<Result<Vec<_>, _>>()?;
 
     // 2. Read the body. `-F -` is stdin; `-F <path>` is the file's
@@ -1732,17 +1889,31 @@ fn print_issue_plain(issue: &Issue) {
     println!("labels: {labels}");
     let assignee = issue.assignee.as_deref().unwrap_or("(none)");
     println!("assignee: {assignee}");
-    let deps = if issue.dependencies.is_empty() {
-        "(none)".to_owned()
+    // v2.4: the dependency section renders one line per kind so the
+    // typed-edge model is visible at a glance. Empty kinds are
+    // collapsed; an entirely empty dep set falls back to the v1 shape
+    // `dependencies: (none)`.
+    if issue.dependencies.is_empty() {
+        println!("dependencies: (none)");
     } else {
-        issue
-            .dependencies
-            .iter()
-            .map(|d| d.as_str().to_owned())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    println!("dependencies: {deps}");
+        println!("dependencies:");
+        for kind in [
+            DepKind::Blocks,
+            DepKind::ParentChild,
+            DepKind::Related,
+            DepKind::DiscoveredFrom,
+        ] {
+            let targets: Vec<String> = issue
+                .dependencies
+                .iter()
+                .filter(|e| e.kind == kind)
+                .map(|e| e.target.as_str().to_owned())
+                .collect();
+            if !targets.is_empty() {
+                println!("  {}: {}", kind.as_str(), targets.join(", "));
+            }
+        }
+    }
     println!(
         "created: {}   updated: {}",
         issue.created_at, issue.updated_at
@@ -1901,6 +2072,97 @@ fn run_label(json: bool, id: String, label: String, op: LabelOp) -> Result<(), C
         println!("label {action_word}: {label} -> {issue_id}");
     }
     Ok(())
+}
+
+/// `jjf dep add|rm <child> <parent> [--kind <kind>]` — wrap
+/// `Storage::add_dep_edge` / `Storage::remove_dep_edge`. v2.4
+/// (`agent-dep-types`). Preflight mirrors `run_label`: refuse to run
+/// from the source repo, probe for the `issues` bookmark, resolve
+/// both handles (id-or-slug). The edge kind defaults to `blocks` at
+/// the clap layer; the storage call lands a `dep-add` / `dep-rm` op
+/// with the `Jjf-Dep-Kind:` trailer.
+fn run_dep(
+    json: bool,
+    child: String,
+    parent: String,
+    kind: DepKind,
+    op: DepOp,
+) -> Result<(), CliError> {
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    preflight::refuse_self_hosted_write(&cwd, json)?;
+    preflight::issues_bookmark(&cwd)?;
+
+    let storage = Storage::open(&cwd)?;
+    let child_id = resolve_handle(&storage, &child)?;
+    let parent_id = resolve_handle(&storage, &parent)?;
+    match op {
+        DepOp::Add => storage.add_dep_edge(&child_id, &parent_id, kind)?,
+        DepOp::Rm => storage.remove_dep_edge(&child_id, &parent_id, kind)?,
+    }
+
+    let action_word = match op {
+        DepOp::Add => "added",
+        DepOp::Rm => "removed",
+    };
+    if json {
+        let out = serde_json::json!({
+            "ok": true,
+            "child": child_id.as_str(),
+            "parent": parent_id.as_str(),
+            "kind": kind.as_str(),
+            "action": action_word,
+        });
+        println!("{out}");
+    } else {
+        println!(
+            "dep {action_word}: {} {} -> {}",
+            kind.as_str(),
+            child_id,
+            parent_id
+        );
+    }
+    Ok(())
+}
+
+/// `jjf dep tree <id>` — print the parent-child tree rooted at `<id>`.
+/// v2.4 (`agent-dep-types`). Read-only verb; no source-repo guard
+/// needed.
+fn run_dep_tree(json: bool, id: String) -> Result<(), CliError> {
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    preflight::issues_bookmark(&cwd)?;
+
+    let storage = Storage::open(&cwd)?;
+    let root_id = resolve_handle(&storage, &id)?;
+    let tree = storage.dep_tree(&root_id)?;
+    if json {
+        let payload = serde_json::to_string(&tree)
+            .expect("DepTree serializes — derive contract");
+        println!("{payload}");
+    } else {
+        render_dep_tree_text(&tree.root, 0);
+    }
+    Ok(())
+}
+
+/// Indent-by-2-spaces text rendering of a `DepTree`. Each level
+/// shows `<id> <status> <title>`; a cycled node carries a `(cycle)`
+/// suffix and stops recursing.
+fn render_dep_tree_text(node: &DepTreeNode, depth: usize) {
+    let indent = "  ".repeat(depth);
+    let cycle_suffix = if node.cycle { " (cycle)" } else { "" };
+    println!(
+        "{}{} [{}] {}{}",
+        indent,
+        node.id,
+        node.status.as_str(),
+        node.title,
+        cycle_suffix
+    );
+    for child in &node.children {
+        render_dep_tree_text(child, depth + 1);
+    }
 }
 
 /// `jjf remote add <name> <url>` — wrap `jj git remote add <name>

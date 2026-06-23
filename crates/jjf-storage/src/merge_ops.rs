@@ -47,7 +47,7 @@ use crate::history::HistoryEntry;
 use crate::id::IssueId;
 use crate::jj::JjRepo;
 use crate::op::Op;
-use crate::record::{Comment, IssueRecord, IssueType};
+use crate::record::{Comment, DepEdge, DepKind, IssueRecord, IssueType};
 use crate::{issue_comments_relpath, issue_json_relpath, Error, Result};
 
 /// One issue after the op-space reducer has folded all heads' chains
@@ -310,8 +310,14 @@ pub(crate) fn reduce_to_merged(
     // Per-label / per-dep last-write tracker. A `LabelAdd` writes
     // `true`, a `LabelRm` writes `false`; final pass takes the keys
     // whose final value is `true`.
+    //
+    // v2.4: the dep tracker is keyed by `(target, kind)` so the four
+    // kinds compose independently. Same causal algorithm as labels;
+    // wider key. A v1 stanza (no kind tag) materialized through the
+    // parser carries `kind: Blocks`, so old data composes with new
+    // under this same key without special-casing.
     let mut label_state: BTreeMap<String, bool> = BTreeMap::new();
-    let mut dep_state: BTreeMap<IssueId, bool> = BTreeMap::new();
+    let mut dep_state: BTreeMap<(IssueId, DepKind), bool> = BTreeMap::new();
 
     // Track the latest SetBody op's hash so we can look up the
     // matching head's body bytes once the reduce is done.
@@ -354,11 +360,11 @@ pub(crate) fn reduce_to_merged(
             Op::LabelRm { label, .. } => {
                 label_state.insert(label.clone(), false);
             }
-            Op::DepAdd { dep, .. } => {
-                dep_state.insert(dep.clone(), true);
+            Op::DepAdd { dep, kind, .. } => {
+                dep_state.insert((dep.clone(), *kind), true);
             }
-            Op::DepRm { dep, .. } => {
-                dep_state.insert(dep.clone(), false);
+            Op::DepRm { dep, kind, .. } => {
+                dep_state.insert((dep.clone(), *kind), false);
             }
             Op::CommentAdd { comment_id, .. } => {
                 comment_ids.push(comment_id.clone());
@@ -377,10 +383,19 @@ pub(crate) fn reduce_to_merged(
     labels.sort();
     record.labels = labels;
 
-    let mut deps: Vec<IssueId> = dep_state
+    let mut deps: Vec<DepEdge> = dep_state
         .into_iter()
-        .filter_map(|(d, present)| if present { Some(d) } else { None })
+        .filter_map(|((target, kind), present)| {
+            if present {
+                Some(DepEdge { target, kind })
+            } else {
+                None
+            }
+        })
         .collect();
+    // Stable sort by (target, kind) — the BTreeMap iteration order
+    // already gives us this, but the projection is explicit so the
+    // on-disk order is independent of the map impl.
     deps.sort();
     record.dependencies = deps;
 
@@ -1519,12 +1534,13 @@ mod tests {
                 Op::DepAdd {
                     issue_id: id.clone(),
                     dep: dep.clone(),
+                    kind: DepKind::Blocks,
                 },
             ),
         ]);
         let head_b = snap(vec![create_entry(&id, "2026-06-22T12:00:00Z")]);
         let merged = reduce(&id, &[head_a, head_b]);
-        assert_eq!(merged.record.dependencies, vec![dep]);
+        assert_eq!(merged.record.dependencies, vec![DepEdge::blocks(dep)]);
     }
 
     #[test]
@@ -1541,6 +1557,7 @@ mod tests {
                 Op::DepAdd {
                     issue_id: id.clone(),
                     dep: dep.clone(),
+                    kind: DepKind::Blocks,
                 },
             ),
         ]);
@@ -1554,6 +1571,7 @@ mod tests {
                 Op::DepRm {
                     issue_id: id.clone(),
                     dep: dep.clone(),
+                    kind: DepKind::Blocks,
                 },
             ),
         ]);
@@ -1575,6 +1593,7 @@ mod tests {
                 Op::DepAdd {
                     issue_id: id.clone(),
                     dep: dep.clone(),
+                    kind: DepKind::Blocks,
                 },
             ),
         ]);
@@ -1588,11 +1607,12 @@ mod tests {
                 Op::DepAdd {
                     issue_id: id.clone(),
                     dep: dep.clone(),
+                    kind: DepKind::Blocks,
                 },
             ),
         ]);
         let merged = reduce(&id, &[head_a, head_b]);
-        assert_eq!(merged.record.dependencies, vec![dep]);
+        assert_eq!(merged.record.dependencies, vec![DepEdge::blocks(dep)]);
     }
 
     #[test]
@@ -1612,6 +1632,7 @@ mod tests {
                 Op::DepAdd {
                     issue_id: id.clone(),
                     dep: dep1.clone(),
+                    kind: DepKind::Blocks,
                 },
             ),
             entry(
@@ -1622,6 +1643,7 @@ mod tests {
                 Op::DepRm {
                     issue_id: id.clone(),
                     dep: dep1.clone(),
+                    kind: DepKind::Blocks,
                 },
             ),
         ]);
@@ -1635,11 +1657,12 @@ mod tests {
                 Op::DepAdd {
                     issue_id: id.clone(),
                     dep: dep2.clone(),
+                    kind: DepKind::Blocks,
                 },
             ),
         ]);
         let merged = reduce(&id, &[head_a, head_b]);
-        assert_eq!(merged.record.dependencies, vec![dep2]);
+        assert_eq!(merged.record.dependencies, vec![DepEdge::blocks(dep2)]);
     }
 
     // ---- Comments ------------------------------------------------------

@@ -1,6 +1,6 @@
-# jjforge on-disk storage format — v2.3
+# jjforge on-disk storage format — v2.4
 
-Status: v2.3, current. This is the contract every other crate
+Status: v2.4, current. This is the contract every other crate
 implements against. Verdicts pinned by:
 
 - `dcd4b57` — Shape A (dedicated bookmark for issue data).
@@ -8,6 +8,97 @@ implements against. Verdicts pinned by:
   audit surface.
 - `2130de1` — shell out to the `jj` CLI; do not link `jj-lib`.
 - `72638a0` — the `mvp-storage` epic.
+
+## v2.3 → v2.4 changelog
+
+Backwards-compatible additions, landed in the `agent-dep-types`
+ticket (`b6d066b`). v2.3 readers tolerate v2.4 commits (the
+trailer parser drops the new `Jjf-Dep-Kind:` line silently if
+the reader doesn't understand it; the record parser tolerates
+the tagged-object dep shape via the `dependencies` field's
+custom deserializer, which accepts BOTH the v1 bare-id shape
+AND the v2.4 tagged shape). v2.4 readers tolerate v2.3 records
+(every v1-shape `dependencies: ["abc1234"]` materializes as a
+`{target: "abc1234", kind: "blocks"}` edge — no backfill).
+
+- **New on-record field shape `dependencies`** — was
+  `Vec<IssueId>` (bare strings); now `Vec<DepEdge>` where each
+  edge is `{ "target": "<7hex>", "kind": "<kind>" }`. The four
+  kinds:
+
+  - `blocks` — hard prereq. The owning issue is BLOCKED until
+    the target closes. The v1 default; every v1-shape entry
+    reads as this.
+  - `parent-child` — hierarchical. The owning issue is a CHILD
+    of the target. Drives the parent-child cascade in
+    `Storage::list_ready` (see below).
+  - `related` — soft cross-link. Reference only; never affects
+    ready computation.
+  - `discovered-from` — provenance. "I was found while working
+    on X." Never affects ready computation.
+
+  Wire shape (on disk):
+
+  ```json
+  "dependencies": [
+    {"target": "abc1234", "kind": "blocks"},
+    {"target": "def5678", "kind": "parent-child"}
+  ]
+  ```
+
+  Migration: NONE. The reader's custom deserializer accepts
+  the v1 bare-id shape (`["abc1234"]`) AND the v2.4 tagged
+  shape transparently. A mixed array is also tolerated. The
+  writer always emits the v2.4 shape.
+
+- **Extended op vocabulary `dep-add` / `dep-rm`** — both ops
+  gained an optional `Jjf-Dep-Kind:` trailer field carrying the
+  kind. Absence reads as `blocks` (the v1 default). Stanza
+  shape:
+
+  ```text
+  Jjf-Op: dep-add
+  Jjf-Issue: <owner>
+  Jjf-At: <stamp>
+  Jjf-Dep: <target>
+  Jjf-Dep-Kind: <blocks|parent-child|related|discovered-from>
+  ```
+
+  The op-space merge driver keys causal updates by
+  `(target, kind)` — `dep-add` and `dep-rm` for different
+  kinds to the same target compose independently.
+
+- **`Storage::list_ready` cascade rules.** An issue X is
+  BLOCKED iff at least one of:
+
+  1. X has a `blocks`-kind edge whose target is ACTIVE (open
+     or in-progress). Closed and dangling targets don't block.
+  2. X has a `parent-child` edge whose target is ACTIVE AND
+     itself BLOCKED. (The cascade follows blocked-ness, not
+     just open-vs-closed status. An open-and-not-blocked
+     parent does NOT block its children.)
+
+  `related` and `discovered-from` edges are ignored entirely
+  by the ready computation.
+
+  Cycle policy: a pure `parent-child` cycle with no external
+  blocker treats every node in the cycle as NOT BLOCKED — the
+  cascade rule only fires when the parent is independently
+  blocked. Each cycle node can still be blocked by its own
+  `blocks` edges. Fixpoint terminates (bounded by issue
+  count).
+
+- **New CLI verbs `jjf dep add|rm|tree`.** See
+  `docs/cli-json.md`. The `Storage::add_dep_edge` /
+  `Storage::remove_dep_edge` primitives back them; the v1
+  `Storage::add_dependency` / `Storage::remove_dependency`
+  helpers become thin wrappers around the new ones with
+  `kind = Blocks`.
+
+- **`jjf new --dep <kind>:<id>` inline syntax** — the
+  existing `-d/--dep` flag now accepts both `<id>` (defaults
+  to `blocks`) and `<kind>:<id>` for the typed kinds.
+  Unknown kinds surface as `bad_dep_kind` (exit 2).
 
 ## v2.2 → v2.3 changelog
 
@@ -235,7 +326,7 @@ separate lines).
 | `status`       | string enum           | yes  | `open` \| `in-progress` \| `closed`. Default `open`. (v2.3 added `in-progress`.)   |
 | `type`         | string enum           | yes  | v2.1 — `bug` \| `feature` \| `epic` \| `research` \| `roadmap` \| `unspecified`. Default `unspecified`. |
 | `labels`       | array of string       | yes  | Sorted alphabetically. Empty array if none.                    |
-| `dependencies` | array of string       | yes  | Issue IDs this depends on. Sorted. Empty array if none.        |
+| `dependencies` | array of DepEdge (v2.4) | yes | Typed dependency edges. Sorted by `(target, kind)`. Empty array if none. v2.4 — was `array of string` in pre-v2.4 records; the reader accepts both shapes. |
 | `assignee`     | string \| null        | yes  | Free-text identifier. `null` if unassigned.                    |
 | `created_at`   | string (RFC 3339)     | yes  | UTC. Set at create time; never modified.                       |
 | `updated_at`   | string (RFC 3339)     | yes  | UTC. Updated on every mutation.                                |
@@ -425,8 +516,8 @@ trap that §5.6's filter-on-both-files workaround papers over.
 | `set-body`   | `Jjf-Body-Hash` (sha-256 of new body, hex)                | Body itself lives in the JSON; trailer carries hash. |
 | `label-add`  | `Jjf-Label` (one label string; may repeat for >1 label)   | No-op if label already present.                      |
 | `label-rm`   | `Jjf-Label`                                               | No-op if not present.                                |
-| `dep-add`    | `Jjf-Dep` (target issue-id)                               |                                                      |
-| `dep-rm`     | `Jjf-Dep`                                                 |                                                      |
+| `dep-add`    | `Jjf-Dep` (target issue-id), `Jjf-Dep-Kind` (v2.4; one of `blocks` / `parent-child` / `related` / `discovered-from`) | v2.4 — absent kind reads as `blocks` for back-compat. |
+| `dep-rm`     | `Jjf-Dep`, `Jjf-Dep-Kind` (v2.4)                          | v2.4 — kind required for op-space causal merge keyed by `(target, kind)`. |
 | `set-assignee` | `Jjf-Assignee` (string or empty for unassign)           |                                                      |
 | `set-type`   | `Jjf-Type` (one of `bug` / `feature` / `epic` / `research` / `roadmap` / `unspecified`) | v2.1.                              |
 | `set-slug`   | `Jjf-Slug` (validated kebab-case per §3.4; empty clears) | v2.1.                                                |

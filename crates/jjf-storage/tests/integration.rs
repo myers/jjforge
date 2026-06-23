@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use jjf_storage::{
-    Error as StorageError, IssueDraft, IssueId, IssueType, Op,
-    ReadyFilter, SlugInvalidReason, Status, Storage, UpdateFields,
+    DepEdge, DepKind, Error as StorageError, IssueDraft, IssueId, IssueType, Op, ReadyFilter,
+    SlugInvalidReason, Status, Storage, UpdateFields,
 };
 use serde::Serialize;
 
@@ -337,7 +337,7 @@ fn read_roundtrip_after_multiple_mutations() {
     assert_eq!(bug.status, Status::Closed);
     // Labels are sorted alphabetically per spec §3.1.
     assert_eq!(bug.labels, vec!["bug".to_string(), "p1".to_string()]);
-    assert_eq!(bug.dependencies, Vec::<IssueId>::new());
+    assert_eq!(bug.dependencies, Vec::<DepEdge>::new());
     assert_eq!(bug.assignee, None);
 
     // Two comments, chronological. The first add gets created_at
@@ -422,7 +422,7 @@ fn read_then_serialize_byte_equals_on_disk_record() {
         #[serde(rename = "type")]
         type_: &'a str,
         labels: &'a [String],
-        dependencies: &'a [IssueId],
+        dependencies: &'a [DepEdge],
         assignee: Option<&'a str>,
         created_at: &'a str,
         updated_at: &'a str,
@@ -1558,7 +1558,7 @@ fn list_ready_open_dependency_blocks_the_dependent_issue() {
         .create_issue(&IssueDraft {
             title: "B — blocked".into(),
             type_: Some(IssueType::Feature),
-            dependencies: vec![a.clone()],
+            dependencies: vec![DepEdge::blocks(a.clone())],
             ..Default::default()
         })
         .unwrap();
@@ -1594,7 +1594,7 @@ fn list_ready_closed_dependency_does_not_block() {
         .create_issue(&IssueDraft {
             title: "B — was blocked".into(),
             type_: Some(IssueType::Feature),
-            dependencies: vec![a.clone()],
+            dependencies: vec![DepEdge::blocks(a.clone())],
             ..Default::default()
         })
         .unwrap();
@@ -1831,7 +1831,7 @@ fn list_ready_dangling_dependency_does_not_block() {
         .create_issue(&IssueDraft {
             title: "depends on a ghost".into(),
             type_: Some(IssueType::Bug),
-            dependencies: vec![phantom],
+            dependencies: vec![DepEdge::blocks(phantom)],
             ..Default::default()
         })
         .unwrap();
@@ -2435,7 +2435,7 @@ fn in_progress_dep_blocks_dependent_from_ready() {
         .create_issue(&IssueDraft {
             title: "B".into(),
             type_: Some(IssueType::Feature),
-            dependencies: vec![a.clone()],
+            dependencies: vec![DepEdge::blocks(a.clone())],
             ..Default::default()
         })
         .unwrap();

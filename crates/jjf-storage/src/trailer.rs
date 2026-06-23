@@ -21,7 +21,7 @@
 
 use crate::id::IssueId;
 use crate::op::Op;
-use crate::record::{IssueType, Status};
+use crate::record::{DepKind, IssueType, Status};
 
 /// A parsed op stanza plus its trailer-level metadata.
 ///
@@ -178,14 +178,33 @@ fn stanza_to_op(stanza: &[(&str, &str)], id: &IssueId) -> Option<Op> {
             issue_id,
             label: get("Jjf-Label")?,
         },
-        "dep-add" => Op::DepAdd {
-            issue_id,
-            dep: IssueId::parse(&get("Jjf-Dep")?).ok()?,
-        },
-        "dep-rm" => Op::DepRm {
-            issue_id,
-            dep: IssueId::parse(&get("Jjf-Dep")?).ok()?,
-        },
+        "dep-add" => {
+            // v2.4: optional `Jjf-Dep-Kind:`. v1 stanzas without the
+            // line read as `kind: Blocks` for back-compat. Unknown
+            // kinds (a future variant we haven't taught this build
+            // about) fall through to the unknown-op-type branch via
+            // the `?` on `parse_wire`.
+            let kind = match get("Jjf-Dep-Kind") {
+                Some(v) => DepKind::parse_wire(&v)?,
+                None => DepKind::Blocks,
+            };
+            Op::DepAdd {
+                issue_id,
+                dep: IssueId::parse(&get("Jjf-Dep")?).ok()?,
+                kind,
+            }
+        }
+        "dep-rm" => {
+            let kind = match get("Jjf-Dep-Kind") {
+                Some(v) => DepKind::parse_wire(&v)?,
+                None => DepKind::Blocks,
+            };
+            Op::DepRm {
+                issue_id,
+                dep: IssueId::parse(&get("Jjf-Dep")?).ok()?,
+                kind,
+            }
+        }
         "set-assignee" => {
             let v = get("Jjf-Assignee").unwrap_or_default();
             Op::SetAssignee {

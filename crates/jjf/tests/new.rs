@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use jjf_storage::{IssueId, Storage};
+use jjf_storage::{DepEdge, IssueId, Storage};
 
 /// Path to the compiled `jjf` binary. Cargo sets this env var for every
 /// integration test in the same package as the `[[bin]]` target.
@@ -356,7 +356,7 @@ fn new_full_field_round_trip() {
     // Storage sorts labels — the writer guarantees that, but we assert
     // on the (sorted) shape so a future reorder can't slip past.
     assert_eq!(bug.labels, vec!["bug".to_string(), "p1".to_string()]);
-    assert_eq!(bug.dependencies, vec![first_id]);
+    assert_eq!(bug.dependencies, vec![DepEdge::blocks(first_id)]);
     assert_eq!(bug.assignee.as_deref(), Some("alice"));
     assert!(bug.comments.is_empty());
 }
