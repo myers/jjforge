@@ -44,10 +44,13 @@ pub(crate) struct ParsedOp {
 /// silently.
 ///
 /// Convenience wrapper around `parse_ops_with_meta` that drops the
-/// trailer-level metadata; preserved so call sites that only care
-/// about the typed op (the debug-only read-path cross-check, the
-/// per-issue history view's payload) don't have to thread the meta
-/// they don't use.
+/// trailer-level metadata; kept as a test-only helper so the parser
+/// fixtures here don't have to thread the unused `Jjf-At:` value.
+/// Non-test code paths go through `parse_ops_with_meta` directly —
+/// the read-path cross-check now folds via `history::read_history_at`
+/// + LWW sort (see `read.rs::replay_ops`), so the typed-op-only
+/// convenience isn't needed in the prod path.
+#[cfg(test)]
 pub(crate) fn parse_ops(desc: &str, id: &IssueId) -> Vec<Op> {
     parse_ops_with_meta(desc, id)
         .into_iter()

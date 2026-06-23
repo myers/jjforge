@@ -108,6 +108,14 @@ impl OpKey {
     }
 }
 
+/// Sort a slice of [`HistoryEntry`] in spec §6 LWW order:
+/// `(jjf_at if Some else commit_time, commit, trailer_index)`. Shared
+/// with the read-path cross-check in `read.rs` so file-read and
+/// op-replay land on identical projections of the same op chain.
+pub(crate) fn sort_entries_lww(entries: &mut [HistoryEntry]) {
+    entries.sort_by(|a, b| OpKey::from_entry(a).cmp(&OpKey::from_entry(b)));
+}
+
 /// Run the op-space resolver against the given heads. Returns one
 /// [`MergedIssue`] per issue touched by any head's chain.
 ///
@@ -1967,5 +1975,52 @@ mod tests {
         ]);
         let merged = reduce(&id, &[head_a, head_b]);
         assert_eq!(merged.record.slug.as_deref(), Some("from-b"));
+    }
+
+    /// Regression for the divergence surfaced when the read-path
+    /// cross-check guard was removed. Before the fold-by-LWW fix,
+    /// `replay_ops` in `read.rs` walked the jj-log ordering (newest →
+    /// oldest reversed), which does NOT match the resolver's spec §6
+    /// total order on divergent heads. Two `SetTitle` ops at the same
+    /// commit-time but with `jjf_at` stamps from different writers
+    /// would fold in jj-log order on read while the resolver had
+    /// already written the file via LWW order — a guaranteed mismatch.
+    ///
+    /// This test pins the LWW order across two stamped entries at the
+    /// same commit-time second: the later `jjf_at` wins regardless of
+    /// the input slice ordering, which is what makes the cross-check
+    /// trivially agree with the resolver's on-disk projection.
+    #[test]
+    fn sort_entries_lww_orders_stamped_by_jjf_at() {
+        let id = crate::id::IssueId::parse("aa6600b").unwrap();
+        let earlier = HistoryEntry {
+            commit: "bbb".into(),
+            author: "alice".into(),
+            timestamp: "2026-06-22T12:00:00Z".into(),
+            jjf_at: Some("2026-06-22T12:00:00.111111111Z".into()),
+            trailer_index: 0,
+            op: Op::SetTitle {
+                issue_id: id.clone(),
+                title: "alice title".into(),
+            },
+        };
+        let later = HistoryEntry {
+            commit: "aaa".into(),
+            author: "bob".into(),
+            timestamp: "2026-06-22T12:00:00Z".into(),
+            jjf_at: Some("2026-06-22T12:00:00.222222222Z".into()),
+            trailer_index: 0,
+            op: Op::SetTitle {
+                issue_id: id.clone(),
+                title: "bob title".into(),
+            },
+        };
+
+        // Feed `later` first to force the sort to do work — the LWW
+        // sort must pull `earlier` to position 0 regardless of input.
+        let mut entries = vec![later.clone(), earlier.clone()];
+        sort_entries_lww(&mut entries);
+        assert_eq!(entries[0].commit, earlier.commit);
+        assert_eq!(entries[1].commit, later.commit);
     }
 }

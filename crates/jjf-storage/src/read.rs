@@ -13,16 +13,24 @@
 //! 1. **File-read.** Pull `issues/<id>.json` and
 //!    `issues/<id>.comments.jsonl` straight off the bookmark tip via
 //!    `jj file show`.
-//! 2. **Op-replay.** Walk `ancestors(bookmarks(issues))` filtered to
-//!    `root:issues/<id>.json`, parse the `Jjf-Op:` trailers out of each
-//!    commit description (oldest first), and fold them into a record.
+//! 2. **Op-replay.** Walk `ancestors(bookmarks(issues))` via
+//!    `history::read_history_at`, sort the resulting per-op entries by
+//!    the spec §6 LWW total order — `(jjf_at if Some else commit_time,
+//!    commit, trailer_index)`, the same key the op-space merge driver
+//!    uses — and fold them into a record.
 //!
 //! When file-read and op-replay disagree on a structural field, that's
 //! a violation of the storage contract — either the writer didn't
-//! record an op for a mutation, or the writer wrote the file without a
-//! corresponding op. Crashing in debug builds is the cheapest way to
-//! catch a regression in the write path. Release builds trust the
-//! file (it's the authoritative copy).
+//! record an op for a mutation, the writer wrote the file without a
+//! corresponding op, or the resolver and the cross-check diverged on
+//! how to project the op chain. Crashing in debug builds is the
+//! cheapest way to catch a regression in the write path. Release
+//! builds trust the file (it's the authoritative copy).
+//!
+//! Sorting by the resolver's LWW key (rather than the jj-log order
+//! the v1 cross-check used) is what makes the check valid across
+//! merges. The resolver writes the merged file by applying ops in
+//! LWW order; we re-derive that same order on read.
 //!
 //! Timestamps (`created_at` / `updated_at`) deliberately do NOT
 //! participate in the equality check. The on-disk record carries
@@ -41,12 +49,7 @@ use crate::op::Op;
 #[cfg(any(debug_assertions, test))]
 use crate::record::{IssueType, Status};
 use crate::record::{Comment, Issue, IssueRecord};
-#[cfg(debug_assertions)]
-use crate::trailer::parse_ops;
-use crate::{
-    issue_comments_relpath, issue_json_relpath, v1_issue_comments_relpath,
-    v1_issue_json_relpath, Error, Result, ISSUES_BOOKMARK_REVSET,
-};
+use crate::{issue_comments_relpath, issue_json_relpath, Error, Result, ISSUES_BOOKMARK_REVSET};
 
 /// Read a single issue from the `issues` bookmark tip.
 ///
@@ -69,22 +72,16 @@ pub(crate) fn read(repo: &JjRepo, id: &IssueId) -> Result<Issue> {
     #[cfg(debug_assertions)]
     {
         let op_view = replay_ops(repo, id)?;
-        // Skip the cross-check whenever the chain has been through a
-        // merge commit. The `Jjf-Op: merge` trailer carries no
-        // payload (spec §5.2): "the merge driver records the
-        // resolution itself in the file diff." Op-replay can therefore
-        // walk both branches of the merge, fold their `set-*` ops in
-        // some order, and end up at a structural view that does NOT
-        // match the file (the merge driver picked a winner that
-        // disagrees with whichever side op-replay happened to apply
-        // last). The file remains authoritative after a merge; the
-        // cross-check is a debug-only safety net for the
-        // non-merged write path. A future ticket may enrich the merge
-        // trailer with per-field "Jjf-Resolved-*" payload so op-replay
-        // can be authoritative across merges too; for now, skip.
-        if !op_view.touched_by_merge {
-            cross_check(&record, &comments, &op_view);
-        }
+        // Cross-check runs unconditionally, including across merges.
+        // With op-space resolution (`bfc732b`), the file on disk after
+        // a merge IS a deterministic projection of the op chain: the
+        // resolver folds both branches of the merge in a canonical
+        // order and writes the merged record. Op-replay folds the same
+        // op chain on read and lands on the same view by construction,
+        // so file-read and op-replay must agree. Any disagreement
+        // surfaced here is a real write-path or resolver bug, and the
+        // panic is the cheapest catch-it-early signal we have.
+        cross_check(&record, &comments, &op_view);
     }
 
     Ok(Issue {
@@ -196,63 +193,45 @@ struct OpView {
     /// Comment IDs in the order they were added (op chain order, oldest
     /// first). Used to validate that the JSONL file matches.
     comment_ids: Vec<IssueId>,
-    /// `true` once a `Jjf-Op: merge` trailer has been seen anywhere in
-    /// the chain. The cross-check honors this by skipping — see the
-    /// rationale at the call-site in `read`.
-    touched_by_merge: bool,
 }
 
 /// Walk the per-issue op chain and fold it into a structural view.
 ///
-/// Uses `ancestors(bookmarks(issues))` filtered by
-/// `root:issues/<id>.json`, templated to dump the full description so
-/// we can parse trailers. The output is newest-first; we reverse to
-/// oldest-first before folding.
+/// Uses `history::read_history_at` to enumerate the per-op entries
+/// reachable from `bookmarks(issues)`, then sorts them with
+/// `merge_ops::sort_entries_lww` — the same `(jjf_at, commit,
+/// trailer_index)` total order the op-space merge driver applies when
+/// it writes the merged file. Folding in this order means file-read
+/// and op-replay project the same op chain identically, including
+/// across merges where two heads' `set-*` ops compose by LWW. (Per
+/// spec §6.)
 #[cfg(debug_assertions)]
 fn replay_ops(repo: &JjRepo, id: &IssueId) -> Result<OpView> {
-    let json_relpath = issue_json_relpath(id);
-    let comments_relpath = issue_comments_relpath(id);
-    let v1_json_relpath = v1_issue_json_relpath(id);
-    let v1_comments_relpath = v1_issue_comments_relpath(id);
-    // Filter spans all four paths (v1 + v2 × json + comments-jsonl).
-    // Same reasoning as `history.rs::read_history_at`:
-    //   - v1 paths catch pre-migration ops that touched `bugs/<id>.*`.
-    //     Without them, an issue created before the v1→v2 migration
-    //     drops its `create` op out of the replay chain and folds to
-    //     nothing.
-    //   - Both file kinds at each version: spec §5.6 — a comments-jsonl
-    //     append in the same second as a prior mutation produces no
-    //     json diff and gets missed if we filter only on the json file.
-    let sep = "\n----JJF-DESC-END-c0ffee----\n";
-    let template = format!("description ++ \"{}\"", sep.replace('\n', "\\n"));
-    let raw = repo.run(&[
-        "log",
-        "--no-graph",
-        "-r",
-        "ancestors(bookmarks(issues))",
-        "-T",
-        &template,
-        &format!("root:{}", json_relpath.display()),
-        &format!("root:{}", comments_relpath.display()),
-        &format!("root:{}", v1_json_relpath.display()),
-        &format!("root:{}", v1_comments_relpath.display()),
-    ])?;
+    use crate::merge_ops::sort_entries_lww;
 
-    // Newest-first → oldest-first.
-    let mut descs: Vec<&str> = raw.split(sep).filter(|s| !s.trim().is_empty()).collect();
-    descs.reverse();
+    let mut entries = match crate::history::read_history_at(
+        repo,
+        ISSUES_BOOKMARK_REVSET,
+        id,
+    ) {
+        Ok(v) => v,
+        Err(Error::IssueNotFound(_)) => return Err(Error::IssueNotFound(id.clone())),
+        Err(e) => return Err(e),
+    };
 
-    if descs.is_empty() {
+    sort_entries_lww(&mut entries);
+
+    if entries.is_empty() {
         return Err(Error::IssueNotFound(id.clone()));
     }
 
-    // Fold ops left-to-right. The first commit MUST carry a `create`
-    // for this issue; we initialize the view from it.
+    // Fold ops in LWW order. The first op MUST be `Create` for a
+    // well-formed chain — `Create` carries the earliest stamp by
+    // construction (no later write can predate the issue's own
+    // creation), so the LWW sort lands it first.
     let mut view: Option<OpView> = None;
-    for desc in descs {
-        for op in parse_ops(desc, id) {
-            apply_op(&mut view, op);
-        }
+    for entry in entries {
+        apply_op(&mut view, entry.op);
     }
 
     view.ok_or_else(|| {
@@ -286,7 +265,6 @@ fn apply_op(view: &mut Option<OpView>, op: Op) {
                 dependencies: Vec::new(),
                 assignee: None,
                 comment_ids: Vec::new(),
-                touched_by_merge: false,
             });
         }
         op => {
@@ -318,15 +296,11 @@ fn apply_op(view: &mut Option<OpView>, op: Op) {
                 Op::SetSlug { slug, .. } => v.slug = slug,
                 Op::CommentAdd { comment_id, .. } => v.comment_ids.push(comment_id),
                 Op::Merge { .. } => {
-                    // No structural change; the merge driver records
-                    // the resolution itself in the file diff. We flag
-                    // the view so the cross-check skips — op-replay
-                    // can walk the merge's two parent branches in
-                    // some order, fold their `set-*` ops, and produce
-                    // a structural view that doesn't match the file
-                    // (the merge driver's pick disagrees with the
-                    // side op-replay happened to apply last).
-                    v.touched_by_merge = true;
+                    // No structural change. The `Jjf-Op: merge`
+                    // trailer is a marker on the merge commit itself;
+                    // op-replay folds the same op set the resolver
+                    // folded when it wrote the merged file, so both
+                    // sides land on the same structural view.
                 }
             }
         }
@@ -528,7 +502,6 @@ mod tests {
             dependencies: Vec::new(),
             assignee: None,
             comment_ids: Vec::new(),
-            touched_by_merge: false,
         });
         apply_op(
             &mut view,
