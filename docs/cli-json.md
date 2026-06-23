@@ -1,5 +1,78 @@
 # `jjf --json` output contract
 
+## v2.1 → v2.2 changelog
+
+Backwards-compatible additions, landed in the `agent-remember`
+ticket (`81db913`).
+
+- **Four new verbs** for persistent memories: `remember`,
+  `memories`, `recall`, `forget`. Envelope shapes below in
+  the "Memory verbs" section.
+- **`jjf show` gains `--include-memories`** — plain-text
+  affordance only. `--json` output of `show` is unchanged
+  (memories are reachable via `jjf memories --json`).
+- **Three new error kinds** — `missing_memory_value`
+  (preflight, exit 2), `empty_memory_key` (preflight, exit 2,
+  with `details.value`), `memory_not_found` (runtime, exit 1,
+  with `details.key`).
+
+## Memory verbs (v2.2)
+
+### `jjf remember [<value>] [--key <slug>] [-F <path|->]`
+
+Mutating envelope:
+
+```json
+{"ok": true, "key": "dolt-phantoms", "action": "remembered"}
+```
+
+- `key`: the kebab-case key (either the operator's `--key`
+  or the slugified value).
+- `action`: `"remembered"` for a fresh memory; `"updated"`
+  for the upsert path.
+
+### `jjf memories [<search>]`
+
+Bare payload — array of `Memory` records (no envelope):
+
+```json
+[
+  {"key": "alpha", "value": "a", "created_at": "...", "updated_at": "..."},
+  {"key": "beta",  "value": "b", "created_at": "...", "updated_at": "..."}
+]
+```
+
+Empty result is `[]`, never silence (matches `ls --json` /
+`remote ls --json`'s "valid empty array" rule).
+
+The `<search>` substring filter is case-insensitive over the
+key + value combo (any match counts).
+
+### `jjf recall <key>`
+
+Envelope shape — `{key, value, found}`:
+
+```json
+{"key": "dolt-phantoms", "value": "the insight", "found": true}
+```
+
+When the key doesn't exist, the verb exits 1 with the
+`memory_not_found` error envelope on stderr:
+
+```json
+{"ok": false, "error": {"kind": "memory_not_found", "message": "...", "details": {"key": "no-such-thing"}}}
+```
+
+### `jjf forget <key>`
+
+Mutating envelope:
+
+```json
+{"ok": true, "key": "dolt-phantoms", "action": "forgot"}
+```
+
+Missing key → exit 1 + `memory_not_found` error envelope.
+
 ## v2 → v2.1 changelog
 
 Backwards-compatible additions, landed in

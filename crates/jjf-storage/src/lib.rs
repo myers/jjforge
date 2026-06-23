@@ -63,6 +63,7 @@
 mod history;
 mod id;
 mod jj;
+mod memory;
 mod merge_ops;
 mod op;
 mod read;
@@ -74,9 +75,10 @@ use std::path::{Path, PathBuf};
 pub use history::HistoryEntry;
 pub use id::{IdError, IssueId};
 pub use jj::JjError;
+pub use memory::slugify;
 pub use merge_ops::{MergeReport, MergedIssue};
 pub use op::Op;
-pub use record::{Comment, Issue, IssueDraft, IssueRecord, IssueType, Status};
+pub use record::{Comment, Issue, IssueDraft, IssueRecord, IssueType, Memory, Status};
 
 // `ReadyFilter` is declared below alongside its helpers, but we
 // re-state the export here for discoverability. Public types live
@@ -996,6 +998,110 @@ impl Storage {
         Ok(comment_id)
     }
 
+    /// Write a persistent memory keyed by `key`. Upsert semantics: if a
+    /// memory with that key already exists, update its `value` and
+    /// `updated_at`; otherwise create a fresh record. Spec v2.2 §10.
+    ///
+    /// Lands one commit on the `issues` bookmark with a single
+    /// `Jjf-Op: set-memory` trailer. The file written is
+    /// `memories/<key>.json`.
+    ///
+    /// Errors:
+    /// - [`Error::Invalid`] if `key` is empty or contains characters
+    ///   outside `[a-z0-9-]` or violates slug-shape rules.
+    /// - [`Error::Invalid`] if `value` is empty after trim — an empty
+    ///   memory is almost certainly an operator mistake.
+    /// - `Jj` / `Io` from the underlying write dance.
+    pub fn set_memory(&self, key: &str, value: &str) -> Result<()> {
+        if value.trim().is_empty() {
+            return Err(Error::Invalid("memory value must not be empty".into()));
+        }
+        // Memory keys reuse the slug validation rules: kebab-case,
+        // `[a-z0-9-]`, length 3-48. (We deliberately reuse the slug
+        // validator rather than introducing a parallel rule set; the
+        // shape is intentionally identical.)
+        if let Err(reason) = validate_slug(key) {
+            return Err(Error::Invalid(format!(
+                "invalid memory key {key:?}: {reason}"
+            )));
+        }
+        let now = now_rfc3339()?;
+        let existing = self.read_memory_from_bookmark(key)?;
+        let record = match existing {
+            Some(mut prev) => {
+                prev.value = value.to_owned();
+                prev.updated_at = now;
+                prev
+            }
+            None => Memory {
+                key: key.to_owned(),
+                value: value.to_owned(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        };
+        let summary = format!("jjf: memory {} - set", key);
+        let jjf_at = now_rfc3339_nanos()?;
+        let msg = memory::build_set_memory_commit_message(&summary, key, value, &jjf_at);
+        let key_owned = key.to_owned();
+        self.commit_memory_change(&msg, |wc_root| {
+            write_memory_json(&wc_root.join(memory::memory_json_relpath(&key_owned)), &record)
+        })
+    }
+
+    /// Remove a persistent memory by key. Lands one commit on the
+    /// `issues` bookmark with a single `Jjf-Op: unset-memory` trailer
+    /// and deletes the on-disk `memories/<key>.json` file.
+    ///
+    /// Errors:
+    /// - [`Error::Invalid`] if `key` is malformed.
+    /// - [`Error::Invalid`] (with a `not found` message) if no memory
+    ///   with that key exists at the bookmark tip — the CLI translates
+    ///   this into an exit-1 "no memory with key" error.
+    pub fn unset_memory(&self, key: &str) -> Result<()> {
+        if let Err(reason) = validate_slug(key) {
+            return Err(Error::Invalid(format!(
+                "invalid memory key {key:?}: {reason}"
+            )));
+        }
+        if self.read_memory_from_bookmark(key)?.is_none() {
+            return Err(Error::Invalid(format!(
+                "no memory with key {key:?}"
+            )));
+        }
+        let summary = format!("jjf: memory {} - unset", key);
+        let jjf_at = now_rfc3339_nanos()?;
+        let msg = memory::build_unset_memory_commit_message(&summary, key, &jjf_at);
+        let key_owned = key.to_owned();
+        self.commit_memory_change(&msg, |wc_root| {
+            let path = wc_root.join(memory::memory_json_relpath(&key_owned));
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Read one memory by key from the `issues` bookmark tip. Returns
+    /// `Ok(None)` if no memory with that key exists.
+    pub fn read_memory(&self, key: &str) -> Result<Option<Memory>> {
+        self.read_memory_from_bookmark(key)
+    }
+
+    /// Enumerate every memory present at the `issues` bookmark tip,
+    /// sorted by key ascending. Reads each `memories/<key>.json` and
+    /// returns the parsed records.
+    pub fn list_memories(&self) -> Result<Vec<Memory>> {
+        let keys = self.list_memory_keys()?;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(mem) = self.read_memory_from_bookmark(&key)? {
+                out.push(mem);
+            }
+        }
+        Ok(out)
+    }
+
     /// Read a single issue back from the `issues` bookmark tip. Returns
     /// the latest scalar field values plus the full chronological
     /// comment thread. Errors with `IssueNotFound` if `issues/<id>.json`
@@ -1632,6 +1738,90 @@ impl Storage {
         Ok(())
     }
 
+    /// Run the 4-CLI dance for a memory mutation. Memory commits carry
+    /// a single `Jjf-Op: set-memory` or `unset-memory` trailer (no
+    /// `Jjf-Issue:`), so we build the message directly rather than via
+    /// [`build_commit_message`] (which assumes per-issue ops).
+    fn commit_memory_change<F>(&self, msg: &str, apply: F) -> Result<()>
+    where
+        F: FnOnce(&Path) -> Result<()>,
+    {
+        // 1. jj new bookmarks(issues) -m '<msg>'
+        self.repo.run(&["new", ISSUES_BOOKMARK_REVSET, "-m", msg])?;
+
+        // 2. Edit the working copy. jj snapshots on the next command.
+        apply(self.repo.root())?;
+
+        // 3. jj bookmark set issues -r @ --allow-backwards
+        self.repo.run(&[
+            "bookmark",
+            "set",
+            ISSUES_BOOKMARK,
+            "-r",
+            "@",
+            "--allow-backwards",
+        ])?;
+
+        // 4. jj new root() — step @ off the bookmark.
+        self.repo.run(&["new", "root()"])?;
+
+        Ok(())
+    }
+
+    /// Read a single `memories/<key>.json` from the bookmark tip.
+    /// Returns `Ok(None)` if the file is absent (the key doesn't
+    /// exist, or `unset_memory` cleared it).
+    fn read_memory_from_bookmark(&self, key: &str) -> Result<Option<Memory>> {
+        let relpath = memory::memory_json_relpath(key);
+        let text = match self.repo.run(&[
+            "file",
+            "show",
+            "-r",
+            ISSUES_BOOKMARK_REVSET,
+            &format!("root:{}", relpath.display()),
+        ]) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        Ok(Some(serde_json::from_str(&text)?))
+    }
+
+    /// Enumerate every memory key present in `memories/<key>.json` at
+    /// the `issues` bookmark tip. Sorted ascending, deduplicated.
+    fn list_memory_keys(&self) -> Result<Vec<String>> {
+        let text = match self.repo.run(&[
+            "file",
+            "list",
+            "-r",
+            ISSUES_BOOKMARK_REVSET,
+            "-T",
+            "path ++ \"\\n\"",
+            "root:memories/",
+        ]) {
+            Ok(s) => s,
+            // No memories directory yet — empty list.
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut keys: Vec<String> = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("memories/") else {
+                continue;
+            };
+            let Some(stem) = rest.strip_suffix(".json") else {
+                continue;
+            };
+            // Defensive: reject any path with directory separators.
+            if stem.contains('/') {
+                continue;
+            }
+            keys.push(stem.to_owned());
+        }
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
+    }
+
     /// Does this issue id already have a record on the bookmark? Used
     /// for the collision retry in `create_issue`.
     fn issue_exists_on_bookmark(&self, id: &IssueId) -> Result<bool> {
@@ -1686,6 +1876,16 @@ fn write_record_json(path: &Path, record: &IssueRecord) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let mut s = serde_json::to_string_pretty(record)?;
+    s.push('\n');
+    std::fs::write(path, s)?;
+    Ok(())
+}
+
+fn write_memory_json(path: &Path, mem: &Memory) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut s = serde_json::to_string_pretty(mem)?;
     s.push('\n');
     std::fs::write(path, s)?;
     Ok(())

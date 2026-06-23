@@ -1,6 +1,6 @@
-# jjforge on-disk storage format — v2.1
+# jjforge on-disk storage format — v2.2
 
-Status: v2.1, current. This is the contract every other crate
+Status: v2.2, current. This is the contract every other crate
 implements against. Verdicts pinned by:
 
 - `dcd4b57` — Shape A (dedicated bookmark for issue data).
@@ -8,6 +8,32 @@ implements against. Verdicts pinned by:
   audit surface.
 - `2130de1` — shell out to the `jj` CLI; do not link `jj-lib`.
 - `72638a0` — the `mvp-storage` epic.
+
+## v2.1 → v2.2 changelog
+
+Backwards-compatible additions, landed in the `agent-remember`
+ticket (`81db913`). v2.1 readers tolerate v2.2 commits (the
+trailer parser drops unknown ops per §5.2; the per-issue
+history walker drops trailer stanzas with no `Jjf-Issue:`
+field); v2.2 readers tolerate v2.1 commits (no migration, no
+new bookmark).
+
+- **New on-bookmark file family `memories/<key>.json`** — one
+  file per memory. Schema in §10: `{ "key", "value",
+  "created_at", "updated_at" }`. The family lives on the
+  `issues` bookmark next to `issues/<id>.json`, riding the
+  same git transport (so `jjf push` / `jjf pull` carry
+  memories automatically).
+- **New op `set-memory`** — payload fields `Jjf-Memory-Key`,
+  `Jjf-Memory-Value`. The trailer carries a single-lined,
+  truncated preview of the value (≤200 chars); the on-disk
+  `memories/<key>.json` holds the untouched full value.
+- **New op `unset-memory`** — payload field `Jjf-Memory-Key`.
+  Removes the on-disk file.
+- **Memory op stanzas don't carry `Jjf-Issue:`** — they're
+  global to the bookmark, not per-issue. The per-issue trailer
+  parser (§5.6) drops them silently for any given issue's op
+  chain.
 
 ## v2 → v2.1 changelog
 
@@ -372,6 +398,8 @@ trap that §5.6's filter-on-both-files workaround papers over.
 | `set-slug`   | `Jjf-Slug` (validated kebab-case per §3.4; empty clears) | v2.1.                                                |
 | `comment-add` | `Jjf-Comment-Id` (the new comment's 7-hex id)            | The comment body lives in `<id>.comments.jsonl`.     |
 | `merge`      | (no extra payload fields)                                 | Used by the merge driver in `e2e473b`.               |
+| `set-memory` | `Jjf-Memory-Key`, `Jjf-Memory-Value` (single-line, ≤200 chars; full value in `memories/<key>.json`) | v2.2. **No `Jjf-Issue:`** — global to the bookmark.    |
+| `unset-memory` | `Jjf-Memory-Key`                                        | v2.2. **No `Jjf-Issue:`**.                            |
 
 Unknown trailers and unknown op-types **must be tolerated** by
 readers — they get logged in the audit view as
@@ -629,6 +657,117 @@ constrains it. The 4-CLI dance (jj 0.40–0.42 has no `file write
 
 Cost ≈60ms per mutation at jj's measured ~15ms/CLI call
 (`2130de1`), which is acceptable for `jjf`.
+
+---
+
+## 10. Persistent memories (v2.2)
+
+Memories are short declarative facts (operational rules,
+codebase folklore, architectural decisions) keyed by a
+kebab-case slug. They ride the `issues` bookmark like
+per-issue records do — `jjf push` / `jjf pull` carry them
+automatically — but they're global to the bookmark, not
+scoped to any one issue.
+
+### 10.1 File family
+
+```
+<repo>/
+  memories/
+    dolt-phantoms.json
+    auth-jwt.json
+    ...
+```
+
+One file per memory, named by its kebab-case key. The
+directory lives at the repo root next to `issues/`. Empty
+directory (no memories yet) is the steady state.
+
+### 10.2 Record schema
+
+```json
+{
+  "key": "dolt-phantoms",
+  "value": "Dolt phantom DBs hide in three places",
+  "created_at": "2026-06-23T01:23:45Z",
+  "updated_at": "2026-06-23T01:23:45Z"
+}
+```
+
+- `key`: kebab-case slug, validated per spec §3.4's slug rules
+  (`[a-z0-9-]+`, length 3–48, no leading/trailing/consecutive
+  hyphens). The key in the record agrees with the file name.
+- `value`: the free-text insight. Newlines preserved. No
+  length limit at the storage layer.
+- `created_at`, `updated_at`: RFC 3339 second resolution, per
+  spec §3.1.
+
+The writer emits fields in this declaration order; readers
+parse via serde and tolerate field reordering for forward
+compatibility.
+
+### 10.3 Op vocabulary
+
+Two ops, both on the `issues` bookmark, both single-stanza
+single-op commits (no multi-op-per-commit yet — operator path
+is "one memory at a time").
+
+```
+jjf: memory dolt-phantoms - set
+
+Jjf-Op: set-memory
+Jjf-At: 2026-06-22T12:34:56.123456789Z
+Jjf-Memory-Key: dolt-phantoms
+Jjf-Memory-Value: Dolt phantom DBs hide in three places
+```
+
+```
+jjf: memory dolt-phantoms - unset
+
+Jjf-Op: unset-memory
+Jjf-At: 2026-06-22T12:34:56.123456789Z
+Jjf-Memory-Key: dolt-phantoms
+```
+
+The `Jjf-Memory-Value:` trailer carries a **single-lined,
+truncated** preview of the value (newlines → spaces, capped
+at 200 chars with a `...` suffix on truncation). The
+authoritative bytes live in `memories/<key>.json`; the
+trailer is for human-readable audit only.
+
+**No `Jjf-Issue:`** on memory op stanzas. The per-issue
+trailer parser drops these stanzas silently for any specific
+issue's op chain — see `crate::trailer::stanza_to_op`.
+
+### 10.4 Upsert semantics
+
+`set-memory` is upsert by key: if `memories/<key>.json`
+already exists, the writer rewrites the file (bumping
+`updated_at` but preserving `created_at`) and lands a new
+commit. The audit chain accumulates one `set-memory` op per
+write — no dedupe.
+
+### 10.5 Slugification
+
+When the operator writes a memory without an explicit `--key`,
+the CLI derives one from the value via `jjf_storage::slugify`:
+lowercase, non-alphanumeric runs collapse to a single `-`,
+trim leading/trailing `-`, take the first ~8 hyphen-separated
+tokens, cap at 60 chars. Empty result (no alphanumerics in the
+input) surfaces as a typed error pointing at `--key`. Port of
+beads' `slugify()` from `reference/beads/cmd/bd/memory.go:23-44`.
+
+### 10.6 Merge semantics
+
+Memories are independent files per key, so jj's textual
+auto-merger handles the common cases for free: disjoint keys
+land cleanly; same key with the same bytes is a no-op merge.
+Same key with divergent bytes does conflict at the file level
+— the op-space resolver in §6 doesn't currently fold memory
+ops, so the user resolves textually (or runs `jjf remember
+--key <k> "<final value>"` to pin the winner). Op-space
+memory resolution is a separate ticket if usage shows the
+manual path is friction.
 
 ---
 

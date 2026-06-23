@@ -157,6 +157,22 @@ pub struct Comment {
     pub body: String,
 }
 
+/// One persistent memory: a short declarative fact keyed by a
+/// kebab-case slug, kept on the `issues` bookmark in
+/// `memories/<key>.json`. Spec v2.2 §10.
+///
+/// Memories travel with the bookmark just like issue records do, so
+/// every operator who pulls inherits them automatically. Field
+/// declaration order doubles as on-disk emission order, matching
+/// `IssueRecord`'s schema-stability rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Memory {
+    pub key: String,
+    pub value: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// The read-side view of an issue: the latest scalar state plus the full
 /// chronological comment thread. Returned by `Storage::read`.
 ///

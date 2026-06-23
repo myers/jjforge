@@ -1958,3 +1958,219 @@ fn read_history_walks_same_second_comment_appends() {
         same_second_clusters,
     );
 }
+
+
+// -------- memories (spec v2.2 §10) -----------------------------------
+
+#[test]
+fn set_memory_lands_file_under_memories_at_bookmark() {
+    let repo = make_scratch_repo("memory_set");
+    let storage = Storage::open(&repo).expect("Storage::open");
+
+    storage
+        .set_memory("dolt-phantoms", "Dolt phantom DBs hide in three places")
+        .expect("set_memory");
+
+    let text = read_at_bookmark(&repo, "memories/dolt-phantoms.json");
+    let mem: jjf_storage::Memory = serde_json::from_str(&text).unwrap();
+    assert_eq!(mem.key, "dolt-phantoms");
+    assert_eq!(mem.value, "Dolt phantom DBs hide in three places");
+    assert!(!mem.created_at.is_empty());
+    assert_eq!(mem.created_at, mem.updated_at);
+}
+
+#[test]
+fn set_memory_is_upsert_updates_value_and_updated_at() {
+    let repo = make_scratch_repo("memory_upsert");
+    let storage = Storage::open(&repo).expect("Storage::open");
+
+    storage.set_memory("auth-jwt", "uses JWT").expect("first set");
+    let first = storage.read_memory("auth-jwt").unwrap().unwrap();
+
+    // Sleep a hair to avoid a same-second updated_at collision; the
+    // storage uses second-resolution stamps.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    storage
+        .set_memory("auth-jwt", "uses JWT not sessions")
+        .expect("second set");
+    let second = storage.read_memory("auth-jwt").unwrap().unwrap();
+
+    assert_eq!(second.value, "uses JWT not sessions");
+    // created_at preserved across upsert.
+    assert_eq!(second.created_at, first.created_at);
+    // updated_at bumped.
+    assert_ne!(second.updated_at, first.updated_at);
+}
+
+#[test]
+fn read_memory_returns_none_for_unknown_key() {
+    let repo = make_scratch_repo("memory_read_missing");
+    let storage = Storage::open(&repo).expect("Storage::open");
+    assert!(storage.read_memory("nope").unwrap().is_none());
+}
+
+#[test]
+fn unset_memory_removes_file_and_record() {
+    let repo = make_scratch_repo("memory_unset");
+    let storage = Storage::open(&repo).expect("Storage::open");
+
+    storage.set_memory("temp-rule", "a value").unwrap();
+    assert!(storage.read_memory("temp-rule").unwrap().is_some());
+
+    storage.unset_memory("temp-rule").expect("unset_memory");
+    assert!(storage.read_memory("temp-rule").unwrap().is_none());
+
+    // File listing should also stop returning the key.
+    let mems = storage.list_memories().unwrap();
+    assert!(mems.iter().all(|m| m.key != "temp-rule"));
+}
+
+#[test]
+fn unset_memory_on_unknown_key_errors() {
+    let repo = make_scratch_repo("memory_unset_missing");
+    let storage = Storage::open(&repo).expect("Storage::open");
+    let err = storage.unset_memory("no-such-key").unwrap_err();
+    match err {
+        StorageError::Invalid(msg) => {
+            assert!(msg.contains("no memory with key"), "got: {msg}");
+        }
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+}
+
+#[test]
+fn list_memories_returns_ascending_keys() {
+    let repo = make_scratch_repo("memory_list");
+    let storage = Storage::open(&repo).expect("Storage::open");
+
+    storage.set_memory("zebra-rule", "z").unwrap();
+    storage.set_memory("alpha-rule", "a").unwrap();
+    storage.set_memory("middle-rule", "m").unwrap();
+
+    let mems = storage.list_memories().unwrap();
+    let keys: Vec<&str> = mems.iter().map(|m| m.key.as_str()).collect();
+    assert_eq!(keys, vec!["alpha-rule", "middle-rule", "zebra-rule"]);
+}
+
+#[test]
+fn list_memories_empty_when_none_set() {
+    let repo = make_scratch_repo("memory_list_empty");
+    let storage = Storage::open(&repo).expect("Storage::open");
+    let mems = storage.list_memories().unwrap();
+    assert!(mems.is_empty(), "expected no memories, got {mems:?}");
+}
+
+#[test]
+fn set_memory_rejects_empty_value() {
+    let repo = make_scratch_repo("memory_empty_value");
+    let storage = Storage::open(&repo).expect("Storage::open");
+    let err = storage.set_memory("some-key", "   ").unwrap_err();
+    matches!(err, StorageError::Invalid(_));
+}
+
+#[test]
+fn set_memory_rejects_invalid_key() {
+    let repo = make_scratch_repo("memory_bad_key");
+    let storage = Storage::open(&repo).expect("Storage::open");
+    let err = storage.set_memory("Bad Key", "value").unwrap_err();
+    match err {
+        StorageError::Invalid(msg) => {
+            assert!(msg.contains("invalid memory key"), "got: {msg}");
+        }
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+}
+
+#[test]
+fn set_memory_commit_carries_set_memory_trailer() {
+    let repo = make_scratch_repo("memory_trailer_shape");
+    let storage = Storage::open(&repo).expect("Storage::open");
+    storage.set_memory("hello-world", "the value").unwrap();
+    let desc = jj_capture(
+        &[
+            "log",
+            "-r",
+            "bookmarks(issues)",
+            "--no-graph",
+            "-T",
+            "description",
+        ],
+        &repo,
+    );
+    assert!(
+        desc.contains("Jjf-Op: set-memory"),
+        "commit description missing set-memory trailer:\n{desc}"
+    );
+    assert!(
+        desc.contains("Jjf-Memory-Key: hello-world"),
+        "commit description missing key trailer:\n{desc}"
+    );
+    assert!(
+        desc.contains("Jjf-Memory-Value: the value"),
+        "commit description missing value trailer:\n{desc}"
+    );
+    // No Jjf-Issue trailer — memory ops don't carry one.
+    assert!(
+        !desc.contains("Jjf-Issue:"),
+        "memory commit should not carry Jjf-Issue trailer:\n{desc}"
+    );
+}
+
+#[test]
+fn unset_memory_commit_carries_unset_memory_trailer() {
+    let repo = make_scratch_repo("memory_unset_trailer");
+    let storage = Storage::open(&repo).expect("Storage::open");
+    storage.set_memory("temp", "value").unwrap();
+    storage.unset_memory("temp").unwrap();
+    let desc = jj_capture(
+        &[
+            "log",
+            "-r",
+            "bookmarks(issues)",
+            "--no-graph",
+            "-T",
+            "description",
+        ],
+        &repo,
+    );
+    assert!(
+        desc.contains("Jjf-Op: unset-memory"),
+        "commit description missing unset-memory trailer:\n{desc}"
+    );
+}
+
+#[test]
+fn memory_ops_do_not_pollute_issue_history() {
+    // A memory mutation lands a commit on the issues bookmark, but the
+    // per-issue history walker must NOT include it in any issue's
+    // chain (its trailer has no Jjf-Issue).
+    let repo = make_scratch_repo("memory_no_pollute");
+    let storage = Storage::open(&repo).expect("Storage::open");
+
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "the issue".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.set_memory("some-rule", "the rule").unwrap();
+
+    let hist = storage.read_history(&id).unwrap();
+    // Should be exactly the create op — no memory op in the issue's chain.
+    let memory_ops: Vec<_> = hist
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.op,
+                Op::CommentAdd { .. } | Op::SetBody { .. } | Op::SetTitle { .. }
+            )
+        })
+        .collect();
+    assert_eq!(memory_ops.len(), 0);
+    // The issue's history is just `create`.
+    assert!(hist.iter().any(|e| matches!(e.op, Op::Create { .. })));
+    assert!(
+        hist.iter().all(|e| !matches!(e.op, Op::Merge { .. })),
+        "no merge ops expected, got {hist:?}"
+    );
+}

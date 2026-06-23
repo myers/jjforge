@@ -42,7 +42,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use jjf_storage::{
     ISSUES_BOOKMARK, Error as StorageError, IdError, Issue, IssueDraft, IssueId, IssueType,
-    ReadyFilter, SlugInvalidReason, Status, Storage, UpdateFields,
+    Memory, ReadyFilter, SlugInvalidReason, Status, Storage, UpdateFields,
 };
 
 /// Top-level CLI shape. Subcommands live on the `Commands` enum; the
@@ -186,6 +186,15 @@ enum Commands {
         /// (`slug_not_found`); a parseable id with no matching
         /// record on the bookmark is exit 1 (`issue_not_found`).
         id: String,
+
+        /// Append a `## Persistent Memories (N)` block after the
+        /// issue body, listing every memory at the bookmark tip
+        /// alphabetically by key. v2.2 — primarily intended for
+        /// `jjf show roadmap --include-memories` at session start.
+        /// Has no effect on `--json` output (memories are reachable
+        /// via `jjf memories --json` for machine consumers).
+        #[arg(long = "include-memories")]
+        include_memories: bool,
     },
 
     /// List issues from the `issues` bookmark, with optional filters.
@@ -406,6 +415,76 @@ enum Commands {
     Remote {
         #[command(subcommand)]
         action: RemoteAction,
+    },
+
+    /// Store a persistent memory on the `issues` bookmark.
+    ///
+    /// Memories are short declarative facts (operational rules,
+    /// codebase folklore, architectural decisions) that travel with the
+    /// planner data via `jjf push` / `jjf pull`. v2.2 spec §10.
+    ///
+    /// Examples:
+    ///
+    ///   jjf remember "always run tests with -race flag"
+    ///   jjf remember "Dolt phantom DBs hide in three places" --key dolt-phantoms
+    ///   jjf remember --key big-note -F notes.md
+    ///
+    /// When `--key` is omitted, the key is derived from the value via
+    /// the slugify rule (first ~8 hyphen-separated tokens, lowercase,
+    /// capped at 60 chars). When a memory with the key already exists,
+    /// `remember` upserts in place (updates `value` and `updated_at`).
+    Remember {
+        /// The memory's value. Positional argument; omit when reading
+        /// from `-F`. Mutually exclusive with `-F`.
+        #[arg(conflicts_with = "file")]
+        value: Option<String>,
+
+        /// Explicit key (kebab-case). Optional; when absent, the key
+        /// is derived from `value` via [`jjf_storage::slugify`].
+        /// Required when `-F -` reads the value from stdin and the
+        /// value's slugify would surprise the operator.
+        #[arg(long)]
+        key: Option<String>,
+
+        /// Source for the memory value when the positional argument is
+        /// omitted. Path to read, or `-` to read stdin. Mutually
+        /// exclusive with the positional `value`.
+        #[arg(short = 'F', long)]
+        file: Option<PathBuf>,
+    },
+
+    /// List or search persistent memories.
+    ///
+    /// With no argument, prints every memory. With a positional
+    /// `<search>`, filters case-insensitively by substring match
+    /// across keys AND values. Plain-text output is `<key>\n  <value
+    /// truncated>\n` per memory, alphabetical by key. `--json` emits a
+    /// JSON array of `Memory` records.
+    Memories {
+        /// Substring to filter by (case-insensitive). Matches if the
+        /// substring appears in either the key or the value.
+        search: Option<String>,
+    },
+
+    /// Print the full value of one memory by key.
+    ///
+    /// Exits 0 with the value on stdout when found, 1 with no output
+    /// (or `{"found": false}` under `--json`) when absent. Useful in
+    /// scripts: `value=$(jjf recall some-key)`.
+    Recall {
+        /// Memory key to look up.
+        key: String,
+    },
+
+    /// Remove a persistent memory by key.
+    ///
+    /// Exits 0 with a confirmation when found+removed, 1 when the key
+    /// doesn't exist. Per spec §5.2-style audit semantics, the
+    /// `unset-memory` op lands on the bookmark even though the file
+    /// gets deleted.
+    Forget {
+        /// Memory key to remove.
+        key: String,
     },
 
     /// Push the `issues` bookmark to a git remote. Wraps
@@ -756,6 +835,24 @@ enum CliError {
     /// issue carries that slug. Preflight failure (exit 2).
     #[error("no issue with handle {handle:?}")]
     SlugNotFound { handle: String },
+
+    /// `jjf remember` ran with no value source — neither a positional
+    /// arg nor `-F`. Preflight failure (exit 2).
+    #[error("no memory value supplied; pass a positional argument or `-F <path|->`")]
+    MissingMemoryValue,
+
+    /// `jjf remember` was unable to derive a key from the value (the
+    /// value contained no alphanumeric characters). Preflight failure
+    /// (exit 2). The operator should pass `--key`.
+    #[error("could not derive memory key from {value:?}; pass --key <slug>")]
+    EmptyMemoryKey { value: String },
+
+    /// `jjf recall <key>` or `jjf forget <key>` looked up a memory key
+    /// that doesn't exist at the bookmark tip. Runtime failure
+    /// (exit 1) — the input was well-formed, the answer is "no such
+    /// memory."
+    #[error("no memory with key {key:?}")]
+    MemoryNotFound { key: String },
 }
 
 impl CliError {
@@ -785,6 +882,9 @@ impl CliError {
             CliError::InvalidSlug { .. } => 2,
             CliError::SlugCollision { .. } => 2,
             CliError::SlugNotFound { .. } => 2,
+            CliError::MissingMemoryValue => 2,
+            CliError::EmptyMemoryKey { .. } => 2,
+            CliError::MemoryNotFound { .. } => 1,
             CliError::Probe(_) => 1,
             CliError::JjGitRemote(_) => 1,
             // Sync verbs: the user typed a well-formed command; the
@@ -827,6 +927,9 @@ impl CliError {
             CliError::InvalidSlug { .. } => "invalid_slug",
             CliError::SlugCollision { .. } => "slug_collision",
             CliError::SlugNotFound { .. } => "slug_not_found",
+            CliError::MissingMemoryValue => "missing_memory_value",
+            CliError::EmptyMemoryKey { .. } => "empty_memory_key",
+            CliError::MemoryNotFound { .. } => "memory_not_found",
             CliError::Cwd(_) => "cwd_error",
             CliError::BodyRead { .. } => "body_read_error",
             CliError::BadDepId { .. } => "bad_id",
@@ -904,6 +1007,8 @@ impl CliError {
             }
             CliError::Storage(StorageError::SlugNotFound { handle })
             | CliError::SlugNotFound { handle } => json!({ "handle": handle }),
+            CliError::EmptyMemoryKey { value } => json!({ "value": value }),
+            CliError::MemoryNotFound { key } => json!({ "key": key }),
             _ => serde_json::Value::Null,
         }
     }
@@ -981,7 +1086,15 @@ fn run(cli: Cli) -> Result<(), CliError> {
             r#type,
             slug,
         } => run_new(cli.json, title, file, labels, deps, assignee, r#type, slug),
-        Commands::Show { id } => run_show(cli.json, id),
+        Commands::Show { id, include_memories } => {
+            run_show(cli.json, id, include_memories)
+        }
+        Commands::Remember { value, key, file } => {
+            run_remember(cli.json, value, key, file)
+        }
+        Commands::Memories { search } => run_memories(cli.json, search),
+        Commands::Recall { key } => run_recall(cli.json, key),
+        Commands::Forget { key } => run_forget(cli.json, key),
         Commands::Ls {
             status,
             labels,
@@ -1229,7 +1342,7 @@ fn read_body(file: Option<&Path>) -> Result<String, CliError> {
 /// the storage layer. Issue-not-found is a runtime failure (exit 1) —
 /// the user typed something well-formed, we tried to honor it, and
 /// the answer is "no such issue at the bookmark tip."
-fn run_show(json: bool, id: String) -> Result<(), CliError> {
+fn run_show(json: bool, id: String, include_memories: bool) -> Result<(), CliError> {
     // 1. Resolve the cwd. `Storage::open` wants an absolute path;
     // canonicalize so symlinks don't bite.
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
@@ -1254,13 +1367,242 @@ fn run_show(json: bool, id: String) -> Result<(), CliError> {
         // verbatim, no `{"ok": true, ...}` envelope. (`init` and `new`
         // use the envelope because they have no payload beyond a
         // success signal; `show`'s whole job is to expose the record.)
+        // `--include-memories` is plain-text only — JSON consumers
+        // call `jjf memories --json` for that.
         let s = serde_json::to_string_pretty(&issue)
             .map_err(|e| CliError::Storage(StorageError::Json(e)))?;
         println!("{s}");
     } else {
         print_issue_plain(&issue);
+        if include_memories {
+            let memories = storage.list_memories()?;
+            print_memories_block(&memories);
+        }
     }
     Ok(())
+}
+
+/// Render a `## Persistent Memories (N)` block after an issue body.
+/// Format mirrors beads' non-compact `prime` output
+/// (`reference/beads/cmd/bd/prime.go:387-393`): a header with the
+/// count, a one-line usage hint, then per-memory `### <key>\n<value>\n`
+/// sections in ASCII order by key. Empty memory list prints nothing.
+fn print_memories_block(memories: &[Memory]) {
+    if memories.is_empty() {
+        return;
+    }
+    println!();
+    println!("## Persistent Memories ({})", memories.len());
+    println!();
+    println!(
+        "Stored via `jjf remember`. Update in place with `jjf remember --key <key> \"new content\"`. Search with `jjf memories <keyword>`. Remove with `jjf forget <key>`."
+    );
+    println!();
+    for m in memories {
+        println!("### {}", m.key);
+        println!("{}", m.value);
+        println!();
+    }
+}
+
+/// `jjf remember "<value>" [--key <slug>] [-F <path|->]` — write a
+/// persistent memory to the `issues` bookmark.
+///
+/// Body source rules mirror `jjf new`'s `-F` convention: a positional
+/// `value` is the value verbatim; `-F <path>` reads from a file; `-F -`
+/// reads from stdin. Exactly one source must be present; clap enforces
+/// the `conflicts_with` between `value` and `file`.
+///
+/// When `--key` is absent, the key is derived from the value via
+/// `slugify`. If the value contains no alphanumerics, slugify returns
+/// `""` and we surface a typed `EmptyMemoryKey` error.
+fn run_remember(
+    json: bool,
+    value: Option<String>,
+    key: Option<String>,
+    file: Option<PathBuf>,
+) -> Result<(), CliError> {
+    // 1. Resolve the value source.
+    let value: String = match (value, file) {
+        (Some(v), None) => v,
+        (None, Some(path)) => read_body(Some(path.as_path()))?,
+        (None, None) => return Err(CliError::MissingMemoryValue),
+        (Some(_), Some(_)) => {
+            // Clap's `conflicts_with` should prevent this; defensive.
+            return Err(CliError::MissingMemoryValue);
+        }
+    };
+    let trimmed = value.trim_end_matches('\n').to_owned();
+
+    // 2. Resolve the key. Explicit --key wins; otherwise slugify the
+    // value. An empty slugify result (the value had no alphanumerics)
+    // is a typed exit-2 error pointing at --key.
+    let key = match key {
+        Some(k) => k,
+        None => {
+            let auto = jjf_storage::slugify(&trimmed);
+            if auto.is_empty() {
+                return Err(CliError::EmptyMemoryKey {
+                    value: trimmed.clone(),
+                });
+            }
+            auto
+        }
+    };
+
+    // 3. Preflight cwd + bookmark + self-host guard.
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    preflight::refuse_self_hosted_write(&cwd, json)?;
+    preflight::issues_bookmark(&cwd)?;
+
+    // 4. Hand off to storage.
+    let storage = Storage::open(&cwd)?;
+    let existed = storage.read_memory(&key)?.is_some();
+    storage.set_memory(&key, &trimmed)?;
+
+    // 5. Render. `action` is `"remembered"` for the create case and
+    // `"updated"` for the upsert case — gives the operator a clear
+    // signal which path ran.
+    let action = if existed { "updated" } else { "remembered" };
+    if json {
+        let out = serde_json::json!({
+            "ok": true,
+            "key": key,
+            "action": action,
+        });
+        println!("{out}");
+    } else {
+        // Single-line summary using a truncated value, matching beads'
+        // shape.
+        let preview = truncate_memory(&trimmed, 80);
+        let verb = if existed { "Updated" } else { "Remembered" };
+        println!("{verb} [{key}]: {preview}");
+    }
+    Ok(())
+}
+
+/// `jjf memories [<search>] [--json]` — list memories, optionally
+/// filtered by a case-insensitive substring match across key + value.
+///
+/// Plain-text shape per the ticket: `<key>\n  <value-truncated>\n` per
+/// memory, alphabetical by key, with a header line summarizing the
+/// count (or the search term). `--json` emits the bare array of
+/// `Memory` records (same envelope rule as `ls --json` / `show
+/// --json`).
+fn run_memories(json: bool, search: Option<String>) -> Result<(), CliError> {
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    preflight::issues_bookmark(&cwd)?;
+    let storage = Storage::open(&cwd)?;
+    let mut memories = storage.list_memories()?;
+    if let Some(s) = &search {
+        let s = s.to_lowercase();
+        memories.retain(|m| {
+            m.key.to_lowercase().contains(&s)
+                || m.value.to_lowercase().contains(&s)
+        });
+    }
+    if json {
+        let payload = serde_json::to_string_pretty(&memories)
+            .map_err(|e| CliError::Storage(StorageError::Json(e)))?;
+        println!("{payload}");
+        return Ok(());
+    }
+    if memories.is_empty() {
+        if let Some(s) = &search {
+            println!("no memories matching {s:?}");
+        } else {
+            println!(
+                "no memories stored. Use `jjf remember \"insight\"` to add one."
+            );
+        }
+        return Ok(());
+    }
+    if let Some(s) = &search {
+        println!("memories matching {s:?}:");
+    } else {
+        println!("memories ({}):", memories.len());
+    }
+    println!();
+    for m in &memories {
+        println!("{}", m.key);
+        println!("  {}", truncate_memory(&m.value, 120));
+        println!();
+    }
+    Ok(())
+}
+
+/// `jjf recall <key> [--json]` — print the full value of one memory.
+///
+/// Plain-text shape: the value verbatim on stdout (newline-appended),
+/// exit 1 with a stderr error if absent. `--json` shape: `{key, value,
+/// found}` always, with exit 1 + `found: false` when absent so a
+/// pipeline can `jq` either form.
+fn run_recall(json: bool, key: String) -> Result<(), CliError> {
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    preflight::issues_bookmark(&cwd)?;
+    let storage = Storage::open(&cwd)?;
+    let mem = storage.read_memory(&key)?;
+    match mem {
+        Some(m) => {
+            if json {
+                let out = serde_json::json!({
+                    "key": m.key,
+                    "value": m.value,
+                    "found": true,
+                });
+                println!("{out}");
+            } else {
+                println!("{}", m.value);
+            }
+            Ok(())
+        }
+        None => Err(CliError::MemoryNotFound { key }),
+    }
+}
+
+/// `jjf forget <key> [--json]` — remove one memory by key.
+///
+/// Exit 0 with a confirmation on success; exit 1 with `memory_not_found`
+/// when the key doesn't exist. The storage layer's `unset_memory`
+/// surfaces the "no memory with key" message as `Error::Invalid`; we
+/// translate that to the typed `MemoryNotFound` for kind stability.
+fn run_forget(json: bool, key: String) -> Result<(), CliError> {
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    preflight::refuse_self_hosted_write(&cwd, json)?;
+    preflight::issues_bookmark(&cwd)?;
+    let storage = Storage::open(&cwd)?;
+    // Probe up-front so we can surface `MemoryNotFound` rather than
+    // storage's generic `Invalid` message.
+    if storage.read_memory(&key)?.is_none() {
+        return Err(CliError::MemoryNotFound { key });
+    }
+    storage.unset_memory(&key)?;
+    if json {
+        let out = serde_json::json!({
+            "ok": true,
+            "key": key,
+            "action": "forgot",
+        });
+        println!("{out}");
+    } else {
+        println!("forgot [{key}]");
+    }
+    Ok(())
+}
+
+/// Shorten a memory value to `max_len` for display. Newlines collapse
+/// to spaces so the truncated line stays single-line.
+fn truncate_memory(s: &str, max_len: usize) -> String {
+    let one_line = s.replace('\n', " ");
+    if one_line.chars().count() <= max_len {
+        return one_line;
+    }
+    let prefix: String = one_line.chars().take(max_len.saturating_sub(3)).collect();
+    format!("{prefix}...")
 }
 
 /// Render an issue as human-readable plain text. v1 shape per the
