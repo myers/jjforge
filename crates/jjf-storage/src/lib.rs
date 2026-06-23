@@ -2621,11 +2621,29 @@ fn hex_nybble(n: u8) -> char {
 /// Current time as RFC 3339 in UTC, second resolution. We avoid
 /// pulling `chrono` / `time` just to render the timestamps the spec
 /// asks for; format is well-known and the math is small.
+///
+/// Tests may pin the clock by setting `JJF_TEST_CLOCK_SECS` to a
+/// fixed `u64` epoch-seconds value (e.g. `1735660800`). The override
+/// affects both this function and [`now_rfc3339_nanos`], which derives
+/// its seconds from the same source. Production code never sets this
+/// env var; the override exists so timing-sensitive tests (like
+/// `read_history_walks_same_second_comment_appends`, which depends on
+/// two consecutive writes landing in the same wall-clock second) are
+/// deterministic under heavy parallel test load.
 fn now_rfc3339() -> Result<String> {
+    Ok(epoch_secs_to_rfc3339(current_epoch_secs()?))
+}
+
+fn current_epoch_secs() -> Result<u64> {
+    if let Ok(v) = std::env::var("JJF_TEST_CLOCK_SECS") {
+        if let Ok(n) = v.parse::<u64>() {
+            return Ok(n);
+        }
+    }
     let dur = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| Error::Clock(format!("system clock before unix epoch: {e}")))?;
-    Ok(epoch_secs_to_rfc3339(dur.as_secs()))
+    Ok(dur.as_secs())
 }
 
 /// Current time as RFC 3339 in UTC with nanosecond resolution. Used by
@@ -2636,6 +2654,17 @@ fn now_rfc3339() -> Result<String> {
 /// continue to use [`now_rfc3339`] per spec §3.1 — only trailers get
 /// nanos.
 fn now_rfc3339_nanos() -> Result<String> {
+    // When `JJF_TEST_CLOCK_SECS` is set, nanos resolve to live
+    // sub-second so trailer ordering still works; only the second
+    // component is pinned.
+    if std::env::var_os("JJF_TEST_CLOCK_SECS").is_some() {
+        let secs = current_epoch_secs()?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        return Ok(epoch_nanos_to_rfc3339(secs, nanos));
+    }
     let dur = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| Error::Clock(format!("system clock before unix epoch: {e}")))?;

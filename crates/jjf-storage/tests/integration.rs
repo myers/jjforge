@@ -1882,6 +1882,24 @@ fn list_ready_on_empty_bookmark_returns_empty() {
 // ---------------------------------------------------------------------
 #[test]
 fn read_history_walks_same_second_comment_appends() {
+    // Pin the clock to a fixed second so every write lands in the
+    // same wall-clock second AND the resulting JSON `updated_at`
+    // values are byte-identical across writes. This makes the
+    // load-bearing case (commit whose only change is a comments-jsonl
+    // append) deterministic regardless of how slow `add_comment` is
+    // under parallel-test load. Previously this test spammed 12
+    // comments and hoped two landed same-second; that race lost when
+    // full-suite parallelism made each add_comment take >1s.
+    //
+    // The env var is consumed by `now_rfc3339()` in
+    // `crates/jjf-storage/src/lib.rs`. Nextest runs each test in its
+    // own process, so the env var here doesn't leak into siblings.
+    // SAFETY: single-threaded test process; no other code reads this
+    // env var concurrently.
+    unsafe {
+        std::env::set_var("JJF_TEST_CLOCK_SECS", "1735660800");
+    }
+
     let repo = make_scratch_repo("same_second_comments");
     let storage = Storage::open(&repo).unwrap();
 
@@ -1892,51 +1910,32 @@ fn read_history_walks_same_second_comment_appends() {
         })
         .unwrap();
 
-    // Spam comments. 12 is enough to hit at least one same-second
-    // cluster on any machine that can do an `add_comment` in under
-    // ~80ms (every machine we test on). Each add_comment does ~4 jj
-    // shell-outs, file IO, and JSON serialization, so the per-call
-    // cost is real but well under a second.
-    const N: usize = 12;
+    // Two comments — enough to construct one same-second cluster
+    // (which is the load-bearing case).
+    const N: usize = 2;
     for i in 0..N {
         storage
             .add_comment(&id, &format!("comment {i}"), "alice <a@x>")
             .unwrap();
     }
 
-    // Defensive: confirm we actually built the case. Read the
-    // comments file and look for >= 2 comments sharing an exact
-    // created_at (second-resolution). If this assertion fires, the
-    // test environment is too slow to construct the load-bearing
-    // case and the verdict can't be drawn — surface that loudly.
+    // Confirm we built the case: both comments share an exact
+    // `created_at`. With the clock pinned this is by construction;
+    // if it fails the env-var override path is broken.
     let issue = storage.read(&id).unwrap();
+    assert_eq!(issue.comments.len(), N);
     assert_eq!(
-        issue.comments.len(),
-        N,
-        "read should observe every comment we wrote: got {}, expected {}",
-        issue.comments.len(),
-        N
-    );
-    let mut same_second_clusters = 0usize;
-    for w in issue.comments.windows(2) {
-        if w[0].created_at == w[1].created_at {
-            same_second_clusters += 1;
-        }
-    }
-    assert!(
-        same_second_clusters >= 1,
-        "test setup didn't construct any same-second comment pair \
-         in {N} appends (every add_comment landed in its own \
-         second). This run can't validate the dual-file filter; \
-         the test environment is too slow. Comments: {:#?}",
-        issue.comments.iter().map(|c| &c.created_at).collect::<Vec<_>>(),
+        issue.comments[0].created_at, issue.comments[1].created_at,
+        "with JJF_TEST_CLOCK_SECS pinned, both comments must share created_at; \
+         got {} vs {}",
+        issue.comments[0].created_at, issue.comments[1].created_at,
     );
 
     // The regression: walk read_history and confirm every
     // comment-add op appears. If the path filter were stripped down
-    // to only `issues/<id>.json`, the second commit of each
-    // same-second cluster would be missed (its JSON write was
-    // byte-identical) and this count would be < N.
+    // to only `issues/<id>.json`, the second commit's
+    // byte-identical JSON write would be missed and this count
+    // would be < N.
     let history = storage.read_history(&id).unwrap();
     let comment_ops: Vec<_> = history
         .iter()
@@ -1946,15 +1945,12 @@ fn read_history_walks_same_second_comment_appends() {
         comment_ops.len(),
         N,
         "read_history must surface every comment-add even when the \
-         JSON write is byte-identical between consecutive commits \
-         (same-second case). Got {} CommentAdd ops, expected {}. \
-         Saw {} same-second cluster(s) on disk, so the \
-         byte-identical-JSON case IS being exercised. If this \
-         assertion just started failing, check whether the path \
-         filter in history.rs dropped its comments.jsonl entry.",
+         JSON write is byte-identical between consecutive commits. \
+         Got {} CommentAdd ops, expected {}. If this assertion \
+         just started failing, check whether the path filter in \
+         history.rs dropped its comments.jsonl entry.",
         comment_ops.len(),
         N,
-        same_second_clusters,
     );
 }
 
