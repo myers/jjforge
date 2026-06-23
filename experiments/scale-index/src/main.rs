@@ -85,41 +85,73 @@ fn bench_size(out_dir: &Path, n: usize) {
     let ids = storage.list_ids().expect("list_ids");
     assert_eq!(ids.len(), n, "list_ids returned {} (want {})", ids.len(), n);
 
-    // Skip the O(N) measurements at N>=10000 — they'd take minutes
-    // each and the linear extrapolation is unambiguous.
-    let skip_n2 = n >= 10000;
-
-    if !skip_n2 {
-        // 1. list_ready
+    // Post-`61e9a1c` (`docs/storage-index-design.md`), `list_ready`
+    // / `resolve` no longer spawn O(N) `jj file show` calls — the
+    // snapshot cache means a head-commit probe + (on first call) a
+    // single batched read suffices. Measure at every N including
+    // 10k, where the prior O(N) shape would have taken ~4 minutes.
+    //
+    // Each row uses a FRESH `Storage::open` instance — that's the
+    // shape a real CLI invocation has (one process per verb call).
+    // A fresh Storage has an empty in-process memo; the first read
+    // probes the bookmark + loads the on-disk cache (or rebuilds if
+    // the on-disk cache is missing / stale).
+    {
+        // Cold: fresh Storage, ON-DISK CACHE WAS WRITTEN by the
+        // sanity-check `list_ids` above. So this measures
+        // "process startup + head probe + on-disk cache load".
+        let fresh = Storage::open(&abs_repo).expect("Storage::open");
         let t = Instant::now();
-        let ready = storage
+        let ready = fresh.list_ready(&ReadyFilter::default()).expect("list_ready");
+        let elapsed = t.elapsed();
+        println!(
+            "  list_ready cold-storage (on-disk cache hit):  {:.3}s ({} ready)",
+            elapsed.as_secs_f64(),
+            ready.len()
+        );
+
+        // Warm in-process memo: same Storage, second call returns
+        // from the per-Storage cache without any jj invocation.
+        let t = Instant::now();
+        let ready2 = fresh
             .list_ready(&ReadyFilter::default())
             .expect("list_ready");
         let elapsed = t.elapsed();
         println!(
-            "  list_ready (current, 1 jj-file-show per issue x2): {:.3}s ({} ready)",
+            "  list_ready warm-storage (memo):              {:.3}s ({} ready)",
             elapsed.as_secs_f64(),
-            ready.len()
-        );
-        println!(
-            "    per-issue: {:.1} ms",
-            elapsed.as_secs_f64() * 1000.0 / (n as f64)
+            ready2.len()
         );
 
-        // 2. resolve(slug) — worst-case (last slug, so we have to scan
-        // every issue). Slug pattern: "synth-NNNN".
-        let target_slug = format!("synth-{:04}", n - 1);
+        // Cold-storage, on-disk cache MISSING: delete the cache and
+        // open a fresh Storage. Measures rebuild via batched read.
+        let cache_path = abs_repo.join(".jj").join("jjforge-cache.json");
+        let _ = std::fs::remove_file(&cache_path);
+        let fresh2 = Storage::open(&abs_repo).expect("Storage::open");
         let t = Instant::now();
-        let id = storage.resolve(&target_slug).expect("resolve");
+        let ready3 = fresh2
+            .list_ready(&ReadyFilter::default())
+            .expect("list_ready");
         let elapsed = t.elapsed();
         println!(
-            "  resolve(\"{}\") (current, slug worst case): {:.3}s -> {}",
+            "  list_ready cold-storage (cache rebuild):     {:.3}s ({} ready)",
+            elapsed.as_secs_f64(),
+            ready3.len()
+        );
+
+        // resolve(slug) — worst-case (last slug). Fresh Storage,
+        // on-disk cache present, slug_index lookup.
+        let target_slug = format!("synth-{:04}", n - 1);
+        let fresh3 = Storage::open(&abs_repo).expect("Storage::open");
+        let t = Instant::now();
+        let id = fresh3.resolve(&target_slug).expect("resolve");
+        let elapsed = t.elapsed();
+        println!(
+            "  resolve(\"{}\") cold-storage:              {:.3}s -> {}",
             target_slug,
             elapsed.as_secs_f64(),
             id
         );
-    } else {
-        println!("  list_ready / resolve: SKIPPED at N=10000 (would be ~4 min each); extrapolate linearly");
     }
 
     // 3. Batched alternative: one `jj log` with --files for every

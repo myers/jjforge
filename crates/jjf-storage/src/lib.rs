@@ -60,6 +60,7 @@
 
 #![forbid(unsafe_code)]
 
+mod cache;
 mod history;
 mod id;
 mod jj;
@@ -488,9 +489,19 @@ pub struct DepTree {
 /// [`Storage::init`] to create the bookmark (idempotent) in a fresh
 /// repo, or [`Storage::open`] when you know the bookmark is already
 /// in place.
+///
+/// Carries a per-instance snapshot cache memo so multiple read calls
+/// within one CLI invocation share the head-probe + cache load. The
+/// memo is invalidated on writes (the mutator drops it), so the next
+/// read sees fresh state.
 #[derive(Debug, Clone)]
 pub struct Storage {
     repo: JjRepo,
+    /// In-process snapshot cache memo. Lazily populated on first
+    /// read; cleared by every mutator so the next read sees the
+    /// post-write bookmark state. `Arc<Mutex<...>>` so clones share
+    /// the memo and Storage stays Send/Sync.
+    snapshot_memo: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<cache::SnapshotCache>>>>,
 }
 
 impl Storage {
@@ -517,6 +528,7 @@ impl Storage {
         }
         let storage = Self {
             repo: JjRepo::open(root),
+            snapshot_memo: Default::default(),
         };
         storage.maybe_migrate_v1_to_v2()?;
         Ok(storage)
@@ -569,7 +581,10 @@ impl Storage {
         // v1 → v2 migration first. If a `bugs` bookmark exists and
         // `issues` doesn't, rename. After this point, the bookmark
         // probe below will succeed if migration ran.
-        let storage = Self { repo: repo.clone() };
+        let storage = Self {
+            repo: repo.clone(),
+            snapshot_memo: Default::default(),
+        };
         storage.maybe_migrate_v1_to_v2()?;
 
         // Probe: does the `issues` bookmark already exist? `jj bookmark
@@ -713,6 +728,13 @@ impl Storage {
         self.repo.run(&["bookmark", "delete", V1_BUGS_BOOKMARK])?;
         self.repo.run(&["new", "root()"])?;
 
+        // Snapshot memo: a fresh Storage instance built by
+        // `Storage::open` / `init` has an empty memo, so dropping
+        // is a no-op here. We still call it for symmetry / future
+        // proofing (if `maybe_migrate_v1_to_v2` ever runs after a
+        // `snapshot()` lazy-load).
+        self.invalidate_snapshot_memo();
+
         Ok(())
     }
 
@@ -723,6 +745,69 @@ impl Storage {
             .repo
             .run(&["bookmark", "list", "-T", "name ++ \"\\n\"", name])?;
         Ok(stdout.lines().any(|line| line.trim() == name))
+    }
+
+    /// Load the snapshot cache, sharing the result across multiple
+    /// read calls in this Storage instance. Internal helper used by
+    /// every read-path verb.
+    ///
+    /// First call probes the bookmark head and loads / rebuilds the
+    /// cache as needed. Subsequent calls return the memoized cache
+    /// without re-probing — they trust that no mutation has landed
+    /// through THIS Storage instance since the last load. Mutators
+    /// call [`Storage::invalidate_snapshot_memo`] to drop the memo
+    /// so the next read re-probes.
+    ///
+    /// The memo IS shared across `Storage::clone()` instances by
+    /// design — same `Arc<Mutex<...>>`. A caller that wants
+    /// independent memos clones via [`Storage::open`] / [`init`]
+    /// from scratch.
+    fn snapshot(&self) -> Result<std::sync::Arc<cache::SnapshotCache>> {
+        // Fast path: read the memo. If populated, return.
+        {
+            let guard = self
+                .snapshot_memo
+                .lock()
+                .expect("snapshot memo mutex poisoned");
+            if let Some(cached) = guard.as_ref() {
+                return Ok(cached.clone());
+            }
+        }
+        // Slow path: load / rebuild, then install in the memo.
+        // We drop the mutex during the I/O so concurrent callers
+        // (e.g. a multi-threaded CLI doing a `list_ready` + a
+        // `list_memories` from different tasks) don't serialize.
+        // Cost of a duplicate rebuild is bounded — second writer
+        // just overwrites the first; net result is correct either
+        // way.
+        let snap = std::sync::Arc::new(cache::load_or_rebuild(
+            &self.repo,
+            self.repo.root(),
+        )?);
+        let mut guard = self
+            .snapshot_memo
+            .lock()
+            .expect("snapshot memo mutex poisoned");
+        // If a concurrent caller raced us, take whichever finished
+        // first. Both reflect the same bookmark tip.
+        if let Some(existing) = guard.as_ref() {
+            return Ok(existing.clone());
+        }
+        *guard = Some(snap.clone());
+        Ok(snap)
+    }
+
+    /// Drop the in-process snapshot memo so the next read re-probes
+    /// the bookmark head. Every mutator calls this after the 4-CLI
+    /// dance lands. The on-disk cache (`.jj/jjforge-cache.json`)
+    /// stays put; it'll be detected as stale on the next probe and
+    /// rebuilt.
+    fn invalidate_snapshot_memo(&self) {
+        let mut guard = self
+            .snapshot_memo
+            .lock()
+            .expect("snapshot memo mutex poisoned");
+        *guard = None;
     }
 
     /// The repo root this storage handle is rooted at.
@@ -1267,11 +1352,11 @@ impl Storage {
         // (id, title, status) — the tree consumer can `read` for
         // more — but we need the full deps field of every candidate
         // to find children.
-        let ids = self.list_ids()?;
-        let mut all: Vec<Issue> = Vec::with_capacity(ids.len());
-        for id in &ids {
-            all.push(self.read(id)?);
-        }
+        //
+        // Snapshot cache (per `docs/storage-index-design.md`)
+        // replaces the prior N-spawn `read()` loop.
+        let snapshot = self.snapshot()?;
+        let all: Vec<Issue> = snapshot.issues.values().cloned().collect();
 
         // Build a child index: for each `parent-child` edge X →
         // target, register X as a child of `target`. Iterating the
@@ -1474,20 +1559,23 @@ impl Storage {
     /// Read one memory by key from the `issues` bookmark tip. Returns
     /// `Ok(None)` if no memory with that key exists.
     pub fn read_memory(&self, key: &str) -> Result<Option<Memory>> {
-        self.read_memory_from_bookmark(key)
+        // Cache fast path: HashMap lookup by key. Cache rebuild is
+        // the same cost as the prior single-key `jj file show`
+        // worst case, and amortizes across subsequent calls.
+        let snapshot = self.snapshot()?;
+        Ok(snapshot.memories.get(key).cloned())
     }
 
     /// Enumerate every memory present at the `issues` bookmark tip,
     /// sorted by key ascending. Reads each `memories/<key>.json` and
     /// returns the parsed records.
     pub fn list_memories(&self) -> Result<Vec<Memory>> {
-        let keys = self.list_memory_keys()?;
-        let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            if let Some(mem) = self.read_memory_from_bookmark(&key)? {
-                out.push(mem);
-            }
-        }
+        // Snapshot cache: every Memory on the bookmark tip is in
+        // `snapshot.memories`. Skip the per-key `jj file show`
+        // loop entirely. See `docs/storage-index-design.md`.
+        let snapshot = self.snapshot()?;
+        let mut out: Vec<Memory> = snapshot.memories.values().cloned().collect();
+        out.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(out)
     }
 
@@ -1498,7 +1586,23 @@ impl Storage {
     ///
     /// Implementation cross-checks the file-read view against an
     /// op-replay view in debug builds — see `read.rs` for the rules.
+    ///
+    /// **Snapshot cache.** Per `docs/storage-index-design.md`, this
+    /// consults the snapshot cache before falling back to per-id
+    /// shell-outs. A cache hit returns the pre-projected `Issue`
+    /// (skipping the debug cross-check; the rebuild path projected
+    /// from the same files `read::read` would have read). A cache
+    /// miss falls back to the per-id path, which still runs the
+    /// cross-check in debug.
     pub fn read(&self, id: &IssueId) -> Result<Issue> {
+        let snapshot = self.snapshot()?;
+        if let Some(issue) = snapshot.issues.get(id) {
+            return Ok(issue.clone());
+        }
+        // Cache miss for this id (very unusual — either a race with
+        // a concurrent writer between probe and lookup, OR the id
+        // genuinely isn't on the bookmark). Fall through to the
+        // per-id read for a sharp `IssueNotFound` error.
         read::read(&self.repo, id)
     }
 
@@ -1528,11 +1632,20 @@ impl Storage {
         if let Ok(id) = IssueId::parse(handle) {
             return Ok(id);
         }
-        // Slow path: scan every issue's slug.
-        for id in self.list_ids()? {
-            let rec = self.read_record_from_bookmark(&id)?;
-            if rec.slug.as_deref() == Some(handle) {
-                return Ok(id);
+        // Slug path: HashMap lookup on the snapshot cache's
+        // pre-built `slug_index`. Before the cache, this was an
+        // O(N) shell-out loop — see closing comment on `b9f628b`.
+        let snapshot = self.snapshot()?;
+        if let Some(id) = snapshot.slug_index.get(handle) {
+            return Ok(id.clone());
+        }
+        // The slug_index only carries OPEN/InProgress slugs (per
+        // spec v2.1, closed issues release their slug). But the
+        // method contract says we scan closed issues too — fall
+        // back to a linear scan over the cache's full issue map.
+        for issue in snapshot.issues.values() {
+            if issue.slug.as_deref() == Some(handle) {
+                return Ok(issue.id.clone());
             }
         }
         Err(Error::SlugNotFound {
@@ -1555,16 +1668,26 @@ impl Storage {
         slug: &str,
         self_id: Option<&IssueId>,
     ) -> Result<Option<IssueId>> {
-        for id in self.list_ids()? {
-            if Some(&id) == self_id {
-                continue;
+        // Snapshot cache: the cache's slug_index only carries
+        // ACTIVE (Open / InProgress) slug holders by construction
+        // (see `cache::SnapshotCache::from_parts`). One HashMap
+        // lookup replaces the per-id `jj file show` loop.
+        let snapshot = self.snapshot()?;
+        if let Some(holder) = snapshot.slug_index.get(slug) {
+            // The slug_index may hold a closed issue if no active
+            // issue claims this slug. Re-check status to be
+            // tolerant of that case (defensive — `from_parts`
+            // populates active first).
+            if Some(holder) == self_id {
+                return Ok(None);
             }
-            let rec = self.read_record_from_bookmark(&id)?;
-            if rec.status == Status::Closed {
-                continue;
-            }
-            if rec.slug.as_deref() == Some(slug) {
-                return Ok(Some(id));
+            if let Some(issue) = snapshot.issues.get(holder) {
+                match issue.status {
+                    Status::Open | Status::InProgress => {
+                        return Ok(Some(holder.clone()));
+                    }
+                    Status::Closed => return Ok(None),
+                }
             }
         }
         Ok(None)
@@ -1590,44 +1713,12 @@ impl Storage {
     /// --issue-changes`, agent `ready` selection, and the PWA's home
     /// view will all sit on top of it.
     pub fn list_ids(&self) -> Result<Vec<IssueId>> {
-        // `jj file list` prints paths relative to the CURRENT WORKING
-        // DIRECTORY by default — which means a subprocess invoked from
-        // any cwd other than the repo root sees its output prefixed with
-        // a relative climb (e.g. `p/jjforge/crates/.../issues/<id>.json`).
-        // We pin the output to repo-root-relative slash-paths by piping
-        // the `TreeEntry.path()` `RepoPath` through the template (its
-        // template form is exactly that). This is cwd-independent and
-        // stable across platforms.
-        let text = self.repo.run(&[
-            "file",
-            "list",
-            "-r",
-            ISSUES_BOOKMARK_REVSET,
-            "-T",
-            "path ++ \"\\n\"",
-            "root:issues/",
-        ])?;
-        let mut ids: Vec<IssueId> = Vec::new();
-        for line in text.lines() {
-            let line = line.trim();
-            // Path shape: `issues/<7-hex>.json`. We only key off `.json`
-            // entries — `.comments.jsonl` siblings belong to issues that
-            // also have a `.json`, so they'd double-count. A bare-named
-            // file (no `issues/` prefix) or a file without `.json` is
-            // skipped silently.
-            let Some(rest) = line.strip_prefix("issues/") else {
-                continue;
-            };
-            let Some(stem) = rest.strip_suffix(".json") else {
-                continue;
-            };
-            // Defensive: parse as IssueId (rejects uppercase, wrong
-            // length, non-hex). A stray `issues/foo.json` is skipped
-            // rather than blowing up enumeration.
-            if let Ok(id) = IssueId::parse(stem) {
-                ids.push(id);
-            }
-        }
+        // Snapshot cache provides every id on the bookmark tip with
+        // one process spawn (head probe) on the hit path. On a miss,
+        // the rebuild reads every record via one batched `jj file
+        // show` invocation. See `docs/storage-index-design.md`.
+        let snapshot = self.snapshot()?;
+        let mut ids: Vec<IssueId> = snapshot.issues.keys().cloned().collect();
         ids.sort();
         ids.dedup();
         Ok(ids)
@@ -1673,11 +1764,13 @@ impl Storage {
         // Read every issue on the bookmark. We need full records
         // (status, type_, dependencies, labels) for both the
         // candidate set and the dep-status lookup.
-        let ids = self.list_ids()?;
-        let mut all: Vec<Issue> = Vec::with_capacity(ids.len());
-        for id in &ids {
-            all.push(self.read(id)?);
-        }
+        //
+        // Snapshot cache (per `docs/storage-index-design.md`):
+        // probe the bookmark head, load `.jj/jjforge-cache.json` on
+        // a hit, rebuild via one batched `jj file show` on a miss.
+        // Replaces the prior N-spawn `read()` loop.
+        let snapshot = self.snapshot()?;
+        let all: Vec<Issue> = snapshot.issues.values().cloned().collect();
 
         let blocked = compute_blocked_set(&all);
 
@@ -1854,6 +1947,9 @@ impl Storage {
         // snapshot the merge commit again.
         self.repo.run(&["new", "root()"])?;
 
+        // Drop the in-process snapshot memo — the bookmark moved.
+        self.invalidate_snapshot_memo();
+
         Ok(())
     }
 
@@ -1976,6 +2072,9 @@ impl Storage {
 
         // 4. Step `@` off the bookmark.
         self.repo.run(&["new", "root()"])?;
+
+        // Drop the in-process snapshot memo — the bookmark moved.
+        self.invalidate_snapshot_memo();
 
         Ok(())
     }
@@ -2123,6 +2222,11 @@ impl Storage {
         // 4. jj new root() — step @ off the bookmark.
         self.repo.run(&["new", "root()"])?;
 
+        // Drop the in-process snapshot memo. The on-disk cache file
+        // stays put; the next read probes the head, sees the new
+        // commit, and rebuilds.
+        self.invalidate_snapshot_memo();
+
         Ok(())
     }
 
@@ -2153,6 +2257,10 @@ impl Storage {
         // 4. jj new root() — step @ off the bookmark.
         self.repo.run(&["new", "root()"])?;
 
+        // Drop the in-process snapshot memo so the next read picks
+        // up the new memory record.
+        self.invalidate_snapshot_memo();
+
         Ok(())
     }
 
@@ -2176,6 +2284,12 @@ impl Storage {
 
     /// Enumerate every memory key present in `memories/<key>.json` at
     /// the `issues` bookmark tip. Sorted ascending, deduplicated.
+    ///
+    /// Kept around as a typed primitive even though `list_memories`
+    /// now uses the snapshot cache — internal callers that only
+    /// need keys can still use this without paying the full
+    /// per-record parse.
+    #[allow(dead_code)]
     fn list_memory_keys(&self) -> Result<Vec<String>> {
         let text = match self.repo.run(&[
             "file",

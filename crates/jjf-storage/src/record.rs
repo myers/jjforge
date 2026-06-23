@@ -376,7 +376,7 @@ pub struct Memory {
 /// emits — field declaration order doubles as on-the-wire JSON field
 /// order, mirroring `IssueRecord`'s schema-stability rule (spec §3.3)
 /// even though no merge ever sees this projection on disk.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Issue {
     pub id: IssueId,
     pub title: String,
