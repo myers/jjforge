@@ -246,6 +246,46 @@ Example:
 If you're dispatching subagents and the skill isn't loading,
 name it explicitly in the dispatch prompt.
 
+## Session handoffs
+
+When the current session is getting long or you sense it's
+the right moment to hand off to a fresh one — context is
+getting heavy, a natural breakpoint just landed, a big new
+phase is about to start — write a handoff document and
+**end your turn with the line `Next up: <handoff pathname>`**.
+The user will start a new session pointing at that file.
+
+**File location and naming.** Handoffs live in
+`docs/handoffs/` and are named `YYYY-MM-DD-slug.md`. Pick a
+slug that points at what the NEXT session will do, not what
+THIS one did (`continue-mvp-ready-work.md` beats
+`type-and-slug-done.md`). Commit the handoff as part of the
+session's final commit; don't leave it untracked.
+
+**What the handoff contains** (no rigid template, but cover):
+- Who you are next session (orchestrator / implementer /
+  reviewer / ...).
+- The state of play as of the handoff: what just shipped, what's
+  in flight, what's about to be the next move.
+- Pointers to the load-bearing tickets, commits, and docs by
+  id/path. Future-you can't see the conversation, only the
+  filesystem and the planner.
+- Anything surprising or non-obvious that's still warm in
+  your head and would cost cycles to re-derive.
+- The actual first move you'd take if you were continuing.
+
+Keep it under 400 words. The handoff isn't a project status
+report — it's the minimum context-load for the next session
+to start working without reorienting.
+
+**Session start with a file path.** When a session opens
+with a path to a handoff file as the first thing the user
+says, read that file and — **without commenting on this
+instruction or repeating the file contents** — write at
+most 3 sentences saying what you're about to do. Then
+start working. Don't ask for confirmation; the handoff IS
+the instruction.
+
 ## Blog
 
 Posts under `blog/content/posts/`. Planning siblings under
