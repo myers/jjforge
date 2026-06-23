@@ -27,6 +27,13 @@ Backwards-compatible additions, landed in
   `details.slug` + `details.reason`), `slug_collision` (with
   `details.slug` + `details.conflicts_with`), `slug_not_found`
   (with `details.handle`).
+- **`jjf ready` verb landed** (`agent-ready` ticket) — bare
+  JSON-array payload of `Issue` records (same shape as
+  `ls --json`), filtered to the open + unblocked set and
+  sorted by type priority (bug > feature > research > epic >
+  unspecified; roadmap excluded). Accepts `--label` (AND),
+  `--type` (OR), `--limit`. The canonical agent-loop call is
+  `jjf ready --json --limit 1`.
 
 This document is the canonical reference for what `jjf <verb> --json`
 emits. The contract here is what scripts, the `mvp-sync` orchestrator,
@@ -345,6 +352,70 @@ Error path — running outside a jj repo:
 
 ```sh
 $ jjf ls --json
+{"ok":false,"error":{"kind":"not_a_jj_repo","message":"not a jj repo: /tmp/foo","details":{"path":"/tmp/foo"}}}
+```
+
+### `ready`
+
+Success path is a bare JSON array (possibly empty) of `Issue`
+records — the same per-element shape as `ls --json` and `show
+--json`:
+
+```sh
+$ jjf ready --json --limit 1
+[
+  {
+    "id": "a3f9c01",
+    "title": "fix the thing",
+    "status": "open",
+    "type": "bug",
+    ...
+  }
+]
+```
+
+Filters:
+
+- `--label <NAME>` — repeatable, AND-semantics. Mirrors
+  `jjf ls --label`.
+- `--type <KIND>` — repeatable, OR-semantics. Mirrors
+  `jjf ls --type`. Note that `Roadmap`-typed issues are
+  excluded from the ready set entirely — they're the planning
+  surface, not work to do — regardless of this filter.
+- `--limit <N>` — truncate to the first N entries AFTER the
+  priority sort. Omit for unlimited.
+
+Selection criteria — an issue is "ready" iff:
+
+- Its `status` is `open`.
+- Its `type` is not `roadmap`.
+- Every `dependencies[]` id either points at a CLOSED issue or
+  at a non-existent issue id (a dangling reference is treated
+  as unblocking — a deleted dep doesn't wedge progress).
+- It passes all `--label` / `--type` filters.
+
+Sort order:
+
+1. **Type priority** (descending): `bug` > `feature` >
+   `research` > `epic` > `unspecified`. Higher priority first.
+2. **Tiebreaker**: `created_at` ascending (FIFO — agents grind
+   the oldest unblocked work down first).
+
+Empty result is `[]`, matching `ls`'s convention so scripts
+piping to `jq length` get a useful value.
+
+```sh
+$ jjf ready --json --label backend
+[ ... open + unblocked + label=backend ... ]
+
+$ jjf ready --json --type bug --limit 1
+[ ... the one highest-priority unblocked bug ... ]
+```
+
+Error path — running outside a jj repo:
+
+```sh
+$ jjf ready --json
 {"ok":false,"error":{"kind":"not_a_jj_repo","message":"not a jj repo: /tmp/foo","details":{"path":"/tmp/foo"}}}
 ```
 

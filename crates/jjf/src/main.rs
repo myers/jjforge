@@ -42,7 +42,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use jjf_storage::{
     ISSUES_BOOKMARK, Error as StorageError, IdError, Issue, IssueDraft, IssueId, IssueType,
-    SlugInvalidReason, Status, Storage, UpdateFields,
+    ReadyFilter, SlugInvalidReason, Status, Storage, UpdateFields,
 };
 
 /// Top-level CLI shape. Subcommands live on the `Commands` enum; the
@@ -218,6 +218,46 @@ enum Commands {
         /// Issues with no slug never match.
         #[arg(long)]
         slug: Option<String>,
+    },
+
+    /// List the unblocked open issues — the agent-ready set.
+    ///
+    /// Returns every OPEN issue whose every dependency is closed
+    /// (open deps block; closed and dangling deps don't), filtered
+    /// by optional `--label` (AND) and `--type` (OR) flags,
+    /// sorted by type priority (bug > feature > research > epic >
+    /// unspecified — roadmap excluded entirely) with `created_at`
+    /// ascending as the tiebreaker. `--limit N` truncates after
+    /// sorting.
+    ///
+    /// Plain-text output is the same tab-separated row shape as
+    /// `ls` (`<id>\t<status>\t<labelN>L\t<title>`); `--json` emits
+    /// an array of `Issue` records.
+    ///
+    /// The headline agent-ergonomics primitive: `jjf ready --limit 1
+    /// --json` returns one unblocked issue to feed into the next
+    /// action of an automation loop.
+    Ready {
+        /// Filter by label. Repeatable. Semantics: AND — an issue
+        /// must carry every listed label to match. Mirrors
+        /// `jjf ls --label`.
+        #[arg(short = 'l', long = "label")]
+        labels: Vec<String>,
+
+        /// Filter by issue type. Repeatable. Semantics: OR — an
+        /// issue matches if its type equals any of the listed
+        /// types. Omit the flag to include every type. Mirrors
+        /// `jjf ls --type`. Note: `Roadmap`-typed issues are
+        /// excluded from the ready set entirely (the roadmap
+        /// ticket isn't work to do), regardless of this filter.
+        #[arg(long = "type", value_enum)]
+        types: Vec<TypeArg>,
+
+        /// Truncate the result to the first N entries after the
+        /// priority sort. Omit for unlimited. The canonical
+        /// agent-loop call is `jjf ready --limit 1 --json`.
+        #[arg(long)]
+        limit: Option<usize>,
     },
 
     /// Mutate one or more scalar fields of an issue in a single commit.
@@ -948,6 +988,11 @@ fn run(cli: Cli) -> Result<(), CliError> {
             types,
             slug,
         } => run_ls(cli.json, status, labels, types, slug),
+        Commands::Ready {
+            labels,
+            types,
+            limit,
+        } => run_ready(cli.json, labels, types, limit),
         Commands::Close { id } => run_set_status(cli.json, id, Status::Closed),
         Commands::Open { id } => run_set_status(cli.json, id, Status::Open),
         Commands::Comment { id, file, author } => run_comment(cli.json, id, file, author),
@@ -1923,6 +1968,65 @@ fn run_ls(
         // (CLAUDE.md). label-count is rendered with a trailing `L` so
         // an eyeball can tell `3L` (three labels) apart from a numeric
         // column that might mean comments or something else later.
+        for issue in &issues {
+            let status_s = match issue.status {
+                Status::Open => "open",
+                Status::Closed => "closed",
+            };
+            println!(
+                "{id}\t{status}\t{n}L\t{title}",
+                id = issue.id,
+                status = status_s,
+                n = issue.labels.len(),
+                title = issue.title,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `jjf ready [--label L...] [--type T...] [--limit N] [--json]`
+/// — list the open issues whose dependencies are all closed (the
+/// agent-ready set), sorted by type priority then created_at
+/// ascending.
+///
+/// This is the headline agent-ergonomics verb. `jjf ready --limit 1
+/// --json` is the canonical orchestrator-loop call: one unblocked
+/// issue, machine-readable, ready to feed into the next action.
+///
+/// Preflight matches `run_ls` exactly — read verb, no
+/// self-host-write guard. The filter/sort logic lives in
+/// `Storage::list_ready`; this fn is just the clap → storage →
+/// render plumbing.
+fn run_ready(
+    json: bool,
+    labels: Vec<String>,
+    types: Vec<TypeArg>,
+    limit: Option<usize>,
+) -> Result<(), CliError> {
+    // Preflight: cwd is a jj repo AND `issues` bookmark exists.
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    preflight::issues_bookmark(&cwd)?;
+
+    let storage = Storage::open(&cwd)?;
+    let filter = ReadyFilter {
+        labels,
+        types: types.into_iter().map(IssueType::from).collect(),
+        limit,
+    };
+    let issues = storage.list_ready(&filter)?;
+
+    if json {
+        // Array of `Issue` records, pretty-printed. Same per-element
+        // shape `ls --json` and `show --json` emit; callers parsing
+        // one parse the others. Empty result is `[]`, not silence.
+        let s = serde_json::to_string_pretty(&issues)
+            .map_err(|e| CliError::Storage(StorageError::Json(e)))?;
+        println!("{s}");
+    } else {
+        // Plain text: tab-separated rows mirroring `ls`'s shape so a
+        // single awk/cut pipeline handles both. Silent on empty.
         for issue in &issues {
             let status_s = match issue.status {
                 Status::Open => "open",

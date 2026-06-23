@@ -11,7 +11,7 @@ use std::process::Command;
 
 use jjf_storage::{
     Error as StorageError, IssueDraft, IssueId, IssueType, Op,
-    SlugInvalidReason, Status, Storage, UpdateFields,
+    ReadyFilter, SlugInvalidReason, Status, Storage, UpdateFields,
 };
 use serde::Serialize;
 
@@ -1497,4 +1497,357 @@ fn op_set_type_and_set_slug_round_trip_serde() {
     let block = set_slug.to_trailer_block("2026-06-22T12:34:56.000000000Z");
     assert!(block.contains("Jjf-Op: set-slug"));
     assert!(block.contains("Jjf-Slug: epic-slug"));
+}
+
+// ---------------------------------------------------------------------
+// `Storage::list_ready` tests (issue 69d5e1b).
+//
+// The ticket calls out:
+//   - 3 issues, no deps → all returned, sorted oldest first (FIFO
+//     within equal priority).
+//   - 3 issues, B depends on A (open) → A and C returned, B blocked.
+//   - 3 issues, B depends on A (closed) → all three returned.
+//   - Label filter intersection.
+//   - Limit clamps the returned vec.
+// Plus a few additional pins for the v2.1 type-priority sort and
+// roadmap exclusion since those are load-bearing for the agent loop.
+// ---------------------------------------------------------------------
+
+#[test]
+fn list_ready_three_open_no_deps_returns_all_fifo() {
+    let repo = make_scratch_repo("ready_three_no_deps");
+    let storage = Storage::open(&repo).unwrap();
+    // Three issues of the same type so the secondary key (FIFO by
+    // created_at) is the only differentiator.
+    let mut ids: Vec<IssueId> = Vec::new();
+    for title in ["first", "second", "third"] {
+        let id = storage
+            .create_issue(&IssueDraft {
+                title: (*title).into(),
+                type_: Some(IssueType::Feature),
+                ..Default::default()
+            })
+            .unwrap();
+        ids.push(id);
+        // Sleep one second between creates so the second-resolution
+        // `created_at` timestamps differ. The storage layer's
+        // `now_rfc3339` is second-precision; without the delay the
+        // three issues can share a timestamp and the order is
+        // ambiguous.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+
+    let ready = storage.list_ready(&ReadyFilter::default()).unwrap();
+    assert_eq!(ready.len(), 3, "expected all 3 issues ready, got {ready:#?}");
+    // FIFO: insertion order matches the result order.
+    assert_eq!(ready[0].id, ids[0], "oldest first");
+    assert_eq!(ready[1].id, ids[1]);
+    assert_eq!(ready[2].id, ids[2], "newest last");
+}
+
+#[test]
+fn list_ready_open_dependency_blocks_the_dependent_issue() {
+    let repo = make_scratch_repo("ready_open_dep_blocks");
+    let storage = Storage::open(&repo).unwrap();
+    // A is open. B depends on A. C is independent.
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A — blocker".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+    let b = storage
+        .create_issue(&IssueDraft {
+            title: "B — blocked".into(),
+            type_: Some(IssueType::Feature),
+            dependencies: vec![a.clone()],
+            ..Default::default()
+        })
+        .unwrap();
+    let c = storage
+        .create_issue(&IssueDraft {
+            title: "C — independent".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let ready = storage.list_ready(&ReadyFilter::default()).unwrap();
+    let ids: Vec<&IssueId> = ready.iter().map(|i| &i.id).collect();
+    assert!(ids.contains(&&a), "A is open with no deps → ready");
+    assert!(!ids.contains(&&b), "B depends on open A → blocked");
+    assert!(ids.contains(&&c), "C is independent → ready");
+    assert_eq!(ready.len(), 2, "exactly A and C: {ready:#?}");
+}
+
+#[test]
+fn list_ready_closed_dependency_does_not_block() {
+    let repo = make_scratch_repo("ready_closed_dep_unblocks");
+    let storage = Storage::open(&repo).unwrap();
+    // A is closed. B depends on A. C is independent.
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A — done".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+    let b = storage
+        .create_issue(&IssueDraft {
+            title: "B — was blocked".into(),
+            type_: Some(IssueType::Feature),
+            dependencies: vec![a.clone()],
+            ..Default::default()
+        })
+        .unwrap();
+    let c = storage
+        .create_issue(&IssueDraft {
+            title: "C — independent".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.set_status(&a, Status::Closed).unwrap();
+
+    let ready = storage.list_ready(&ReadyFilter::default()).unwrap();
+    let ids: Vec<&IssueId> = ready.iter().map(|i| &i.id).collect();
+    // A is closed → not in the OPEN ready set.
+    assert!(!ids.contains(&&a), "A is closed → excluded from ready");
+    // B's only dep (A) is closed → B is ready.
+    assert!(ids.contains(&&b), "B's dep A is closed → B ready");
+    assert!(ids.contains(&&c), "C independent → ready");
+    assert_eq!(ready.len(), 2, "exactly B and C: {ready:#?}");
+}
+
+#[test]
+fn list_ready_type_priority_orders_bug_before_feature_before_epic() {
+    let repo = make_scratch_repo("ready_type_priority");
+    let storage = Storage::open(&repo).unwrap();
+    // File in a deliberately scrambled order so the sort is doing
+    // real work. Created order: epic, bug, feature, research,
+    // unspecified.
+    let epic = storage
+        .create_issue(&IssueDraft {
+            title: "epic ticket".into(),
+            type_: Some(IssueType::Epic),
+            ..Default::default()
+        })
+        .unwrap();
+    let bug = storage
+        .create_issue(&IssueDraft {
+            title: "bug ticket".into(),
+            type_: Some(IssueType::Bug),
+            ..Default::default()
+        })
+        .unwrap();
+    let feature = storage
+        .create_issue(&IssueDraft {
+            title: "feature ticket".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+    let research = storage
+        .create_issue(&IssueDraft {
+            title: "research ticket".into(),
+            type_: Some(IssueType::Research),
+            ..Default::default()
+        })
+        .unwrap();
+    let unspec = storage
+        .create_issue(&IssueDraft {
+            title: "unspecified ticket".into(),
+            // Default type_ = Unspecified.
+            ..Default::default()
+        })
+        .unwrap();
+
+    let ready = storage.list_ready(&ReadyFilter::default()).unwrap();
+    assert_eq!(ready.len(), 5);
+    // Expected: bug > feature > research > epic > unspecified.
+    assert_eq!(ready[0].id, bug, "bug first: {ready:#?}");
+    assert_eq!(ready[1].id, feature);
+    assert_eq!(ready[2].id, research);
+    assert_eq!(ready[3].id, epic);
+    assert_eq!(ready[4].id, unspec);
+}
+
+#[test]
+fn list_ready_excludes_roadmap_type_entirely() {
+    // The roadmap ticket isn't work to do — it's the planning
+    // surface itself. Spec: never appears in `ready`.
+    let repo = make_scratch_repo("ready_excludes_roadmap");
+    let storage = Storage::open(&repo).unwrap();
+    let _roadmap = storage
+        .create_issue(&IssueDraft {
+            title: "the roadmap".into(),
+            type_: Some(IssueType::Roadmap),
+            ..Default::default()
+        })
+        .unwrap();
+    let bug = storage
+        .create_issue(&IssueDraft {
+            title: "a bug".into(),
+            type_: Some(IssueType::Bug),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let ready = storage.list_ready(&ReadyFilter::default()).unwrap();
+    assert_eq!(ready.len(), 1, "only the bug; roadmap excluded: {ready:#?}");
+    assert_eq!(ready[0].id, bug);
+}
+
+#[test]
+fn list_ready_label_intersection_filter() {
+    let repo = make_scratch_repo("ready_label_filter");
+    let storage = Storage::open(&repo).unwrap();
+    let only_x = storage
+        .create_issue(&IssueDraft {
+            title: "only-x".into(),
+            type_: Some(IssueType::Feature),
+            labels: vec!["x".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    let _only_y = storage
+        .create_issue(&IssueDraft {
+            title: "only-y".into(),
+            type_: Some(IssueType::Feature),
+            labels: vec!["y".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    let both_xy = storage
+        .create_issue(&IssueDraft {
+            title: "both-xy".into(),
+            type_: Some(IssueType::Feature),
+            labels: vec!["x".into(), "y".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+    // --label x → only-x AND both-xy (2).
+    let ready = storage
+        .list_ready(&ReadyFilter {
+            labels: vec!["x".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    let ids: Vec<&IssueId> = ready.iter().map(|i| &i.id).collect();
+    assert_eq!(ready.len(), 2);
+    assert!(ids.contains(&&only_x));
+    assert!(ids.contains(&&both_xy));
+
+    // --label x --label y → both-xy only (intersection AND).
+    let ready = storage
+        .list_ready(&ReadyFilter {
+            labels: vec!["x".into(), "y".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].id, both_xy);
+}
+
+#[test]
+fn list_ready_type_filter_or_semantics() {
+    let repo = make_scratch_repo("ready_type_filter");
+    let storage = Storage::open(&repo).unwrap();
+    let bug = storage
+        .create_issue(&IssueDraft {
+            title: "bug ticket".into(),
+            type_: Some(IssueType::Bug),
+            ..Default::default()
+        })
+        .unwrap();
+    let feature = storage
+        .create_issue(&IssueDraft {
+            title: "feature ticket".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+    let _epic = storage
+        .create_issue(&IssueDraft {
+            title: "epic ticket".into(),
+            type_: Some(IssueType::Epic),
+            ..Default::default()
+        })
+        .unwrap();
+
+    // --type bug --type feature → exactly those two.
+    let ready = storage
+        .list_ready(&ReadyFilter {
+            types: vec![IssueType::Bug, IssueType::Feature],
+            ..Default::default()
+        })
+        .unwrap();
+    let ids: Vec<&IssueId> = ready.iter().map(|i| &i.id).collect();
+    assert_eq!(ready.len(), 2);
+    assert!(ids.contains(&&bug));
+    assert!(ids.contains(&&feature));
+}
+
+#[test]
+fn list_ready_limit_clamps_after_sort() {
+    let repo = make_scratch_repo("ready_limit_clamp");
+    let storage = Storage::open(&repo).unwrap();
+    // Five features in insertion order. Limit 2 should return the
+    // two highest-priority = oldest-by-FIFO entries.
+    let mut ids: Vec<IssueId> = Vec::new();
+    for title in ["a", "b", "c", "d", "e"] {
+        ids.push(
+            storage
+                .create_issue(&IssueDraft {
+                    title: (*title).into(),
+                    type_: Some(IssueType::Feature),
+                    ..Default::default()
+                })
+                .unwrap(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+
+    let ready = storage
+        .list_ready(&ReadyFilter {
+            limit: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(ready.len(), 2, "limit 2 should clamp: {ready:#?}");
+    assert_eq!(ready[0].id, ids[0], "oldest first");
+    assert_eq!(ready[1].id, ids[1]);
+}
+
+#[test]
+fn list_ready_dangling_dependency_does_not_block() {
+    // A dangling dep id (one that doesn't exist on the bookmark)
+    // shouldn't wedge progress — a deleted/mistyped dep would
+    // otherwise lock the issue out of `ready` forever. Closed-or-
+    // dangling both pass; only open-and-extant blocks.
+    let repo = make_scratch_repo("ready_dangling_dep");
+    let storage = Storage::open(&repo).unwrap();
+    let phantom = IssueId::parse("deadbee").unwrap();
+    let issue = storage
+        .create_issue(&IssueDraft {
+            title: "depends on a ghost".into(),
+            type_: Some(IssueType::Bug),
+            dependencies: vec![phantom],
+            ..Default::default()
+        })
+        .unwrap();
+
+    let ready = storage.list_ready(&ReadyFilter::default()).unwrap();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].id, issue);
+}
+
+#[test]
+fn list_ready_on_empty_bookmark_returns_empty() {
+    let repo = make_scratch_repo("ready_empty");
+    let storage = Storage::open(&repo).unwrap();
+    let ready = storage.list_ready(&ReadyFilter::default()).unwrap();
+    assert!(ready.is_empty(), "empty bookmark → empty ready: {ready:#?}");
 }

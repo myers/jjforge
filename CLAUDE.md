@@ -545,6 +545,16 @@ jjf ls --type epic --type feature # OR-semantics across types
 # Slug substring lookup (v2.1)
 jjf ls --slug agent
 
+# Next unblocked thing to work on (v2.1) — agent-ergonomics
+# headline verb. Returns issues whose deps are all closed,
+# sorted by type priority (bug > feature > research > epic >
+# unspecified; roadmap excluded), then FIFO by created_at.
+jjf ready                         # everything that's unblocked
+jjf ready --limit 1               # just the next one
+jjf ready --json --limit 1        # machine-readable, one issue
+jjf ready --label backend         # filter by label intersection
+jjf ready --type bug              # bugs only
+
 # Work under one epic — open tickets only
 jjf ls --label epic:mvp-storage --status open
 
@@ -558,14 +568,17 @@ jjf ls --status closed
 jjf ls --json --label epic | jq '.[] | {id, title}'
 ```
 
-Two filters jjforge doesn't yet ship that we want (file as
+Filters jjforge doesn't yet ship that we want (file as
 agent-ergonomics tickets when needed):
 
-- A real `blocks` / `blocked-by` relation. `jjf ls --ready`
-  filtering open issues whose dependencies are all closed is
-  the headline agent-ergonomics primitive (`jjf ready`).
 - Full-text search across bodies and comments. git-bug had a
   query language; jjforge has none yet.
+- `--unblocked-by <id>`: "tell me what would become ready if X
+  closes." Useful follow-up to `jjf ready` for planning.
+- CLI verbs for declaring dependency edges (`jjf dep add|rm`).
+  The storage layer has `Storage::add_dependency`; the CLI
+  doesn't expose it yet, so dep edges currently get set via
+  `jjf new -d <id>` only.
 
 If a useful filter isn't here, add it. If `jjf` can't express
 it, that's a feature request — file it.

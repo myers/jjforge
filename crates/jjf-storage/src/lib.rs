@@ -78,6 +78,10 @@ pub use merge_ops::{MergeReport, MergedIssue};
 pub use op::Op;
 pub use record::{Comment, Issue, IssueDraft, IssueRecord, IssueType, Status};
 
+// `ReadyFilter` is declared below alongside its helpers, but we
+// re-state the export here for discoverability. Public types live
+// at the crate root.
+
 /// Field-update bundle for [`Storage::update`].
 ///
 /// Each `Option` field is "do not touch" when `None`. A populated
@@ -173,6 +177,56 @@ pub enum Error {
     /// surface the operator-supplied value.
     #[error("no issue with handle {handle:?}")]
     SlugNotFound { handle: String },
+}
+
+/// Filter bundle for [`Storage::list_ready`].
+///
+/// All filters AND with the implicit "open + unblocked" criteria;
+/// within each filter axis the semantics match `jjf ls`:
+///
+/// - `labels`: AND — an issue must carry EVERY listed label.
+/// - `types`: OR — an issue's type must equal AT LEAST ONE listed
+///   type. Empty filter accepts every type.
+/// - `limit`: truncate the returned vec after the priority sort.
+///   `None` means unlimited.
+///
+/// The default value (`ReadyFilter::default()`) is "no extra
+/// filters" — equivalent to `jjf ready` with no flags.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadyFilter {
+    pub labels: Vec<String>,
+    pub types: Vec<IssueType>,
+    pub limit: Option<usize>,
+}
+
+/// Priority weight for `Storage::list_ready`'s primary sort key.
+/// Lower number = higher priority. The order pins the agreed type
+/// priority: bug > feature > research > epic > unspecified.
+/// `Roadmap` is unreachable here (filtered out before sorting), but
+/// has a stable weight so the function is total.
+fn ready_priority(t: IssueType) -> u8 {
+    match t {
+        IssueType::Bug => 0,
+        IssueType::Feature => 1,
+        IssueType::Research => 2,
+        IssueType::Epic => 3,
+        IssueType::Unspecified => 4,
+        // Roadmap is excluded upstream; the weight is arbitrary but
+        // distinct so a future caller that lifts the filter doesn't
+        // see it tie with anything actionable.
+        IssueType::Roadmap => 5,
+    }
+}
+
+/// Label intersection helper shared between `list_ready` and any
+/// future filter caller. Empty wanted = match every issue.
+fn labels_match_all(issue_labels: &[String], wanted: &[String]) -> bool {
+    wanted.iter().all(|w| issue_labels.iter().any(|l| l == w))
+}
+
+/// Type union helper. Empty wanted = match every type.
+fn types_match_any(issue_type: IssueType, wanted: &[IssueType]) -> bool {
+    wanted.is_empty() || wanted.iter().any(|t| *t == issue_type)
 }
 
 /// Why a slug failed validation. Each variant maps to one of the
@@ -1081,6 +1135,97 @@ impl Storage {
         ids.sort();
         ids.dedup();
         Ok(ids)
+    }
+
+    /// Enumerate every OPEN issue whose dependencies are all closed —
+    /// the agent-ready set.
+    ///
+    /// An issue is "ready" iff:
+    ///
+    /// - Its `status` is [`Status::Open`].
+    /// - Every id in its `dependencies` field either points at a
+    ///   [`Status::Closed`] issue OR at a non-existent issue id (a
+    ///   dangling reference). Open deps block; closed and dangling
+    ///   deps don't.
+    /// - It passes any `filter.labels` (AND across labels — same
+    ///   semantics as `jjf ls --label`).
+    /// - It passes any `filter.types` (OR across types — same
+    ///   semantics as `jjf ls --type`).
+    ///
+    /// Return order is the agent priority:
+    ///
+    /// 1. Primary: type priority, in this order
+    ///    [`IssueType::Bug`] > [`IssueType::Feature`] >
+    ///    [`IssueType::Research`] > [`IssueType::Epic`] >
+    ///    [`IssueType::Unspecified`]. [`IssueType::Roadmap`] is
+    ///    excluded entirely — the roadmap ticket isn't work to do.
+    /// 2. Secondary: `created_at` ascending (FIFO — agents grind the
+    ///    oldest unblocked work down first).
+    ///
+    /// If `filter.limit` is `Some(n)`, the returned vec is truncated
+    /// to `n` entries AFTER sorting. `None` returns every match.
+    ///
+    /// Implementation is read-all-then-filter: O(N) over every
+    /// `issues/<id>.json` at the bookmark tip. For the live planner's
+    /// small N this is fine; if it ever proves slow, a persistent
+    /// index is the follow-up (out of scope per the ticket).
+    pub fn list_ready(&self, filter: &ReadyFilter) -> Result<Vec<Issue>> {
+        // Read every issue on the bookmark. We need full records
+        // (status, type_, dependencies, labels) for both the
+        // candidate set and the dep-status lookup.
+        let ids = self.list_ids()?;
+        let mut all: Vec<Issue> = Vec::with_capacity(ids.len());
+        for id in &ids {
+            all.push(self.read(id)?);
+        }
+
+        // Build the closed-id set from the SAME read pass — no
+        // second IO round-trip. An open issue that depends on an id
+        // NOT in `all` (dangling) is treated as unblocked: the dep
+        // can't ever close (it doesn't exist), so we don't want to
+        // wedge progress on an editing typo.
+        //
+        // The sets own clones of the ids so the subsequent
+        // `all.into_iter().filter(...)` can move issues out of `all`
+        // without a borrow conflict.
+        let known: std::collections::HashSet<IssueId> =
+            all.iter().map(|i| i.id.clone()).collect();
+        let closed: std::collections::HashSet<IssueId> = all
+            .iter()
+            .filter(|i| i.status == Status::Closed)
+            .map(|i| i.id.clone())
+            .collect();
+
+        // Roadmap-type issues are never returned. They're never work
+        // to do; they're the planning surface itself. The ticket and
+        // the closing comment on `7100b51` both pin this.
+        let mut ready: Vec<Issue> = all
+            .into_iter()
+            .filter(|i| i.status == Status::Open)
+            .filter(|i| i.type_ != IssueType::Roadmap)
+            .filter(|i| {
+                // Every dep is either closed or dangling. An open,
+                // existing dep blocks.
+                i.dependencies
+                    .iter()
+                    .all(|d| !known.contains(d) || closed.contains(d))
+            })
+            .filter(|i| labels_match_all(&i.labels, &filter.labels))
+            .filter(|i| types_match_any(i.type_, &filter.types))
+            .collect();
+
+        // Sort: type priority, then created_at ASC. Stable sort means
+        // equal-priority entries fall back to the second key cleanly.
+        ready.sort_by(|a, b| {
+            ready_priority(a.type_)
+                .cmp(&ready_priority(b.type_))
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+
+        if let Some(n) = filter.limit {
+            ready.truncate(n);
+        }
+        Ok(ready)
     }
 
     /// Enumerate the change_id shorts of every head of the `issues`
