@@ -229,6 +229,17 @@ fn stanza_to_op(stanza: &[(&str, &str)], id: &IssueId) -> Option<Op> {
                 slug: if v.is_empty() { None } else { Some(v) },
             }
         }
+        "set-block-reason" => {
+            // v2.5: free-text reason for `Status::Blocked`. Same
+            // empty-string-means-None convention as `set-assignee` /
+            // `set-slug`. Absent trailer (defensive — the writer
+            // always emits the line) also reads as None.
+            let v = get("Jjf-Reason").unwrap_or_default();
+            Op::SetBlockReason {
+                issue_id,
+                reason: if v.is_empty() { None } else { Some(v) },
+            }
+        }
         "comment-add" => Op::CommentAdd {
             issue_id,
             comment_id: IssueId::parse(&get("Jjf-Comment-Id")?).ok()?,
@@ -245,6 +256,7 @@ fn stanza_to_op(stanza: &[(&str, &str)], id: &IssueId) -> Option<Op> {
 fn parse_status(s: &str) -> Option<Status> {
     match s {
         "open" => Some(Status::Open),
+        "blocked" => Some(Status::Blocked),
         "in-progress" => Some(Status::InProgress),
         "closed" => Some(Status::Closed),
         _ => None,

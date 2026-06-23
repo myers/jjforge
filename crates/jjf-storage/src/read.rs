@@ -90,6 +90,7 @@ pub(crate) fn read(repo: &JjRepo, id: &IssueId) -> Result<Issue> {
         slug: record.slug,
         body: record.body,
         status: record.status,
+        block_reason: record.block_reason,
         type_: record.type_,
         // Defensive re-sort — writer guarantees sorted, but the merge
         // driver may emit unioned arrays.
@@ -183,6 +184,12 @@ struct OpView {
     /// the check otherwise.
     body_hash: Option<String>,
     status: Status,
+    /// Latest reason seen in a `set-block-reason` op. `None` either
+    /// means no reason op was applied or the most recent op cleared
+    /// it (`Op::SetBlockReason { reason: None }`). v2.5
+    /// (`agent-await-gates-impl`). Cross-check matches this against
+    /// the file's `block_reason` field directly.
+    block_reason: Option<String>,
     /// Latest type seen in a `set-type` op, or `Unspecified` if no
     /// type op was applied (the v2.1-default for any chain that
     /// predates the new field).
@@ -264,6 +271,7 @@ fn apply_op(view: &mut Option<OpView>, op: Op) {
                 slug: None,
                 body_hash: None,
                 status,
+                block_reason: None,
                 type_: IssueType::Unspecified,
                 labels: Vec::new(),
                 dependencies: Vec::new(),
@@ -302,6 +310,7 @@ fn apply_op(view: &mut Option<OpView>, op: Op) {
                 Op::SetAssignee { assignee, .. } => v.assignee = assignee,
                 Op::SetType { kind, .. } => v.type_ = kind,
                 Op::SetSlug { slug, .. } => v.slug = slug,
+                Op::SetBlockReason { reason, .. } => v.block_reason = reason,
                 Op::CommentAdd { comment_id, .. } => v.comment_ids.push(comment_id),
                 Op::Merge { .. } => {
                     // No structural change. The `Jjf-Op: merge`
@@ -416,6 +425,16 @@ fn cross_check(record: &IssueRecord, comments: &[Comment], op_view: &OpView) {
         )
     );
 
+    assert_eq!(
+        record.block_reason, op_view.block_reason,
+        "{}",
+        mismatch(
+            "block_reason",
+            format!("{:?}", record.block_reason),
+            format!("{:?}", op_view.block_reason)
+        )
+    );
+
     // Body: only check when a `set-body` op recorded a hash. The
     // create-only path leaves the body unmolested in the file but
     // doesn't carry a hash op (spec §5.2 lists `set-body` but no
@@ -505,6 +524,7 @@ mod tests {
             slug: None,
             body_hash: None,
             status: Status::Open,
+            block_reason: None,
             type_: IssueType::Unspecified,
             labels: Vec::new(),
             dependencies: Vec::new(),

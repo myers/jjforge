@@ -120,7 +120,7 @@ impl SnapshotCache {
             HashMap::with_capacity(issues.len());
         use crate::record::Status;
         for issue in &issues {
-            if !matches!(issue.status, Status::Open | Status::InProgress) {
+            if !matches!(issue.status, Status::Open | Status::Blocked | Status::InProgress) {
                 continue;
             }
             if let Some(slug) = &issue.slug {
@@ -128,7 +128,7 @@ impl SnapshotCache {
             }
         }
         for issue in &issues {
-            if matches!(issue.status, Status::Open | Status::InProgress) {
+            if matches!(issue.status, Status::Open | Status::Blocked | Status::InProgress) {
                 continue;
             }
             if let Some(slug) = &issue.slug {
@@ -346,6 +346,7 @@ pub(crate) fn rebuild(
             slug: record.slug,
             body: record.body,
             status: record.status,
+            block_reason: record.block_reason,
             type_: record.type_,
             labels,
             dependencies,
@@ -568,6 +569,7 @@ mod tests {
             slug: Some("slug-a".into()),
             body: String::new(),
             status: crate::record::Status::Open,
+            block_reason: None,
             type_: crate::record::IssueType::Unspecified,
             labels: Vec::new(),
             dependencies: Vec::new(),

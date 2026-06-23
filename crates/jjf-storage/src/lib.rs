@@ -195,8 +195,9 @@ pub enum Error {
 
 /// Filter bundle for [`Storage::list_ready`].
 ///
-/// All filters AND with the implicit "active + unblocked + unclaimed"
-/// criteria; within each filter axis the semantics match `jjf ls`:
+/// All filters AND with the implicit "active + unblocked + unclaimed
+/// + not-parked" criteria; within each filter axis the semantics
+/// match `jjf ls`:
 ///
 /// - `labels`: AND — an issue must carry EVERY listed label.
 /// - `types`: OR — an issue's type must equal AT LEAST ONE listed
@@ -208,6 +209,11 @@ pub enum Error {
 ///   excluded — they're claimed and another agent shouldn't see
 ///   them as ready work. When `true`, InProgress issues are
 ///   included so an operator can see "what's in flight."
+/// - `include_blocked`: when `false` (default, v2.5
+///   `agent-await-gates-impl`), [`Status::Blocked`] issues are
+///   excluded — they're parked on an external signal and an idle
+///   agent shouldn't see them as workable. When `true`, Blocked
+///   issues are included so an operator can see "what's parked."
 ///
 /// The default value (`ReadyFilter::default()`) is "no extra
 /// filters" — equivalent to `jjf ready` with no flags.
@@ -219,6 +225,9 @@ pub struct ReadyFilter {
     /// v2.3 (`agent-claim-atomic`). When `false` (default),
     /// `Storage::list_ready` excludes [`Status::InProgress`] issues.
     pub include_claimed: bool,
+    /// v2.5 (`agent-await-gates-impl`). When `false` (default),
+    /// `Storage::list_ready` excludes [`Status::Blocked`] issues.
+    pub include_blocked: bool,
 }
 
 /// Priority weight for `Storage::list_ready`'s primary sort key.
@@ -276,12 +285,15 @@ fn compute_blocked_set(all: &[Issue]) -> std::collections::HashSet<IssueId> {
 
     let by_id: HashMap<IssueId, &Issue> = all.iter().map(|i| (i.id.clone(), i)).collect();
 
-    // Helper: is `target` active (open or in-progress)? Closed and
-    // dangling targets are NOT active and never block.
+    // Helper: is `target` active (open, blocked, or in-progress)?
+    // Closed and dangling targets are NOT active and never block.
+    // A `Blocked` target (v2.5) is still ACTIVE — it's parked on
+    // an external signal, not done. A dep on a blocked issue still
+    // blocks the dependent (the work isn't complete).
     let is_active = |target: &IssueId| -> bool {
         match by_id.get(target) {
             Some(i) => match i.status {
-                Status::Open | Status::InProgress => true,
+                Status::Open | Status::Blocked | Status::InProgress => true,
                 Status::Closed => false,
             },
             None => false, // dangling
@@ -874,6 +886,7 @@ impl Storage {
             slug: draft.slug.clone(),
             body: draft.body.clone(),
             status: Status::Open,
+            block_reason: None,
             type_,
             labels: sorted_dedup(&draft.labels),
             dependencies: sorted_dedup_edges(&draft.dependencies),
@@ -1157,6 +1170,17 @@ impl Storage {
                     "issue {id} is closed; reopen before claiming"
                 )));
             }
+            Status::Blocked => {
+                // v2.5: parked on an external signal. Claiming a
+                // blocked issue would silently flip its status to
+                // in-progress AND drop the reason on the floor —
+                // confusing for the next reader. Force the operator
+                // to `jjf unblock` first; the explicit step preserves
+                // the audit trail.
+                return Err(Error::Invalid(format!(
+                    "issue {id} is blocked; unblock before claiming"
+                )));
+            }
             Status::InProgress => {
                 // Already claimed. Same user → no-op (return Ok
                 // without writing). Different user → AlreadyClaimed.
@@ -1228,6 +1252,113 @@ impl Storage {
                 Op::SetStatus {
                     issue_id: rec.id.clone(),
                     status: Status::Open,
+                },
+            ])
+        })
+    }
+
+    /// Park an issue: set status to [`Status::Blocked`] and record a
+    /// free-text `reason` in ONE multi-op commit. v2.5
+    /// (`agent-await-gates-impl`). The companion verb
+    /// [`Storage::unblock`] flips it back to [`Status::Open`] and
+    /// clears the reason.
+    ///
+    /// Semantics:
+    ///
+    /// - The commit lands one [`Op::SetStatus`] and one
+    ///   [`Op::SetBlockReason`] in field-declaration order: status,
+    ///   then reason. Two ops, one commit; the op-space resolver's
+    ///   LWW projection lands on the same final state regardless of
+    ///   read order.
+    /// - `reason` is optional. `None` records `block_reason: null`;
+    ///   `Some(text)` stores the text verbatim. Empty / whitespace-
+    ///   only reasons are normalized to `None` so the on-disk shape
+    ///   stays consistent.
+    /// - Reasons must be single-line — newlines would corrupt the
+    ///   `Jjf-Reason:` trailer. The storage layer rejects multi-line
+    ///   reasons with [`Error::Invalid`]; callers (the CLI) should
+    ///   pre-trim their input.
+    /// - Returns [`Error::Invalid`] if the issue is already closed
+    ///   — parking a closed issue doesn't compose; the operator
+    ///   probably meant to reopen first.
+    /// - Not idempotent at the commit level — re-blocking an
+    ///   already-blocked issue with the same reason still lands a
+    ///   fresh commit (audit-log discipline matches `set_status` /
+    ///   `add_label`). The in-memory record stays consistent.
+    pub fn block(&self, id: &IssueId, reason: Option<&str>) -> Result<()> {
+        let normalized: Option<String> = match reason {
+            Some(r) => {
+                if r.contains('\n') || r.contains('\r') {
+                    return Err(Error::Invalid(
+                        "block reason must be single-line (no newlines)".into(),
+                    ));
+                }
+                let t = r.trim();
+                if t.is_empty() { None } else { Some(t.to_owned()) }
+            }
+            None => None,
+        };
+        let current = self.read_record_from_bookmark(id)?;
+        if current.status == Status::Closed {
+            return Err(Error::Invalid(format!(
+                "issue {id} is closed; reopen before blocking"
+            )));
+        }
+        let reason_owned = normalized;
+        self.mutate(id, &format!("jjf: issue {} - block", id), |rec| {
+            rec.status = Status::Blocked;
+            rec.block_reason = reason_owned.clone();
+            Ok(vec![
+                Op::SetStatus {
+                    issue_id: rec.id.clone(),
+                    status: Status::Blocked,
+                },
+                Op::SetBlockReason {
+                    issue_id: rec.id.clone(),
+                    reason: reason_owned.clone(),
+                },
+            ])
+        })
+    }
+
+    /// Inverse of [`Storage::block`]: set status back to
+    /// [`Status::Open`] and clear `block_reason` in ONE multi-op
+    /// commit. v2.5 (`agent-await-gates-impl`).
+    ///
+    /// Semantics:
+    ///
+    /// - Lands one [`Op::SetStatus`] (`Open`) and one
+    ///   [`Op::SetBlockReason`] (`None`) in field-declaration order.
+    /// - Idempotent: if the issue is already Open with no
+    ///   block_reason, returns `Ok(())` without writing.
+    /// - Returns [`Error::Invalid`] if the issue is closed —
+    ///   unblocking a closed issue doesn't compose.
+    /// - Works regardless of current status (Blocked, InProgress,
+    ///   or Open with a stale reason). The operator is asserting
+    ///   "this is workable now"; flipping to Open is the right
+    ///   semantics across all three.
+    pub fn unblock(&self, id: &IssueId) -> Result<()> {
+        let current = self.read_record_from_bookmark(id)?;
+        if current.status == Status::Closed {
+            return Err(Error::Invalid(format!(
+                "issue {id} is closed; nothing to unblock"
+            )));
+        }
+        if current.status == Status::Open && current.block_reason.is_none() {
+            // No-op: already in the unblocked state.
+            return Ok(());
+        }
+        self.mutate(id, &format!("jjf: issue {} - unblock", id), |rec| {
+            rec.status = Status::Open;
+            rec.block_reason = None;
+            Ok(vec![
+                Op::SetStatus {
+                    issue_id: rec.id.clone(),
+                    status: Status::Open,
+                },
+                Op::SetBlockReason {
+                    issue_id: rec.id.clone(),
+                    reason: None,
                 },
             ])
         })
@@ -1683,7 +1814,7 @@ impl Storage {
             }
             if let Some(issue) = snapshot.issues.get(holder) {
                 match issue.status {
-                    Status::Open | Status::InProgress => {
+                    Status::Open | Status::Blocked | Status::InProgress => {
                         return Ok(Some(holder.clone()));
                     }
                     Status::Closed => return Ok(None),
@@ -1788,10 +1919,12 @@ impl Storage {
         // prereq) and `parent-child` (cascade-via-parent) edges.
         // `related` and `discovered-from` never affect blocked.
         let include_claimed = filter.include_claimed;
+        let include_blocked = filter.include_blocked;
         let mut ready: Vec<Issue> = all
             .into_iter()
             .filter(|i| match i.status {
                 Status::Open => true,
+                Status::Blocked => include_blocked,
                 Status::InProgress => include_claimed,
                 Status::Closed => false,
             })
@@ -2662,6 +2795,7 @@ mod tests {
             slug: Some("segfault-on-empty-input".into()),
             body: "Running `./app` with no arguments crashes.".into(),
             status: Status::Open,
+            block_reason: None,
             type_: IssueType::Bug,
             labels: vec!["bug".into(), "p1".into()],
             dependencies: vec![],
@@ -2926,6 +3060,7 @@ Jjf-Label: fixed
             slug: None,
             body: String::new(),
             status: Status::Open,
+            block_reason: None,
             type_: IssueType::Feature,
             labels: vec![],
             dependencies: vec![
@@ -3049,6 +3184,7 @@ Jjf-Label: fixed
             slug: None,
             body: String::new(),
             status,
+            block_reason: None,
             type_: IssueType::Unspecified,
             labels: vec![],
             dependencies: deps,

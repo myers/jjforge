@@ -175,16 +175,29 @@ pub(crate) mod dep_edges_serde {
     }
 }
 
-/// Issue status. Spec §3 — `open`, `in-progress`, `closed`. v2.3
-/// added [`Status::InProgress`] (spelled `in-progress` on the wire)
-/// as the "claimed by some agent" state between [`Status::Open`]
-/// (idle, available) and [`Status::Closed`] (terminal). `Open` and
-/// `InProgress` are both "active"; `Closed` is terminal.
+/// Issue status. Spec §3 — `open`, `blocked`, `in-progress`,
+/// `closed`. v2.3 added [`Status::InProgress`] (spelled
+/// `in-progress` on the wire) as the "claimed by some agent"
+/// state. v2.5 added [`Status::Blocked`] (spelled `blocked` on
+/// the wire) as the "parked on an external signal" state —
+/// waiting on a PR, a timer, a human response. `Open`,
+/// `Blocked`, and `InProgress` are all "active" in the sense
+/// that the issue isn't terminal; only `Closed` is terminal.
+/// `jjf ready` excludes both `Blocked` and `InProgress` by
+/// default — neither is workable right now for an idle agent
+/// (blocked = waiting on an external signal; in-progress =
+/// already claimed). Variant declaration order matches the
+/// natural lifecycle: open → blocked → in-progress → closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     #[default]
     Open,
+    /// Parked on an external signal (PR landing, timer, human).
+    /// Wire spelling: `blocked`. v2.5 (`agent-await-gates-impl`).
+    /// The accompanying `block_reason` field on
+    /// [`IssueRecord`] carries the free-text rationale.
+    Blocked,
     /// Claimed by an agent / operator. Wire spelling: `in-progress`
     /// (hyphenated). v2.3 (`agent-claim-atomic`).
     #[serde(rename = "in-progress")]
@@ -200,6 +213,7 @@ impl Status {
     pub fn as_str(self) -> &'static str {
         match self {
             Status::Open => "open",
+            Status::Blocked => "blocked",
             Status::InProgress => "in-progress",
             Status::Closed => "closed",
         }
@@ -276,6 +290,14 @@ impl IssueType {
 /// on read so any pre-v2.1 record (which lacks them) deserializes
 /// cleanly. The on-disk emission order matches the declaration order
 /// here per spec §3.3.
+///
+/// **v2.5 (`agent-await-gates-impl`):** new `block_reason` field
+/// sits immediately after `status`. Carries the free-text reason
+/// an issue was set to [`Status::Blocked`]; `None` (the default,
+/// emitted as `null`) for every other status. The reason is a
+/// scalar under the op-space resolver — LWW by `Jjf-At:` just
+/// like title / body / assignee. Serde-default on read so any
+/// pre-v2.5 record (which lacks the field) deserializes cleanly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueRecord {
     pub version: u32,
@@ -289,6 +311,14 @@ pub struct IssueRecord {
     pub slug: Option<String>,
     pub body: String,
     pub status: Status,
+    /// Free-text reason for the current [`Status::Blocked`] state.
+    /// `None` (serialized as `null`) when the issue isn't blocked or
+    /// the operator declined to record a reason. v2.5
+    /// (`agent-await-gates-impl`). Per spec §3.1 the field always
+    /// appears in the record; serde-default on read so pre-v2.5
+    /// records (which lack the field) deserialize cleanly.
+    #[serde(default)]
+    pub block_reason: Option<String>,
     /// Coarse classifier. Default `Unspecified`; the field always
     /// appears in the record (no `#[serde(skip)]`).
     #[serde(default, rename = "type")]
@@ -383,6 +413,12 @@ pub struct Issue {
     pub slug: Option<String>,
     pub body: String,
     pub status: Status,
+    /// Free-text reason for [`Status::Blocked`]. Mirrors
+    /// [`IssueRecord::block_reason`]; serialized between `status`
+    /// and `type` to match the on-disk record's emission order.
+    /// v2.5 (`agent-await-gates-impl`).
+    #[serde(default)]
+    pub block_reason: Option<String>,
     #[serde(rename = "type")]
     pub type_: IssueType,
     pub labels: Vec<String>,

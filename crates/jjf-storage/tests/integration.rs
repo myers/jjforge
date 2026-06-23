@@ -419,6 +419,7 @@ fn read_then_serialize_byte_equals_on_disk_record() {
         slug: Option<&'a str>,
         body: &'a str,
         status: &'a str,
+        block_reason: Option<&'a str>,
         #[serde(rename = "type")]
         type_: &'a str,
         labels: &'a [String],
@@ -435,6 +436,7 @@ fn read_then_serialize_byte_equals_on_disk_record() {
         slug: bug.slug.as_deref(),
         body: &bug.body,
         status: bug.status.as_str(),
+        block_reason: bug.block_reason.as_deref(),
         type_: bug.type_.as_str(),
         labels: &bug.labels,
         dependencies: &bug.dependencies,
@@ -2446,6 +2448,316 @@ fn in_progress_dep_blocks_dependent_from_ready() {
     let ids: Vec<&IssueId> = ready.iter().map(|i| &i.id).collect();
     assert!(!ids.contains(&&a), "A is claimed: {ids:?}");
     assert!(!ids.contains(&&b), "B blocked on InProgress A: {ids:?}");
+}
+
+// ---- agent-await-gates-impl (v2.5) -----------------------------------
+
+#[test]
+fn status_blocked_serializes_with_wire_spelling() {
+    // Wire spelling: serde rename_all = lowercase. `Status::Blocked`
+    // round-trips as `blocked`.
+    let s = serde_json::to_string(&Status::Blocked).unwrap();
+    assert_eq!(s, "\"blocked\"");
+    let back: Status = serde_json::from_str("\"blocked\"").unwrap();
+    assert_eq!(back, Status::Blocked);
+}
+
+#[test]
+fn block_lands_set_status_and_set_block_reason_in_one_commit() {
+    // The headline acceptance: `Storage::block` sets status =
+    // blocked AND records block_reason in ONE commit carrying
+    // TWO `Jjf-Op:` trailers.
+    let repo = make_scratch_repo("block_atomic_one_commit");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "park me".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let baseline = storage.read_history(&id).unwrap().len();
+
+    storage.block(&id, Some("waiting on PR-42")).unwrap();
+
+    let issue = storage.read(&id).unwrap();
+    assert_eq!(issue.status, Status::Blocked);
+    assert_eq!(issue.block_reason.as_deref(), Some("waiting on PR-42"));
+
+    let hist = storage.read_history(&id).unwrap();
+    let new = &hist[baseline..];
+    assert_eq!(
+        new.len(),
+        2,
+        "expected two ops (set-status + set-block-reason), got {new:#?}"
+    );
+    let commit = &new[0].commit;
+    assert!(
+        new.iter().all(|e| &e.commit == commit),
+        "both ops must share ONE commit: {new:#?}"
+    );
+    assert!(matches!(
+        new[0].op,
+        Op::SetStatus {
+            status: Status::Blocked,
+            ..
+        }
+    ));
+    assert!(matches!(
+        new[1].op,
+        Op::SetBlockReason {
+            reason: Some(ref r),
+            ..
+        } if r == "waiting on PR-42"
+    ));
+}
+
+#[test]
+fn block_without_reason_records_null() {
+    let repo = make_scratch_repo("block_no_reason");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "park me silently".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.block(&id, None).unwrap();
+    let issue = storage.read(&id).unwrap();
+    assert_eq!(issue.status, Status::Blocked);
+    assert_eq!(issue.block_reason, None);
+}
+
+#[test]
+fn block_normalizes_whitespace_only_reason_to_none() {
+    // A whitespace-only reason should land as `None` rather than
+    // a confusing `Some(" ")`. The CLI relies on this for clean
+    // round-trip behavior when the user passes `--reason ""`.
+    let repo = make_scratch_repo("block_whitespace_reason");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.block(&id, Some("   ")).unwrap();
+    let issue = storage.read(&id).unwrap();
+    assert_eq!(issue.block_reason, None);
+}
+
+#[test]
+fn block_rejects_multiline_reason() {
+    // Newlines would corrupt the `Jjf-Reason:` trailer. Reject at
+    // the storage boundary with `Error::Invalid`.
+    let repo = make_scratch_repo("block_rejects_newlines");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let err = storage.block(&id, Some("line one\nline two")).unwrap_err();
+    assert!(
+        matches!(err, StorageError::Invalid(_)),
+        "expected Invalid, got {err:?}"
+    );
+}
+
+#[test]
+fn block_on_closed_issue_errors_invalid() {
+    let repo = make_scratch_repo("block_closed_errors");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.set_status(&id, Status::Closed).unwrap();
+    let err = storage.block(&id, Some("reason")).unwrap_err();
+    assert!(
+        matches!(err, StorageError::Invalid(_)),
+        "expected Invalid, got {err:?}"
+    );
+}
+
+#[test]
+fn unblock_clears_status_and_reason() {
+    let repo = make_scratch_repo("unblock_round_trip");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.block(&id, Some("a reason")).unwrap();
+    storage.unblock(&id).unwrap();
+    let issue = storage.read(&id).unwrap();
+    assert_eq!(issue.status, Status::Open);
+    assert_eq!(issue.block_reason, None);
+}
+
+#[test]
+fn unblock_lands_two_trailers_on_one_commit() {
+    let repo = make_scratch_repo("unblock_one_commit");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.block(&id, Some("park")).unwrap();
+    let before_unblock = storage.read_history(&id).unwrap().len();
+    storage.unblock(&id).unwrap();
+    let hist = storage.read_history(&id).unwrap();
+    let new = &hist[before_unblock..];
+    assert_eq!(new.len(), 2, "expected two ops, got {new:#?}");
+    let commit = &new[0].commit;
+    assert!(
+        new.iter().all(|e| &e.commit == commit),
+        "both unblock ops must share ONE commit: {new:#?}"
+    );
+    assert!(matches!(
+        new[0].op,
+        Op::SetStatus {
+            status: Status::Open,
+            ..
+        }
+    ));
+    assert!(matches!(
+        new[1].op,
+        Op::SetBlockReason { reason: None, .. }
+    ));
+}
+
+#[test]
+fn unblock_on_already_open_unparked_is_no_op() {
+    let repo = make_scratch_repo("unblock_no_op");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let baseline = storage.read_history(&id).unwrap().len();
+    storage.unblock(&id).unwrap();
+    let after = storage.read_history(&id).unwrap().len();
+    assert_eq!(baseline, after, "unblock on already-open must not commit");
+}
+
+#[test]
+fn list_ready_excludes_blocked_by_default() {
+    let repo = make_scratch_repo("ready_excludes_blocked");
+    let storage = Storage::open(&repo).unwrap();
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+    let _b = storage
+        .create_issue(&IssueDraft {
+            title: "B".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.block(&a, Some("waiting")).unwrap();
+
+    let ready = storage.list_ready(&ReadyFilter::default()).unwrap();
+    let ids: Vec<&IssueId> = ready.iter().map(|i| &i.id).collect();
+    assert!(!ids.contains(&&a), "blocked A must not appear: {ids:?}");
+    assert_eq!(ready.len(), 1, "only B should be ready: {ready:#?}");
+}
+
+#[test]
+fn list_ready_includes_blocked_when_include_blocked_set() {
+    let repo = make_scratch_repo("ready_include_blocked");
+    let storage = Storage::open(&repo).unwrap();
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+    let _b = storage
+        .create_issue(&IssueDraft {
+            title: "B".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.block(&a, Some("park")).unwrap();
+
+    let ready = storage
+        .list_ready(&ReadyFilter {
+            include_blocked: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let ids: Vec<&IssueId> = ready.iter().map(|i| &i.id).collect();
+    assert!(
+        ids.contains(&&a),
+        "blocked A must appear with include_blocked: {ids:?}"
+    );
+    assert_eq!(
+        ready.len(),
+        2,
+        "both A and B should be visible: {ready:#?}"
+    );
+}
+
+#[test]
+fn blocked_dep_blocks_dependent_from_ready() {
+    // A Blocked dep blocks dependents the same way Open/InProgress
+    // do — it's not closed yet, just parked.
+    let repo = make_scratch_repo("ready_blocked_dep_blocks");
+    let storage = Storage::open(&repo).unwrap();
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+    let b = storage
+        .create_issue(&IssueDraft {
+            title: "B".into(),
+            type_: Some(IssueType::Feature),
+            dependencies: vec![DepEdge::blocks(a.clone())],
+            ..Default::default()
+        })
+        .unwrap();
+    storage.block(&a, Some("park")).unwrap();
+    let ready = storage.list_ready(&ReadyFilter::default()).unwrap();
+    let ids: Vec<&IssueId> = ready.iter().map(|i| &i.id).collect();
+    assert!(!ids.contains(&&a), "A is blocked: {ids:?}");
+    assert!(!ids.contains(&&b), "B blocked on Blocked A: {ids:?}");
+}
+
+#[test]
+fn block_reason_lww_later_overwrites_earlier() {
+    // Scalar LWW: a second `block` with a different reason
+    // overwrites the first. The op-space resolver picks the
+    // later write by `Jjf-At`, same as title/body/assignee.
+    let repo = make_scratch_repo("block_reason_lww");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.block(&id, Some("first reason")).unwrap();
+    storage.block(&id, Some("second reason")).unwrap();
+    let issue = storage.read(&id).unwrap();
+    assert_eq!(issue.block_reason.as_deref(), Some("second reason"));
 }
 
 // ============================================================

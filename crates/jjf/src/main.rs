@@ -68,11 +68,12 @@ struct Cli {
 
 /// What `jjf ls --status <X>` accepts. Distinct from `Status` because
 /// `all` (no filter) is a CLI-only affordance with no storage-layer
-/// equivalent. v2.3 added `in-progress` mirroring the new
-/// `Status::InProgress` variant.
+/// equivalent. v2.3 added `in-progress` mirroring `Status::InProgress`;
+/// v2.5 added `blocked` mirroring `Status::Blocked`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum StatusFilter {
     Open,
+    Blocked,
     #[value(name = "in-progress")]
     InProgress,
     Closed,
@@ -87,6 +88,7 @@ enum StatusFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum StatusArg {
     Open,
+    Blocked,
     #[value(name = "in-progress")]
     InProgress,
     Closed,
@@ -96,6 +98,7 @@ impl From<StatusArg> for Status {
     fn from(s: StatusArg) -> Self {
         match s {
             StatusArg::Open => Status::Open,
+            StatusArg::Blocked => Status::Blocked,
             StatusArg::InProgress => Status::InProgress,
             StatusArg::Closed => Status::Closed,
         }
@@ -339,6 +342,13 @@ enum Commands {
         #[arg(long = "include-claimed")]
         include_claimed: bool,
 
+        /// Include `blocked` (parked) issues in the ready set.
+        /// Off by default so an idle agent doesn't see an issue
+        /// that's parked on an external signal. Useful for
+        /// "what's parked" views. v2.5 (`agent-await-gates-impl`).
+        #[arg(long = "include-blocked")]
+        include_blocked: bool,
+
         /// Atomically claim the top result and emit its id. Only
         /// makes sense with `--limit 1` (claiming multiple at once
         /// would be ambiguous); other values are rejected at exit 2.
@@ -497,6 +507,41 @@ enum Commands {
         /// Full 7-char hex issue id. A bad parse is a preflight
         /// failure (exit 2); a well-formed id that doesn't exist on
         /// the bookmark is a runtime failure (exit 1).
+        id: String,
+    },
+
+    /// Park an issue: set status to `blocked` and record a free-text
+    /// reason, in ONE multi-op commit. v2.5 (`agent-await-gates-impl`).
+    ///
+    /// Blocked issues are excluded from `jjf ready` by default — an
+    /// idle agent shouldn't see them as workable. Use this when an
+    /// issue is parked on an external signal (a PR landing, a
+    /// timer, a human response) that the orchestrator (or a separate
+    /// script) is responsible for clearing. The companion verb
+    /// `jjf unblock <id>` flips the status back to `open` and clears
+    /// the reason.
+    ///
+    /// Inverse: `jjf unblock <id>`. (`jjf open <id>` also clears the
+    /// status but does NOT clear the reason — use `unblock` for the
+    /// canonical round-trip.)
+    Block {
+        /// Issue handle (7-char hex id OR a slug).
+        id: String,
+
+        /// Free-text reason recorded on the issue's `block_reason`
+        /// field. Single-line; newlines are rejected at exit 2.
+        /// Optional, but strongly recommended — without a reason
+        /// the operator who finds the issue later has no signal
+        /// for why it's parked.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// Unpark an issue: clear status back to `open` and clear the
+    /// `block_reason` in ONE multi-op commit. Inverse of `jjf block`.
+    /// v2.5 (`agent-await-gates-impl`).
+    Unblock {
+        /// Issue handle (7-char hex id OR a slug).
         id: String,
     },
 
@@ -1342,10 +1387,21 @@ fn run(cli: Cli) -> Result<(), CliError> {
             types,
             limit,
             include_claimed,
+            include_blocked,
             claim,
-        } => run_ready(cli.json, labels, types, limit, include_claimed, claim),
+        } => run_ready(
+            cli.json,
+            labels,
+            types,
+            limit,
+            include_claimed,
+            include_blocked,
+            claim,
+        ),
         Commands::Close { id } => run_set_status(cli.json, id, Status::Closed),
         Commands::Open { id } => run_set_status(cli.json, id, Status::Open),
+        Commands::Block { id, reason } => run_block(cli.json, id, reason),
+        Commands::Unblock { id } => run_unblock(cli.json, id),
         Commands::Comment { id, file, author } => run_comment(cli.json, id, file, author),
         Commands::Label { action } => match action {
             LabelAction::Add { id, label } => {
@@ -1874,6 +1930,21 @@ fn print_issue_plain(issue: &Issue) {
     let status = issue.status.as_str();
     println!("{}  [{}]", issue.id, status);
     println!("{}", issue.title);
+    // v2.5 (`agent-await-gates-impl`): when the issue is parked
+    // (`Status::Blocked`), surface the recorded reason on its
+    // own line. We show it even when the reason is `None` so the
+    // operator gets a clear "(no reason recorded)" signal rather
+    // than wondering whether the field is missing or just empty.
+    // For non-Blocked statuses we drop the line entirely — a stale
+    // reason on an Open issue would be misleading, and the storage
+    // layer's `unblock` clears it as part of the transition.
+    if issue.status == Status::Blocked {
+        let reason = issue
+            .block_reason
+            .as_deref()
+            .unwrap_or("(no reason recorded)");
+        println!("block-reason: {reason}");
+    }
     // type + slug rendered alongside the rest of the header. type
     // shows the lowercase wire spelling (matches CLI flag values
     // and storage trailers); slug renders as `(none)` when null so
@@ -2001,8 +2072,91 @@ fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError
             Status::Open => "opened",
             Status::Closed => "closed",
             Status::InProgress => "claimed",
+            Status::Blocked => "blocked",
         };
         println!("{verb} {issue_id}");
+    }
+    Ok(())
+}
+
+/// `jjf block <id> --reason <text>` — park an issue. Sets status to
+/// `blocked` and records the (optional) reason in ONE multi-op
+/// commit via [`Storage::block`]. v2.5 (`agent-await-gates-impl`).
+///
+/// Preflight order mirrors `run_set_status`: refuse-self-host, then
+/// `issues_bookmark`, then resolve the handle, then hand off to
+/// storage. Single-line reason validation is the storage layer's
+/// responsibility — newlines in `--reason` come back as a typed
+/// `invalid_input` error from storage.
+fn run_block(json: bool, id: String, reason: Option<String>) -> Result<(), CliError> {
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    preflight::refuse_self_hosted_write(&cwd, json)?;
+    preflight::issues_bookmark(&cwd)?;
+
+    let storage = Storage::open(&cwd)?;
+    let issue_id = resolve_handle(&storage, &id)?;
+    storage.block(&issue_id, reason.as_deref())?;
+
+    if json {
+        let mut obj = serde_json::Map::new();
+        obj.insert("ok".into(), serde_json::Value::Bool(true));
+        obj.insert(
+            "id".into(),
+            serde_json::Value::String(issue_id.as_str().to_owned()),
+        );
+        obj.insert(
+            "status".into(),
+            serde_json::Value::String(Status::Blocked.as_str().to_owned()),
+        );
+        obj.insert(
+            "reason".into(),
+            match reason.as_deref() {
+                Some(r) if !r.trim().is_empty() => {
+                    serde_json::Value::String(r.trim().to_owned())
+                }
+                _ => serde_json::Value::Null,
+            },
+        );
+        obj.insert("blocked".into(), serde_json::Value::Bool(true));
+        let out = serde_json::Value::Object(obj);
+        println!("{out}");
+    } else if let Some(r) = reason.as_deref() {
+        let trimmed = r.trim();
+        if trimmed.is_empty() {
+            println!("blocked {issue_id}");
+        } else {
+            println!("blocked {issue_id}: {trimmed}");
+        }
+    } else {
+        println!("blocked {issue_id}");
+    }
+    Ok(())
+}
+
+/// `jjf unblock <id>` — unpark an issue. Sets status back to `open`
+/// AND clears the `block_reason` in ONE multi-op commit via
+/// [`Storage::unblock`]. v2.5 (`agent-await-gates-impl`).
+fn run_unblock(json: bool, id: String) -> Result<(), CliError> {
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    preflight::refuse_self_hosted_write(&cwd, json)?;
+    preflight::issues_bookmark(&cwd)?;
+
+    let storage = Storage::open(&cwd)?;
+    let issue_id = resolve_handle(&storage, &id)?;
+    storage.unblock(&issue_id)?;
+
+    if json {
+        let out = serde_json::json!({
+            "ok": true,
+            "id": issue_id.as_str(),
+            "status": Status::Open.as_str(),
+            "blocked": false,
+        });
+        println!("{out}");
+    } else {
+        println!("unblocked {issue_id}");
     }
     Ok(())
 }
@@ -2765,6 +2919,7 @@ fn run_ready(
     types: Vec<TypeArg>,
     limit: Option<usize>,
     include_claimed: bool,
+    include_blocked: bool,
     claim: bool,
 ) -> Result<(), CliError> {
     // Preflight: --claim only composes with --limit 1. Reject any
@@ -2794,6 +2949,7 @@ fn run_ready(
         types: types.into_iter().map(IssueType::from).collect(),
         limit,
         include_claimed,
+        include_blocked,
     };
     let issues = storage.list_ready(&filter)?;
 
@@ -2868,6 +3024,7 @@ fn status_matches(issue: &Issue, filter: StatusFilter) -> bool {
     match filter {
         StatusFilter::All => true,
         StatusFilter::Open => issue.status == Status::Open,
+        StatusFilter::Blocked => issue.status == Status::Blocked,
         StatusFilter::InProgress => issue.status == Status::InProgress,
         StatusFilter::Closed => issue.status == Status::Closed,
     }

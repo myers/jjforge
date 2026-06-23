@@ -1,6 +1,6 @@
-# jjforge on-disk storage format — v2.4
+# jjforge on-disk storage format — v2.5
 
-Status: v2.4, current. This is the contract every other crate
+Status: v2.5, current. This is the contract every other crate
 implements against. Verdicts pinned by:
 
 - `dcd4b57` — Shape A (dedicated bookmark for issue data).
@@ -8,6 +8,59 @@ implements against. Verdicts pinned by:
   audit surface.
 - `2130de1` — shell out to the `jj` CLI; do not link `jj-lib`.
 - `72638a0` — the `mvp-storage` epic.
+
+## v2.4 → v2.5 changelog
+
+Backwards-compatible additions, landed in the
+`agent-await-gates-impl` ticket (`8ddf3fb`). Strict subset of
+the beads-style gates feature evaluated and ruled out in
+`docs/agent-await-gates-design.md`. v2.4 readers tolerate v2.5
+commits (the new `set-block-reason` op is dropped by the
+unknown-op-type tolerance in §5.2; the new `Jjf-Status:
+blocked` value surfaces as a typed deserialize failure to
+older parsers — same contract as the v2.3 `in-progress`
+addition). v2.5 readers tolerate v2.4 records (`status`
+defaults to `open`, `block_reason` defaults to `null` via
+serde-derive's `#[default]` if the field is missing).
+
+- **New `status` value `blocked`** — `Status::Blocked`. Wire
+  spelling: `blocked` (lowercase, via serde rename_all).
+  Semantically: parked on an external signal (a PR landing, a
+  timer, a human response). `Open`, `Blocked`, and `InProgress`
+  are all "active"; only `Closed` is terminal.
+- **New on-record field `block_reason`** — `string | null`,
+  default `null`. Appears in the record between `status` and
+  `type` (per §3.3 field-order rule). Carries the free-text
+  reason for the current `Status::Blocked` state; the storage
+  layer's `unblock` clears it as part of the `Open` transition.
+  Reasons MUST be single-line — newlines would corrupt the
+  `Jjf-Reason:` trailer. The storage layer rejects multi-line
+  reasons with `Error::Invalid`.
+- **New op `set-block-reason`** — payload field `Jjf-Reason`
+  (string or empty for clear). Same `empty == None` convention
+  as `set-assignee` / `set-slug`. The op is a scalar under the
+  op-space resolver (§6 LWW) — same shape as title / body /
+  assignee, no new resolver machinery required.
+- **New atomic verbs.**
+  - `Storage::block(id, reason)` — set status = blocked AND
+    record `block_reason` in ONE multi-op commit (`set-status` +
+    `set-block-reason`). Errors with `Error::Invalid` on
+    closed-issue block or on multi-line reason.
+  - `Storage::unblock(id)` — inverse: set status = open AND
+    clear `block_reason` in ONE multi-op commit. Idempotent
+    when already open + unblocked.
+- **`Storage::list_ready` excludes `Blocked` by default.** The
+  `ReadyFilter` adds `include_blocked: bool`; when `true`,
+  Blocked issues are included. A `Blocked` dependency still
+  BLOCKS dependents (it's not closed — parked but unfinished).
+- **`claim` rejects `Blocked` issues.** `Storage::claim` on a
+  blocked issue returns `Error::Invalid` ("issue X is blocked;
+  unblock before claiming"). Same shape as the closed-issue
+  rejection — the operator is forced to explicitly `unblock`
+  rather than silently dropping the recorded reason.
+- **Slug uniqueness scope** widens from "Open OR InProgress" to
+  "Open OR Blocked OR InProgress" — blocking an issue shouldn't
+  free its slug. Closed issues still release their slug.
 
 ## v2.3 → v2.4 changelog
 
@@ -323,7 +376,8 @@ separate lines).
 | `title`        | string                | yes  | Single-line. Must not be empty.                                |
 | `slug`         | string \| null        | yes  | v2.1 — kebab-case orientation handle. Default `null`. See §3.4. |
 | `body`         | string                | yes  | Opening description. May be empty.                             |
-| `status`       | string enum           | yes  | `open` \| `in-progress` \| `closed`. Default `open`. (v2.3 added `in-progress`.)   |
+| `status`       | string enum           | yes  | `open` \| `blocked` \| `in-progress` \| `closed`. Default `open`. (v2.3 added `in-progress`; v2.5 added `blocked`.) |
+| `block_reason` | string \| null        | yes  | v2.5 — free-text reason for the current `blocked` status. `null` when not blocked. Single-line. |
 | `type`         | string enum           | yes  | v2.1 — `bug` \| `feature` \| `epic` \| `research` \| `roadmap` \| `unspecified`. Default `unspecified`. |
 | `labels`       | array of string       | yes  | Sorted alphabetically. Empty array if none.                    |
 | `dependencies` | array of DepEdge (v2.4) | yes | Typed dependency edges. Sorted by `(target, kind)`. Empty array if none. v2.4 — was `array of string` in pre-v2.4 records; the reader accepts both shapes. |
@@ -356,6 +410,7 @@ Adds over git-bug:
   "slug": "segfault-on-empty-input",
   "body": "Running `./app` with no arguments crashes.",
   "status": "open",
+  "block_reason": null,
   "type": "bug",
   "labels": ["bug", "p1"],
   "dependencies": [],
@@ -512,7 +567,8 @@ trap that §5.6's filter-on-both-files workaround papers over.
 | ------------ | --------------------------------------------------------- | ---------------------------------------------------- |
 | `create`     | `Jjf-Title`, `Jjf-Status` (always `open`)                 | Must be the first op on this issue.                  |
 | `set-title`  | `Jjf-Title`                                               | Replaces title outright.                             |
-| `set-status` | `Jjf-Status` (`open` \| `in-progress` \| `closed`)        | Replaces status outright. v2.3 added `in-progress`.  |
+| `set-status` | `Jjf-Status` (`open` \| `blocked` \| `in-progress` \| `closed`) | Replaces status outright. v2.3 added `in-progress`; v2.5 added `blocked`. |
+| `set-block-reason` | `Jjf-Reason` (string or empty for clear)            | v2.5. Scalar LWW under §6. Lands alongside `set-status: blocked` in a `block` commit. |
 | `set-body`   | `Jjf-Body-Hash` (sha-256 of new body, hex)                | Body itself lives in the JSON; trailer carries hash. |
 | `label-add`  | `Jjf-Label` (one label string; may repeat for >1 label)   | No-op if label already present.                      |
 | `label-rm`   | `Jjf-Label`                                               | No-op if not present.                                |

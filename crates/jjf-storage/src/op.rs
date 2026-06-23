@@ -105,6 +105,16 @@ pub enum Op {
         issue_id: IssueId,
         slug: Option<String>,
     },
+    /// Set the free-text reason for [`crate::record::Status::Blocked`]
+    /// (spec v2.5). `None` clears it. The trailer carries the chosen
+    /// value verbatim or `""` for "no reason"; the empty form is
+    /// distinct from "no `Jjf-Reason:` line" only at the wire layer —
+    /// both deserialize to `reason: None`. v2.5
+    /// (`agent-await-gates-impl`).
+    SetBlockReason {
+        issue_id: IssueId,
+        reason: Option<String>,
+    },
     CommentAdd {
         issue_id: IssueId,
         comment_id: IssueId,
@@ -129,6 +139,7 @@ impl Op {
             Op::SetAssignee { .. } => "set-assignee",
             Op::SetType { .. } => "set-type",
             Op::SetSlug { .. } => "set-slug",
+            Op::SetBlockReason { .. } => "set-block-reason",
             Op::CommentAdd { .. } => "comment-add",
             Op::Merge { .. } => "merge",
         }
@@ -148,6 +159,7 @@ impl Op {
             | Op::SetAssignee { issue_id, .. }
             | Op::SetType { issue_id, .. }
             | Op::SetSlug { issue_id, .. }
+            | Op::SetBlockReason { issue_id, .. }
             | Op::CommentAdd { issue_id, .. }
             | Op::Merge { issue_id } => issue_id,
         }
@@ -222,6 +234,17 @@ impl Op {
             Op::SetSlug { slug, .. } => {
                 s.push_str("Jjf-Slug: ");
                 s.push_str(slug.as_deref().unwrap_or(""));
+                s.push('\n');
+            }
+            Op::SetBlockReason { reason, .. } => {
+                // v2.5: free-text reason. `None` and `Some("")` both
+                // render as `Jjf-Reason:` with an empty value; both
+                // parse back as `None`. Reasons are single-line by
+                // contract — the storage layer's `block` method
+                // rejects bodies containing newlines so the trailer
+                // round-trip stays clean.
+                s.push_str("Jjf-Reason: ");
+                s.push_str(reason.as_deref().unwrap_or(""));
                 s.push('\n');
             }
             Op::CommentAdd { comment_id, .. } => {

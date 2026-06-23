@@ -290,6 +290,7 @@ pub(crate) fn reduce_to_merged(
             slug: None,
             body: String::new(),
             status: *status,
+            block_reason: None,
             type_: IssueType::Unspecified,
             labels: Vec::new(),
             dependencies: Vec::new(),
@@ -350,6 +351,12 @@ pub(crate) fn reduce_to_merged(
             }
             Op::SetSlug { slug, .. } => {
                 record.slug = slug.clone();
+            }
+            Op::SetBlockReason { reason, .. } => {
+                // v2.5: scalar LWW — same shape as title/slug. The
+                // resolver's existing `(jjf_at, commit, trailer_index)`
+                // total order picks the winning op; we just overwrite.
+                record.block_reason = reason.clone();
             }
             Op::SetBody { body_hash, .. } => {
                 latest_body_hash = Some(body_hash.clone());
@@ -1159,6 +1166,7 @@ mod tests {
                 slug: None,
                 body: body_a.clone(),
                 status: Status::Open,
+                block_reason: None,
                 type_: IssueType::Unspecified,
                 labels: Vec::new(),
                 dependencies: Vec::new(),
@@ -1189,6 +1197,7 @@ mod tests {
                 slug: None,
                 body: body_b.clone(),
                 status: Status::Open,
+                block_reason: None,
                 type_: IssueType::Unspecified,
                 labels: Vec::new(),
                 dependencies: Vec::new(),
@@ -1235,6 +1244,7 @@ mod tests {
                 slug: None,
                 body: body_high.clone(),
                 status: Status::Open,
+                block_reason: None,
                 type_: IssueType::Unspecified,
                 labels: Vec::new(),
                 dependencies: Vec::new(),
@@ -1286,6 +1296,7 @@ mod tests {
                 slug: None,
                 body: "actual bytes".into(),
                 status: Status::Open,
+                block_reason: None,
                 type_: IssueType::Unspecified,
                 labels: Vec::new(),
                 dependencies: Vec::new(),
@@ -1331,6 +1342,7 @@ mod tests {
                 slug: None,
                 body: body.clone(),
                 status: Status::Open,
+                block_reason: None,
                 type_: IssueType::Unspecified,
                 labels: Vec::new(),
                 dependencies: Vec::new(),

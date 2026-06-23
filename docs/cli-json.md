@@ -1,5 +1,60 @@
 # `jjf --json` output contract
 
+## v2.4 → v2.5 changelog
+
+Backwards-compatible additions, landed in the
+`agent-await-gates-impl` ticket (`8ddf3fb`). Strict subset of
+the beads-style gates feature (see
+`docs/agent-await-gates-design.md` §6 for the verdict).
+
+- **Two new verbs** `jjf block <id> [--reason <text>]` and
+  `jjf unblock <id>`. Both land one multi-op commit on the
+  `issues` bookmark:
+  - `block`: sets `status = blocked` AND records
+    `block_reason` as a scalar. Two trailers (`set-status` +
+    `set-block-reason`), one commit.
+  - `unblock`: sets `status = open` AND clears
+    `block_reason`. Inverse of `block`. Idempotent when
+    already open + unblocked.
+  Reasons MUST be single-line — newlines surface as exit 1
+  `invalid_input` from storage.
+- **`jjf ready` gains `--include-blocked`** (mirror of the
+  v2.3 `--include-claimed` flag). Without it, `blocked` issues
+  are excluded from the ready set (an idle agent shouldn't see
+  parked work). With it, blocked issues appear alongside open
+  ones for "what's parked" views.
+- **New status enum value `blocked`** on every verb that emits
+  or accepts status (`show`, `ls --status blocked`, `update
+  --status blocked`). `Status::Blocked` is wire-spelled
+  `blocked`.
+- **New record field `block_reason`** on the `Issue` JSON
+  payload (string-or-null, default null). Visible on `jjf show
+  --json` and on every `--json` verb that emits an Issue
+  (`ls`, `ready`). Plain-text `jjf show` renders a
+  `block-reason: <text>` line immediately under the status when
+  the issue is blocked; non-blocked statuses don't render the
+  line at all.
+- **`jjf block --json` mutating envelope**:
+
+  ```json
+  {"ok": true, "id": "aa6600b", "status": "blocked", "reason": "waiting on PR-42", "blocked": true}
+  ```
+
+  When `--reason` is omitted (or whitespace-only), `reason` is
+  `null`.
+
+- **`jjf unblock --json` mutating envelope**:
+
+  ```json
+  {"ok": true, "id": "aa6600b", "status": "open", "blocked": false}
+  ```
+
+- **No new error kinds.** A multi-line `--reason` surfaces the
+  existing `invalid_input` kind from storage (exit 1).
+  Blocking a closed issue surfaces the same kind. Claiming a
+  blocked issue (`jjf update <id> --claim`) surfaces
+  `invalid_input` with a "unblock before claiming" hint.
+
 ## v2.3 → v2.4 changelog
 
 Backwards-compatible additions, landed in the `agent-dep-types`
