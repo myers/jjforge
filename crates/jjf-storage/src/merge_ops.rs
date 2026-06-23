@@ -168,6 +168,23 @@ fn list_ids_at(repo: &JjRepo, rev: &str) -> Result<Vec<IssueId>> {
     Ok(ids)
 }
 
+/// Per-head structural snapshot the pure reducer consumes. The reducer
+/// uses the op chain for everything that can be op-replayed
+/// (title/status/labels/…); the rendered files provide body bytes
+/// (matched to the winning `SetBody` hash) and comment bodies
+/// (matched to `CommentAdd` ids).
+///
+/// Lifted out of `resolve_one` so the pure-reduction step
+/// [`reduce_to_merged`] is reachable from the unit-test module without
+/// a real `JjRepo`. The full operator path still goes through
+/// `resolve_one` → `reduce_to_merged`; this struct is the seam between
+/// the I/O loader and the pure folder.
+pub(crate) struct HeadSnapshot {
+    pub record: Option<IssueRecord>,
+    pub comments: Vec<Comment>,
+    pub entries: Vec<HistoryEntry>,
+}
+
 /// Replay one issue across every head and produce the merged
 /// [`MergedIssue`].
 ///
@@ -176,15 +193,6 @@ fn list_ids_at(repo: &JjRepo, rev: &str) -> Result<Vec<IssueId>> {
 /// - Read its rendered record + comments file (if present) so we can
 ///   look up body bytes by hash and union comment bodies by id.
 fn resolve_one(repo: &JjRepo, heads: &[String], id: &IssueId) -> Result<MergedIssue> {
-    // Per-head structural snapshots. The reducer uses the op chain
-    // for everything that can be op-replayed (title/status/labels/…);
-    // the rendered files provide body bytes and comment bodies.
-    struct HeadSnapshot {
-        record: Option<IssueRecord>,
-        comments: Vec<Comment>,
-        entries: Vec<HistoryEntry>,
-    }
-
     let mut snapshots: Vec<HeadSnapshot> = Vec::with_capacity(heads.len());
     for head in heads {
         let entries = match super::history::read_history_at(repo, head, id) {
@@ -201,13 +209,46 @@ fn resolve_one(repo: &JjRepo, heads: &[String], id: &IssueId) -> Result<MergedIs
         });
     }
 
-    // 1. Flatten + sort every head's entries by the spec §6 ordering
-    //    tuple. The same op may appear on multiple heads if both
-    //    heads share that commit's ancestry (e.g. ops before the
-    //    fork); we de-dup by `(commit, trailer_index)`.
+    reduce_to_merged(id, &snapshots)
+}
+
+/// Pure reducer: given each head's `(entries, record, comments)`
+/// snapshot, produce the merged [`MergedIssue`] per spec §6's
+/// per-field policy.
+///
+/// Steps:
+/// 1. Flatten every head's entries, de-dup by `(commit, trailer_index)`
+///    (the same op may appear on multiple heads if both heads share
+///    that commit's ancestry — e.g. ops before the fork), and sort by
+///    the [`OpKey`] tuple.
+/// 2. Initialize the record from the first op (must be `Create`).
+///    Reduce field-by-field:
+///    - `SetTitle`/`SetStatus`/`SetAssignee`/`SetType`/`SetSlug`/
+///      `SetBody`: LWW — the last op in the sorted stream wins.
+///    - `LabelAdd`/`LabelRm`, `DepAdd`/`DepRm`: causal order; last
+///      operation per `(label / dep)` decides presence.
+///    - `CommentAdd`: union of `comment_id`s (no conflict possible).
+///    - `Merge`: marker; no-op for state.
+/// 3. Resolve the winning `SetBody` hash against the heads' rendered
+///    body bytes. No `SetBody` at all: take the body from whichever
+///    head has a record (create-time body, multi-op create only emits
+///    `SetBody` when non-empty).
+/// 4. Union comment bodies by id, ordered by `created_at` ascending.
+///
+/// Errors:
+/// - `Invalid` if the chain is empty (shouldn't happen — `resolve_one`
+///   only calls us for ids that surfaced on at least one head).
+/// - `Invalid` if the first op isn't `Create`.
+/// - `Invalid` if the winning `body_hash` isn't present on any head's
+///   rendered record.
+pub(crate) fn reduce_to_merged(
+    id: &IssueId,
+    snapshots: &[HeadSnapshot],
+) -> Result<MergedIssue> {
+    // 1. Flatten + dedup + sort.
     let mut all_entries: Vec<HistoryEntry> = Vec::new();
     let mut seen: BTreeSet<(String, u32)> = BTreeSet::new();
-    for snap in &snapshots {
+    for snap in snapshots {
         for entry in &snap.entries {
             let key = (entry.commit.clone(), entry.trailer_index);
             if seen.insert(key) {
@@ -228,20 +269,7 @@ fn resolve_one(repo: &JjRepo, heads: &[String], id: &IssueId) -> Result<MergedIs
         )));
     }
 
-    // 2. Reduce. Per spec §6 the rules are:
-    //    - `Create`: earliest wins; should agree across heads since
-    //      create predates the fork. The sorted stream guarantees the
-    //      first op IS that earliest create.
-    //    - `SetTitle`/`SetStatus`/`SetAssignee`/`SetBody`: LWW by the
-    //      ordering tuple — the LAST op in the sorted stream wins.
-    //    - `LabelAdd`/`LabelRm`, `DepAdd`/`DepRm`: causal order;
-    //      "last operation per (label/dep) wins."
-    //    - `CommentAdd`: union of comment_ids (no conflict possible).
-    //    - `Merge`: marker; folded as a no-op for state purposes
-    //      (the parents' chains are the truth).
-
-    // Initialize from the first op (must be `Create` for a well-
-    // formed chain).
+    // 2. Initialize from the first op (must be `Create`).
     let mut record = match &all_entries[0].op {
         Op::Create {
             issue_id,
@@ -272,16 +300,14 @@ fn resolve_one(repo: &JjRepo, heads: &[String], id: &IssueId) -> Result<MergedIs
     };
 
     // Per-label / per-dep last-write tracker. A `LabelAdd` writes
-    // `Some(())`, a `LabelRm` writes `None`; final pass takes
-    // present-labels = keys whose final value is `Some`.
+    // `true`, a `LabelRm` writes `false`; final pass takes the keys
+    // whose final value is `true`.
     let mut label_state: BTreeMap<String, bool> = BTreeMap::new();
     let mut dep_state: BTreeMap<IssueId, bool> = BTreeMap::new();
 
     // Track the latest SetBody op's hash so we can look up the
     // matching head's body bytes once the reduce is done.
     let mut latest_body_hash: Option<String> = None;
-    // Pre-seed from `Create` whose ops also include `set-body` per
-    // spec §5.7 (multi-op create). The fold below picks that up.
 
     let mut comment_ids: Vec<IssueId> = Vec::new();
 
@@ -335,7 +361,7 @@ fn resolve_one(repo: &JjRepo, heads: &[String], id: &IssueId) -> Result<MergedIs
         }
     }
 
-    // Project final state.
+    // Project final label / dep state.
     let mut labels: Vec<String> = label_state
         .into_iter()
         .filter_map(|(l, present)| if present { Some(l) } else { None })
@@ -354,7 +380,7 @@ fn resolve_one(repo: &JjRepo, heads: &[String], id: &IssueId) -> Result<MergedIs
     //    head's rendered file; pluck the bytes from there.
     if let Some(hash) = &latest_body_hash {
         let mut found: Option<String> = None;
-        for snap in &snapshots {
+        for snap in snapshots {
             if let Some(rec) = &snap.record {
                 if crate::body_hash_hex(&rec.body) == *hash {
                     found = Some(rec.body.clone());
@@ -401,7 +427,7 @@ fn resolve_one(repo: &JjRepo, heads: &[String], id: &IssueId) -> Result<MergedIs
             continue;
         }
         let mut picked: Option<Comment> = None;
-        for snap in &snapshots {
+        for snap in snapshots {
             if let Some(c) = snap.comments.iter().find(|c| &c.id == cid) {
                 picked = Some(c.clone());
                 break;
@@ -510,6 +536,99 @@ fn truncate_to_seconds(rfc_nano: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::Status;
+
+    // ---- helpers --------------------------------------------------------
+
+    /// A fixed 7-hex issue id reused across tests. The reducer never
+    /// looks at the id semantically; any valid id works.
+    fn iid(s: &str) -> IssueId {
+        IssueId::parse(s).expect("test issue id is 7 lowercase hex")
+    }
+
+    /// Build a `HistoryEntry` carrying the given op. `jjf_at` is the
+    /// nano-precision op-time stamp the post-spec-bump writer emits;
+    /// `None` simulates a pre-bump (v1-trailer) stanza. `timestamp` is
+    /// the commit's author second; the reducer falls back to it when
+    /// `jjf_at` is `None`. `commit` is the 40-hex commit_id; the
+    /// reducer uses it as a tiebreaker and to dedup ops shared across
+    /// heads. `trailer_index` is the 0-based stanza position within
+    /// the commit; the final tiebreaker when `(jjf_at, commit)` ties.
+    fn entry(
+        commit: &str,
+        timestamp: &str,
+        jjf_at: Option<&str>,
+        trailer_index: u32,
+        op: Op,
+    ) -> HistoryEntry {
+        HistoryEntry {
+            commit: commit.into(),
+            author: "Test <t@example.com>".into(),
+            timestamp: timestamp.into(),
+            jjf_at: jjf_at.map(|s| s.into()),
+            trailer_index,
+            op,
+        }
+    }
+
+    /// Build a `Create` entry rooted at `t0`. Tests build a chain on
+    /// top of this seed; the reducer requires the first sorted op to
+    /// be `Create` or it errors out.
+    fn create_entry(id: &IssueId, t0: &str) -> HistoryEntry {
+        entry(
+            "00000000000000000000000000000000000000a0",
+            t0,
+            Some(t0),
+            0,
+            Op::Create {
+                issue_id: id.clone(),
+                title: "initial".into(),
+                status: Status::Open,
+            },
+        )
+    }
+
+    /// Pre-bump (v1-trailer) Create entry — no `Jjf-At` stamp. Used by
+    /// tests that mix unstamped and stamped ops on the same chain: in
+    /// the implementation, *every* unstamped op (`PrimaryKey::Unstamped`)
+    /// sorts before *every* stamped op (`PrimaryKey::Stamped`)
+    /// regardless of clock time (see the variant declaration order on
+    /// `PrimaryKey`). So mixing a stamped Create with unstamped ops
+    /// makes the unstamped op sort BEFORE the Create — the chain
+    /// errors with "does not start with `create`." For cross-version
+    /// scenarios that mirror real data (where v1 ops predate the v2
+    /// spec bump), the Create is also v1-style: unstamped.
+    fn unstamped_create_entry(id: &IssueId, t0: &str) -> HistoryEntry {
+        entry(
+            "00000000000000000000000000000000000000a0",
+            t0,
+            None,
+            0,
+            Op::Create {
+                issue_id: id.clone(),
+                title: "initial".into(),
+                status: Status::Open,
+            },
+        )
+    }
+
+    /// Wrap entries into a single-head snapshot. Tests that don't
+    /// exercise body or comment lookup can use this — they leave the
+    /// rendered record and comments empty.
+    fn snap(entries: Vec<HistoryEntry>) -> HeadSnapshot {
+        HeadSnapshot {
+            record: None,
+            comments: Vec::new(),
+            entries,
+        }
+    }
+
+    /// Run the reducer on the given head snapshots and unwrap.
+    fn reduce(id: &IssueId, snapshots: &[HeadSnapshot]) -> MergedIssue {
+        reduce_to_merged(id, snapshots).expect("reducer should succeed")
+    }
+
+    // ---- existing tests -------------------------------------------------
 
     #[test]
     fn truncate_drops_nanos() {
@@ -544,5 +663,1309 @@ mod tests {
         // exactly the orchestrator's "older data loses to newer data"
         // semantics.
         assert!(unstamped < stamped);
+    }
+
+    // ---- LWW scalars: status -------------------------------------------
+
+    #[test]
+    fn status_lww_later_jjf_at_wins() {
+        // Two heads: head A closes the issue at t1, head B leaves it
+        // open at t2. By the LWW rule, head B's later op wins.
+        let id = iid("1111111");
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aa",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000000Z"),
+                0,
+                Op::SetStatus {
+                    issue_id: id.clone(),
+                    status: Status::Closed,
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bb",
+                "2026-06-22T12:00:02Z",
+                Some("2026-06-22T12:00:02.000000000Z"),
+                0,
+                Op::SetStatus {
+                    issue_id: id.clone(),
+                    status: Status::Open,
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.status, Status::Open);
+    }
+
+    #[test]
+    fn status_tie_break_by_commit_hash() {
+        // Same Jjf-At on both heads; the larger commit-id string wins.
+        let id = iid("2222222");
+        let at = "2026-06-22T12:00:01.000000000Z";
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aaaa",
+                "2026-06-22T12:00:01Z",
+                Some(at),
+                0,
+                Op::SetStatus {
+                    issue_id: id.clone(),
+                    status: Status::Closed,
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bbbb",
+                "2026-06-22T12:00:01Z",
+                Some(at),
+                0,
+                Op::SetStatus {
+                    issue_id: id.clone(),
+                    status: Status::Open,
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        // "bbbb" > "aaaa" lexicographically, so head_b's op wins.
+        assert_eq!(merged.record.status, Status::Open);
+    }
+
+    #[test]
+    fn status_tie_break_by_trailer_index() {
+        // One commit carries two SetStatus stanzas — the higher
+        // trailer_index wins.
+        let id = iid("3333333");
+        let at = "2026-06-22T12:00:01.000000000Z";
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "cc",
+                "2026-06-22T12:00:01Z",
+                Some(at),
+                0,
+                Op::SetStatus {
+                    issue_id: id.clone(),
+                    status: Status::Closed,
+                },
+            ),
+            entry(
+                "cc",
+                "2026-06-22T12:00:01Z",
+                Some(at),
+                1,
+                Op::SetStatus {
+                    issue_id: id.clone(),
+                    status: Status::Open,
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a]);
+        assert_eq!(merged.record.status, Status::Open);
+    }
+
+    #[test]
+    fn status_unstamped_loses_to_stamped_at_same_second() {
+        // Head A's op is pre-bump (no Jjf-At). Head B's op stamps at
+        // the same author-second. The stamped op wins. The Create
+        // itself is unstamped — see `unstamped_create_entry`'s
+        // docstring for why mixing stamped Create + unstamped op
+        // breaks the "first sorted op must be Create" invariant.
+        let id = iid("4444444");
+        let head_a = snap(vec![
+            unstamped_create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aa",
+                "2026-06-22T12:00:01Z",
+                None,
+                0,
+                Op::SetStatus {
+                    issue_id: id.clone(),
+                    status: Status::Closed,
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            unstamped_create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bb",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000001Z"),
+                0,
+                Op::SetStatus {
+                    issue_id: id.clone(),
+                    status: Status::Open,
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.status, Status::Open);
+    }
+
+    // ---- LWW scalars: title --------------------------------------------
+
+    #[test]
+    fn title_lww_later_wins() {
+        let id = iid("5555555");
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aa",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000000Z"),
+                0,
+                Op::SetTitle {
+                    issue_id: id.clone(),
+                    title: "from A".into(),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bb",
+                "2026-06-22T12:00:02Z",
+                Some("2026-06-22T12:00:02.000000000Z"),
+                0,
+                Op::SetTitle {
+                    issue_id: id.clone(),
+                    title: "from B".into(),
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.title, "from B");
+    }
+
+    #[test]
+    fn title_tie_break_by_commit_hash() {
+        let id = iid("6666666");
+        let at = "2026-06-22T12:00:01.000000000Z";
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aaaa",
+                "2026-06-22T12:00:01Z",
+                Some(at),
+                0,
+                Op::SetTitle {
+                    issue_id: id.clone(),
+                    title: "from A".into(),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bbbb",
+                "2026-06-22T12:00:01Z",
+                Some(at),
+                0,
+                Op::SetTitle {
+                    issue_id: id.clone(),
+                    title: "from B".into(),
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.title, "from B");
+    }
+
+    #[test]
+    fn title_tie_break_by_trailer_index() {
+        let id = iid("7777777");
+        let at = "2026-06-22T12:00:01.000000000Z";
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "cc",
+                "2026-06-22T12:00:01Z",
+                Some(at),
+                0,
+                Op::SetTitle {
+                    issue_id: id.clone(),
+                    title: "first stanza".into(),
+                },
+            ),
+            entry(
+                "cc",
+                "2026-06-22T12:00:01Z",
+                Some(at),
+                1,
+                Op::SetTitle {
+                    issue_id: id.clone(),
+                    title: "second stanza".into(),
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a]);
+        assert_eq!(merged.record.title, "second stanza");
+    }
+
+    #[test]
+    fn title_unstamped_loses_to_stamped_at_same_second() {
+        // Pre-bump Create (no Jjf-At) so mixing unstamped + stamped
+        // ops doesn't break the "first op must be Create" invariant.
+        let id = iid("8888888");
+        let head_a = snap(vec![
+            unstamped_create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aa",
+                "2026-06-22T12:00:01Z",
+                None,
+                0,
+                Op::SetTitle {
+                    issue_id: id.clone(),
+                    title: "from pre-bump".into(),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            unstamped_create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bb",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000001Z"),
+                0,
+                Op::SetTitle {
+                    issue_id: id.clone(),
+                    title: "from post-bump".into(),
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.title, "from post-bump");
+    }
+
+    // ---- LWW scalars: assignee -----------------------------------------
+
+    #[test]
+    fn assignee_lww_later_wins() {
+        let id = iid("9999999");
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aa",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000000Z"),
+                0,
+                Op::SetAssignee {
+                    issue_id: id.clone(),
+                    assignee: Some("alice".into()),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bb",
+                "2026-06-22T12:00:02Z",
+                Some("2026-06-22T12:00:02.000000000Z"),
+                0,
+                Op::SetAssignee {
+                    issue_id: id.clone(),
+                    assignee: Some("bob".into()),
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.assignee.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn assignee_tie_break_by_commit_hash() {
+        let id = iid("aaaaaa0");
+        let at = "2026-06-22T12:00:01.000000000Z";
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aaaa",
+                "2026-06-22T12:00:01Z",
+                Some(at),
+                0,
+                Op::SetAssignee {
+                    issue_id: id.clone(),
+                    assignee: Some("alice".into()),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bbbb",
+                "2026-06-22T12:00:01Z",
+                Some(at),
+                0,
+                Op::SetAssignee {
+                    issue_id: id.clone(),
+                    assignee: Some("bob".into()),
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.assignee.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn assignee_tie_break_by_trailer_index() {
+        let id = iid("aaaaaa1");
+        let at = "2026-06-22T12:00:01.000000000Z";
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "cc",
+                "2026-06-22T12:00:01Z",
+                Some(at),
+                0,
+                Op::SetAssignee {
+                    issue_id: id.clone(),
+                    assignee: Some("first".into()),
+                },
+            ),
+            entry(
+                "cc",
+                "2026-06-22T12:00:01Z",
+                Some(at),
+                1,
+                Op::SetAssignee {
+                    issue_id: id.clone(),
+                    assignee: Some("second".into()),
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a]);
+        assert_eq!(merged.record.assignee.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn assignee_unstamped_loses_to_stamped_at_same_second() {
+        // Pre-bump Create (no Jjf-At) so mixing unstamped + stamped
+        // ops doesn't break the "first op must be Create" invariant.
+        let id = iid("aaaaaa2");
+        let head_a = snap(vec![
+            unstamped_create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aa",
+                "2026-06-22T12:00:01Z",
+                None,
+                0,
+                Op::SetAssignee {
+                    issue_id: id.clone(),
+                    assignee: Some("pre".into()),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            unstamped_create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bb",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000001Z"),
+                0,
+                Op::SetAssignee {
+                    issue_id: id.clone(),
+                    assignee: Some("post".into()),
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.assignee.as_deref(), Some("post"));
+    }
+
+    #[test]
+    fn assignee_unset_lww_wins() {
+        // `SetAssignee { assignee: None }` is the unassign op — the
+        // reducer must treat it as the winning value, not as
+        // "no-op."
+        let id = iid("aaaaaa3");
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aa",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000000Z"),
+                0,
+                Op::SetAssignee {
+                    issue_id: id.clone(),
+                    assignee: Some("alice".into()),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bb",
+                "2026-06-22T12:00:02Z",
+                Some("2026-06-22T12:00:02.000000000Z"),
+                0,
+                Op::SetAssignee {
+                    issue_id: id.clone(),
+                    assignee: None,
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.assignee, None);
+    }
+
+    // ---- LWW scalars: body ---------------------------------------------
+
+    #[test]
+    fn body_lww_winning_hash_resolved_to_bytes() {
+        // Two heads each ran SetBody on disjoint body bytes. The
+        // later head's hash is the winner; the reducer pulls the
+        // bytes from whichever head's rendered record matches that
+        // hash.
+        let id = iid("aaaaaa4");
+        let body_a = "body from A".to_owned();
+        let body_b = "body from B".to_owned();
+        let hash_a = crate::body_hash_hex(&body_a);
+        let hash_b = crate::body_hash_hex(&body_b);
+        let snap_a = HeadSnapshot {
+            record: Some(IssueRecord {
+                version: 2,
+                id: id.clone(),
+                title: "initial".into(),
+                slug: None,
+                body: body_a.clone(),
+                status: Status::Open,
+                type_: IssueType::Unspecified,
+                labels: Vec::new(),
+                dependencies: Vec::new(),
+                assignee: None,
+                created_at: "2026-06-22T12:00:00Z".into(),
+                updated_at: "2026-06-22T12:00:01Z".into(),
+            }),
+            comments: Vec::new(),
+            entries: vec![
+                create_entry(&id, "2026-06-22T12:00:00Z"),
+                entry(
+                    "aa",
+                    "2026-06-22T12:00:01Z",
+                    Some("2026-06-22T12:00:01.000000000Z"),
+                    0,
+                    Op::SetBody {
+                        issue_id: id.clone(),
+                        body_hash: hash_a.clone(),
+                    },
+                ),
+            ],
+        };
+        let snap_b = HeadSnapshot {
+            record: Some(IssueRecord {
+                version: 2,
+                id: id.clone(),
+                title: "initial".into(),
+                slug: None,
+                body: body_b.clone(),
+                status: Status::Open,
+                type_: IssueType::Unspecified,
+                labels: Vec::new(),
+                dependencies: Vec::new(),
+                assignee: None,
+                created_at: "2026-06-22T12:00:00Z".into(),
+                updated_at: "2026-06-22T12:00:02Z".into(),
+            }),
+            comments: Vec::new(),
+            entries: vec![
+                create_entry(&id, "2026-06-22T12:00:00Z"),
+                entry(
+                    "bb",
+                    "2026-06-22T12:00:02Z",
+                    Some("2026-06-22T12:00:02.000000000Z"),
+                    0,
+                    Op::SetBody {
+                        issue_id: id.clone(),
+                        body_hash: hash_b.clone(),
+                    },
+                ),
+            ],
+        };
+        let merged = reduce(&id, &[snap_a, snap_b]);
+        assert_eq!(merged.record.body, body_b);
+    }
+
+    #[test]
+    fn body_tie_break_by_trailer_index() {
+        // Same commit, two SetBody stanzas; higher trailer_index wins.
+        let id = iid("aaaaaa5");
+        let body_low = "first stanza body".to_owned();
+        let body_high = "second stanza body".to_owned();
+        let hash_low = crate::body_hash_hex(&body_low);
+        let hash_high = crate::body_hash_hex(&body_high);
+        // The single rendered record carries `body_high` — the
+        // winning hash; the bytes for `body_low` aren't on disk
+        // (they got overwritten when the commit landed). The reducer
+        // only needs the winning bytes.
+        let head_a = HeadSnapshot {
+            record: Some(IssueRecord {
+                version: 2,
+                id: id.clone(),
+                title: "initial".into(),
+                slug: None,
+                body: body_high.clone(),
+                status: Status::Open,
+                type_: IssueType::Unspecified,
+                labels: Vec::new(),
+                dependencies: Vec::new(),
+                assignee: None,
+                created_at: "2026-06-22T12:00:00Z".into(),
+                updated_at: "2026-06-22T12:00:01Z".into(),
+            }),
+            comments: Vec::new(),
+            entries: vec![
+                create_entry(&id, "2026-06-22T12:00:00Z"),
+                entry(
+                    "cc",
+                    "2026-06-22T12:00:01Z",
+                    Some("2026-06-22T12:00:01.000000000Z"),
+                    0,
+                    Op::SetBody {
+                        issue_id: id.clone(),
+                        body_hash: hash_low,
+                    },
+                ),
+                entry(
+                    "cc",
+                    "2026-06-22T12:00:01Z",
+                    Some("2026-06-22T12:00:01.000000000Z"),
+                    1,
+                    Op::SetBody {
+                        issue_id: id.clone(),
+                        body_hash: hash_high.clone(),
+                    },
+                ),
+            ],
+        };
+        let merged = reduce(&id, &[head_a]);
+        assert_eq!(merged.record.body, body_high);
+    }
+
+    #[test]
+    fn body_winning_hash_missing_from_heads_errors() {
+        // Defensive path: the winning SetBody hash isn't present in
+        // any head's rendered record. Should surface a typed
+        // Error::Invalid, not panic.
+        let id = iid("aaaaaa6");
+        let bogus_hash = "deadbeef".repeat(8);
+        let head_a = HeadSnapshot {
+            record: Some(IssueRecord {
+                version: 2,
+                id: id.clone(),
+                title: "initial".into(),
+                slug: None,
+                body: "actual bytes".into(),
+                status: Status::Open,
+                type_: IssueType::Unspecified,
+                labels: Vec::new(),
+                dependencies: Vec::new(),
+                assignee: None,
+                created_at: "2026-06-22T12:00:00Z".into(),
+                updated_at: "2026-06-22T12:00:01Z".into(),
+            }),
+            comments: Vec::new(),
+            entries: vec![
+                create_entry(&id, "2026-06-22T12:00:00Z"),
+                entry(
+                    "aa",
+                    "2026-06-22T12:00:01Z",
+                    Some("2026-06-22T12:00:01.000000000Z"),
+                    0,
+                    Op::SetBody {
+                        issue_id: id.clone(),
+                        body_hash: bogus_hash,
+                    },
+                ),
+            ],
+        };
+        let err = reduce_to_merged(&id, &[head_a]).unwrap_err();
+        assert!(
+            matches!(err, Error::Invalid(ref m) if m.contains("winning body hash")),
+            "expected Invalid(winning body hash...), got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn body_no_set_body_op_pulls_create_time_body_from_record() {
+        // Chain has no SetBody op (create's body was empty so the
+        // multi-op writer skipped it). The reducer should still
+        // pull bytes from whichever head has a rendered record.
+        let id = iid("aaaaaa7");
+        let body = "create-time body".to_owned();
+        let head = HeadSnapshot {
+            record: Some(IssueRecord {
+                version: 2,
+                id: id.clone(),
+                title: "initial".into(),
+                slug: None,
+                body: body.clone(),
+                status: Status::Open,
+                type_: IssueType::Unspecified,
+                labels: Vec::new(),
+                dependencies: Vec::new(),
+                assignee: None,
+                created_at: "2026-06-22T12:00:00Z".into(),
+                updated_at: "2026-06-22T12:00:00Z".into(),
+            }),
+            comments: Vec::new(),
+            entries: vec![create_entry(&id, "2026-06-22T12:00:00Z")],
+        };
+        let merged = reduce(&id, &[head]);
+        assert_eq!(merged.record.body, body);
+    }
+
+    // ---- Sets: labels --------------------------------------------------
+
+    #[test]
+    fn labels_add_on_one_side_present() {
+        // Head A adds label "x"; head B leaves it alone. The merged
+        // record carries {"x"}.
+        let id = iid("bbbbbb0");
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aa",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000000Z"),
+                0,
+                Op::LabelAdd {
+                    issue_id: id.clone(),
+                    label: "x".into(),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![create_entry(&id, "2026-06-22T12:00:00Z")]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.labels, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn labels_add_then_remove_remove_wins_when_later() {
+        // Head A adds "x" at t1; head B removes "x" at t2. Removal
+        // is later, so "x" is absent.
+        let id = iid("bbbbbb1");
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aa",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000000Z"),
+                0,
+                Op::LabelAdd {
+                    issue_id: id.clone(),
+                    label: "x".into(),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bb",
+                "2026-06-22T12:00:02Z",
+                Some("2026-06-22T12:00:02.000000000Z"),
+                0,
+                Op::LabelRm {
+                    issue_id: id.clone(),
+                    label: "x".into(),
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert!(merged.record.labels.is_empty(), "expected no labels, got {:?}", merged.record.labels);
+    }
+
+    #[test]
+    fn labels_remove_then_add_add_wins_when_later() {
+        // Mirror of the above: remove first, then add — add wins.
+        let id = iid("bbbbbb2");
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aa",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000000Z"),
+                0,
+                Op::LabelRm {
+                    issue_id: id.clone(),
+                    label: "x".into(),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bb",
+                "2026-06-22T12:00:02Z",
+                Some("2026-06-22T12:00:02.000000000Z"),
+                0,
+                Op::LabelAdd {
+                    issue_id: id.clone(),
+                    label: "x".into(),
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.labels, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn labels_both_sides_add_same_label_idempotent() {
+        // Both heads independently add "x" — present, single copy.
+        let id = iid("bbbbbb3");
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aa",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000000Z"),
+                0,
+                Op::LabelAdd {
+                    issue_id: id.clone(),
+                    label: "x".into(),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bb",
+                "2026-06-22T12:00:02Z",
+                Some("2026-06-22T12:00:02.000000000Z"),
+                0,
+                Op::LabelAdd {
+                    issue_id: id.clone(),
+                    label: "x".into(),
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.labels, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn labels_one_side_add_then_remove_other_adds_y_final_is_y_only() {
+        // Head A: add x at t1, remove x at t3. Head B: add y at t2.
+        // Final: {y}.
+        let id = iid("bbbbbb4");
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "a1",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000000Z"),
+                0,
+                Op::LabelAdd {
+                    issue_id: id.clone(),
+                    label: "x".into(),
+                },
+            ),
+            entry(
+                "a2",
+                "2026-06-22T12:00:03Z",
+                Some("2026-06-22T12:00:03.000000000Z"),
+                0,
+                Op::LabelRm {
+                    issue_id: id.clone(),
+                    label: "x".into(),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bb",
+                "2026-06-22T12:00:02Z",
+                Some("2026-06-22T12:00:02.000000000Z"),
+                0,
+                Op::LabelAdd {
+                    issue_id: id.clone(),
+                    label: "y".into(),
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.labels, vec!["y".to_string()]);
+    }
+
+    // ---- Sets: dependencies --------------------------------------------
+
+    #[test]
+    fn deps_add_on_one_side_present() {
+        let id = iid("ccccc00");
+        let dep = iid("dad0001");
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aa",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000000Z"),
+                0,
+                Op::DepAdd {
+                    issue_id: id.clone(),
+                    dep: dep.clone(),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![create_entry(&id, "2026-06-22T12:00:00Z")]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.dependencies, vec![dep]);
+    }
+
+    #[test]
+    fn deps_add_then_remove_remove_wins_when_later() {
+        let id = iid("ccccc01");
+        let dep = iid("dad0001");
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aa",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000000Z"),
+                0,
+                Op::DepAdd {
+                    issue_id: id.clone(),
+                    dep: dep.clone(),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bb",
+                "2026-06-22T12:00:02Z",
+                Some("2026-06-22T12:00:02.000000000Z"),
+                0,
+                Op::DepRm {
+                    issue_id: id.clone(),
+                    dep: dep.clone(),
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert!(merged.record.dependencies.is_empty());
+    }
+
+    #[test]
+    fn deps_both_sides_add_same_dep_idempotent() {
+        let id = iid("ccccc02");
+        let dep = iid("dad0001");
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aa",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000000Z"),
+                0,
+                Op::DepAdd {
+                    issue_id: id.clone(),
+                    dep: dep.clone(),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bb",
+                "2026-06-22T12:00:02Z",
+                Some("2026-06-22T12:00:02.000000000Z"),
+                0,
+                Op::DepAdd {
+                    issue_id: id.clone(),
+                    dep: dep.clone(),
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.dependencies, vec![dep]);
+    }
+
+    #[test]
+    fn deps_one_side_add_remove_other_adds_different_final_only_one() {
+        // Symmetric to the labels test: A adds dep1 then removes;
+        // B adds dep2. Final: {dep2}.
+        let id = iid("ccccc03");
+        let dep1 = iid("dad0001");
+        let dep2 = iid("dad0002");
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "a1",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000000Z"),
+                0,
+                Op::DepAdd {
+                    issue_id: id.clone(),
+                    dep: dep1.clone(),
+                },
+            ),
+            entry(
+                "a2",
+                "2026-06-22T12:00:03Z",
+                Some("2026-06-22T12:00:03.000000000Z"),
+                0,
+                Op::DepRm {
+                    issue_id: id.clone(),
+                    dep: dep1.clone(),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bb",
+                "2026-06-22T12:00:02Z",
+                Some("2026-06-22T12:00:02.000000000Z"),
+                0,
+                Op::DepAdd {
+                    issue_id: id.clone(),
+                    dep: dep2.clone(),
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.dependencies, vec![dep2]);
+    }
+
+    // ---- Comments ------------------------------------------------------
+
+    #[test]
+    fn comments_both_sides_distinct_union_by_created_at() {
+        // Head A appends comment c1; head B appends c2. Merged: both,
+        // ordered by created_at ascending.
+        let id = iid("ddddd00");
+        let c1 = iid("c000001");
+        let c2 = iid("c000002");
+        let comment1 = Comment {
+            id: c1.clone(),
+            author: "alice".into(),
+            created_at: "2026-06-22T12:00:01Z".into(),
+            body: "from A".into(),
+        };
+        let comment2 = Comment {
+            id: c2.clone(),
+            author: "bob".into(),
+            created_at: "2026-06-22T12:00:02Z".into(),
+            body: "from B".into(),
+        };
+        let head_a = HeadSnapshot {
+            record: None,
+            comments: vec![comment1.clone()],
+            entries: vec![
+                create_entry(&id, "2026-06-22T12:00:00Z"),
+                entry(
+                    "aa",
+                    "2026-06-22T12:00:01Z",
+                    Some("2026-06-22T12:00:01.000000000Z"),
+                    0,
+                    Op::CommentAdd {
+                        issue_id: id.clone(),
+                        comment_id: c1.clone(),
+                    },
+                ),
+            ],
+        };
+        let head_b = HeadSnapshot {
+            record: None,
+            comments: vec![comment2.clone()],
+            entries: vec![
+                create_entry(&id, "2026-06-22T12:00:00Z"),
+                entry(
+                    "bb",
+                    "2026-06-22T12:00:02Z",
+                    Some("2026-06-22T12:00:02.000000000Z"),
+                    0,
+                    Op::CommentAdd {
+                        issue_id: id.clone(),
+                        comment_id: c2.clone(),
+                    },
+                ),
+            ],
+        };
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.comments.len(), 2);
+        assert_eq!(merged.comments[0].id, c1);
+        assert_eq!(merged.comments[1].id, c2);
+    }
+
+    #[test]
+    fn comments_duplicate_id_across_heads_kept_once() {
+        // Both heads add a CommentAdd op with the same comment_id
+        // (spec says "shouldn't happen" — different writers must
+        // mint different ids — but the reducer should be robust).
+        let id = iid("ddddd01");
+        let cid = iid("c000001");
+        let comment = Comment {
+            id: cid.clone(),
+            author: "alice".into(),
+            created_at: "2026-06-22T12:00:01Z".into(),
+            body: "shared bytes".into(),
+        };
+        let head_a = HeadSnapshot {
+            record: None,
+            comments: vec![comment.clone()],
+            entries: vec![
+                create_entry(&id, "2026-06-22T12:00:00Z"),
+                entry(
+                    "aa",
+                    "2026-06-22T12:00:01Z",
+                    Some("2026-06-22T12:00:01.000000000Z"),
+                    0,
+                    Op::CommentAdd {
+                        issue_id: id.clone(),
+                        comment_id: cid.clone(),
+                    },
+                ),
+            ],
+        };
+        let head_b = HeadSnapshot {
+            record: None,
+            comments: vec![comment.clone()],
+            entries: vec![
+                create_entry(&id, "2026-06-22T12:00:00Z"),
+                entry(
+                    "bb",
+                    "2026-06-22T12:00:02Z",
+                    Some("2026-06-22T12:00:02.000000000Z"),
+                    0,
+                    Op::CommentAdd {
+                        issue_id: id.clone(),
+                        comment_id: cid.clone(),
+                    },
+                ),
+            ],
+        };
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.comments.len(), 1);
+        assert_eq!(merged.comments[0].id, cid);
+    }
+
+    // ---- Cross-version (v1 + v2 trailers in the same chain) ------------
+
+    #[test]
+    fn cross_version_stamped_beats_unstamped_at_same_second() {
+        // Head A's op is a v1-style stanza (no Jjf-At). Head B's op
+        // is v2 with a Jjf-At at the same author-second. Spec §6 +
+        // the orchestrator's call: stamped beats unstamped at the
+        // same second. The Create is also v1-style — see
+        // `unstamped_create_entry`'s docstring for why.
+        let id = iid("eeeee00");
+        let head_a = snap(vec![
+            unstamped_create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aa",
+                "2026-06-22T12:00:01Z",
+                None,
+                0,
+                Op::SetTitle {
+                    issue_id: id.clone(),
+                    title: "v1 trailer".into(),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            unstamped_create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bb",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000001Z"),
+                0,
+                Op::SetTitle {
+                    issue_id: id.clone(),
+                    title: "v2 trailer".into(),
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.title, "v2 trailer");
+    }
+
+    #[test]
+    fn cross_version_any_stamped_beats_any_unstamped_regardless_of_clock() {
+        // Surprise: the spec-comment claim "unstamped sorts before
+        // stamped *at the same second*" is wider in implementation:
+        // `PrimaryKey::Unstamped` is declared before
+        // `PrimaryKey::Stamped`, so derived `Ord` makes EVERY
+        // unstamped op sort before EVERY stamped op, regardless of
+        // clock time. This pins the actual behavior: a stamped op at
+        // t1 still beats an unstamped op at t2.
+        //
+        // In practice this is the right semantics — every unstamped
+        // op is a pre-spec-bump artifact and so predates every
+        // stamped op by construction — but the spec-comment is
+        // narrower than the code. Worth flagging if the spec ever
+        // tightens to require strict clock comparison.
+        let id = iid("eeeee01");
+        let head_a = snap(vec![
+            unstamped_create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aa",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000000Z"),
+                0,
+                Op::SetTitle {
+                    issue_id: id.clone(),
+                    title: "v2 stamped at t1".into(),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            unstamped_create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bb",
+                "2026-06-22T12:00:02Z",
+                None,
+                0,
+                Op::SetTitle {
+                    issue_id: id.clone(),
+                    title: "v1 unstamped at t2".into(),
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        // The stamped op wins despite landing earlier on the clock.
+        assert_eq!(merged.record.title, "v2 stamped at t1");
+    }
+
+    // ---- De-dup of shared ancestry -------------------------------------
+
+    #[test]
+    fn shared_pre_fork_ops_deduplicated() {
+        // Both heads' chains include the pre-fork SetTitle at commit
+        // "shared". The reducer dedups by (commit, trailer_index) so
+        // the shared op only counts once. The later per-head op
+        // determines the winning title.
+        let id = iid("fffff00");
+        let shared_set = entry(
+            "shared",
+            "2026-06-22T12:00:01Z",
+            Some("2026-06-22T12:00:01.000000000Z"),
+            0,
+            Op::SetTitle {
+                issue_id: id.clone(),
+                title: "pre-fork title".into(),
+            },
+        );
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            shared_set.clone(),
+            entry(
+                "aa",
+                "2026-06-22T12:00:02Z",
+                Some("2026-06-22T12:00:02.000000000Z"),
+                0,
+                Op::SetTitle {
+                    issue_id: id.clone(),
+                    title: "head A wins".into(),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            shared_set,
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.title, "head A wins");
+    }
+
+    // ---- Error path: chain not starting with `Create` ------------------
+
+    #[test]
+    fn chain_without_create_errors() {
+        // The reducer requires the first sorted op to be a Create;
+        // a chain starting with anything else surfaces a typed
+        // Error::Invalid.
+        let id = iid("fffff01");
+        let head = snap(vec![entry(
+            "aa",
+            "2026-06-22T12:00:01Z",
+            Some("2026-06-22T12:00:01.000000000Z"),
+            0,
+            Op::SetTitle {
+                issue_id: id.clone(),
+                title: "no create".into(),
+            },
+        )]);
+        let err = reduce_to_merged(&id, &[head]).unwrap_err();
+        assert!(
+            matches!(err, Error::Invalid(ref m) if m.contains("does not start with `create`")),
+            "expected Invalid(does not start with `create`), got {:?}",
+            err
+        );
+    }
+
+    // ---- LWW scalars: type and slug (v2.1 additions) ------------------
+
+    #[test]
+    fn type_lww_later_wins() {
+        let id = iid("fffff02");
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aa",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000000Z"),
+                0,
+                Op::SetType {
+                    issue_id: id.clone(),
+                    kind: IssueType::Bug,
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bb",
+                "2026-06-22T12:00:02Z",
+                Some("2026-06-22T12:00:02.000000000Z"),
+                0,
+                Op::SetType {
+                    issue_id: id.clone(),
+                    kind: IssueType::Feature,
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.type_, IssueType::Feature);
+    }
+
+    #[test]
+    fn slug_lww_later_wins() {
+        let id = iid("fffff03");
+        let head_a = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "aa",
+                "2026-06-22T12:00:01Z",
+                Some("2026-06-22T12:00:01.000000000Z"),
+                0,
+                Op::SetSlug {
+                    issue_id: id.clone(),
+                    slug: Some("from-a".into()),
+                },
+            ),
+        ]);
+        let head_b = snap(vec![
+            create_entry(&id, "2026-06-22T12:00:00Z"),
+            entry(
+                "bb",
+                "2026-06-22T12:00:02Z",
+                Some("2026-06-22T12:00:02.000000000Z"),
+                0,
+                Op::SetSlug {
+                    issue_id: id.clone(),
+                    slug: Some("from-b".into()),
+                },
+            ),
+        ]);
+        let merged = reduce(&id, &[head_a, head_b]);
+        assert_eq!(merged.record.slug.as_deref(), Some("from-b"));
     }
 }
