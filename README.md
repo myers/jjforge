@@ -2,88 +2,201 @@
 
 A jj-native, agent-first issue tracker. CLI: `jjf`.
 
-**Status:** scoping. See the roadmap (`git-bug bug --label roadmap`)
-for the plan.
+**Status:** post-MVP. The Rust binary at `crates/jjf/` covers
+the full v1 verb set with `--json` on every command, push/pull
+over standard git transport, and an op-space merge driver so
+two clones can edit issues offline and converge without human
+intervention. 178 workspace tests green; spec pinned in
+`docs/storage-format.md`; output contract in `docs/cli-json.md`.
 
-Inspirations and what we take from each:
+The project is self-hosted at
+[github.com/myers/jjforge](https://github.com/myers/jjforge)
+on a Forgejo instance, and it tracks its own work — see the
+roadmap (`jjf show 9566f52`) for what's open and what's next.
 
-- **[git-bug](https://github.com/git-bug/git-bug)** — DAG-of-operations, fast-forward
-  push, content-hash IDs that survive concurrent edits, separation of identity
-  from issue. Distributed semantics that work.
-- **[Beads](https://github.com/steveyegge/beads)** (Steve Yegge) — `ready` as a
-  first-class agent primitive, `remember` for persistent project memory, `--json`
-  on every command, MCP-shaped, hierarchical issues, compaction-aware. Agents are
-  the primary user.
-- **[jj](https://github.com/jj-vcs/jj)** — stable change IDs that survive
-  rewrites, operation log, automatic conflict resolution baked in. Don't
-  reinvent what jj already does better than git.
-- **zfs-workspace markdown-in-repo convention** — disciplines emerge from
-  incidents, closure ties to a physical artifact, "no parser depends on the
-  format."
+## Inspirations
+
+- **[git-bug](https://github.com/git-bug/git-bug)** —
+  DAG-of-operations, fast-forward push, content-hash IDs that
+  survive concurrent edits, separation of identity from issue.
+  Distributed semantics that work. (jjforge ran on git-bug as
+  its own planner during MVP; cutover happened
+  2026-06-22 — see `docs/git-bug-cutover.md`.)
+- **[Beads](https://github.com/steveyegge/beads)** (Steve
+  Yegge) — `ready` as a first-class agent primitive,
+  `remember` for persistent project memory, `--json` on every
+  command, MCP-shaped, hierarchical issues, compaction-aware.
+  Agents are the primary user. (`jjf ready` is sketched in
+  `epic:agent-ergonomics`.)
+- **[jj](https://github.com/jj-vcs/jj)** — stable change IDs
+  that survive rewrites, operation log, automatic conflict
+  resolution baked in. Don't reinvent what jj already does
+  better than git.
+- **zfs-workspace markdown-in-repo convention** — disciplines
+  emerge from incidents, closure ties to a physical artifact,
+  "no parser depends on the format."
+
+## What jjforge tracks
+
+The artifacts are **issues** (matching Gitea / GitHub / Beads
+terminology — same word everyone else uses; we don't call them
+"bugs" because most of what we track is roadmap and epic work,
+not defects). One issue per work item: roadmap, epic, story,
+research note, defect, whatever. Each issue has an id, title,
+status (open / closed), body, labels, dependencies, assignee,
+and an append-only comment thread.
+
+> Heads-up: the code still says `Bug` / `BugId` in a few
+> places — the rename is filed as issue `199ed91`. The
+> user-facing terminology is "issue."
 
 ## First-time setup
 
-Stable Rust toolchain (1.75+ should be fine; project is currently
-on whatever rustup gives you).
+Stable Rust toolchain (1.75+; whatever rustup gives you).
 
 Install once:
 
 ```bash
-# git-bug — the interim issue tracker (we'll replace it with jjf)
-brew install git-bug
-
-# jj — Jujutsu, the substrate we shell out to from jjf
+# jj — Jujutsu, the substrate jjf shells out to
 brew install jj   # or: cargo install --git https://github.com/jj-vcs/jj.git --locked --bin jj
 
-# nextest — preferred test runner; isolates test processes, which matters for
-# the integration tests that spawn real `jj` subprocesses
+# nextest — preferred test runner; isolates test processes,
+# which matters for the integration tests that spawn real
+# `jj` subprocesses
 cargo install cargo-nextest --locked
 ```
 
-Run the workspace tests:
+Build and verify:
 
 ```bash
+cargo build --release -p jjf
 cargo nextest run --workspace
 # fall back to `cargo test --workspace` if nextest isn't available
 ```
 
-## Planning lives in git-bug
+The binary lands at `target/release/jjf`.
 
-Plans, decisions, and work items live in `git-bug` issues in this repo,
-not in markdown files. The roadmap is the entry point; read it first:
+## Quick tour
+
+Initialize a jj repo (if you don't have one already), then
+bootstrap jjforge on top of it:
 
 ```bash
-git-bug bug --label roadmap
+jj git init my-project
+cd my-project
+jjf init                              # creates the `issues` bookmark
 ```
 
-Quick reference:
+Create, list, read:
+
+```bash
+jjf new -t "the title" -F body.md -l epic            # body from file
+echo "the body" | jjf new -t "the title" -F -        # body from stdin
+jjf ls                                                # open issues
+jjf ls --status all                                   # everything
+jjf ls --label epic                                   # filter by label
+jjf show <id>                                         # one issue
+jjf show <id> --json                                  # machine-readable
+```
+
+Mutate:
+
+```bash
+jjf update <id> --title "new title" --status closed   # multi-field, one commit
+jjf close <id>                                        # convenience
+jjf open <id>
+jjf comment <id> -F note.md                           # append
+jjf label add <id> backend
+jjf label rm <id> backend
+```
+
+Sync across clones:
+
+```bash
+jjf remote add origin <url>                           # configure a remote
+jjf push origin                                       # publish
+jjf pull origin                                       # fetch + merge
+```
+
+Every verb takes `--json` and emits the envelope shape
+documented in `docs/cli-json.md`. Errors under `--json` come
+back as `{"ok": false, "error": {"kind": "...", "message": "...", "details": {...}}}`
+so scripts can branch on `kind`.
+
+## Architecture
+
+Issues live as commits on a dedicated `issues` bookmark in
+the underlying jj repo. Each issue is two files on that
+bookmark:
+
+- `issues/<7hex-id>.json` — the current rendered state
+  (title, status, labels, dependencies, assignee, body).
+- `issues/<7hex-id>.comments.jsonl` — one JSON object per
+  line, append-only.
+
+Every mutation lands as a new commit on the `issues`
+bookmark. The commit description carries `Jjf-Op:` and
+`Jjf-At:` git-trailers documenting which op ran and when
+(nanosecond resolution). Both files and the trailers
+travel automatically with standard `git push` / `git fetch`
+of the bookmark.
+
+On divergence (two clones modify the same issue offline),
+the merge driver walks both heads' op chains in op-space,
+resolves field-by-field with last-write-wins-by-`Jjf-At`,
+takes the set-union of labels / dependencies, unions the
+comment files chronologically, and lands a single merge
+commit with one `Jjf-Op: merge` trailer per resolved issue.
+There is no "body conflict" failure mode — the body is
+just another LWW field.
+
+For the full data shape: `docs/storage-format.md`.
+For the merge model: `docs/storage-format.md` §6.
+For the output contract: `docs/cli-json.md`.
+
+## Why jj-native
+
+- **Bookmarks are the unit of sync.** Push/pull a bookmark
+  and you've round-tripped a whole issue tracker. No
+  separate `refs/issues/*` namespace, no special transport.
+- **The op log makes audit free.** `jj op log` already
+  records every mutation; we just add structured trailers
+  to commit descriptions so the per-issue history is
+  reconstructable without protobuf.
+- **Conflicts as data.** jj's conflict model is rich and
+  programmatic, so the merge driver can be deterministic
+  rather than asking humans to resolve markers.
+- **Change IDs over commit IDs.** Issues survive history
+  rewrites because the bookmark moves over the same files,
+  not over the same commits.
+
+## Planning lives in jjforge
+
+Self-hosted on this very binary. The roadmap is the entry
+point in any new session:
+
+```bash
+jjf show 9566f52
+```
+
+See `CLAUDE.md` for the orchestration conventions if you're
+driving agent work against this repo.
+
+## Repo layout
 
 ```
-git-bug bug                            # list everything
-git-bug bug --label roadmap            # the priority order — read this first
-git-bug bug --label epic               # the six epics
-git-bug bug --label epic:mvp-storage   # one epic + its related issues
-git-bug bug --label research           # historical research record
-git-bug bug show <id>                  # one issue
-git-bug bug new -t "<title>" -F -      # new, body on stdin
-git-bug bug comment new <id> -F -      # comment, body on stdin
+crates/
+  jjf-storage/     # the storage primitives (init/read/write/history/list/merge)
+  jjf-merge/       # the legacy file-bytes merge driver (kept as library)
+  jjf/             # the `jjf` binary (clap-derive CLI over the storage layer)
+docs/
+  storage-format.md    # the on-disk spec
+  cli-json.md          # the CLI output contract
+  git-bug-cutover.md   # bridge to the archived pre-cutover planner data
+experiments/       # throwaway scratch work; see CLAUDE.md
+blog/              # Zola site at jjforge.dev (or wherever we end up)
 ```
 
-Label scheme:
+## License
 
-- `roadmap` — the project's running priority list (one ticket, never
-  closes; latest comment is the truth).
-- `epic` — the six top-level epic issues.
-- `epic:<slug>` — every issue belonging to an epic (the epic itself
-  plus its research and child tickets).
-- `research` — historical research issues.
-
-## Why git-bug for planning
-
-We're using git-bug to plan its jj-native successor. If the
-experience is rough, that's exactly the input we need: the friction
-shows up in detail, and jjforge can specifically improve on it.
-
-The CLI shim at `bin/jjf` already wraps git-bug, so the verb shape
-of the eventual Rust binary stays consistent through the planning
-phase.
+TBD.
