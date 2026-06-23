@@ -152,7 +152,12 @@ needed — jj 0.40 carries the bookmark automatically (finding
 verified in archived `refs/bugs/07780aa`). `jjf remote
 add|ls|rm` wraps `jj git remote *` for managing remotes.
 
-No remote is configured on this repo yet, so don't try to push.
+**The `origin` remote (`git@github.com:myers/jjforge.git`,
+a Forgejo on the user's infrastructure) IS configured.** It's
+the canonical home of the code; `main` tracks `origin/main`.
+Push at the end of every issue (see Commits section). The
+jjforge `bugs` bookmark also rides this remote — `jjf push
+origin` round-trips the planner data alongside.
 
 ### Reading historical (pre-cutover) git-bug data
 
@@ -255,7 +260,21 @@ git add experiments/<topic>
 - Use a HEREDOC for multi-line commit messages.
 - The Claude-Session footer in commits is fine in this repo
   unless you're told otherwise.
-- Don't push to remote (none configured).
+- **Push to `origin` at the end of every issue.** The remote
+  (`git@github.com:myers/jjforge.git`,
+  Forgejo on the user's infra) is canonical. After the
+  commit(s) that close an issue land on `main`:
+  ```bash
+  git push origin main
+  ```
+  And, when the issue's work mutated jjforge data on the
+  `bugs` bookmark (status comments, new tickets, etc.):
+  ```bash
+  jjf push origin
+  ```
+  Don't batch these across multiple issues — one push per
+  closed issue, so the remote tracks the orchestration
+  cadence and any rollback is per-issue, not per-session.
 
 ## Orchestrating work
 
