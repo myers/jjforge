@@ -104,10 +104,19 @@ pub(crate) fn read_history_at(
     // pre-migration op out of the chain and `read.rs`'s replay can't
     // find the issue's `create` op.
     //
-    // Filtering on BOTH json AND comments-jsonl at each version is the
-    // same reason as spec §5.6: a commit whose only change is a
-    // comments-jsonl append (same-second `updated_at`, json content
-    // byte-identical, no jj snapshot) would otherwise be missed.
+    // Filtering on BOTH json AND comments-jsonl at each version is
+    // load-bearing — see spec §5.6 and the regression test
+    // `read_history_walks_same_second_comment_appends` in
+    // `crates/jjf-storage/tests/integration.rs`. The case: two
+    // `add_comment` calls land within the same wall-clock second.
+    // `add_comment` stamps `record.updated_at = now_rfc3339()` at
+    // second resolution, so both writes produce a byte-identical
+    // JSON file (nothing else in the record changes). jj snapshots
+    // by content; with no JSON delta on the second commit, only the
+    // comments-jsonl file changes. A filter that names only the
+    // JSON path would miss that second commit entirely — verified
+    // in issue 004dd23: dropping the comments-jsonl path entry
+    // dropped 9 of 12 ops in the regression test.
     //
     // We emit one record per commit, packing four fields delimited by
     // a per-field sentinel and a per-record terminator. The sentinels

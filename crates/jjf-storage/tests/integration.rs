@@ -1851,3 +1851,110 @@ fn list_ready_on_empty_bookmark_returns_empty() {
     let ready = storage.list_ready(&ReadyFilter::default()).unwrap();
     assert!(ready.is_empty(), "empty bookmark → empty ready: {ready:#?}");
 }
+
+// ---------------------------------------------------------------------
+// Same-second comment-append regression (issue 004dd23).
+//
+// The dual-file path filter in `history.rs` (`jj log --files`
+// covering both `issues/<id>.json` AND `issues/<id>.comments.jsonl`)
+// claims to be load-bearing for the following case: two
+// `add_comment` calls happen within the same wall-clock second, so
+// the second call's JSON write is BYTE-IDENTICAL to the first's
+// (both stamp `updated_at` to the same RFC 3339 second-resolution
+// string; nothing else in the record changes). jj snapshots the
+// JSON file by content; with no JSON delta in commit B, only the
+// comments.jsonl file changes, so a path filter that names ONLY the
+// JSON file would miss commit B entirely.
+//
+// This test exercises that case: spam N `add_comment` calls in a
+// tight loop. On any modern machine many will fall in the same
+// wall-clock second; the second within the same second produces a
+// byte-identical JSON write. We then walk `read_history` and assert
+// every comment-add appears in the chain. If the dual-file filter
+// were dropped, the same-second commits would drop out of the
+// history and the count would be < N.
+//
+// To make the failure mode crisp, we also assert (defensively) that
+// at least one same-second comment cluster was constructed during
+// the run. If a future test environment is so slow that every
+// add_comment lands in its own second, the assertion fails loudly
+// with a "test setup didn't construct the case" message rather than
+// quietly passing on a degraded invariant.
+// ---------------------------------------------------------------------
+#[test]
+fn read_history_walks_same_second_comment_appends() {
+    let repo = make_scratch_repo("same_second_comments");
+    let storage = Storage::open(&repo).unwrap();
+
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "comment-spam target".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    // Spam comments. 12 is enough to hit at least one same-second
+    // cluster on any machine that can do an `add_comment` in under
+    // ~80ms (every machine we test on). Each add_comment does ~4 jj
+    // shell-outs, file IO, and JSON serialization, so the per-call
+    // cost is real but well under a second.
+    const N: usize = 12;
+    for i in 0..N {
+        storage
+            .add_comment(&id, &format!("comment {i}"), "alice <a@x>")
+            .unwrap();
+    }
+
+    // Defensive: confirm we actually built the case. Read the
+    // comments file and look for >= 2 comments sharing an exact
+    // created_at (second-resolution). If this assertion fires, the
+    // test environment is too slow to construct the load-bearing
+    // case and the verdict can't be drawn — surface that loudly.
+    let issue = storage.read(&id).unwrap();
+    assert_eq!(
+        issue.comments.len(),
+        N,
+        "read should observe every comment we wrote: got {}, expected {}",
+        issue.comments.len(),
+        N
+    );
+    let mut same_second_clusters = 0usize;
+    for w in issue.comments.windows(2) {
+        if w[0].created_at == w[1].created_at {
+            same_second_clusters += 1;
+        }
+    }
+    assert!(
+        same_second_clusters >= 1,
+        "test setup didn't construct any same-second comment pair \
+         in {N} appends (every add_comment landed in its own \
+         second). This run can't validate the dual-file filter; \
+         the test environment is too slow. Comments: {:#?}",
+        issue.comments.iter().map(|c| &c.created_at).collect::<Vec<_>>(),
+    );
+
+    // The regression: walk read_history and confirm every
+    // comment-add op appears. If the path filter were stripped down
+    // to only `issues/<id>.json`, the second commit of each
+    // same-second cluster would be missed (its JSON write was
+    // byte-identical) and this count would be < N.
+    let history = storage.read_history(&id).unwrap();
+    let comment_ops: Vec<_> = history
+        .iter()
+        .filter(|e| matches!(e.op, Op::CommentAdd { .. }))
+        .collect();
+    assert_eq!(
+        comment_ops.len(),
+        N,
+        "read_history must surface every comment-add even when the \
+         JSON write is byte-identical between consecutive commits \
+         (same-second case). Got {} CommentAdd ops, expected {}. \
+         Saw {} same-second cluster(s) on disk, so the \
+         byte-identical-JSON case IS being exercised. If this \
+         assertion just started failing, check whether the path \
+         filter in history.rs dropped its comments.jsonl entry.",
+        comment_ops.len(),
+        N,
+        same_second_clusters,
+    );
+}
