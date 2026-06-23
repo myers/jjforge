@@ -14,24 +14,25 @@ first.**
 
 ## Project shape today
 
-- **Status:** scoping. No Rust binary yet; `bin/jjf` is a shell
-  shim around `git-bug` so we can plan jjforge with the same
-  verb shape we want the eventual binary to have.
-- **Planning surface:** `git-bug` issues in this repo. Plans
-  live in the issues, not in markdown files. The blog
-  (`blog/content/posts/`) captures milestones for the public
-  record.
-- **Entry point:** the roadmap (`git-bug bug --label roadmap`).
-  Read it first.
+- **Status:** post-MVP. The Rust binary at `crates/jjf/` covers
+  the full v1 verb set (`init`, `new`, `show`, `ls`, `update`,
+  `comment`, `close`/`open`, `label add|rm`, `remote add|ls|rm`,
+  `push`, `pull`) with `--json` on every verb. Storage spec
+  pinned in `docs/storage-format.md`; CLI output contract in
+  `docs/cli-json.md`. 178 workspace tests green.
+- **Planning surface:** `jjforge` itself, on the `bugs` bookmark
+  in this repo. As of 2026-06-22 the project's own planning runs
+  on `jjf`. Pre-cutover history lives in archived git-bug refs
+  (`refs/bugs/*`); the bridge is `docs/git-bug-cutover.md`.
+- **Entry point:** the roadmap (`9566f52`). Read it first.
 - **CI:** `.woodpecker/blog.yaml` builds and pushes a Zola site
   image. Mirrors zfs-workspace's pattern except for the
   notify-flux hook (jjforge isn't a Flux deployment target).
 
-## How to use git-bug (before we replace it with our own)
+## How to use jjforge
 
-We are dogfooding `git-bug` as the planner for the jj-native
-tracker that will eventually replace it. Treat every rough edge
-as data, not as something to fix in the planner.
+The project is dogfooding `jjf` as its own planner. Treat every
+rough edge as data, not as something to fix around.
 
 ### Entry point and discovery
 
@@ -39,7 +40,7 @@ The roadmap is the orientation document. Start there in any
 new session before touching anything else:
 
 ```bash
-git-bug bug --label roadmap
+jjf show 9566f52
 ```
 
 To navigate from there, see the Queries section at the bottom
@@ -48,27 +49,24 @@ of this file.
 ### Label scheme
 
 - **`roadmap`** — the running plan (one ticket, never closes;
-  latest comment is the truth).
-- **`epic`** — the six top-level epic issues. Each carries the
-  goal, the sketched approach, the tickets we expect to file
-  under it, and its dependency graph.
+  body edited in place via `jjf update --body-file`).
+- **`epic`** — the top-level epic issues. Each carries the goal,
+  the sketched approach, the tickets we expect to file under it,
+  and its dependency graph.
 - **`epic:<slug>`** — every issue belonging to an epic (the epic
-  itself, plus research issues that informed it, plus child
-  tickets when they're filed). Use the colon-prefixed form
-  always; bare `<slug>` labels were tried briefly and removed.
-- **`research`** — historical research record. The five
-  research issues filed and worked on 2026-06-21 pinned the
-  load-bearing decisions; they're closed, but their closing
-  comments are the source of truth for the verdicts the epics
-  reference.
+  itself plus child tickets when they're filed). Use the
+  colon-prefixed form always.
 
 ### Creating a new bug
 
-Use stdin for multi-line bodies. The interactive flow is off-limits
-for agents.
+Use `-F -` to read the body from stdin (the recommended pattern
+— no interactive flow, no editor invocation, scripts cleanly).
+Pass labels with `-l` (repeatable). Optional flags: `-d <id>`
+(repeatable, dependencies), `-a <name>` (assignee). Use
+`--json` for the machine-readable envelope.
 
 ```bash
-cat <<'EOF' | git-bug bug new --non-interactive --title "Real title goes here" --file -
+cat <<'EOF' | jjf new --json -t "Real title goes here" -F - -l epic -l epic:mvp-cli
 # Goal
 
 What does done look like.
@@ -79,93 +77,117 @@ How we get there.
 EOF
 ```
 
-**Important gotcha.** The `--title` flag is silently ignored when
-`--file -` is also given — git-bug takes the first line of the
-body as the title instead. The two-step pattern that works:
+Stdout under `--json`:
 
-```bash
-# Step 1: create with placeholder title
-cat <<'EOF' | git-bug bug new --non-interactive --title "x" --file -
-# Goal
-...
-EOF
-# Step 2: capture the printed id and edit the title
-ID=<from-stdout-of-step-1>
-git-bug bug title edit "$ID" -t "Real title goes here" --non-interactive
+```json
+{"ok":true,"id":"a3f9c01"}
 ```
 
-### Capturing a newly-created bug's id
+No gotchas — `-t` and `-F -` compose cleanly. (Contrast: the
+pre-cutover `git-bug bug new --title X --file -` silently
+dropped `--title` and took the body's first line. Documented
+here because it bit prior sessions; see archived
+`refs/bugs/*` for the war story.)
 
-`git-bug bug new` prints the new id to stdout on a line like
-`<id> created`. **Capture from that output.** Do NOT use:
-
-```bash
-# WRONG: returns the first id in the list (oldest), not newest
-ID=$(git-bug bug -f id | head -1)
-```
-
-This footgun bit us when filing the meta-epic — we accidentally
-overwrote the title of an unrelated existing issue. Always
-capture the printed id:
+Capture the new id from the JSON envelope:
 
 ```bash
-CREATE_OUT=$(cat <<'EOF' | git-bug bug new --non-interactive --title "x" --file -
-...
-EOF
-)
-ID=$(echo "$CREATE_OUT" | awk '/created$/ {print $1}')
+NEW_ID=$(jjf new --json -t "..." -F body.txt -l epic | jq -r .id)
 ```
 
 ### Updating bugs
 
 ```bash
-git-bug bug title edit <id> -t "New title" --non-interactive
-git-bug bug status close <id>
-git-bug bug status open <id>
-git-bug bug label new <id> <label>           # add a label
-git-bug bug label rm <id> <label>            # remove a label
-git-bug bug comment new <id> --non-interactive --file -    # body on stdin
+jjf update <id> --title "New title"          # rename
+jjf update <id> --status closed              # change status
+jjf update <id> --body-file body.md          # rewrite body in place
+jjf update <id> --assignee alice             # assign
+jjf update <id> --unset-assignee             # unassign
+
+jjf close <id>                               # convenience for status closed
+jjf open <id>                                # convenience for status open
+
+jjf label add <id> <label>                   # add a label
+jjf label rm <id> <label>                    # remove a label
+
+cat body.md | jjf comment <id> -F -          # append a comment
+jjf comment <id> -F body.md                  # ... from a file
 ```
 
-### Bodies vs comments — the editing limitation
+Every mutating verb takes `--json` and emits the
+`{"ok": true, ...}` envelope shape documented in
+`docs/cli-json.md`. Multiple `--title`/`--status`/`--body-file`/
+`--assignee` flags on the same `update` call land as a single
+multi-op commit (one trailer per field).
 
-**`git-bug` has no "edit body" command.** The original body is
-the first comment; every subsequent update is an appended
-comment. Implications:
+### Bodies are editable now
 
-- If you need to revise an epic's plan after filing it, post a
-  follow-up comment. The original goal statement stays put.
-  This is one of the things jjforge should improve on.
-- The **roadmap** ticket (`--label roadmap`) is the live
-  example of this. Its body has the original framing; the
-  *latest* comment carries the current priority order.
-  Readers should know to scroll to the bottom of `bug show`
-  output for the truth.
+Unlike pre-cutover git-bug, **jjforge supports editing a bug's
+body in place** via `jjf update <id> --body-file <path>`. This
+is the right way to revise a roadmap, fix an epic's plan, or
+restate scope. Comments are still useful for status updates and
+mid-stream findings — but the body can be made authoritative
+without an append-only comment trail.
+
+The pre-cutover roadmap convention ("latest comment is the
+truth, body is stale") was a workaround for git-bug's missing
+edit-body command. We can stop doing that. When the priority
+order shifts, edit the roadmap body; a single `jjf comment`
+on the roadmap announcing the change is courtesy, not contract.
 
 ### Issue-id length
 
-`git-bug` accepts any unambiguous prefix. The convention in this
-repo is to use the **7-character prefix** (e.g. `04e1dac`,
-`72638a0`) in prose, just like git short SHAs. Full hex ids
-appear only in `git-bug bug show` headers and when collision
-risk matters (which is essentially never at this scale).
+jjforge ids are **7-character lowercase hex** by design (28 bits,
+generated at create time per `docs/storage-format.md` §2). The
+displayed id IS the full id — there is no prefix convention to
+worry about, no SHA stem to lengthen. CLI verbs accept any
+unambiguous prefix (often 4 characters is enough), but the
+canonical id is the 7-char string `jjf ls` prints.
 
 ### Push / pull
 
-`git-bug push` and `git-bug pull` round-trip the issue data via
-the `refs/bugs/*` namespace. No remote is configured on this
-repo yet, so don't try to push.
+`jjf push <remote>` and `jjf pull <remote>` round-trip the `bugs`
+bookmark via standard git transport. No special refspec config
+needed — jj 0.40 carries the bookmark automatically (finding
+verified in archived `refs/bugs/07780aa`). `jjf remote
+add|ls|rm` wraps `jj git remote *` for managing remotes.
 
-### Wiping
+No remote is configured on this repo yet, so don't try to push.
 
-`git-bug wipe` deletes all git-bug data from the repo. Catastrophic.
-Never run it without explicit user approval.
+### Reading historical (pre-cutover) git-bug data
+
+The `bin/jjf` shell shim still delegates to `git-bug` against
+`refs/bugs/*` (the pre-2026-06-22 planner data). It stays in
+place as a **read-only window** until `cli-replace-shim`
+flips it to the Rust binary. The archived data covers:
+
+- Every status-update comment on each pre-cutover epic.
+- The five 2026-06-21 research tickets and their full closing
+  comments (the source of truth for the storage and sync
+  verdicts pinned in the current epic bodies).
+- Every closed child ticket (the workshop floor: subagent
+  finds, follow-ups, debate notes).
+
+Useful:
+
+```bash
+git-bug bug show <old-7hex-id>      # one ticket
+git-bug bug --label epic            # archived epics
+git-bug bug --label research        # the research record
+git-bug bug --status closed         # archived closed tickets
+```
+
+The cutover doc at `docs/git-bug-cutover.md` carries the
+old → new id mapping and the historical-bug recipe.
+
+**Never run `git-bug wipe`**. The archived data is the only
+copy of pre-cutover history; once gone, it's gone.
 
 ## Subagent discipline
 
 When dispatching a subagent to work an issue, the
-**`subagent-working-a-git-bug-issue`** skill auto-loads. It
-enforces:
+**`subagent-working-a-git-bug-issue`** skill auto-loads on
+keywords like "issue" or "git-bug". It enforces:
 
 - The closing comment uses the four-section recipe: Findings,
   Recommendation, Confidence, Open follow-ups.
@@ -176,9 +198,18 @@ enforces:
 - The closing return-value to the orchestrator is under 200
   words.
 
-If you're dispatching subagents and the skill isn't loading, name
-it explicitly in the dispatch prompt — it should auto-load on
-"git-bug" or "issue" keywords but isn't guaranteed.
+**Heads-up (2026-06-22):** the skill's *body* still talks about
+`git-bug` commands and `refs/bugs/*` semantics — it's stale
+post-cutover. The closure recipe is still correct; the verb
+shape needs updating to `jjf comment`, `jjf close`, etc. A
+follow-up to rewrite this skill is tracked under
+`epic:agent-ergonomics` (`5a755ec`) as `ergo-subagent-skill`.
+Until that lands: the skill auto-loads and gives the right
+discipline, but mentally translate `git-bug X` → `jjf X` when
+following its instructions.
+
+If you're dispatching subagents and the skill isn't loading,
+name it explicitly in the dispatch prompt.
 
 ## Blog
 
@@ -231,28 +262,27 @@ git add experiments/<topic>
 When the user asks you to "orchestrate" or "make progress" or
 "dispatch subagents," the loop is:
 
-1. **Read the roadmap first** (`git-bug bug --label roadmap`)
-   to orient on what's up next and what's blocking it.
+1. **Read the roadmap first** (`jjf show 9566f52`) to orient on
+   what's up next and what's blocking it.
 
 2. **Find the next concrete ticket.** Either there's a named
-   "do this now" ticket (today: `e2e473b`, the merge driver) or
-   there isn't. If there is one, work backward: are its
-   prerequisites filed and viable, or do they need detailing
-   first?
+   "do this now" ticket or there isn't. If there is, work
+   backward: are its prerequisites filed and viable, or do
+   they need detailing first?
 
 3. **File any missing prerequisite tickets yourself before
    dispatching subagents.** The orchestrator owns the ticket
    graph. Subagents own the work inside one ticket. A subagent
    asked to "build X and file the ticket for it" will either
    skip the ticket or write it badly. Pre-file with a sketched
-   body; let the subagent close it.
+   body via `jjf new`; let the subagent close it.
 
 4. **Dispatch serially, not in parallel.** Subagents writing to
-   `refs/bugs/*` race each other — git-bug's underlying refs
-   aren't atomic across processes. The earlier session learned
-   this the hard way. Parallel is fine ONLY when the subagents
-   have disjoint write targets (different bug ids, different
-   files in `experiments/<topic>/`). When in doubt, serial.
+   the `bugs` bookmark race each other — concurrent commits on
+   the same bookmark force one to lose and re-run. Parallel is
+   fine ONLY when the subagents have disjoint write targets
+   (different bug ids, different files in `experiments/<topic>/`).
+   When in doubt, serial.
 
 5. **Commit between dispatches.** Each subagent's experiments,
    docs, or other artifacts get committed before the next is
@@ -275,13 +305,14 @@ When the user asks you to "orchestrate" or "make progress" or
    by dispatching more work on top of it.
 
 7. **Post a status comment to each affected epic** when a child
-   ticket closes. The comment goes on the epic issue (e.g.
-   `72638a0`), names the closed ticket, links the commit if one
-   landed, and notes what's still unfiled. **If the priority
-   order changed during the round** — a sketched epic earned a
-   promotion, a closed epic falls off — post the new ordering
-   as a comment on the roadmap (`6a65c0d`). Don't restate
-   queryable state in the comment; just the priority delta.
+   ticket closes (`jjf comment <epic-id> -F -`). The comment
+   names the closed ticket, links the commit if one landed, and
+   notes what's still unfiled. **If the priority order changed
+   during the round** — a sketched epic earned a promotion, a
+   closed epic falls off — update the roadmap (`9566f52`) body
+   via `jjf update 9566f52 --body-file ...`. A short comment
+   announcing "promoted X above Y" is fine but the truth lives
+   in the body.
 
 8. **Surface follow-ups to the user.** Stop and report when:
    the subagent budget is exhausted, a finding contradicts an
@@ -299,16 +330,33 @@ work and commits stay in the worktree. Do NOT chdir to
 `~/p/jjforge` to commit if you were invoked elsewhere — that
 contaminates the real working tree with experimental state.
 
-`git-bug` data lives in `refs/bugs/*` and is shared across
-worktrees automatically; bug edits travel between them. Code
-and experiments do not.
+jjforge data lives on the `bugs` bookmark in the same repo; it
+travels between worktrees automatically with the bookmark.
+Code and experiments do not.
+
+### Operating in a colocated jj+git repo
+
+This repo is colocated (`jj git init --colocate` was run during
+the cutover). `jjf` operations move the jj working copy onto
+the `bugs` bookmark and back — between dispatches it's normal
+for `@` to drift off `main`. After running `jjf <verb>`, if you
+need to write code or docs, run:
+
+```bash
+jj edit main
+```
+
+to put `@` back on `main` before editing. Otherwise the working
+tree may reflect the empty `bugs` bookmark instead of the
+project tree, and any files you wrote during the drift won't
+end up on `main`.
 
 ### Dispatch prompt template
 
 When dispatching a subagent on an issue, include:
 
 - The issue id and the command to view it
-  (`cd ~/p/jjforge && git-bug bug show <id>`).
+  (`cd ~/p/jjforge && jjf show <id>`).
 - A one-sentence summary of why this work is happening now
   (which epic, what's blocked on it).
 - Pointers to prior-subagent findings as paths or issue ids
@@ -319,9 +367,10 @@ When dispatching a subagent on an issue, include:
 - An explicit "report back under 200 words" cap.
 
 The `subagent-working-a-git-bug-issue` skill auto-loads from
-keywords ("git-bug", "issue") and enforces the four-section
+keywords ("issue" most reliably) and enforces the four-section
 closing-comment recipe. Don't re-explain that in the dispatch
-prompt; let the skill carry it.
+prompt; let the skill carry it. (See "Subagent discipline"
+above for the stale-name note.)
 
 ## What's next
 
@@ -329,14 +378,14 @@ The project's running roadmap is a single ticket labeled
 `roadmap`:
 
 ```bash
-git-bug bug --label roadmap
+jjf show 9566f52
 ```
 
 It lists the open epics in priority order, with an "above
 the line" / "below the line" cut for what's shipping now vs.
-queued. The ticket stays open for the life of the project;
-the latest comment is the truth (git-bug has no edit-body
-command).
+queued. The ticket stays open for the life of the project.
+Body-edit it (`jjf update 9566f52 --body-file <path>`) when the
+order shifts; fall back to comments for finer-grained changes.
 
 For "what exists" — every issue, by label, by status — use
 the queries below, not a maintained index.
@@ -346,33 +395,51 @@ line" cut until the roadmap explicitly pulls them up.
 
 ## Queries
 
-git-bug has a query language for filtering. The useful
-filters for navigating jjforge:
+Useful invocations for navigating jjforge. See
+`docs/cli-json.md` for the output shapes.
 
 ```bash
 # Roadmap — priority order, blocking judgment
-git-bug bug --label roadmap
+jjf show 9566f52
 
 # Epics — the six top-level milestones
-git-bug bug --label epic
+jjf ls --label epic
 
 # Work under one epic — open tickets only
-git-bug bug --label epic:mvp-storage --status open
+jjf ls --label epic:mvp-storage --status open
 
 # Everything ever attached to an epic — open and closed
-git-bug bug --label epic:mvp-sync
+jjf ls --label epic:mvp-sync --status all
 
-# Historical research record
-git-bug bug --label research
+# Closed tickets
+jjf ls --status closed
 
-# Recently closed (handy for orchestration retro)
-git-bug bug --status closed --by edit -d desc
-
-# Search bodies and comments
-git-bug bug "merge driver"
+# JSON for scripting
+jjf ls --json --label epic | jq '.[] | {id, title}'
 ```
 
-If a useful filter isn't here, add it. If git-bug can't
-express it, that's a feature request for `jjf` (a real
-`blocks` / `blocked-by` relation, for example, is exactly
-why we're building this).
+Two filters jjforge doesn't yet ship that we want (file as
+agent-ergonomics tickets when needed):
+
+- A real `blocks` / `blocked-by` relation. `jjf ls --ready`
+  filtering open bugs whose dependencies are all closed is
+  the headline agent-ergonomics primitive (`jjf ready`).
+- Full-text search across bodies and comments. git-bug had a
+  query language; jjforge has none yet.
+
+If a useful filter isn't here, add it. If `jjf` can't express
+it, that's a feature request — file it.
+
+## History
+
+This project ran on `git-bug` (in `refs/bugs/*`) for three
+sessions before cutover on 2026-06-22. The pre-cutover history
+is preserved in git and remains readable via `git-bug bug show
+<id>`. The mapping from old to new issue ids — and the
+rationale for "start fresh" vs. "migrate" — lives in
+`docs/git-bug-cutover.md` and in archived `d12031c`.
+
+The `bin/jjf` shell shim still points at `git-bug` as a
+read-only window into the archive; `cli-replace-shim`
+(under `epic:mvp-cli`, ticket `a5f8122`) flips it to the
+Rust binary.
