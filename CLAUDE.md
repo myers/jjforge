@@ -284,32 +284,45 @@ When the user asks you to "orchestrate" or "make progress" or
 1. **Read the roadmap first** (`jjf show 9566f52`) to orient on
    what's up next and what's blocking it.
 
-2. **Find the next concrete ticket.** Either there's a named
+2. **Bugs before features.** Per Joel Spolsky's rule: fix
+   defects in already-shipped behavior before starting new
+   work. Before picking the next feature ticket, check for
+   open bug-class issues — anything labeled `bug` or whose
+   title/body reads as "X is broken" / "Y silently corrupts" /
+   "Z doesn't do what it claims." If any are open, those go
+   first, regardless of what the roadmap's feature order says.
+   The roadmap describes the feature trajectory; the bug
+   queue interrupts it. Rationale: shipped-but-broken behavior
+   poisons the next feature built on top of it, and the cost
+   of fixing a bug only grows as more code gets layered on
+   the broken substrate.
+
+3. **Find the next concrete ticket.** Either there's a named
    "do this now" ticket or there isn't. If there is, work
    backward: are its prerequisites filed and viable, or do
    they need detailing first?
 
-3. **File any missing prerequisite tickets yourself before
+4. **File any missing prerequisite tickets yourself before
    dispatching subagents.** The orchestrator owns the ticket
    graph. Subagents own the work inside one ticket. A subagent
    asked to "build X and file the ticket for it" will either
    skip the ticket or write it badly. Pre-file with a sketched
    body via `jjf new`; let the subagent close it.
 
-4. **Dispatch serially, not in parallel.** Subagents writing to
+5. **Dispatch serially, not in parallel.** Subagents writing to
    the `bugs` bookmark race each other — concurrent commits on
    the same bookmark force one to lose and re-run. Parallel is
    fine ONLY when the subagents have disjoint write targets
    (different bug ids, different files in `experiments/<topic>/`).
    When in doubt, serial.
 
-5. **Commit between dispatches.** Each subagent's experiments,
+6. **Commit between dispatches.** Each subagent's experiments,
    docs, or other artifacts get committed before the next is
    dispatched. The next agent reads a clean tree; commit
    messages double as a worklog. Use the explicit-filename
    discipline from the Commits section.
 
-6. **Run the workspace tests between dispatches.** After
+7. **Run the workspace tests between dispatches.** After
    committing one subagent's work and before dispatching the
    next:
 
@@ -323,7 +336,7 @@ When the user asks you to "orchestrate" or "make progress" or
    dispatching the next subagent. Don't paper over a regression
    by dispatching more work on top of it.
 
-7. **Post a status comment to each affected epic** when a child
+8. **Post a status comment to each affected epic** when a child
    ticket closes (`jjf comment <epic-id> -F -`). The comment
    names the closed ticket, links the commit if one landed, and
    notes what's still unfiled. **If the priority order changed
@@ -333,7 +346,7 @@ When the user asks you to "orchestrate" or "make progress" or
    announcing "promoted X above Y" is fine but the truth lives
    in the body.
 
-8. **Surface follow-ups to the user.** Stop and report when:
+9. **Surface follow-ups to the user.** Stop and report when:
    the subagent budget is exhausted, a finding contradicts an
    epic's sketched approach, scope is creeping into a different
    epic, or the next move requires a design call only the user
