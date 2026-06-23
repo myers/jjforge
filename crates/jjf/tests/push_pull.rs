@@ -174,7 +174,8 @@ fn pull_json_envelope_with_no_remote_bookmark_yet() {
         Some(false),
         "remote_present must be false when remote has no bugs bookmark; got: {stdout}"
     );
-    assert_eq!(v["merged_files"].as_i64(), Some(0));
+    assert_eq!(v["resolved_bugs"].as_i64(), Some(0));
+    assert_eq!(v["merge_strategy"].as_str(), Some("op_space"));
 
     // Plain-text variant.
     let out = run_jjf(&alice, &["pull", "origin"]);
@@ -190,13 +191,14 @@ fn pull_json_envelope_with_no_remote_bookmark_yet() {
 // Two-clone divergence
 // ---------------------------------------------------------------
 
-/// Same-field divergence (both edit `title`). The merge driver's LWW
-/// policy + the default `prefer_side: Side::B` chooses the
-/// "incoming" (remote) side; in our pull semantics that's whichever
-/// head got listed second by `jj log -r heads(...)`. We don't pin
-/// which side wins (jj's head ordering isn't a stable contract); we
-/// just pin that exactly one of the two values wins and the bookmark
-/// converges.
+/// Same-field divergence (both edit `title`). The op-space resolver
+/// applies LWW by the spec §6 ordering tuple — `(jjf_at, commit,
+/// trailer_index)` — to pick a single winner. The two clones' edits
+/// land at different `now_rfc3339_nanos()` instants (the writer's
+/// op-time stamp), so the later wall-clock instant wins. We don't pin
+/// which clone wins (clock skew + test scheduling makes that flaky to
+/// assert on); we pin that exactly one of the two values wins and the
+/// bookmark converges.
 #[test]
 fn pull_two_clones_same_field_lww_converges() {
     let root = setup("two_same_field", &["alice", "bob"]);
@@ -221,13 +223,13 @@ fn pull_two_clones_same_field_lww_converges() {
         "bob update",
     );
 
-    // Pull triggers the merge driver pass.
+    // Pull triggers the op-space resolver pass.
     let pull = run_jjf(&bob, &["pull", "origin"]);
     must_succeed(&pull, "bob pull (divergent)");
     let pull_stdout = String::from_utf8_lossy(&pull.stdout);
     assert!(
-        pull_stdout.contains("merged 1 file"),
-        "pull stdout should mention merged file count; got: {pull_stdout}"
+        pull_stdout.contains("resolved 1 bug"),
+        "pull stdout should mention resolved bug count; got: {pull_stdout}"
     );
 
     // Verify bob's view post-merge: one of the two titles wins; never
@@ -248,21 +250,13 @@ fn pull_two_clones_same_field_lww_converges() {
 }
 
 /// Different-fields divergence: alice adds a label, bob adds a
-/// different label. Both should survive the merge — labels are
-/// set-union, not LWW, so the merge driver preserves both sides'
-/// additions regardless of jj's content-merge outcome. This is the
-/// ticket's "unrelated fields" acceptance test, in a shape that's
-/// stable against jj's per-second timestamp granularity.
-///
-/// (The "alice changes title, bob changes status" variant the
-/// ticket sketches relies on jj's textual content-merge succeeding
-/// on near-line diffs. In practice that case races jj's diff
-/// heuristic under parallel test load: when it falls back to the
-/// merge driver, the v1 LWW policy picks one side's whole record,
-/// which drops the unedited side's "untouched" field. Set-union
-/// fields don't have that ambiguity — both sides' additions land
-/// in the output by construction. See `pull_two_clones_same_field_lww_converges`
-/// for the scalar-LWW story.)
+/// different label. Both should survive the merge — under the
+/// op-space resolver, each `label-add` op is applied in causal order
+/// across the merged op stream (spec §6); two disjoint adds compose
+/// to a final state with both labels present. Same outcome shape as
+/// the v1 file-bytes driver's set-union approximation, but reached
+/// through the principled "replay-by-op" path rather than a
+/// JSON-set-union policy hack.
 #[test]
 fn pull_two_clones_different_fields_both_survive() {
     let root = setup("two_diff_fields", &["alice", "bob"]);

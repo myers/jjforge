@@ -217,12 +217,38 @@ jjf: <human summary>
 <optional free-text body>
 
 Jjf-Op: <op-type>
+Jjf-At: <rfc3339-nano>
 Jjf-Bug: <bug-id>
 Jjf-...: <payload field>
 [Jjf-Op: <second-op-type>  ← multi-op-per-commit supported]
+[Jjf-At: <rfc3339-nano>]
 [Jjf-Bug: <bug-id>]
 [Jjf-...: ...]
 ```
+
+**`Jjf-At:` is required on every emitted stanza.** It carries an
+RFC 3339 timestamp with nanosecond precision (`%Y-%m-%dT%H:%M:%S
+%.9fZ`), UTC, stamped by the writer at the moment of the op. The
+field appears once per stanza, between the `Jjf-Op:` line and the
+payload trailers. Multiple stanzas in the same commit share the
+same `Jjf-At:` value (they were issued together, see
+`build_commit_message`); the trailer-index tiebreaker in §6
+separates them when needed.
+
+**Parsers MUST tolerate stanzas without `Jjf-At:`** — pre-spec-bump
+trailers, hand-written fixtures, and any other forward-compat
+data return `None` for the field. The §6 ordering tuple sorts
+unstamped stanzas before stamped ones at the same commit-time
+second, which is the desired migration semantics (older data
+loses to newer data when they tie on commit-time).
+
+Why nanos in the trailer when the JSON record's `created_at` /
+`updated_at` are second-resolution (§3.1)? Because the byte-equality
+round-trip property test on the JSON record is load-bearing for
+the storage layer, and bumping the record to nano-resolution
+re-opens that contract. The trailer is a fresh surface — adding
+nanos there is free. It also subsumes the same-second-collision
+trap that §5.6's filter-on-both-files workaround papers over.
 
 ### 5.2 Op-type vocabulary
 
@@ -264,6 +290,7 @@ chunk independently.
 jjf: bug aa6600b - create
 
 Jjf-Op: create
+Jjf-At: 2026-06-22T12:34:56.123456789Z
 Jjf-Bug: aa6600b
 Jjf-Title: segfault on empty input
 Jjf-Status: open
@@ -271,15 +298,19 @@ Jjf-Status: open
 
 ### 5.5 Example: multi-op commit
 
+Both ops share the same `Jjf-At:` — they were issued together.
+
 ```
 jjf: bug aa6600b - close + label
 
 Closing as fixed in #42.
 
 Jjf-Op: set-status
+Jjf-At: 2026-06-22T12:34:56.123456789Z
 Jjf-Bug: aa6600b
 Jjf-Status: closed
 Jjf-Op: label-add
+Jjf-At: 2026-06-22T12:34:56.123456789Z
 Jjf-Bug: aa6600b
 Jjf-Label: fixed
 ```
@@ -307,7 +338,11 @@ mutations land within the same second, the JSON record's
 `updated_at` is byte-identical between commits and jj's
 snapshotter records no change to that file — a JSON-only filter
 silently drops the second commit. The comments-jsonl path picks
-those up because every comment-add appends a new line.
+those up because every comment-add appends a new line. (The
+nanosecond-resolution `Jjf-At:` trailer added in this section
+makes the same-second collision case observationally rare, but
+not impossible — the workaround stays in place as a belt-and-
+braces guard against future regressions.)
 
 **Anchor the revset to `ancestors(bookmarks(bugs))`.** Without
 the explicit revset, `jj log` defaults to a working-copy
@@ -331,25 +366,30 @@ Example single-bug merge commit:
 jjf: bug aa6600b - merge
 
 Jjf-Op: merge
+Jjf-At: 2026-06-22T12:34:56.123456789Z
 Jjf-Bug: aa6600b
 ```
 
-Example two-bug merge commit:
+Example two-bug merge commit (both ops share the same `Jjf-At:`
+— they were issued together):
 
 ```
 jjf: merge 2 bugs
 
 Jjf-Op: merge
+Jjf-At: 2026-06-22T12:34:56.123456789Z
 Jjf-Bug: aa6600b
 Jjf-Op: merge
+Jjf-At: 2026-06-22T12:34:56.123456789Z
 Jjf-Bug: bb7700c
 ```
 
-Op-replay readers (see `crates/jjf-storage/src/read.rs`) treat
-the `merge` op as a marker that the file diff supersedes the
-op-replay state — the file remains authoritative across merges.
-A v2 enrichment could carry per-field "Jjf-Resolved-*" payload so
-op-replay can stay authoritative across merges too; v1 doesn't.
+The merge commit's file diff IS the resolution, and that
+resolution is now produced by the op-space resolver (§6) rather
+than the legacy file-bytes merge driver. The `merge` op stays a
+payload-free marker — replay readers fold each parent's op chain
+and the merge commit announces "here's the projection of those
+chains together," not a per-field decision.
 
 ### 5.8 Create-time fields and op chains
 
@@ -369,7 +409,101 @@ present).
 
 ---
 
-## 6. Write path summary (informative)
+## 6. Merge semantics
+
+When a divergent `bugs` bookmark needs to converge — two clones
+both pushed concurrent edits, or any two heads exist under
+`heads(bookmarks(bugs))` — the op-space resolver in
+`crates/jjf-storage/src/merge_ops.rs` reduces both heads' op
+chains to a single rendered state. **The file is a deterministic
+projection of the op chain.** Divergence resolves in op-space;
+the rendered `bugs/<id>.json` and `bugs/<id>.comments.jsonl` fall
+out as the projection of the merged op stream.
+
+### 6.1 LWW ordering tuple
+
+Every op across both heads sorts by
+
+    (jjf_at if Some else commit_time, commit, trailer_index)
+
+- **`jjf_at`** is the writer's `now_rfc3339_nanos()` stamp from
+  the `Jjf-At:` trailer (§5.1). Nanosecond precision; total order
+  within a single writer's process.
+- **`commit_time`** is jj's `author.timestamp()`, second
+  resolution. Fallback for stanzas predating the spec §5 op-time
+  bump. Unstamped stanzas sort *before* stamped stanzas at the
+  same commit-time second — older data loses to newer data, the
+  desired migration semantics.
+- **`commit`** is the full-hex commit_id. Deterministic across
+  clones; the second-level tiebreaker.
+- **`trailer_index`** is the 0-based stanza position within its
+  commit. Every multi-op commit has at least two stanzas
+  distinguishable only by this index; it's the final tiebreaker.
+
+This tuple is total over every pair of ops the resolver will see,
+so the merged state is deterministic regardless of which clone
+runs the merge.
+
+### 6.2 Field-by-field reducer
+
+| Op | Reduction rule |
+| --- | --- |
+| `create` | Earliest in the sorted stream initializes the record (title, status). Predates the fork, so should agree across heads in practice. |
+| `set-title`, `set-status`, `set-assignee`, `set-body` | LWW: the last op in the sorted stream wins. |
+| `label-add`, `label-rm`, `dep-add`, `dep-rm` | Causal order: each add/remove tracked per (label/dep); final state is `present` iff the last write for that key was an add. |
+| `comment-add` | Union of all `comment_id`s across both heads. Comments are append-only; no conflict possible. |
+| `merge` | Marker; no-op for state reconstruction. The parent chains are the truth. |
+
+### 6.3 Body-hash join
+
+`Op::SetBody` carries only `body_hash` (§5.2). The reducer picks
+the winning hash from the ordering tuple, but the body bytes
+themselves live in the rendered `bugs/<id>.json`, not in any
+trailer. To recover the body text:
+
+1. Pick the winning `set-body` op's `body_hash` from the sorted
+   stream.
+2. Look up that hash in each head's rendered `bugs/<id>.json`
+   (compute `sha-256(body)` on the JSON record's `body` field for
+   each head).
+3. The hash will match exactly one head by construction — that
+   head's chain is the one whose latest `set-body` op was the
+   winner. (Both heads might match if they shared the body op;
+   the bytes are byte-identical either way.)
+4. Take the body bytes from the matching head.
+
+This is the join between op-space (where LWW decides which body
+*op* won) and bytes (where the actual content lives). It's what
+lets the resolver keep the file as a projection without
+duplicating the body text in every trailer.
+
+### 6.4 Comment union
+
+Each `comment-add` op references a `comment_id`; the actual
+comment body lives in `bugs/<id>.comments.jsonl`. The resolver
+reads each head's `.comments.jsonl` (via `jj file show -r
+<head>`), unions them by `comment_id`, and re-renders the merged
+file in `created_at` ascending order (§4.2). Same-id-different-body
+collisions are a spec violation (the writer always appends the
+body alongside the `comment-add` commit) and the resolver drops
+silently rather than failing — there's no operator action that
+could fix the underlying data.
+
+### 6.5 What this replaces
+
+The v1 file-bytes merge driver (`jjf-merge`) reads jj's textual
+conflict markers and runs a JSON-level LWW/union policy on the
+record bytes. It has a real "unmergeable" failure mode when body
+text collides; `jjf pull` would exit with a human-resolution
+escape hatch. The op-space resolver has no such failure mode:
+`set-body` is just another LWW scalar in §6.2, and the file
+falls out as a projection. `jjf-merge` stays in the workspace
+as a library for non-operator callers and as a parser-behavior
+fixture; `jjf pull` no longer wires it in.
+
+---
+
+## 7. Write path summary (informative)
 
 The exact write path is `storage-write`'s ticket, but the format
 constrains it. The 4-CLI dance (jj 0.40–0.42 has no `file write
@@ -387,7 +521,7 @@ Cost ≈60ms per mutation at jj's measured ~15ms/CLI call
 
 ---
 
-## 7. What's deliberately out of scope for v1
+## 8. What's deliberately out of scope for v1
 
 - **Attachments / binary blobs.** No `files` array (git-bug
   uses git blob refs; we don't need it yet).
@@ -401,7 +535,7 @@ Cost ≈60ms per mutation at jj's measured ~15ms/CLI call
 
 ---
 
-## 8. References
+## 9. References
 
 - `dcd4b57` — Shape A verdict (bookmark choice + blast-radius).
 - `a60bb95` — `Jjf-Op:` trailer verdict (audit shape).

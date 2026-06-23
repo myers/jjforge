@@ -14,12 +14,44 @@ use crate::id::BugId;
 use crate::op::Op;
 use crate::record::Status;
 
+/// A parsed op stanza plus its trailer-level metadata.
+///
+/// `jjf_at` is the value of the optional `Jjf-At:` trailer (spec §5,
+/// the op-time field added when the v1 spec was extended for op-space
+/// merge). Stanzas without that field surface `None` here; the merge
+/// driver's ordering tuple treats them as "older than any stamped op
+/// at the same commit-time second."
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedOp {
+    pub op: Op,
+    pub jjf_at: Option<String>,
+}
+
 /// Parse all `Jjf-Op:` stanzas from a commit description, returning
 /// typed ops in trailer order. Stanzas whose `Jjf-Bug:` field doesn't
 /// match `id` are dropped (spec allows multi-bug commits even though
 /// the v1 writer doesn't emit them). Unknown op-types are tolerated
 /// per spec §5.2 — they're skipped silently.
+///
+/// Convenience wrapper around `parse_ops_with_meta` that drops the
+/// trailer-level metadata; preserved so call sites that only care
+/// about the typed op (the debug-only read-path cross-check, the
+/// per-bug history view's payload) don't have to thread the meta
+/// they don't use.
 pub(crate) fn parse_ops(desc: &str, id: &BugId) -> Vec<Op> {
+    parse_ops_with_meta(desc, id)
+        .into_iter()
+        .map(|p| p.op)
+        .collect()
+}
+
+/// Parse all `Jjf-Op:` stanzas from a commit description, returning
+/// each typed op alongside the `Jjf-At:` value (if present).
+///
+/// Stanzas whose `Jjf-Bug:` field doesn't match `id` are dropped,
+/// matching `parse_ops`'s semantics. Unknown op-types are tolerated
+/// per spec §5.2 — skipped silently.
+pub(crate) fn parse_ops_with_meta(desc: &str, id: &BugId) -> Vec<ParsedOp> {
     // Find the trailer block: the last paragraph of trailer lines at
     // the end of the description. We don't need to be too clever — we
     // just iterate every `Jjf-Op:` we see and pair it with subsequent
@@ -67,7 +99,11 @@ pub(crate) fn parse_ops(desc: &str, id: &BugId) -> Vec<Op> {
     let mut out = Vec::new();
     for stanza in stanzas {
         if let Some(op) = stanza_to_op(&stanza, id) {
-            out.push(op);
+            let jjf_at = stanza
+                .iter()
+                .find(|(k, _)| *k == "Jjf-At")
+                .map(|(_, v)| (*v).to_owned());
+            out.push(ParsedOp { op, jjf_at });
         }
     }
     out
@@ -257,6 +293,48 @@ Jjf-Status: closed
                 status: Status::Closed,
             }]
         );
+    }
+
+    #[test]
+    fn parses_jjf_at_when_present() {
+        // Stanza carries the optional Jjf-At trailer — surface it.
+        let desc = "\
+jjf: bug aa6600b - close
+
+Jjf-Op: set-status
+Jjf-Bug: aa6600b
+Jjf-At: 2026-06-22T12:34:56.123456789Z
+Jjf-Status: closed
+";
+        let parsed = parse_ops_with_meta(desc, &id("aa6600b"));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0].jjf_at.as_deref(),
+            Some("2026-06-22T12:34:56.123456789Z")
+        );
+        assert_eq!(
+            parsed[0].op,
+            Op::SetStatus {
+                bug_id: id("aa6600b"),
+                status: Status::Closed,
+            }
+        );
+    }
+
+    #[test]
+    fn jjf_at_absence_is_none_for_forward_compat() {
+        // Older fixtures and pre-spec-bump data have no Jjf-At; spec
+        // §5 says parsers MUST tolerate that. Surface as None.
+        let desc = "\
+jjf: bug aa6600b - close
+
+Jjf-Op: set-status
+Jjf-Bug: aa6600b
+Jjf-Status: closed
+";
+        let parsed = parse_ops_with_meta(desc, &id("aa6600b"));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].jjf_at, None);
     }
 
     #[test]

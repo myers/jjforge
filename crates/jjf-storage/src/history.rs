@@ -19,7 +19,7 @@
 use crate::id::BugId;
 use crate::jj::JjRepo;
 use crate::op::Op;
-use crate::trailer::parse_ops;
+use crate::trailer::parse_ops_with_meta;
 use crate::{bug_comments_relpath, bug_json_relpath, Error, Result};
 
 /// One row of the op-by-op timeline.
@@ -37,6 +37,12 @@ use crate::{bug_comments_relpath, bug_json_relpath, Error, Result};
 /// record's `created_at` / `updated_at`. See spec §5 and the closing
 /// comment on `b650d74` for why the two clocks don't always agree.
 ///
+/// `jjf_at` is the value of the optional `Jjf-At:` trailer (RFC 3339
+/// with nanosecond precision, UTC, set by the writer at the moment of
+/// the op). Stanzas predating the spec §5 op-time bump return `None`;
+/// the op-space merge driver's ordering tuple treats those as older
+/// than any stamped op at the same `timestamp` second.
+///
 /// `author` is rendered as `Name <email>` by jj's `author` template
 /// field, matching git's standard. May be empty if no jj user is
 /// configured (e.g. throwaway test repos with no `user.name`).
@@ -45,6 +51,12 @@ pub struct HistoryEntry {
     pub commit: String,
     pub author: String,
     pub timestamp: String,
+    pub jjf_at: Option<String>,
+    /// 0-based position of this op within its commit's trailer stanza
+    /// block. Used as the deterministic tiebreaker when two ops share
+    /// `(jjf_at, commit)` — every multi-op commit has at least two
+    /// stanzas distinguishable only by this index.
+    pub trailer_index: u32,
     pub op: Op,
 }
 
@@ -56,6 +68,24 @@ pub struct HistoryEntry {
 ///   touches `bugs/<id>.json` or `bugs/<id>.comments.jsonl`).
 /// - `Jj` if the underlying `jj log` shell-out fails.
 pub(crate) fn read_history(repo: &JjRepo, id: &BugId) -> Result<Vec<HistoryEntry>> {
+    read_history_at(repo, "bookmarks(bugs)", id)
+}
+
+/// Walk the per-bug op chain rooted at `rev` and return one entry per
+/// op, oldest first. The default `read_history` is this with `rev =
+/// bookmarks(bugs)`; pass an explicit commit (e.g. a change_id short
+/// from `bugs_heads`) to walk one head of a divergent bookmark
+/// independently of the others.
+///
+/// Errors:
+/// - `BugNotFound` if no commit reachable from `rev` touches this
+///   bug's files.
+/// - `Jj` if the underlying `jj log` shell-out fails.
+pub(crate) fn read_history_at(
+    repo: &JjRepo,
+    rev: &str,
+    id: &BugId,
+) -> Result<Vec<HistoryEntry>> {
     let json_relpath = bug_json_relpath(id);
     let comments_relpath = bug_comments_relpath(id);
 
@@ -87,11 +117,12 @@ pub(crate) fn read_history(repo: &JjRepo, id: &BugId) -> Result<Vec<HistoryEntry
         r = record_sep.replace('\n', "\\n"),
     );
 
+    let ancestors_rev = format!("ancestors({rev})");
     let raw = repo.run(&[
         "log",
         "--no-graph",
         "-r",
-        "ancestors(bookmarks(bugs))",
+        &ancestors_rev,
         "-T",
         &template,
         &format!("root:{}", json_relpath.display()),
@@ -127,15 +158,21 @@ pub(crate) fn read_history(repo: &JjRepo, id: &BugId) -> Result<Vec<HistoryEntry
         let timestamp = parts[2].to_owned();
         let description = parts[3];
 
-        // One commit, possibly many ops. parse_ops already filters to
-        // this bug and drops unknown op-types per spec §5.2; we trust
-        // its order (trailer order = spec §5.3 application order).
-        for op in parse_ops(description, id) {
+        // One commit, possibly many ops. parse_ops_with_meta already
+        // filters to this bug and drops unknown op-types per spec §5.2;
+        // we trust its order (trailer order = spec §5.3 application
+        // order). `trailer_index` is the 0-based stanza position within
+        // this commit — used by the op-space merge driver as the
+        // final tiebreaker in the LWW ordering tuple.
+        for (idx, parsed) in parse_ops_with_meta(description, id).into_iter().enumerate()
+        {
             out.push(HistoryEntry {
                 commit: commit.clone(),
                 author: author.clone(),
                 timestamp: timestamp.clone(),
-                op,
+                jjf_at: parsed.jjf_at,
+                trailer_index: idx as u32,
+                op: parsed.op,
             });
         }
     }

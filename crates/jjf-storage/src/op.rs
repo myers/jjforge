@@ -108,14 +108,23 @@ impl Op {
     }
 
     /// Render one op stanza: the `Jjf-Op:` line, the `Jjf-Bug:` line,
-    /// and any op-specific payload trailers, each terminated with `\n`.
-    pub fn to_trailer_block(&self) -> String {
+    /// the `Jjf-At:` line, and any op-specific payload trailers, each
+    /// terminated with `\n`.
+    ///
+    /// `jjf_at` is the RFC-3339-nano timestamp the writer stamps at the
+    /// moment of the op. See spec §5 (`Jjf-At` is required on every
+    /// stanza this writer emits; parsers tolerate absence for forward
+    /// compatibility with older fixtures and pre-spec-bump data).
+    pub fn to_trailer_block(&self, jjf_at: &str) -> String {
         let mut s = String::new();
         s.push_str("Jjf-Op: ");
         s.push_str(self.op_type());
         s.push('\n');
         s.push_str("Jjf-Bug: ");
         s.push_str(self.bug_id().as_str());
+        s.push('\n');
+        s.push_str("Jjf-At: ");
+        s.push_str(jjf_at);
         s.push('\n');
         match self {
             Op::Create { title, status, .. } => {

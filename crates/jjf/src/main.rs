@@ -554,21 +554,31 @@ enum CliError {
     #[error("jj git fetch failed: {0}")]
     JjGitFetch(String),
 
-    /// `jjf pull` invoked the merge driver and got
-    /// `jjf_merge::Error::Unmergeable` back — typically the bug
-    /// record's body field has free-text conflicts the LWW/union
-    /// policy can't dispatch. Runtime (exit 1). The
-    /// `sync-conflict-fallback` ticket owns the better escape hatch
-    /// for this case; for now we exit 1 with the bug id(s) and the
-    /// merge driver's message so the operator knows where to look.
-    /// The working copy is left with conflict markers intact so a
-    /// human can resolve.
+    /// Legacy v1 file-bytes merge driver failure: the bug record's
+    /// body field had free-text conflicts the LWW/union policy
+    /// couldn't dispatch. Runtime (exit 1). **As of the
+    /// `sync-conflict-fallback` switch (`bfc732b`), this variant is
+    /// unreachable from `jjf pull`** — the op-space resolver has no
+    /// "unmergeable" failure mode, body-text divergence resolves
+    /// LWW by `Jjf-At:` timestamp. The variant stays defined so the
+    /// JSON envelope's error-kind enum, the exit-code table, and any
+    /// external caller of `jjf_merge::resolve` still see a stable
+    /// shape. See `docs/cli-json.md` `pull` section for the contract.
+    #[allow(dead_code)]
     #[error("merge driver could not auto-resolve bug {bug_id}: {detail}\nworking copy left with conflict markers for manual resolution")]
     Unmergeable { bug_id: String, detail: String },
 
-    /// `jjf pull` saw a conflict on a `bugs/<id>.comments.jsonl`
-    /// file. The v1 merge driver doesn't handle comment-file merges
-    /// (`jjf-merge` is v1, JSON-record only). Runtime (exit 1).
+    /// Legacy v1 file-bytes merge driver failure: a
+    /// `bugs/<id>.comments.jsonl` file had conflict markers the v1
+    /// driver couldn't handle. Runtime (exit 1). **As of
+    /// `sync-conflict-fallback` (`bfc732b`), this variant is
+    /// unreachable from `jjf pull`** — the op-space resolver builds
+    /// the merged comments file as a union of each head's pristine
+    /// `.comments.jsonl` (read via `jj file show -r <head>`), so
+    /// jj's conflict markers never appear in the working copy on
+    /// the operator path. Same rationale as `Unmergeable` above for
+    /// keeping the variant defined.
+    #[allow(dead_code)]
     #[error("merge driver does not handle conflicted comment file for bug {bug_id} (v1 limitation)\nworking copy left with conflict markers for manual resolution")]
     CommentFileConflict { bug_id: String },
 }
@@ -1756,13 +1766,23 @@ fn classify_push_error(remote: &str, stderr: String) -> CliError {
 }
 
 /// `jjf pull <remote>` — fetch the remote, track the `bugs@<remote>`
-/// bookmark if needed, then merge any divergence via `jjf_merge`.
+/// bookmark if needed, then resolve any divergence in op-space.
 ///
 /// See the verb's doc-comment on `Commands::Pull` for the high-level
 /// flow. This function is the orchestrator; it shells out to `jj`
 /// directly (mirroring `run_push` / `run_remote_*`) and calls the
-/// storage layer's `record_merge` primitive when the merge driver pass
-/// is needed.
+/// storage layer's `resolve_divergence` + `record_merge_op_space`
+/// primitives for the merge pass.
+///
+/// As of `bfc732b` (sync-conflict-fallback), this verb no longer uses
+/// the v1 file-bytes merge driver (`jjf_merge::resolve`). The op-space
+/// resolver replays each head's op chain field-by-field per spec §6's
+/// LWW ordering tuple, then re-renders the merged file as a
+/// deterministic projection of the op stream. There is no human-surface
+/// "unmergeable" failure mode in this path — every divergence resolves.
+/// The `Unmergeable` / `CommentFileConflict` error kinds stay wired
+/// (they're reachable from external callers of `jjf_merge::resolve` and
+/// from the storage layer) but cannot arise from this v2 operator pull.
 fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
@@ -1862,128 +1882,45 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
         return Ok(());
     }
 
-    // 5. Merge driver pass. Create a `jj new <heads> -m '<msg>'` merge
-    // commit; jj materializes each conflicted file with its textual
-    // conflict markers. We walk every file under `bugs/` looking for
-    // those markers, run `jjf_merge::resolve` on each, and hand the
-    // bytes to `Storage::record_merge` to write+bookmark-set.
-    //
-    // The merge commit's parents are the heads we list here. jj is
-    // happy to take a list of revisions.
-    let merge_args = {
-        let mut v: Vec<&str> = vec!["new"];
-        for h in &heads {
-            v.push(h.as_str());
-        }
-        v.push("-m");
-        v.push("jjf: temporary merge for conflict probe");
-        v
-    };
-    let merge_out = std::process::Command::new("jj")
-        .arg("--repository")
-        .arg(&cwd)
-        .args(&merge_args)
-        .output()
-        .map_err(CliError::Probe)?;
-    if !merge_out.status.success() {
-        return Err(CliError::Probe(std::io::Error::other(format!(
-            "jj new (probe merge) failed: {}",
-            String::from_utf8_lossy(&merge_out.stderr)
-        ))));
-    }
+    // 5. Op-space resolution. Walk each head's op chain per bug,
+    // reduce field-by-field per spec §6's LWW ordering tuple, and
+    // render the merged record + comments. No probe-merge commit is
+    // needed: the op-space driver reads pristine bytes from each head
+    // via `jj file show -r <head>` (see `crates/jjf-storage/src/
+    // merge_ops.rs`) and never touches the working copy with conflict
+    // markers. Body bytes come from whichever head's rendered file
+    // matches the winning `SetBody` op's `body_hash` (the §5.2
+    // body-hash join).
+    let report = storage.resolve_divergence()?;
 
-    // Walk the working copy's `bugs/` directory looking for `.json`
-    // files that contain jj's conflict marker. Anything that doesn't
-    // contain the marker after the probe merge was auto-resolved by
-    // jj's content merger (or never differed) — no action needed.
-    //
-    // For each conflicted `.json` we DON'T feed the conflict-marker
-    // text to the merge driver. jj's textual diff can split a single
-    // logical change into multiple conflict blocks (one for `title`,
-    // one for `updated_at`, …) and may emit the `+++++++` / `%%%%%%%`
-    // markers in either order, which the v1 parser (modeled on the
-    // single-block Python prototype) doesn't accept. Instead we read
-    // the file's pristine contents from each merge parent via
-    // `jj file show -r <head>` and merge those JSON objects directly
-    // through the merge driver's `resolve` path — which canonicalizes
-    // when there are no markers (its no-conflict branch).
-    //
-    // This is robust against jj's marker variability and slightly
-    // faster (no diff reconstruction needed): the parents' files are
-    // each already a valid JSON object.
-    //
-    // Comment files (`.comments.jsonl`) with conflict markers are an
-    // out-of-scope case for v1; we fail loudly so the operator knows
-    // sync-conflict-fallback is the path forward.
-    let bugs_dir = cwd.join("bugs");
-    let mut merged_bugs: Vec<(BugId, String)> = Vec::new();
-    let entries = match std::fs::read_dir(&bugs_dir) {
-        Ok(e) => e,
-        Err(e) => {
+    if report.bugs.is_empty() {
+        // bugs_heads said >=2 heads but no head touched any bug file
+        // we recognized. Defensive: in v1 storage every head exists
+        // because of a bug-mutating commit, so this branch is mostly
+        // unreachable. We still need to pin the bookmark so it stops
+        // being conflicted. Mirror the old clean-merge dance: jj-new
+        // across the heads, set the bookmark, step off.
+        let merge_args = {
+            let mut v: Vec<&str> = vec!["new"];
+            for h in &heads {
+                v.push(h.as_str());
+            }
+            v.push("-m");
+            v.push("jjf: empty merge (no bug files touched)");
+            v
+        };
+        let merge_out = std::process::Command::new("jj")
+            .arg("--repository")
+            .arg(&cwd)
+            .args(&merge_args)
+            .output()
+            .map_err(CliError::Probe)?;
+        if !merge_out.status.success() {
             return Err(CliError::Probe(std::io::Error::other(format!(
-                "could not read bugs/ dir: {e}"
+                "jj new (empty merge) failed: {}",
+                String::from_utf8_lossy(&merge_out.stderr)
             ))));
         }
-    };
-    for entry in entries {
-        let entry = entry.map_err(CliError::Probe)?;
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                return Err(CliError::Probe(std::io::Error::other(format!(
-                    "could not read {}: {e}",
-                    path.display()
-                ))));
-            }
-        };
-        let text = String::from_utf8_lossy(&bytes);
-        // Conflicts contain jj's marker prefix. Cheap check.
-        if !text.contains("<<<<<<< conflict") {
-            continue;
-        }
-        if name.ends_with(".comments.jsonl") {
-            // v1 limitation. Strip prefix `bugs/<id>.comments.jsonl`.
-            let id_stem = name.trim_end_matches(".comments.jsonl");
-            return Err(CliError::CommentFileConflict {
-                bug_id: id_stem.to_owned(),
-            });
-        }
-        if !name.ends_with(".json") {
-            // Some other file under `bugs/` — ignore. (Spec §3 only
-            // pins `.json` and `.comments.jsonl`.)
-            continue;
-        }
-        let stem = name.trim_end_matches(".json");
-        let bug_id = match BugId::parse(stem) {
-            Ok(id) => id,
-            Err(_) => continue, // skip non-bug-shaped files defensively
-        };
-        // Read pristine file from each head; merge directly.
-        let resolved =
-            merge_bug_from_heads(&cwd, &heads, &format!("bugs/{stem}.json"))?;
-        // Wrap any merge-driver error into CliError::Unmergeable.
-        let resolved = match resolved {
-            Ok(s) => s,
-            Err(detail) => {
-                return Err(CliError::Unmergeable {
-                    bug_id: stem.to_owned(),
-                    detail,
-                });
-            }
-        };
-        merged_bugs.push((bug_id, resolved));
-    }
-
-    if merged_bugs.is_empty() {
-        // jj auto-merged everything (or the divergent heads happened
-        // to touch no `bugs/<id>.json` files we recognize). We still
-        // need to land a commit that pins the merge so the bookmark
-        // stops being conflicted: bookmark set bugs -r @ on the
-        // probe-merge commit, then step off.
         let bm_set = std::process::Command::new("jj")
             .arg("--repository")
             .arg(&cwd)
@@ -2019,156 +1956,16 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
         return Ok(());
     }
 
-    // We have a non-empty merge set: discard the temporary merge
-    // commit by stepping `@` somewhere else first, then call the
-    // storage layer's `record_merge` which builds the real merge
-    // commit with the proper `Jjf-Op: merge` trailers per spec §5.2.
-    // Stepping off via `jj new root()` is cheap and matches the
-    // 4-CLI dance's general shape.
-    let abandon = std::process::Command::new("jj")
-        .arg("--repository")
-        .arg(&cwd)
-        .args(["new", "root()"])
-        .output()
-        .map_err(CliError::Probe)?;
-    if !abandon.status.success() {
-        return Err(CliError::Probe(std::io::Error::other(format!(
-            "jj new root() (abandon-probe) failed: {}",
-            String::from_utf8_lossy(&abandon.stderr)
-        ))));
-    }
-
-    storage.record_merge(&heads, &merged_bugs)?;
-    let count = merged_bugs.len();
+    // Non-empty report: land the multi-parent merge commit with one
+    // `Jjf-Op: merge` trailer per resolved bug (spec §5.7) and write
+    // the merged record + comments files. The storage primitive owns
+    // the 4-CLI dance.
+    let count = report.bugs.len();
+    storage.record_merge_op_space(&heads, &report)?;
     emit_pull_success(json, &remote, true, count);
     Ok(())
 }
 
-/// Merge one `bugs/<id>.json` across N heads by reading each head's
-/// pristine version via `jj file show -r <head> root:<relpath>` and
-/// pairwise-folding them through `jjf_merge::merge_values`.
-///
-/// We don't go through `jjf_merge::resolve` because that's the
-/// conflict-marker entry point; we already have clean JSON per head
-/// and just need the policy fold. The merge driver crate's
-/// `merge_values` is the right level of abstraction for that.
-///
-/// Returns:
-/// - `Ok(Ok(bytes))` — resolved JSON bytes ready to write back.
-/// - `Ok(Err(detail))` — merge driver said `Unmergeable`; the caller
-///   wraps the detail into `CliError::Unmergeable`.
-/// - `Err(CliError)` — the jj shell-out or JSON parse itself failed.
-fn merge_bug_from_heads(
-    cwd: &Path,
-    heads: &[String],
-    relpath: &str,
-) -> Result<Result<String, String>, CliError> {
-    // For each head, read its author.timestamp AND its version of the
-    // bug file. We use the author timestamp to drive the LWW
-    // tiebreaker per the merge crate's contract (the merge crate
-    // defers this to the caller): the head with the LATER timestamp
-    // is folded LAST so it wins as `Side::B` under the default policy.
-    //
-    // A head that doesn't have the file (e.g. one side deleted it,
-    // which v1 doesn't actually support but we handle defensively) is
-    // skipped. If no head has it we surface that as Unmergeable.
-    // Each entry: (timestamp, head_change_id, json_value). The
-    // change_id is the deterministic tiebreaker when timestamps tie
-    // (jj 0.40's author.timestamp() is second-granularity, so two
-    // commits made within the same second sort equal on `ts` alone —
-    // observed in `experiments/sync-remote/.scratch/dbg-diff/`). Without
-    // the change_id tiebreaker, `heads(bookmarks(bugs))` would dictate
-    // the merge winner, which isn't a stable contract across jj
-    // versions.
-    let mut sides_with_ts: Vec<(String, String, serde_json::Value)> = Vec::new();
-    for h in heads {
-        let ts_out = std::process::Command::new("jj")
-            .arg("--repository")
-            .arg(cwd)
-            .args([
-                "log",
-                "-r",
-                h,
-                "--no-graph",
-                "-T",
-                "author.timestamp().format(\"%Y-%m-%dT%H:%M:%S%.fZ\")",
-            ])
-            .output()
-            .map_err(CliError::Probe)?;
-        if !ts_out.status.success() {
-            return Err(CliError::Probe(std::io::Error::other(format!(
-                "jj log timestamp probe for {h} failed: {}",
-                String::from_utf8_lossy(&ts_out.stderr)
-            ))));
-        }
-        let ts = String::from_utf8_lossy(&ts_out.stdout).trim().to_owned();
-        let out = std::process::Command::new("jj")
-            .arg("--repository")
-            .arg(cwd)
-            .args(["file", "show", "-r", h, &format!("root:{relpath}")])
-            .output()
-            .map_err(CliError::Probe)?;
-        if !out.status.success() {
-            // Missing file on this head: skip; another head may have it.
-            continue;
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(v) => sides_with_ts.push((ts, h.clone(), v)),
-            Err(e) => {
-                return Ok(Err(format!(
-                    "head {h}: bugs file is not valid JSON: {e}"
-                )));
-            }
-        }
-    }
-    // Sort sides by (timestamp ASC, change_id ASC) so the latest is
-    // last — becomes `Side::B` in the pairwise fold and wins LWW. The
-    // change_id tiebreak makes the merge deterministic when two
-    // commits land in the same second (jj's per-second timestamp
-    // granularity).
-    sides_with_ts.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    let sides: Vec<serde_json::Value> =
-        sides_with_ts.into_iter().map(|(_, _, v)| v).collect();
-    if sides.is_empty() {
-        return Ok(Err(format!(
-            "no head carries {relpath}; cannot merge"
-        )));
-    }
-    if sides.len() == 1 {
-        // Only one head had the file (typical when a clone deleted
-        // it, which v1 doesn't actually support but we handle
-        // defensively). Canonicalize and return.
-        let mut s = serde_json::to_string_pretty(&sides[0])
-            .map_err(|e| CliError::Storage(StorageError::Json(e)))?;
-        s.push('\n');
-        return Ok(Ok(s));
-    }
-    // Fold pairwise: left-to-right. The merge driver's policy is
-    // commutative for set-union fields and uses `prefer_side` for
-    // LWW scalars; the deterministic-default (`Side::B`) means the
-    // last-folded side wins for the same field. Heads are ordered by
-    // `jj log` (we don't pin their order beyond what jj gives us);
-    // the order is stable within a repo because change_ids sort
-    // deterministically.
-    let opts = jjf_merge::MergeOptions::default();
-    let mut acc = sides[0].clone();
-    for next in &sides[1..] {
-        acc = match jjf_merge::merge::merge_values(&acc, next, &opts) {
-            Ok(v) => v,
-            Err(jjf_merge::Error::Unmergeable(detail)) => {
-                return Ok(Err(detail));
-            }
-            Err(e) => {
-                return Ok(Err(e.to_string()));
-            }
-        };
-    }
-    let mut s = serde_json::to_string_pretty(&acc)
-        .map_err(|e| CliError::Storage(StorageError::Json(e)))?;
-    s.push('\n');
-    Ok(Ok(s))
-}
 
 /// Map jj-git-fetch stderr to a typed `CliError`. Mirrors
 /// `classify_push_error`'s shape; the substring sets are the same set
@@ -2212,9 +2009,15 @@ fn classify_fetch_error(remote: &str, stderr: String) -> CliError {
 
 /// Emit the success path for `jjf pull`. Kept as a helper so all four
 /// success branches (no-remote-bookmark, clean-fetch-no-divergence,
-/// clean-merge-no-files, real-merge-with-files) render the same
-/// envelope shape with one shared call site.
-fn emit_pull_success(json: bool, remote: &str, remote_present: bool, merged_files: usize) {
+/// clean-merge-no-resolution, real-merge-with-resolution) render the
+/// same envelope shape with one shared call site.
+///
+/// The `resolved_bugs` field replaces the older `merged_files` (the
+/// shape difference reflects the v1→v2 switch from a file-bytes driver
+/// to an op-space resolver, where the unit of resolution is a bug, not
+/// a file). The `merge_strategy` field pins which driver ran so
+/// downstream consumers can branch on the contract.
+fn emit_pull_success(json: bool, remote: &str, remote_present: bool, resolved_bugs: usize) {
     if json {
         let mut obj = serde_json::Map::new();
         obj.insert("ok".into(), serde_json::Value::Bool(true));
@@ -2228,18 +2031,22 @@ fn emit_pull_success(json: bool, remote: &str, remote_present: bool, merged_file
             serde_json::Value::Bool(remote_present),
         );
         obj.insert(
-            "merged_files".into(),
-            serde_json::Value::from(merged_files),
+            "merge_strategy".into(),
+            serde_json::Value::String("op_space".into()),
+        );
+        obj.insert(
+            "resolved_bugs".into(),
+            serde_json::Value::from(resolved_bugs),
         );
         let envelope = serde_json::Value::Object(obj);
         println!("{envelope}");
     } else if !remote_present {
         println!("pulled {remote}: no bugs bookmark on remote yet");
-    } else if merged_files == 0 {
+    } else if resolved_bugs == 0 {
         println!("pulled bugs <- {remote}");
     } else {
         println!(
-            "pulled bugs <- {remote}; merged {merged_files} file(s)"
+            "pulled bugs <- {remote}; resolved {resolved_bugs} bug(s) op-space"
         );
     }
 }

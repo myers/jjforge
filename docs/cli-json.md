@@ -358,17 +358,22 @@ $ jjf push --json origin
 ### `pull`
 
 Mutating verb — `{"ok": true, ...}` envelope. Three success
-shapes, distinguished by `remote_present` (bool) and `merged_files`
-(non-negative integer):
+shapes, distinguished by `remote_present` (bool) and
+`resolved_bugs` (non-negative integer):
 
 - **remote has no `bugs` bookmark yet** (first push from the other
   side hasn't happened) — exit 0, `remote_present: false`,
-  `merged_files: 0`.
+  `resolved_bugs: 0`.
 - **clean fetch, no divergence** (jj fast-forwarded or there was
-  nothing new) — exit 0, `remote_present: true`, `merged_files: 0`.
-- **divergence, merge driver ran** (`jjf-merge` resolved N
-  `bugs/<id>.json` files) — exit 0, `remote_present: true`,
-  `merged_files: N`.
+  nothing new) — exit 0, `remote_present: true`, `resolved_bugs: 0`.
+- **divergence, op-space resolver ran** (`Storage::
+  resolve_divergence` reduced N bugs across the divergent heads) —
+  exit 0, `remote_present: true`, `resolved_bugs: N`.
+
+Every success envelope carries `merge_strategy: "op_space"` to pin
+which driver ran. The field exists for forward-compat — a future
+`jjf` may grow alternate strategies (e.g. a `file_bytes` escape
+hatch, see `bfc732b`); today the only value is `op_space`.
 
 Preflight is jj-repo-only (not the full `bugs_bookmark` probe) —
 a fresh clone has `bugs@<remote>` but no local `bugs` yet, and
@@ -377,7 +382,7 @@ a fresh clone has `bugs@<remote>` but no local `bugs` yet, and
 
 ```sh
 $ jjf pull --json origin
-{"ok":true,"remote":"origin","bookmark":"bugs","remote_present":true,"merged_files":0}
+{"ok":true,"remote":"origin","bookmark":"bugs","remote_present":true,"merge_strategy":"op_space","resolved_bugs":0}
 ```
 
 Empty-remote variant — first time anyone pulls from a remote whose
@@ -385,14 +390,14 @@ bugs bookmark hasn't been pushed yet:
 
 ```sh
 $ jjf pull --json origin
-{"ok":true,"remote":"origin","bookmark":"bugs","remote_present":false,"merged_files":0}
+{"ok":true,"remote":"origin","bookmark":"bugs","remote_present":false,"merge_strategy":"op_space","resolved_bugs":0}
 ```
 
 With merges:
 
 ```sh
 $ jjf pull --json origin
-{"ok":true,"remote":"origin","bookmark":"bugs","remote_present":true,"merged_files":2}
+{"ok":true,"remote":"origin","bookmark":"bugs","remote_present":true,"merge_strategy":"op_space","resolved_bugs":2}
 ```
 
 Error path — unknown remote:
@@ -402,18 +407,32 @@ $ jjf pull --json nope
 {"ok":false,"error":{"kind":"remote_not_found","message":"git remote not found: nope","details":{"name":"nope"}}}
 ```
 
-Error path — body-text or other free-text conflict the v1 merge
-driver can't resolve (the working copy is left with jj's conflict
-markers intact for human resolution; `sync-conflict-fallback` is
-where the better escape hatch will live):
+#### Unreachable error kinds on the v2 operator path
+
+The legacy v1 file-bytes merge driver (`jjf-merge`) had two
+human-surface failure modes — `unmergeable` (body-text collision)
+and `comment_file_conflict` (jj content-merge marker in a
+`.comments.jsonl` file). The `jjf pull` v1 path could surface
+both.
+
+**As of `bfc732b` (sync-conflict-fallback), `jjf pull` uses the
+op-space resolver in `crates/jjf-storage/src/merge_ops.rs`. That
+resolver has no failure mode that maps to either error kind:
+`set-body` is just another LWW scalar (`storage-format.md` §6.2),
+and `.comments.jsonl` is rebuilt as a union of pristine bytes
+from each head, never read with conflict markers.** The error
+kinds stay defined for shape stability — external callers of
+`jjf_merge::resolve` (the library that stays in the workspace as
+a non-operator-path tool) can still surface them, and the JSON
+envelope contract pins the enum — but `jjf pull` will not raise
+them.
+
+The two error kinds' historic shape (kept for reference):
 
 ```sh
 $ jjf pull --json origin
 {"ok":false,"error":{"kind":"unmergeable","message":"…","details":{"bug_id":"aa6600b","detail":"…"}}}
 ```
-
-Error path — a `bugs/<id>.comments.jsonl` file had a conflict; the
-v1 merge driver doesn't handle comment-file merges:
 
 ```sh
 $ jjf pull --json origin

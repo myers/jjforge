@@ -46,6 +46,7 @@
 mod history;
 mod id;
 mod jj;
+mod merge_ops;
 mod op;
 mod read;
 mod record;
@@ -56,6 +57,7 @@ use std::path::{Path, PathBuf};
 pub use history::HistoryEntry;
 pub use id::{BugId, IdError};
 pub use jj::JjError;
+pub use merge_ops::{MergeReport, MergedBug};
 pub use op::Op;
 pub use record::{Bug, BugDraft, BugRecord, Comment, Status};
 
@@ -710,7 +712,8 @@ impl Storage {
                 bug_id: id.clone(),
             })
             .collect();
-        let msg = build_commit_message(&summary, &ops);
+        let jjf_at = now_rfc3339_nanos()?;
+        let msg = build_commit_message(&summary, &ops, &jjf_at);
 
         // `jj new <r1> <r2> ... -m <msg>` — args are owned `String`s so
         // we build a `Vec<&str>` before handing to `run`.
@@ -764,6 +767,138 @@ impl Storage {
     /// touches this bug's files.
     pub fn read_history(&self, id: &BugId) -> Result<Vec<HistoryEntry>> {
         history::read_history(&self.repo, id)
+    }
+
+    /// Op-space resolver entry point. Discovers heads via
+    /// [`Storage::bugs_heads`]; for each bug touched on any head, walks
+    /// each head's op chain via [`Storage::read_history_at`] and
+    /// reduces field-by-field per spec §6's ordering tuple. Returns
+    /// the merged state for every touched bug.
+    ///
+    /// **Does not land a commit.** Pair with
+    /// [`Storage::record_merge_op_space`] to write the merged record
+    /// + comments back and land a single merge commit with one
+    /// `Jjf-Op: merge` trailer per resolved bug.
+    ///
+    /// Returns an empty [`MergeReport`] if `bugs_heads()` finds zero
+    /// or one head — there's no divergence to resolve.
+    pub fn resolve_divergence(&self) -> Result<MergeReport> {
+        let heads = self.bugs_heads()?;
+        if heads.len() < 2 {
+            return Ok(MergeReport { bugs: Vec::new() });
+        }
+        merge_ops::resolve(&self.repo, &heads)
+    }
+
+    /// Land the resolved merge as a single multi-parent commit on the
+    /// `bugs` bookmark. Companion to [`Storage::resolve_divergence`]:
+    /// the report it returns plus the heads it walked feed straight
+    /// into this call.
+    ///
+    /// Behavior:
+    /// - Creates a merge commit with `heads` as its parents and one
+    ///   `Jjf-Op: merge` trailer per bug in `report` (spec §5.7).
+    /// - Writes the merged `bugs/<id>.json` and
+    ///   `bugs/<id>.comments.jsonl` for every bug in the report,
+    ///   overwriting whatever jj materialized in the merge's working
+    ///   copy (including the textual conflict markers).
+    /// - Points the `bugs` bookmark at the merge commit and steps
+    ///   `@` off it, matching the 4-CLI dance.
+    ///
+    /// Errors with `Invalid` if `heads.len() < 2` (no merge needed) or
+    /// the report is empty (nothing to resolve — the caller should
+    /// pin the bookmark via the file-bytes path or do nothing).
+    pub fn record_merge_op_space(
+        &self,
+        heads: &[String],
+        report: &MergeReport,
+    ) -> Result<()> {
+        if heads.len() < 2 {
+            return Err(Error::Invalid(format!(
+                "record_merge_op_space requires >= 2 heads, got {}",
+                heads.len()
+            )));
+        }
+        if report.bugs.is_empty() {
+            return Err(Error::Invalid(
+                "record_merge_op_space requires at least one resolved bug".into(),
+            ));
+        }
+
+        // 1. Build the merge commit. One `Jjf-Op: merge` per bug.
+        let summary = if report.bugs.len() == 1 {
+            format!("jjf: bug {} - merge", report.bugs[0].id)
+        } else {
+            format!("jjf: merge {} bugs", report.bugs.len())
+        };
+        let ops: Vec<Op> = report
+            .bugs
+            .iter()
+            .map(|b| Op::Merge {
+                bug_id: b.id.clone(),
+            })
+            .collect();
+        let jjf_at = now_rfc3339_nanos()?;
+        let msg = build_commit_message(&summary, &ops, &jjf_at);
+
+        let mut argv: Vec<&str> = vec!["new"];
+        for h in heads {
+            argv.push(h.as_str());
+        }
+        argv.push("-m");
+        argv.push(&msg);
+        self.repo.run(&argv)?;
+
+        // 2. Write resolved bytes — record + comments — for every bug.
+        let wc_root = self.repo.root();
+        for merged in &report.bugs {
+            let json_path = wc_root.join(bug_json_relpath(&merged.id));
+            if let Some(parent) = json_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            write_record_json(&json_path, &merged.record)?;
+            let comments_path = wc_root.join(bug_comments_relpath(&merged.id));
+            write_comments_jsonl(&comments_path, &merged.comments)?;
+        }
+
+        // 3. Pin the bookmark at the merge commit.
+        self.repo.run(&[
+            "bookmark",
+            "set",
+            BUGS_BOOKMARK,
+            "-r",
+            "@",
+            "--allow-backwards",
+        ])?;
+
+        // 4. Step `@` off the bookmark.
+        self.repo.run(&["new", "root()"])?;
+
+        Ok(())
+    }
+
+    /// Read the per-bug op chain rooted at an explicit revision rather
+    /// than the bookmark tip. The default [`Storage::read_history`] is
+    /// this with `rev = "bookmarks(bugs)"`.
+    ///
+    /// Used by the op-space merge driver to walk each head of a
+    /// divergent `bugs` bookmark independently: pass each entry of
+    /// [`Storage::bugs_heads`] as `rev` to get that head's full op
+    /// chain in isolation. The returned [`HistoryEntry`] vector is in
+    /// chronological commit order (oldest first) — the LWW reducer
+    /// sorts by the spec §6 ordering tuple `(jjf_at_or_commit_time,
+    /// commit, trailer_index)` itself.
+    ///
+    /// `rev` can be any revset jj accepts (typically a change_id short
+    /// from `bugs_heads()`, but `bookmarks(bugs)`, a commit_id short,
+    /// or any other shape works). Errors with `BugNotFound` if no
+    /// commit reachable from `rev` touches this bug's files.
+    pub fn read_history_at(
+        &self,
+        rev: &str,
+        id: &BugId,
+    ) -> Result<Vec<HistoryEntry>> {
+        history::read_history_at(&self.repo, rev, id)
     }
 
     // ---- internals ---------------------------------------------------
@@ -858,7 +993,13 @@ impl Storage {
     where
         F: FnOnce(&Path) -> Result<()>,
     {
-        let msg = build_commit_message(summary, ops);
+        // Stamp every op stanza in this commit with the same nano-
+        // precision op-time (spec §5: `Jjf-At:` per stanza). The
+        // record-level `created_at`/`updated_at` use second resolution
+        // and are stamped separately by the per-verb mutators; only the
+        // trailer carries nanos.
+        let jjf_at = now_rfc3339_nanos()?;
+        let msg = build_commit_message(summary, ops, &jjf_at);
 
         // 1. jj new bookmarks(bugs) -m '<msg>'
         self.repo.run(&["new", BUGS_BOOKMARK_REVSET, "-m", &msg])?;
@@ -942,16 +1083,22 @@ fn write_comments_jsonl(path: &Path, comments: &[Comment]) -> Result<()> {
 
 /// Build the full commit message: one-line summary, blank line, then
 /// the trailer stanza per `docs/storage-format.md` §5.
-pub(crate) fn build_commit_message(summary: &str, ops: &[Op]) -> String {
+///
+/// Every op stanza is stamped with the same `jjf_at` (the writer's
+/// `now_rfc3339_nanos()` at the moment of the call). The single-stamp
+/// shape matches the multi-op-per-commit semantics: ops in one commit
+/// were intended together and are ordered by trailer index within the
+/// commit, so they share an op-time and rely on the `(jjf_at,
+/// commit_hash, trailer_index)` tuple for total order in op-space
+/// replay.
+pub(crate) fn build_commit_message(summary: &str, ops: &[Op], jjf_at: &str) -> String {
     let mut s = String::new();
     s.push_str(summary);
     s.push_str("\n\n");
-    for (i, op) in ops.iter().enumerate() {
-        if i > 0 {
-            // No blank line between op stanzas — they're one continuous
-            // trailer block per spec §5.5.
-        }
-        s.push_str(&op.to_trailer_block());
+    for op in ops.iter() {
+        // No blank line between op stanzas — they're one continuous
+        // trailer block per spec §5.5.
+        s.push_str(&op.to_trailer_block(jjf_at));
     }
     s
 }
@@ -977,6 +1124,14 @@ fn sorted_dedup_ids(xs: &[BugId]) -> Vec<BugId> {
 #[cfg(debug_assertions)]
 pub(crate) fn sha256_hex_for_read(bytes: &[u8]) -> String {
     sha256_hex(bytes)
+}
+
+/// Crate-internal helper for the op-space merge driver: hash a body
+/// string to its hex sha-256 so a winning `Op::SetBody { body_hash }`
+/// can be matched against each head's rendered record. Mirrors the
+/// same hash the writer computes at `set_body` time.
+pub(crate) fn body_hash_hex(body: &str) -> String {
+    sha256_hex(body.as_bytes())
 }
 
 /// Hex sha-256 for `set-body` trailers (`Jjf-Body-Hash` per spec §5.2).
@@ -1009,6 +1164,33 @@ fn now_rfc3339() -> Result<String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| Error::Clock(format!("system clock before unix epoch: {e}")))?;
     Ok(epoch_secs_to_rfc3339(dur.as_secs()))
+}
+
+/// Current time as RFC 3339 in UTC with nanosecond resolution. Used by
+/// the trailer writer so each op stanza carries a `Jjf-At:` field with
+/// enough resolution that two ops on the same second (a real failure
+/// mode at jj 0.40's per-second commit-time granularity) sort
+/// deterministically. The JSON record's `created_at`/`updated_at`
+/// continue to use [`now_rfc3339`] per spec §3.1 — only trailers get
+/// nanos.
+fn now_rfc3339_nanos() -> Result<String> {
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| Error::Clock(format!("system clock before unix epoch: {e}")))?;
+    Ok(epoch_nanos_to_rfc3339(dur.as_secs(), dur.subsec_nanos()))
+}
+
+/// Format `(secs_since_epoch, nanos)` as
+/// `YYYY-MM-DDTHH:MM:SS.fffffffffZ` — RFC 3339 with nine fractional
+/// digits. Shares the civil-from-days math with
+/// [`epoch_secs_to_rfc3339`]; only the fractional-seconds suffix
+/// differs.
+pub(crate) fn epoch_nanos_to_rfc3339(secs: u64, nanos: u32) -> String {
+    let base = epoch_secs_to_rfc3339(secs);
+    // base is `YYYY-MM-DDTHH:MM:SSZ`; insert `.fffffffff` before the
+    // trailing `Z` to land on `YYYY-MM-DDTHH:MM:SS.fffffffffZ`.
+    let trunk = &base[..base.len() - 1];
+    format!("{trunk}.{nanos:09}Z")
 }
 
 /// Format seconds-since-epoch as `YYYY-MM-DDTHH:MM:SSZ`. UTC only,
@@ -1208,18 +1390,23 @@ mod tests {
 
     #[test]
     fn trailer_format_single_op_create_matches_spec() {
-        // §5.4 example.
+        // §5.4 example, extended with the §5-mandated `Jjf-At:` line.
         let op = Op::Create {
             bug_id: BugId::parse("aa6600b").unwrap(),
             title: "segfault on empty input".into(),
             status: Status::Open,
         };
-        let msg = build_commit_message("jjf: bug aa6600b - create", &[op]);
+        let msg = build_commit_message(
+            "jjf: bug aa6600b - create",
+            &[op],
+            "2026-06-22T12:34:56.123456789Z",
+        );
         let expected = "\
 jjf: bug aa6600b - create
 
 Jjf-Op: create
 Jjf-Bug: aa6600b
+Jjf-At: 2026-06-22T12:34:56.123456789Z
 Jjf-Title: segfault on empty input
 Jjf-Status: open
 ";
@@ -1230,7 +1417,8 @@ Jjf-Status: open
     fn trailer_format_multi_op_matches_spec() {
         // §5.5 example minus the free-text body (the build_commit_message
         // helper doesn't synthesize that — callers pass it via summary
-        // if they want it).
+        // if they want it). Every stanza in a multi-op commit shares
+        // the same `Jjf-At:` — they were issued together.
         let bug = BugId::parse("aa6600b").unwrap();
         let ops = [
             Op::SetStatus {
@@ -1242,18 +1430,37 @@ Jjf-Status: open
                 label: "fixed".into(),
             },
         ];
-        let msg = build_commit_message("jjf: bug aa6600b - close + label", &ops);
+        let msg = build_commit_message(
+            "jjf: bug aa6600b - close + label",
+            &ops,
+            "2026-06-22T12:34:56.123456789Z",
+        );
         let expected = "\
 jjf: bug aa6600b - close + label
 
 Jjf-Op: set-status
 Jjf-Bug: aa6600b
+Jjf-At: 2026-06-22T12:34:56.123456789Z
 Jjf-Status: closed
 Jjf-Op: label-add
 Jjf-Bug: aa6600b
+Jjf-At: 2026-06-22T12:34:56.123456789Z
 Jjf-Label: fixed
 ";
         assert_eq!(msg, expected);
+    }
+
+    #[test]
+    fn rfc3339_nanos_format_matches_spec_shape() {
+        // 2026-06-22T12:00:00.000000000Z = secs=1_782_129_600 nanos=0.
+        let s = epoch_nanos_to_rfc3339(1_782_129_600, 0);
+        assert_eq!(s, "2026-06-22T12:00:00.000000000Z");
+        // Non-zero nanos lands in the fractional slot, zero-padded to
+        // exactly nine digits (the spec calls this rfc3339-nano).
+        let s = epoch_nanos_to_rfc3339(1_782_129_600, 1);
+        assert_eq!(s, "2026-06-22T12:00:00.000000001Z");
+        let s = epoch_nanos_to_rfc3339(1_782_129_600, 123_456_789);
+        assert_eq!(s, "2026-06-22T12:00:00.123456789Z");
     }
 
     #[test]
