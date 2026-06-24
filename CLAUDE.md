@@ -204,15 +204,14 @@ generated at create time per `docs/storage-format.md` §2). The
 displayed id IS the full id — there is no prefix convention to
 worry about, no SHA stem to lengthen.
 
-CLI verbs accept any unambiguous prefix of lowercase hex (1–6
-chars) in place of the full id. 4 chars is usually enough in a
-project of this size. If the prefix matches two-or-more ids the
-verb fails fast with exit 2 and a JSON `ambiguous_prefix` error
-envelope whose `details.matches` array lists every candidate; if
-it matches none it fails with `id_not_found`. (Implemented in
-`prefix-lookup-broken`, ticket `4940d78`.) The canonical id is
-still the 7-char string `jjf ls` prints — abbreviate at the
-keyboard, never in stored data.
+CLI verbs do NOT accept partial-id prefixes; pass the full
+7-char id or a slug. A 7-char hex handle that doesn't match
+any issue surfaces as `issue_not_found` (exit 1, runtime). A
+non-hex handle with no matching slug surfaces as
+`slug_not_found` (exit 2, preflight). Slugs are the
+human-friendly short form — use `--slug <kebab>` on
+`jjf new` so future commands can say `jjf show agent-ready`
+instead of `jjf show 69d5e1b`.
 
 ### Push / pull
 

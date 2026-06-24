@@ -1,33 +1,5 @@
 # `jjf --json` output contract
 
-## v2.5 → v2.6 changelog
-
-Backwards-compatible additions, landed in the
-`prefix-lookup-broken` ticket (`4940d78`). Restores the
-"unambiguous-prefix handle lookup" behavior CLAUDE.md
-documented but the storage layer didn't implement.
-
-- **Every id-taking verb now accepts an unambiguous hex
-  prefix** (1–6 chars of lowercase hex) in place of the full
-  7-char id. Resolution scans both open and closed issue ids;
-  exactly one match → resolves; zero matches → exit 2
-  `id_not_found`; two-or-more matches → exit 2
-  `ambiguous_prefix` with the candidate list in
-  `details.matches`.
-- **Two new error kinds** (full table updated below):
-  - `id_not_found` (`details.handle`) — hex-shaped handle that
-    matches no id. Distinct from `slug_not_found`, which is now
-    reserved for non-hex handles. Hex-shaped misses no longer
-    surface as `slug_not_found`.
-  - `ambiguous_prefix` (`details.handle`, `details.matches`) —
-    hex-shaped handle that matches two-or-more ids. `matches`
-    is a sorted array of full 7-char ids.
-- **`slug_not_found` is now non-hex-only.** Hex-shaped handles
-  that previously surfaced this kind now route to
-  `id_not_found` instead. Scripts pattern-matching on
-  `slug_not_found` for hex-shaped input need to expand to
-  match `id_not_found` too.
-
 ## v2.4 → v2.5 changelog
 
 Backwards-compatible additions, landed in the
@@ -485,8 +457,6 @@ from plain-text mode (see the top comment in `main.rs`: `0` success,
 | `invalid_title`              | 2    | `Storage::InvalidTitle` / `InvalidTitle` | `title`, `reason`, `codepoint`* |
 | `slug_collision`             | 2    | `Storage::SlugCollision` / `SlugCollision` | `slug`, `conflicts_with` |
 | `slug_not_found`             | 2    | `Storage::SlugNotFound` / `SlugNotFound` | `handle`                 |
-| `id_not_found`               | 2    | `Storage::IdNotFound` / `IdNotFound` | `handle`                 |
-| `ambiguous_prefix`           | 2    | `Storage::AmbiguousPrefix` / `AmbiguousPrefix` | `handle`, `matches[]` |
 | `invalid_input`              | 1    | `Storage::Invalid`            | —                        |
 | `clock_error`                | 1    | `Storage::Clock`              | —                        |
 | `io_error`                   | 1    | `Storage::Io`                 | —                        |

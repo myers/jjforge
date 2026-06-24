@@ -245,34 +245,15 @@ pub enum Error {
     /// `Storage::resolve` was handed a string that isn't a valid id
     /// and doesn't match any open issue's slug. The handle is
     /// preserved so the CLI's `slug_not_found` error envelope can
-    /// surface the operator-supplied value. Surfaced only for
-    /// non-hex-shaped handles — for hex-shaped handles that don't
-    /// resolve as either a full id or a prefix, see
-    /// [`Error::IdNotFound`] instead. (`prefix-lookup-broken`.)
+    /// surface the operator-supplied value.
+    ///
+    /// Note: a 7-char hex handle never reaches this variant — it
+    /// short-circuits via `IssueId::parse` and resolves to that id
+    /// without an existence check. If the id doesn't actually exist
+    /// on the bookmark, the subsequent `Storage::read` (or mutator)
+    /// returns [`Error::IssueNotFound`] instead.
     #[error("no issue with handle {handle:?}")]
     SlugNotFound { handle: String },
-
-    /// `Storage::resolve` was handed a hex-shaped handle (1–7 chars
-    /// of lowercase hex) but no issue id starts with that prefix.
-    /// Separate variant from [`Error::SlugNotFound`] because for a
-    /// hex-shaped handle, "looks like an id, no slug" is the wrong
-    /// hint — the operator was trying to address an issue by id.
-    /// (`prefix-lookup-broken`.)
-    #[error("no issue with id prefix {handle:?}")]
-    IdNotFound { handle: String },
-
-    /// `Storage::resolve` was handed a hex-shaped handle of fewer
-    /// than 7 chars that's a prefix of two or more issue ids. The
-    /// `matches` list carries every candidate so the CLI can echo
-    /// it back to the operator for disambiguation. The list is
-    /// sorted lexicographically and capped at all matches (the v3
-    /// scale assumption — at most a few thousand issues — means
-    /// "all matches" stays bounded). (`prefix-lookup-broken`.)
-    #[error("id prefix {handle:?} matches {} issues", matches.len())]
-    AmbiguousPrefix {
-        handle: String,
-        matches: Vec<IssueId>,
-    },
 
     /// `Storage::claim` was called on an issue that's already
     /// `InProgress` with a DIFFERENT assignee. The `by` field is the
@@ -840,22 +821,6 @@ pub fn validate_slug(slug: &str) -> std::result::Result<(), SlugInvalidReason> {
 
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, Error>;
-
-/// True iff `s` is 1–6 chars of lowercase hex — i.e. shorter than a
-/// full [`IssueId`] but in the id charset. Used by [`Storage::resolve`]
-/// to decide between the prefix-match path and the slug-lookup path:
-/// hex-shaped → search the id space; non-hex → search the slug space.
-/// Length 0 and length 7-plus both return `false` (0-length handles
-/// are nonsense; full-length hex handles are handled by the
-/// `IssueId::parse` fast-path before this function is consulted).
-/// (`prefix-lookup-broken`.)
-fn is_hex_prefix(s: &str) -> bool {
-    let n = s.len();
-    if n == 0 || n >= 7 {
-        return false;
-    }
-    s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
 
 /// The name of the bookmark issue data lives on. See
 /// `docs/storage-format.md` §1.
@@ -2612,63 +2577,28 @@ impl Storage {
     /// Resolve a user-supplied handle to a concrete `IssueId`.
     ///
     /// - If `handle` parses as an `IssueId` (7 lowercase-hex), return
-    ///   that id directly. No bookmark lookup — the id is the
-    ///   authoritative shape; checking existence is the caller's
-    ///   job via `Storage::read`.
-    /// - Else, if `handle` is 1–6 chars of lowercase hex, treat it
-    ///   as an id prefix. Scan every issue id (open and closed)
-    ///   in the snapshot. Exactly one match → return it; zero
-    ///   matches → [`Error::IdNotFound`]; two-or-more matches →
-    ///   [`Error::AmbiguousPrefix`] with all candidate ids. The
-    ///   prefix path is hex-only because slugs are kebab-case
-    ///   non-hex; a 4-char-hex handle is unambiguously "I meant an
-    ///   id." (`prefix-lookup-broken`.)
-    /// - Otherwise (non-hex string), walk every issue on the
-    ///   bookmark and return the id whose slug matches `handle`
-    ///   exactly. Exact-match, case-sensitive (slugs are kebab-case
-    ///   lowercase per validation).
+    ///   that id directly. No existence check — callers that need
+    ///   one get it from the subsequent `Storage::read` / mutator
+    ///   call, which surfaces [`Error::IssueNotFound`] if the id
+    ///   isn't on the bookmark. Partial / prefix ids are NOT
+    ///   accepted; the full 7-char id is the canonical handle.
+    /// - Otherwise (non-id string), walk every issue on the bookmark
+    ///   and return the id whose slug matches `handle` exactly.
+    ///   Exact-match, case-sensitive (slugs are kebab-case lowercase
+    ///   per validation).
     /// - If no issue's slug matches, return [`Error::SlugNotFound`].
     ///
     /// Implementation is read-all-then-match: O(N) over every
-    /// issue in the snapshot cache. For v3's small N this is fine;
-    /// if it ever proves slow, a prefix / slug index is the
-    /// follow-up. The match scans both open AND closed issues (so
-    /// the operator can `jjf show <slug>` or `jjf show <prefix>`
-    /// against a closed handle — slug uniqueness is enforced only
-    /// across OPEN issues at write time).
+    /// issue in the snapshot cache. For v3's small N this is fine.
+    /// The match scans both open AND closed issues (so the
+    /// operator can `jjf show <slug>` against a closed handle —
+    /// slug uniqueness is enforced only across OPEN issues at
+    /// write time).
     pub fn resolve(&self, handle: &str) -> Result<IssueId> {
-        // Fast path: handle IS a full id. We deliberately don't probe
-        // authoritative storage here — callers that need the
-        // existence check get it from the subsequent `read` /
-        // mutator call.
+        // Id path: handle IS a full id. Existence check is the
+        // caller's job via Storage::read.
         if let Ok(id) = IssueId::parse(handle) {
             return Ok(id);
-        }
-        // Prefix path: 1–6 chars of lowercase hex. Anything outside
-        // that shape falls through to the slug resolver.
-        if is_hex_prefix(handle) {
-            let snapshot = self.snapshot()?;
-            let mut matches: Vec<IssueId> = snapshot
-                .issues
-                .keys()
-                .filter(|id| id.as_str().starts_with(handle))
-                .cloned()
-                .collect();
-            match matches.len() {
-                1 => return Ok(matches.pop().unwrap()),
-                0 => {
-                    return Err(Error::IdNotFound {
-                        handle: handle.to_owned(),
-                    });
-                }
-                _ => {
-                    matches.sort();
-                    return Err(Error::AmbiguousPrefix {
-                        handle: handle.to_owned(),
-                        matches,
-                    });
-                }
-            }
         }
         // Slug path: HashMap lookup on the snapshot cache's
         // pre-built `slug_index`. V2 and V3 both route through
