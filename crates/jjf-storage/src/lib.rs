@@ -316,6 +316,65 @@ fn jittered_retry_sleep() {
     std::thread::sleep(std::time::Duration::from_millis(15 + u64::from(jitter_ms)));
 }
 
+/// Outcome of [`Storage::claim`]. Distinguishes "I wrote the claim
+/// commit just now" from "the issue was already claimed by me; no
+/// commit landed (idempotent)."
+///
+/// Callers that propose a fresh claim against an issue they don't yet
+/// own (notably `jjf ready --claim`, where the ready filter excluded
+/// claimed issues) need to know which case fired: an `AlreadyOurs`
+/// against a freshly-picked ready id means the racer beat us to the
+/// CAS, NOT that we genuinely re-claimed our own issue. The CLI
+/// surfaces this via the `claim_race_lost` error envelope so the
+/// orchestrator can retry against the next ready id.
+///
+/// Single-process same-user re-claim is still a quiet success; the
+/// distinction only matters in the parallel-claim scenario, and the
+/// CLI flag (`ready --claim`) is what gates whether `AlreadyOurs` is
+/// surfaced as a race or absorbed as idempotent. v2.3-fix
+/// (`a6b8fb7`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimResult {
+    /// A commit landed; we are the new claimant.
+    Claimed,
+    /// Same user already owned the issue; no commit landed.
+    AlreadyOurs,
+}
+
+/// What [`Storage::mutate`]'s closure returns on each read-mutate-commit
+/// attempt. Tri-state because the closure is the only place that has the
+/// freshly-read record in scope, so it's the only place that can make
+/// the right call about whether a write is still needed.
+///
+/// The retry contract: on a CAS-loss retry, `mutate` re-reads the
+/// record and calls the closure AGAIN with the new state. That second
+/// call MUST re-evaluate any domain precondition (e.g. "is the issue
+/// still Open?" for claim) against the fresh record — not blindly
+/// re-apply the same mutation. Issue `a6b8fb7`: pre-`a6b8fb7`, the
+/// closure was a `Fn(&mut IssueRecord) -> Result<Vec<Op>>` and
+/// preconditions were checked ONCE before `mutate` was entered; the
+/// retry would re-run the closure against a record that no longer
+/// satisfied the precondition, lands a duplicate write, and the verb
+/// returned Ok despite the racer having taken the slot.
+enum MutateOutcome {
+    /// The closure mutated the record and wants these ops persisted.
+    Write(Vec<Op>),
+    /// The fresh record already satisfies the post-condition the caller
+    /// wanted (the racer beat us to the same end-state we'd have
+    /// written). No commit lands; the verb returns `Ok(())`.
+    ///
+    /// Used for idempotent same-user re-claims, double-unclaim of an
+    /// already-unassigned issue, double-unblock of an already-open
+    /// issue, etc.
+    Skip,
+    /// The fresh record violates a domain precondition. Surface this
+    /// typed error to the caller instead of writing.
+    ///
+    /// Used when a racer took the slot we wanted (claim raced and the
+    /// other claimant won; unclaim raced and the issue got closed; etc.).
+    Conflict(Error),
+}
+
 /// Filter bundle for [`Storage::list_ready`].
 ///
 /// All filters AND with the implicit "active + unblocked + unclaimed
@@ -1439,22 +1498,24 @@ impl Storage {
         let title = title.to_owned();
         self.mutate(id, &format!("jjf: issue {} - set-title", id), |rec| {
             rec.title = title.clone();
-            Ok(vec![Op::SetTitle {
+            MutateOutcome::Write(vec![Op::SetTitle {
                 issue_id: rec.id.clone(),
                 title: title.clone(),
             }])
         })
+        .map(|_| ())
     }
 
     /// Replace the status.
     pub fn set_status(&self, id: &IssueId, status: Status) -> Result<()> {
         self.mutate(id, &format!("jjf: issue {} - set-status", id), |rec| {
             rec.status = status;
-            Ok(vec![Op::SetStatus {
+            MutateOutcome::Write(vec![Op::SetStatus {
                 issue_id: rec.id.clone(),
                 status,
             }])
         })
+        .map(|_| ())
     }
 
     /// Replace the body.
@@ -1463,11 +1524,12 @@ impl Storage {
         self.mutate(id, &format!("jjf: issue {} - set-body", id), |rec| {
             rec.body = body.clone();
             let hash = sha256_hex(body.as_bytes());
-            Ok(vec![Op::SetBody {
+            MutateOutcome::Write(vec![Op::SetBody {
                 issue_id: rec.id.clone(),
                 body_hash: hash,
             }])
         })
+        .map(|_| ())
     }
 
     /// Replace the assignee. `None` clears it.
@@ -1487,11 +1549,12 @@ impl Storage {
         let assignee = assignee.map(str::to_owned);
         self.mutate(id, &format!("jjf: issue {} - set-assignee", id), |rec| {
             rec.assignee = assignee.clone();
-            Ok(vec![Op::SetAssignee {
+            MutateOutcome::Write(vec![Op::SetAssignee {
                 issue_id: rec.id.clone(),
                 assignee: assignee.clone(),
             }])
         })
+        .map(|_| ())
     }
 
     /// Update one or more scalar fields in a single commit.
@@ -1546,11 +1609,11 @@ impl Storage {
                 ));
             }
         }
-        // Pre-validate the slug, if any, BEFORE the storage-side
-        // mutate dance. We validate the syntactic shape here and the
-        // uniqueness probe runs INSIDE `mutate` (after we've read the
-        // current record), so we know whether the issue is open and
-        // can scope the collision check accordingly.
+        // Pre-validate the slug syntactic shape (charset, length,
+        // hyphen placement). The uniqueness probe is a domain
+        // precondition vs. OTHER records and so MUST run inside the
+        // closure to re-evaluate on each retry against the post-race
+        // bookmark — see `a6b8fb7`.
         if let Some(Some(slug)) = &fields.slug {
             if let Err(reason) = validate_slug(slug) {
                 return Err(Error::InvalidSlug {
@@ -1559,22 +1622,27 @@ impl Storage {
                 });
             }
         }
-        // Slug uniqueness probe: a non-`None` slug write must not
-        // collide with any OTHER open issue's slug. We probe before
-        // entering `mutate` so a collision error fires before any
-        // commit machinery spins up.
-        if let Some(Some(new_slug)) = &fields.slug {
-            if let Some(conflict) =
-                self.find_open_slug_collision(new_slug, Some(id))?
-            {
-                return Err(Error::SlugCollision {
-                    slug: new_slug.clone(),
-                    conflicts_with: conflict,
-                });
-            }
-        }
         let summary = format!("jjf: issue {} - update", id);
+        let id_owned = id.clone();
         self.mutate(id, &summary, |rec| {
+            // Slug uniqueness probe: a non-`None` slug write must not
+            // collide with any OTHER open issue's slug. Probed on
+            // every retry against the fresh bookmark, so a racer that
+            // claims the slug between our attempts surfaces as a
+            // typed conflict instead of a duplicate write
+            // (`a6b8fb7`).
+            if let Some(Some(new_slug)) = &fields.slug {
+                match self.find_open_slug_collision(new_slug, Some(&id_owned)) {
+                    Ok(Some(conflict)) => {
+                        return MutateOutcome::Conflict(Error::SlugCollision {
+                            slug: new_slug.clone(),
+                            conflicts_with: conflict,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(e) => return MutateOutcome::Conflict(e),
+                }
+            }
             let mut ops: Vec<Op> = Vec::new();
             if let Some(title) = &fields.title {
                 rec.title = title.clone();
@@ -1619,8 +1687,9 @@ impl Storage {
                     assignee: assignee.clone(),
                 });
             }
-            Ok(ops)
+            MutateOutcome::Write(ops)
         })
+        .map(|_| ())
     }
 
     /// Atomically claim an issue: set its assignee to `who` and
@@ -1652,7 +1721,7 @@ impl Storage {
     /// status. (Two ops, one commit; the op-space resolver's LWW
     /// projection lands on the same final state regardless of read
     /// order.)
-    pub fn claim(&self, id: &IssueId, who: &str) -> Result<()> {
+    pub fn claim(&self, id: &IssueId, who: &str) -> Result<ClaimResult> {
         let who = who.trim();
         if who.is_empty() {
             return Err(Error::Invalid(
@@ -1664,48 +1733,58 @@ impl Storage {
                 "claim: assignee must not contain newlines".into(),
             ));
         }
-        let current = self.read_record_from_bookmark(id)?;
-        match current.status {
-            Status::Closed => {
-                return Err(Error::Invalid(format!(
-                    "issue {id} is closed; reopen before claiming"
-                )));
-            }
-            Status::Blocked => {
-                // v2.5: parked on an external signal. Claiming a
-                // blocked issue would silently flip its status to
-                // in-progress AND drop the reason on the floor —
-                // confusing for the next reader. Force the operator
-                // to `jjf unblock` first; the explicit step preserves
-                // the audit trail.
-                return Err(Error::Invalid(format!(
-                    "issue {id} is blocked; unblock before claiming"
-                )));
-            }
-            Status::InProgress => {
-                // Already claimed. Same user → no-op (return Ok
-                // without writing). Different user → AlreadyClaimed.
-                match current.assignee.as_deref() {
-                    Some(existing) if existing == who => return Ok(()),
-                    Some(existing) => {
-                        return Err(Error::AlreadyClaimed {
-                            by: existing.to_owned(),
-                        })
-                    }
-                    // InProgress without an assignee is a degenerate
-                    // state (shouldn't happen via the normal claim
-                    // path), but treat it as claimable rather than
-                    // wedging.
-                    None => {}
-                }
-            }
-            Status::Open => {}
-        }
         let who_owned = who.to_owned();
+        let id_owned = id.clone();
+        // Precondition check lives INSIDE the closure so it re-runs
+        // on every retry against the freshly-read record. The pre-
+        // `a6b8fb7` shape (check once, mutate-and-retry blindly)
+        // produced duplicate claims when two `ready --claim` calls
+        // raced — the loser's retry would blindly re-apply
+        // `set-assignee + set-status InProgress` against a record
+        // that the winner had already claimed, returning Ok and
+        // silently double-claiming.
         self.mutate(id, &format!("jjf: issue {} - claim", id), |rec| {
+            match rec.status {
+                Status::Closed => {
+                    return MutateOutcome::Conflict(Error::Invalid(format!(
+                        "issue {id_owned} is closed; reopen before claiming"
+                    )));
+                }
+                Status::Blocked => {
+                    // v2.5: parked on an external signal. Claiming a
+                    // blocked issue would silently flip its status
+                    // to in-progress AND drop the reason on the
+                    // floor — confusing for the next reader. Force
+                    // the operator to `jjf unblock` first; the
+                    // explicit step preserves the audit trail.
+                    return MutateOutcome::Conflict(Error::Invalid(format!(
+                        "issue {id_owned} is blocked; unblock before claiming"
+                    )));
+                }
+                Status::InProgress => {
+                    // Already claimed. Same user → no-op (Skip).
+                    // Different user → AlreadyClaimed.
+                    match rec.assignee.as_deref() {
+                        Some(existing) if existing == who_owned => {
+                            return MutateOutcome::Skip;
+                        }
+                        Some(existing) => {
+                            return MutateOutcome::Conflict(Error::AlreadyClaimed {
+                                by: existing.to_owned(),
+                            });
+                        }
+                        // InProgress without an assignee is a
+                        // degenerate state (shouldn't happen via the
+                        // normal claim path), but treat it as
+                        // claimable rather than wedging.
+                        None => {}
+                    }
+                }
+                Status::Open => {}
+            }
             rec.assignee = Some(who_owned.clone());
             rec.status = Status::InProgress;
-            Ok(vec![
+            MutateOutcome::Write(vec![
                 Op::SetAssignee {
                     issue_id: rec.id.clone(),
                     assignee: Some(who_owned.clone()),
@@ -1715,6 +1794,13 @@ impl Storage {
                     status: Status::InProgress,
                 },
             ])
+        })
+        .map(|landed| {
+            if landed {
+                ClaimResult::Claimed
+            } else {
+                ClaimResult::AlreadyOurs
+            }
         })
     }
 
@@ -1732,20 +1818,24 @@ impl Storage {
     /// Like `claim`, lands two ops (`SetAssignee None` and
     /// `SetStatus Open`) in field-declaration order.
     pub fn unclaim(&self, id: &IssueId) -> Result<()> {
-        let current = self.read_record_from_bookmark(id)?;
-        if current.status == Status::Closed {
-            return Err(Error::Invalid(format!(
-                "issue {id} is closed; nothing to unclaim"
-            )));
-        }
-        if current.status == Status::Open && current.assignee.is_none() {
-            // No-op: already in the unclaimed state.
-            return Ok(());
-        }
+        let id_owned = id.clone();
+        // Precondition lives inside the closure so a CAS-loss retry
+        // re-checks against the post-race record. Without this, a
+        // racer closing the issue between our read and our retry
+        // would let us silently re-open it (`a6b8fb7`).
         self.mutate(id, &format!("jjf: issue {} - unclaim", id), |rec| {
+            if rec.status == Status::Closed {
+                return MutateOutcome::Conflict(Error::Invalid(format!(
+                    "issue {id_owned} is closed; nothing to unclaim"
+                )));
+            }
+            if rec.status == Status::Open && rec.assignee.is_none() {
+                // No-op: already in the unclaimed state.
+                return MutateOutcome::Skip;
+            }
             rec.assignee = None;
             rec.status = Status::Open;
-            Ok(vec![
+            MutateOutcome::Write(vec![
                 Op::SetAssignee {
                     issue_id: rec.id.clone(),
                     assignee: None,
@@ -1756,6 +1846,7 @@ impl Storage {
                 },
             ])
         })
+        .map(|_| ())
     }
 
     /// Park an issue: set status to [`Status::Blocked`] and record a
@@ -1799,17 +1890,22 @@ impl Storage {
             }
             None => None,
         };
-        let current = self.read_record_from_bookmark(id)?;
-        if current.status == Status::Closed {
-            return Err(Error::Invalid(format!(
-                "issue {id} is closed; reopen before blocking"
-            )));
-        }
         let reason_owned = normalized;
+        let id_owned = id.clone();
+        // Precondition lives in the closure so a CAS-loss retry
+        // re-checks the (possibly-changed) status against the fresh
+        // record. Without this, a racer closing the issue between
+        // our read and the retry would let us silently re-open-then-
+        // block it (`a6b8fb7`).
         self.mutate(id, &format!("jjf: issue {} - block", id), |rec| {
+            if rec.status == Status::Closed {
+                return MutateOutcome::Conflict(Error::Invalid(format!(
+                    "issue {id_owned} is closed; reopen before blocking"
+                )));
+            }
             rec.status = Status::Blocked;
             rec.block_reason = reason_owned.clone();
-            Ok(vec![
+            MutateOutcome::Write(vec![
                 Op::SetStatus {
                     issue_id: rec.id.clone(),
                     status: Status::Blocked,
@@ -1820,6 +1916,7 @@ impl Storage {
                 },
             ])
         })
+        .map(|_| ())
     }
 
     /// Inverse of [`Storage::block`]: set status back to
@@ -1839,20 +1936,22 @@ impl Storage {
     ///   "this is workable now"; flipping to Open is the right
     ///   semantics across all three.
     pub fn unblock(&self, id: &IssueId) -> Result<()> {
-        let current = self.read_record_from_bookmark(id)?;
-        if current.status == Status::Closed {
-            return Err(Error::Invalid(format!(
-                "issue {id} is closed; nothing to unblock"
-            )));
-        }
-        if current.status == Status::Open && current.block_reason.is_none() {
-            // No-op: already in the unblocked state.
-            return Ok(());
-        }
+        let id_owned = id.clone();
+        // Precondition + idempotent-skip live in the closure so a
+        // CAS-loss retry re-checks the fresh record (`a6b8fb7`).
         self.mutate(id, &format!("jjf: issue {} - unblock", id), |rec| {
+            if rec.status == Status::Closed {
+                return MutateOutcome::Conflict(Error::Invalid(format!(
+                    "issue {id_owned} is closed; nothing to unblock"
+                )));
+            }
+            if rec.status == Status::Open && rec.block_reason.is_none() {
+                // No-op: already in the unblocked state.
+                return MutateOutcome::Skip;
+            }
             rec.status = Status::Open;
             rec.block_reason = None;
-            Ok(vec![
+            MutateOutcome::Write(vec![
                 Op::SetStatus {
                     issue_id: rec.id.clone(),
                     status: Status::Open,
@@ -1863,6 +1962,7 @@ impl Storage {
                 },
             ])
         })
+        .map(|_| ())
     }
 
     /// Add a label. No-op (per spec §5.2) if already present, but the
@@ -1879,11 +1979,12 @@ impl Storage {
                 rec.labels.push(label.clone());
                 rec.labels.sort();
             }
-            Ok(vec![Op::LabelAdd {
+            MutateOutcome::Write(vec![Op::LabelAdd {
                 issue_id: rec.id.clone(),
                 label: label.clone(),
             }])
         })
+        .map(|_| ())
     }
 
     /// Remove a label. No-op (spec §5.2) if not present.
@@ -1896,11 +1997,12 @@ impl Storage {
         let label = label.to_owned();
         self.mutate(id, &format!("jjf: issue {} - label-rm", id), |rec| {
             rec.labels.retain(|l| l != &label);
-            Ok(vec![Op::LabelRm {
+            MutateOutcome::Write(vec![Op::LabelRm {
                 issue_id: rec.id.clone(),
                 label: label.clone(),
             }])
         })
+        .map(|_| ())
     }
 
     /// Add a `blocks`-kind dependency. Convenience wrapper around
@@ -1940,11 +2042,23 @@ impl Storage {
         if id == target {
             return Err(Error::SelfDependency { id: id.clone() });
         }
-        if !self.issue_exists_on_bookmark(target)? {
-            return Err(Error::IssueNotFound(target.clone()));
-        }
         let target = target.clone();
+        // Target-existence is a domain precondition vs. OTHER records
+        // (the target's ref). Probed inside the closure so a CAS-loss
+        // retry re-checks against the post-race bookmark — if another
+        // writer deleted the target between attempts, we surface a
+        // typed IssueNotFound instead of writing a dangling dep edge
+        // (`a6b8fb7`).
         self.mutate(id, &format!("jjf: issue {} - dep-add", id), |rec| {
+            match self.issue_exists_on_bookmark(&target) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return MutateOutcome::Conflict(Error::IssueNotFound(
+                        target.clone(),
+                    ));
+                }
+                Err(e) => return MutateOutcome::Conflict(e),
+            }
             let edge = DepEdge {
                 target: target.clone(),
                 kind,
@@ -1957,12 +2071,13 @@ impl Storage {
                 rec.dependencies.push(edge);
                 rec.dependencies.sort();
             }
-            Ok(vec![Op::DepAdd {
+            MutateOutcome::Write(vec![Op::DepAdd {
                 issue_id: rec.id.clone(),
                 dep: target.clone(),
                 kind,
             }])
         })
+        .map(|_| ())
     }
 
     /// Remove a typed dependency edge. Symmetric to
@@ -1979,12 +2094,13 @@ impl Storage {
         self.mutate(id, &format!("jjf: issue {} - dep-rm", id), |rec| {
             rec.dependencies
                 .retain(|d| !(d.target == target && d.kind == kind));
-            Ok(vec![Op::DepRm {
+            MutateOutcome::Write(vec![Op::DepRm {
                 issue_id: rec.id.clone(),
                 dep: target.clone(),
                 kind,
             }])
         })
+        .map(|_| ())
     }
 
     /// Build the parent-child tree rooted at `root_id`. Walks the
@@ -2953,28 +3069,51 @@ impl Storage {
     // ---- internals ---------------------------------------------------
 
     /// Common path for mutate-the-JSON-record ops. Reads the current
-    /// record from the bookmark tip, hands it to `f` for mutation +
-    /// op-list construction, bumps `updated_at`, writes it back inside
-    /// one commit.
+    /// record from the bookmark tip, hands it to `f` to inspect-and-
+    /// optionally-mutate, and writes the result back inside one commit.
+    ///
+    /// The closure returns a [`MutateOutcome`]:
+    ///
+    /// - `Write(ops)` — the closure mutated the record; persist with
+    ///   these ops. `updated_at` is bumped just before the commit.
+    /// - `Skip` — the fresh record already satisfies the caller's
+    ///   intent (idempotent no-op); no commit lands, return `Ok(())`.
+    /// - `Conflict(err)` — the fresh record violates the caller's
+    ///   precondition; surface the typed error.
+    ///
+    /// The tri-state contract exists because the closure is the only
+    /// place with the freshly-read record in scope. On a CAS-loss
+    /// retry, `mutate` calls the closure AGAIN against the new state
+    /// — so any precondition check (e.g. "is the issue still Open?"
+    /// for claim) must live INSIDE the closure to run on every
+    /// attempt. Pre-`a6b8fb7`, preconditions were checked once before
+    /// `mutate` was entered, and the retry would re-apply the
+    /// mutation against a post-race record that no longer satisfied
+    /// the precondition — silently landing a duplicate write. The
+    /// `Mutate` enum surface is the fix; see `a6b8fb7`.
     ///
     /// We read from the bookmark (via `jj file show -r bookmarks(issues)`)
     /// rather than from the working copy because step 4 of the dance
     /// (`jj new root()`) leaves the working copy on a fresh empty
     /// change with no issue files in it. The authoritative state lives
     /// at the bookmark.
-    fn mutate<F>(&self, id: &IssueId, summary: &str, f: F) -> Result<()>
+    fn mutate<F>(&self, id: &IssueId, summary: &str, f: F) -> Result<bool>
     where
-        F: Fn(&mut IssueRecord) -> Result<Vec<Op>>,
+        F: Fn(&mut IssueRecord) -> MutateOutcome,
     {
         // Run the read + mutate + commit cycle. On a typed
         // ConcurrentWrite, re-read the record from the (now-updated)
-        // bookmark and re-apply the user's mutation against it. Slug
-        // claims are pre-validated against an open collision before
-        // the dance, so a race that lands here is genuinely
-        // recoverable — and per `qa-concurrent-write-ux`, one retry
-        // is the v1 policy.
+        // bookmark and re-evaluate the closure against it. Per
+        // `qa-concurrent-write-ux`, one retry is the v1 policy.
+        //
+        // Return value is `true` when a commit landed, `false` when
+        // the closure returned [`MutateOutcome::Skip`] — callers that
+        // need to distinguish "wrote" from "no-op'd" (notably
+        // `Storage::claim`, to surface race-lost vs. fresh-claim to
+        // the `ready --claim` CLI path) inspect this; callers that
+        // don't can ignore it.
         match self.mutate_once(id, summary, &f) {
-            Ok(()) => Ok(()),
+            Ok(landed) => Ok(landed),
             Err(e) if is_typed_concurrent_write(&e) => {
                 // Drop the memo so the retry's read sees the racer's
                 // landed commit, not the pre-race snapshot. Sleep a
@@ -2984,7 +3123,7 @@ impl Storage {
                 self.invalidate_snapshot_memo();
                 jittered_retry_sleep();
                 match self.mutate_once(id, summary, &f) {
-                    Ok(()) => Ok(()),
+                    Ok(landed) => Ok(landed),
                     Err(e2) if is_typed_concurrent_write(&e2) => {
                         Err(Error::ConcurrentWrite {
                             hint: "another writer landed first; retried once and still raced. Retry your command.".into(),
@@ -2998,17 +3137,25 @@ impl Storage {
     }
 
     /// Single attempt of [`Storage::mutate`]: read the record from the
-    /// bookmark, run the user's op-producing closure, and commit the
-    /// resulting changes. Returns a typed [`Error::ConcurrentWrite`]
-    /// if the commit dance races. Doesn't retry — the caller
-    /// (`mutate`) wraps with retry logic that re-reads state on each
-    /// attempt.
-    fn mutate_once<F>(&self, id: &IssueId, summary: &str, f: &F) -> Result<()>
+    /// bookmark, run the user's closure against it, and either commit
+    /// the resulting changes ([`MutateOutcome::Write`]) or short-
+    /// circuit ([`MutateOutcome::Skip`] / [`MutateOutcome::Conflict`]).
+    ///
+    /// Returns a typed [`Error::ConcurrentWrite`] if the commit dance
+    /// races. Doesn't retry — the caller (`mutate`) wraps with retry
+    /// logic that re-reads state on each attempt. The closure is
+    /// re-evaluated on the retry's fresh record (this is the
+    /// re-precondition contract that fixes `a6b8fb7`).
+    fn mutate_once<F>(&self, id: &IssueId, summary: &str, f: &F) -> Result<bool>
     where
-        F: Fn(&mut IssueRecord) -> Result<Vec<Op>>,
+        F: Fn(&mut IssueRecord) -> MutateOutcome,
     {
         let mut record = self.read_record_from_bookmark(id)?;
-        let ops = f(&mut record)?;
+        let ops = match f(&mut record) {
+            MutateOutcome::Write(ops) => ops,
+            MutateOutcome::Skip => return Ok(false),
+            MutateOutcome::Conflict(err) => return Err(err),
+        };
         record.updated_at = now_rfc3339()?;
         if self.mode == StorageMode::V3 {
             // V3: build the new tree from the mutated record. The
@@ -3025,13 +3172,15 @@ impl Storage {
             } else {
                 Some(existing_comments.as_slice())
             };
-            return self.commit_record_v3(id, &record, comments, summary, &ops);
+            self.commit_record_v3(id, &record, comments, summary, &ops)?;
+            return Ok(true);
         }
         let id_clone = id.clone();
         self.commit_record_change(summary, &ops, |wc_root| {
             write_record_json(&wc_root.join(issue_json_relpath(&id_clone)), &record)?;
             Ok(())
-        })
+        })?;
+        Ok(true)
     }
 
     /// Read the current record for `id` from authoritative storage.

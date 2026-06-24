@@ -41,8 +41,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use jjf_storage::{
-    ISSUES_BOOKMARK, DepEdge, DepKind, DepTreeNode, Error as StorageError, IdError, Issue,
-    IssueDraft, IssueId, IssueType, Memory, ReadyFilter, SlugInvalidReason, Status, Storage,
+    ISSUES_BOOKMARK, ClaimResult, DepEdge, DepKind, DepTreeNode, Error as StorageError, IdError,
+    Issue, IssueDraft, IssueId, IssueType, Memory, ReadyFilter, SlugInvalidReason, Status, Storage,
     TitleInvalidReason, UpdateFields,
 };
 
@@ -1165,6 +1165,16 @@ enum CliError {
     #[allow(dead_code)]
     #[error("concurrent write conflict; {hint}")]
     ConcurrentWrite { hint: String },
+
+    /// `jjf ready --claim` raced another claimer for the same id and
+    /// the storage layer's CAS-loss retry found that the id was
+    /// already claimed by the SAME user (i.e., another parallel
+    /// `ready --claim` of ours took the slot). The orchestrator
+    /// should re-run `ready --claim` to pick the next available id.
+    /// Runtime failure (exit 1) — the input was well-formed; the
+    /// race is the issue. v3-fix (`a6b8fb7`).
+    #[error("claim raced another claimer for issue {id}; re-run `ready --claim` to pick the next available id")]
+    ClaimRaceLost { id: String },
 }
 
 impl CliError {
@@ -1208,6 +1218,7 @@ impl CliError {
             CliError::ClaimRequiresLimitOne => 2,
             CliError::AlreadyClaimed { .. } => 2,
             CliError::ConcurrentWrite { .. } => 1,
+            CliError::ClaimRaceLost { .. } => 1,
             CliError::Probe(_) => 1,
             CliError::JjGitRemote(_) => 1,
             // Sync verbs: the user typed a well-formed command; the
@@ -1291,6 +1302,7 @@ impl CliError {
             CliError::ClaimRequiresLimitOne => "claim_requires_limit_one",
             CliError::AlreadyClaimed { .. } => "already_claimed",
             CliError::ConcurrentWrite { .. } => "concurrent_write",
+            CliError::ClaimRaceLost { .. } => "claim_race_lost",
         }
     }
 
@@ -1381,6 +1393,7 @@ impl CliError {
             CliError::SelfDependency { id } => json!({ "id": id }),
             CliError::Storage(StorageError::ConcurrentWrite { hint })
             | CliError::ConcurrentWrite { hint } => json!({ "hint": hint }),
+            CliError::ClaimRaceLost { id } => json!({ "id": id }),
             _ => serde_json::Value::Null,
         }
     }
@@ -3094,7 +3107,23 @@ fn run_ready(
         match target {
             Some(issue) => {
                 let who = resolve_current_user()?;
-                storage.claim(&issue.id, &who)?;
+                match storage.claim(&issue.id, &who)? {
+                    ClaimResult::Claimed => {}
+                    ClaimResult::AlreadyOurs => {
+                        // The storage layer's mutate-retry contract
+                        // surfaces this when our pre-write read showed
+                        // the issue as already-claimed-by-us on the
+                        // post-CAS-loss read. Since the ready filter
+                        // excluded InProgress before we chose this id,
+                        // someone (most likely a parallel `ready --claim`
+                        // of ours) raced us to the CAS. Surface as a
+                        // typed `claim_race_lost` so the orchestrator
+                        // can re-run. `a6b8fb7`.
+                        return Err(CliError::ClaimRaceLost {
+                            id: issue.id.to_string(),
+                        });
+                    }
+                }
                 if json {
                     let out = serde_json::json!({
                         "ok": true,

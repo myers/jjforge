@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use jjf_storage::{
-    DepEdge, DepKind, Error as StorageError, IssueDraft, IssueId, IssueType, Op, ReadyFilter,
-    SlugInvalidReason, Status, Storage, TitleInvalidReason, UpdateFields,
+    ClaimResult, DepEdge, DepKind, Error as StorageError, IssueDraft, IssueId, IssueType, Op,
+    ReadyFilter, SlugInvalidReason, Status, Storage, TitleInvalidReason, UpdateFields,
 };
 use serde::Serialize;
 
@@ -3873,4 +3873,178 @@ fn assert_trailer_block_shape(desc: &str) -> usize {
         stanzas_seen += 1;
     }
     stanzas_seen
+}
+
+// --- a6b8fb7: mutate-retry re-checks domain preconditions ---------
+
+/// `claim_returns_claim_result_claimed_when_fresh` pins the
+/// shape of the new return type: a freshly-claimable issue
+/// returns `ClaimResult::Claimed`.
+#[test]
+fn claim_returns_claim_result_claimed_when_fresh() {
+    let repo = make_scratch_repo("claim_result_claimed");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let result = storage.claim(&id, "alice").unwrap();
+    assert_eq!(result, ClaimResult::Claimed);
+}
+
+/// Same-user idempotent re-claim returns `ClaimResult::AlreadyOurs`
+/// — distinct from `Claimed` so the CLI's `ready --claim` path can
+/// detect the parallel-claim race-lost case (see `a6b8fb7`).
+#[test]
+fn claim_returns_already_ours_on_same_user_idempotent() {
+    let repo = make_scratch_repo("claim_result_already_ours");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.claim(&id, "alice").unwrap();
+    let again = storage.claim(&id, "alice").unwrap();
+    assert_eq!(
+        again,
+        ClaimResult::AlreadyOurs,
+        "second claim by same user must surface as AlreadyOurs"
+    );
+}
+
+/// `a6b8fb7`: if the issue is closed BETWEEN the verb being
+/// called and the closure running, the closure observes the
+/// fresh status and surfaces `Invalid` — not a silent re-open.
+///
+/// We can't easily provoke a real CAS-loss retry in a unit test
+/// because the closure only re-runs after a `jj`-level race —
+/// but we CAN verify the closure-as-precondition contract by
+/// mutating state AND calling claim on a record that's already
+/// closed. If the closure's status check fires correctly, the
+/// pre-existing `claim_on_closed_issue_errors_invalid` test
+/// already covers the happy path. Here we focus on the "the
+/// closure DID see the closed state" property: claim must NOT
+/// successfully write against a Closed record (no silent
+/// status flip).
+#[test]
+fn claim_on_closed_does_not_silently_reopen() {
+    let repo = make_scratch_repo("claim_on_closed_no_reopen");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.set_status(&id, Status::Closed).unwrap();
+    let history_before = storage.read_history(&id).unwrap().len();
+    let err = storage.claim(&id, "alice").unwrap_err();
+    assert!(matches!(err, StorageError::Invalid(_)));
+    // Crucial post-condition: NO new commit landed (no silent
+    // status flip from Closed to InProgress).
+    let history_after = storage.read_history(&id).unwrap().len();
+    assert_eq!(
+        history_before, history_after,
+        "claim on closed must not write any commit (no silent reopen)"
+    );
+    let issue = storage.read(&id).unwrap();
+    assert_eq!(issue.status, Status::Closed);
+    assert_eq!(issue.assignee, None);
+}
+
+/// `a6b8fb7`: unclaim on a closed record surfaces Invalid AND
+/// doesn't write anything. Mirrors `claim_on_closed_does_not_silently_reopen`
+/// for the inverse verb.
+#[test]
+fn unclaim_on_closed_does_not_silently_reopen() {
+    let repo = make_scratch_repo("unclaim_on_closed_no_reopen");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.claim(&id, "alice").unwrap();
+    storage.set_status(&id, Status::Closed).unwrap();
+    let history_before = storage.read_history(&id).unwrap().len();
+    let err = storage.unclaim(&id).unwrap_err();
+    assert!(matches!(err, StorageError::Invalid(_)));
+    let history_after = storage.read_history(&id).unwrap().len();
+    assert_eq!(
+        history_before, history_after,
+        "unclaim on closed must not write any commit"
+    );
+    let issue = storage.read(&id).unwrap();
+    assert_eq!(issue.status, Status::Closed);
+}
+
+/// `a6b8fb7`: block on a closed record surfaces Invalid AND
+/// doesn't write anything.
+#[test]
+fn block_on_closed_does_not_silently_reopen() {
+    let repo = make_scratch_repo("block_on_closed_no_reopen");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.set_status(&id, Status::Closed).unwrap();
+    let history_before = storage.read_history(&id).unwrap().len();
+    let err = storage.block(&id, Some("waiting on upstream")).unwrap_err();
+    assert!(matches!(err, StorageError::Invalid(_)));
+    let history_after = storage.read_history(&id).unwrap().len();
+    assert_eq!(
+        history_before, history_after,
+        "block on closed must not write any commit"
+    );
+    let issue = storage.read(&id).unwrap();
+    assert_eq!(issue.status, Status::Closed);
+    assert_eq!(issue.block_reason, None);
+}
+
+/// `a6b8fb7`: when alice and bob race to claim the same issue,
+/// the loser's CAS-loss retry must observe the post-race record
+/// (claimed by alice) and surface `AlreadyClaimed { by: alice }`
+/// — NOT a silent duplicate claim.
+///
+/// We can't deterministically provoke a CAS-loss retry from a
+/// single-threaded unit test, but we CAN exercise the closure
+/// directly: alice claims, then bob calls claim. The closure
+/// sees the post-alice record on its first read and surfaces
+/// AlreadyClaimed without writing. (The `claim_different_user_errors_with_already_claimed`
+/// test above pinned the same surface; this test additionally
+/// asserts NO commit lands — pinning the "no silent write" half
+/// of the contract that `a6b8fb7` introduces.)
+#[test]
+fn claim_by_different_user_does_not_silently_overwrite() {
+    let repo = make_scratch_repo("claim_diff_user_no_overwrite");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.claim(&id, "alice").unwrap();
+    let history_before_bob = storage.read_history(&id).unwrap().len();
+    let err = storage.claim(&id, "bob").unwrap_err();
+    match err {
+        StorageError::AlreadyClaimed { by } => assert_eq!(by, "alice"),
+        other => panic!("expected AlreadyClaimed{{by:alice}}, got {other:?}"),
+    }
+    // Crucial: no new commit landed despite the failure path.
+    let history_after_bob = storage.read_history(&id).unwrap().len();
+    assert_eq!(
+        history_before_bob, history_after_bob,
+        "bob's failed claim must not have landed any trailer"
+    );
+    let issue = storage.read(&id).unwrap();
+    assert_eq!(issue.assignee.as_deref(), Some("alice"));
 }
