@@ -51,11 +51,8 @@ pub(crate) mod refs {
     /// Prefix for `for_each_ref` enumeration.
     pub(crate) const ISSUES_PREFIX: &str = "refs/jjf/issues/";
 
-    /// Prefix for `for_each_ref` enumeration on memories. Unused on
-    /// the write path (per-memory writes target the named ref
-    /// directly); the v3 read-path ticket (`6e2c843`) needs it to
-    /// list memories.
-    #[allow(dead_code)]
+    /// Prefix for `for_each_ref` enumeration on memories. Used by the
+    /// v3 read path (ticket `6e2c843`) to list memory keys.
     pub(crate) const MEMORIES_PREFIX: &str = "refs/jjf/memories/";
 }
 
@@ -331,6 +328,32 @@ pub(crate) fn list_issue_ids_v3(repo: &GitRepo) -> Result<Vec<IssueId>> {
     ids.sort();
     ids.dedup();
     Ok(ids)
+}
+
+/// Enumerate every memory key present under `refs/jjf/memories/`. The
+/// returned keys are sorted ascending. Used by the v3 read path
+/// (ticket `6e2c843`) to back `Storage::list_memories`.
+pub(crate) fn list_memory_keys_v3(repo: &GitRepo) -> Result<Vec<String>> {
+    let refs = repo
+        .for_each_ref(refs::MEMORIES_PREFIX)
+        .map_err(translate)?;
+    let mut keys: Vec<String> = Vec::with_capacity(refs.len());
+    for r in refs {
+        if let Some(stem) = r.strip_prefix(refs::MEMORIES_PREFIX) {
+            // A memory key, like a slug, is restricted to `[a-z0-9-]+`
+            // (see `crate::memory::slugify`); the for-each-ref output
+            // shouldn't contain anything else, but skip anything with
+            // a `/` defensively (subdirectories under memories aren't
+            // a thing in v3, but a future schema change could add them
+            // and we don't want to crash enumeration).
+            if !stem.is_empty() && !stem.contains('/') {
+                keys.push(stem.to_owned());
+            }
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
 }
 
 /// Initialize the v3 sentinel ref. Idempotent — if the ref already

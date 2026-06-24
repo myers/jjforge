@@ -16,10 +16,12 @@
 //! This is the per-issue stream. A whole-bookmark audit log
 //! (every issue, every op) is a separate ticket.
 
+use crate::git::GitRepo;
 use crate::id::IssueId;
 use crate::jj::JjRepo;
 use crate::op::Op;
 use crate::trailer::parse_ops_with_meta;
+use crate::v3_write;
 use crate::{
     issue_comments_relpath, issue_json_relpath, v1_issue_comments_relpath,
     v1_issue_json_relpath, Error, Result,
@@ -72,6 +74,62 @@ pub struct HistoryEntry {
 /// - `Jj` if the underlying `jj log` shell-out fails.
 pub(crate) fn read_history(repo: &JjRepo, id: &IssueId) -> Result<Vec<HistoryEntry>> {
     read_history_at(repo, "bookmarks(issues)", id)
+}
+
+/// Walk the per-issue op chain on the v3 per-issue ref
+/// (`refs/jjf/issues/<id>`) and return one entry per op, oldest first.
+///
+/// V3 counterpart of `read_history_at`. The v3 storage shape stores
+/// each issue's op log as the commit chain on its own ref — there's
+/// no bookmark, no `ancestors()` revset, no v1/v2 path-filter dance.
+/// Just `git log refs/jjf/issues/<id>`, oldest-first, parse the
+/// trailer block off each commit's full message.
+///
+/// Errors:
+/// - `IssueNotFound` if the ref doesn't exist OR exists but its
+///   commit chain has no Jjf-Op trailer.
+/// - `Git` if the underlying `git log` shell-out fails.
+pub(crate) fn read_history_at_v3(
+    git: &GitRepo,
+    id: &IssueId,
+) -> Result<Vec<HistoryEntry>> {
+    let ref_name = v3_write::refs::issue_ref(id);
+    let walked = git
+        .walk_commits(&ref_name)
+        .map_err(Error::Git)?;
+
+    if walked.is_empty() {
+        return Err(Error::IssueNotFound(id.clone()));
+    }
+
+    let mut out = Vec::new();
+    for w in walked {
+        // Trailer parser filters to this issue's stanzas and drops
+        // unknown op kinds — same contract as the v2 path. The order
+        // within a multi-op commit is preserved (the parser walks the
+        // trailer block top-to-bottom); we re-emit `trailer_index`
+        // for the LWW ordering tuple's final tiebreaker.
+        for (idx, parsed) in
+            parse_ops_with_meta(&w.message, id).into_iter().enumerate()
+        {
+            out.push(HistoryEntry {
+                commit: w.commit.clone(),
+                author: w.author.clone(),
+                timestamp: w.timestamp.clone(),
+                jjf_at: parsed.jjf_at,
+                trailer_index: idx as u32,
+                op: parsed.op,
+            });
+        }
+    }
+
+    if out.is_empty() {
+        // The ref exists but no Jjf-Op trailer for this issue was
+        // found — treat as not found, mirroring v2's behavior when
+        // `parse_ops_with_meta` filters everything away.
+        return Err(Error::IssueNotFound(id.clone()));
+    }
+    Ok(out)
 }
 
 /// Walk the per-issue op chain rooted at `rev` and return one entry per

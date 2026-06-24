@@ -2255,6 +2255,12 @@ impl Storage {
     /// Read one memory by key from the `issues` bookmark tip. Returns
     /// `Ok(None)` if no memory with that key exists.
     pub fn read_memory(&self, key: &str) -> Result<Option<Memory>> {
+        // V3 mode: bypass the cache and read the per-memory ref
+        // directly (the cache key is bookmark-shaped and doesn't
+        // apply). Ticket `aa915fe` will port the cache.
+        if self.mode == StorageMode::V3 {
+            return self.read_memory_from_bookmark(key);
+        }
         // Cache fast path: HashMap lookup by key. Cache rebuild is
         // the same cost as the prior single-key `jj file show`
         // worst case, and amortizes across subsequent calls.
@@ -2262,10 +2268,24 @@ impl Storage {
         Ok(snapshot.memories.get(key).cloned())
     }
 
-    /// Enumerate every memory present at the `issues` bookmark tip,
-    /// sorted by key ascending. Reads each `memories/<key>.json` and
-    /// returns the parsed records.
+    /// Enumerate every memory present in authoritative storage,
+    /// sorted by key ascending. V2 reads each `memories/<key>.json`
+    /// off the bookmark tip; V3 enumerates `refs/jjf/memories/*` and
+    /// reads each ref's `memory.json` blob.
     pub fn list_memories(&self) -> Result<Vec<Memory>> {
+        if self.mode == StorageMode::V3 {
+            let keys = v3_write::list_memory_keys_v3(&self.git)?;
+            let mut out: Vec<Memory> = Vec::with_capacity(keys.len());
+            for k in keys {
+                // A ref with an empty tree (post-unset) returns
+                // `None`; skip — it's tombstoned, no current value.
+                if let Some(mem) = v3_write::read_memory_v3(&self.git, &k)? {
+                    out.push(mem);
+                }
+            }
+            out.sort_by(|a, b| a.key.cmp(&b.key));
+            return Ok(out);
+        }
         // Snapshot cache: every Memory on the bookmark tip is in
         // `snapshot.memories`. Skip the per-key `jj file show`
         // loop entirely. See `docs/storage-index-design.md`.
@@ -2291,6 +2311,17 @@ impl Storage {
     /// miss falls back to the per-id path, which still runs the
     /// cross-check in debug.
     pub fn read(&self, id: &IssueId) -> Result<Issue> {
+        // V3 mode bypasses the snapshot cache entirely — the cache's
+        // probe key is the v2 bookmark tip, which doesn't exist in v3
+        // (per `docs/storage-out-of-tree.md`). Ticket `aa915fe` will
+        // port the cache to a ref-set-derived key; until then, v3
+        // reads go direct via `read::read`. The cost: bulk verbs
+        // (`list_ready`, `list_memories`) become O(N) git calls on
+        // v3 repos. For the live planner's small N this is fine; on
+        // a 1k-issue migration target it's still sub-second.
+        if self.mode == StorageMode::V3 {
+            return read::read(&self.repo, &self.git, self.mode, id);
+        }
         let snapshot = self.snapshot()?;
         if let Some(issue) = snapshot.issues.get(id) {
             return Ok(issue.clone());
@@ -2299,7 +2330,7 @@ impl Storage {
         // a concurrent writer between probe and lookup, OR the id
         // genuinely isn't on the bookmark). Fall through to the
         // per-id read for a sharp `IssueNotFound` error.
-        read::read(&self.repo, id)
+        read::read(&self.repo, &self.git, self.mode, id)
     }
 
     /// Resolve a user-supplied handle to a concrete `IssueId`.
@@ -2327,6 +2358,27 @@ impl Storage {
         // get it from the subsequent `read` / mutator call.
         if let Ok(id) = IssueId::parse(handle) {
             return Ok(id);
+        }
+        // V3: no cache yet (ticket `aa915fe`). Linear scan over every
+        // issue ref, reading just the JSON record (no comments). For
+        // the live planner's N=10ish this is well under 100ms; on a
+        // 1k-issue corpus it's a hot path that the cache port will
+        // accelerate.
+        if self.mode == StorageMode::V3 {
+            let ids = v3_write::list_issue_ids_v3(&self.git)?;
+            for id in ids {
+                let record = match v3_write::read_record_v3(&self.git, &id) {
+                    Ok(r) => r,
+                    Err(Error::IssueNotFound(_)) => continue,
+                    Err(e) => return Err(e),
+                };
+                if record.slug.as_deref() == Some(handle) {
+                    return Ok(record.id);
+                }
+            }
+            return Err(Error::SlugNotFound {
+                handle: handle.to_owned(),
+            });
         }
         // Slug path: HashMap lookup on the snapshot cache's
         // pre-built `slug_index`. Before the cache, this was an
@@ -2456,6 +2508,12 @@ impl Storage {
     /// --issue-changes`, agent `ready` selection, and the PWA's home
     /// view will all sit on top of it.
     pub fn list_ids(&self) -> Result<Vec<IssueId>> {
+        // V3: enumerate `refs/jjf/issues/*`; the ref namespace IS the
+        // id set. No cache (per ticket `aa915fe`); one git call to
+        // for-each-ref, no per-id reads.
+        if self.mode == StorageMode::V3 {
+            return v3_write::list_issue_ids_v3(&self.git);
+        }
         // Snapshot cache provides every id on the bookmark tip with
         // one process spawn (head probe) on the hit path. On a miss,
         // the rebuild reads every record via one batched `jj file
@@ -2508,12 +2566,20 @@ impl Storage {
         // (status, type_, dependencies, labels) for both the
         // candidate set and the dep-status lookup.
         //
-        // Snapshot cache (per `docs/storage-index-design.md`):
+        // V2: Snapshot cache (per `docs/storage-index-design.md`):
         // probe the bookmark head, load `.jj/jjforge-cache.json` on
         // a hit, rebuild via one batched `jj file show` on a miss.
-        // Replaces the prior N-spawn `read()` loop.
-        let snapshot = self.snapshot()?;
-        let all: Vec<Issue> = snapshot.issues.values().cloned().collect();
+        //
+        // V3: enumerate `refs/jjf/issues/*` then read each via the
+        // direct git path. No cache yet — ticket `aa915fe` ports the
+        // cache to a ref-set-derived key. For the live planner this
+        // is N git calls; for ~1k-issue corpora still sub-second.
+        let all: Vec<Issue> = if self.mode == StorageMode::V3 {
+            self.list_all_issues_v3()?
+        } else {
+            let snapshot = self.snapshot()?;
+            snapshot.issues.values().cloned().collect()
+        };
 
         let blocked = compute_blocked_set(&all);
 
@@ -2710,6 +2776,12 @@ impl Storage {
     /// Errors with `IssueNotFound` if no commit on the `issues`
     /// bookmark touches this issue's files.
     pub fn read_history(&self, id: &IssueId) -> Result<Vec<HistoryEntry>> {
+        // V3: walk the per-issue ref's commit chain via git, not jj's
+        // bookmark-spanning revset. Same `HistoryEntry` shape, same
+        // trailer parser; the only difference is the commit source.
+        if self.mode == StorageMode::V3 {
+            return history::read_history_at_v3(&self.git, id);
+        }
         history::read_history(&self.repo, id)
     }
 
@@ -3231,6 +3303,31 @@ impl Storage {
         keys.sort();
         keys.dedup();
         Ok(keys)
+    }
+
+    /// V3 read-all helper: enumerate every issue ref, read each via
+    /// the direct git path, and assemble a Vec of `Issue` values
+    /// (record + comments composed, defensive sort applied — same
+    /// shape `read::read` returns).
+    ///
+    /// No cache. Called by `list_ready` (and indirectly by `read` when
+    /// we extend the cache port in ticket `aa915fe`). One git
+    /// `for-each-ref` plus N pairs of `cat-file blob` calls — bounded
+    /// by issue count, dominated by spawn overhead.
+    fn list_all_issues_v3(&self) -> Result<Vec<Issue>> {
+        let ids = v3_write::list_issue_ids_v3(&self.git)?;
+        let mut out: Vec<Issue> = Vec::with_capacity(ids.len());
+        for id in ids {
+            match read::read(&self.repo, &self.git, self.mode, &id) {
+                Ok(issue) => out.push(issue),
+                // Skip a ref whose blob is missing — corrupt or
+                // mid-write. The list shape mirrors v2's "we tolerate
+                // partial reads" stance.
+                Err(Error::IssueNotFound(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
     }
 
     /// Does this issue id already have a record in authoritative

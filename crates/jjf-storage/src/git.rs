@@ -359,6 +359,126 @@ impl GitRepo {
         refs.sort();
         Ok(refs)
     }
+
+    /// Walk the commit chain ending at `ref_name`, oldest-first. Each
+    /// returned record carries `(commit_oid, author "Name <email>",
+    /// author_timestamp as `YYYY-MM-DDTHH:MM:SSZ`, full commit message)`.
+    ///
+    /// Used by the v3 read path (ticket `6e2c843`) to reconstruct the
+    /// per-issue op log from the per-issue ref's commit chain — the v3
+    /// counterpart to history's `jj log -r ancestors(...)` template
+    /// dance, but cheaper (one process spawn instead of jj's heavier
+    /// invocation).
+    ///
+    /// Returns an empty vec if `ref_name` resolves to no commit (the ref
+    /// doesn't exist). git's `log` exits non-zero on an unknown ref; we
+    /// translate that absence to `Ok(vec![])` so the caller can fall
+    /// through to "no history" without string-matching stderr.
+    ///
+    /// The wire format uses two sentinels: one between fields within a
+    /// record, one between records. Both are deliberately unlikely to
+    /// collide with anything a commit message could contain (a Jjf-Op:
+    /// trailer is plain ASCII; the sentinels are punctuated with hex
+    /// nonces).
+    ///
+    /// The order is **chronological commit order (oldest first)** — we
+    /// pass `--reverse` to `git log` so the first record is the issue's
+    /// `create` commit and the last is the tip. The v3 op-replay folds
+    /// in this order, matching the v2 history walker's contract.
+    pub(crate) fn walk_commits(
+        &self,
+        ref_name: &str,
+    ) -> Result<Vec<WalkedCommit>, GitError> {
+        // Field separator between commit_id / author / timestamp /
+        // message inside one record. Record separator between records.
+        // Both are escape-friendly for git's `--format=` template
+        // (no `%` collisions, no shell metacharacters).
+        let field_sep = "----JJF-V3-WALK-FIELD-c0ffee----";
+        let record_sep = "----JJF-V3-WALK-REC-c0ffee----";
+        // %H: full commit hash. %an <%ae>: author "Name <email>". %aI:
+        // ISO-8601 strict author timestamp (RFC 3339). %B: raw subject
+        // + body (the commit message, including blank lines and any
+        // trailer block). We render the timestamp in the same shape
+        // the v2 history walker produces (`YYYY-MM-DDTHH:MM:SSZ`) by
+        // post-processing — `%aI` emits e.g. `2026-06-23T23:07:15-04:00`
+        // and we normalize via `chrono` if needed, but for the
+        // op-replay cross-check we only care about the trailer's
+        // `Jjf-At` (preferred) and the commit's relative ordering;
+        // the timestamp string is informational. We keep the raw
+        // `%aI` here and let the consumer normalize if it needs to.
+        let format = format!(
+            "%H%n{f}%n%an <%ae>%n{f}%n%aI%n{f}%n%B%n{r}",
+            f = field_sep,
+            r = record_sep,
+        );
+        // Resolve absence cleanly: if the ref doesn't exist, `git log`
+        // exits non-zero with "unknown revision". `resolve_ref`
+        // already has a clean detector; reuse it as a pre-check.
+        if self.resolve_ref(ref_name)?.is_none() {
+            return Ok(Vec::new());
+        }
+        let format_arg = format!("--format={}", format);
+        let raw = self.run(&[
+            "log",
+            "--reverse",
+            &format_arg,
+            ref_name,
+        ])?;
+        let mut out = Vec::new();
+        for record in raw.split(record_sep) {
+            let record = record.trim_matches('\n');
+            if record.is_empty() {
+                continue;
+            }
+            // Each record is "commit\n<sep>\nauthor\n<sep>\nts\n<sep>\nmessage".
+            let parts: Vec<&str> = record.split(field_sep).collect();
+            if parts.len() != 4 {
+                return Err(GitError::Cli {
+                    cmd: format!("git log --reverse --format=... {}", ref_name),
+                    status: None,
+                    stderr: format!(
+                        "internal: walk_commits record split into {} parts (expected 4):\n{:?}",
+                        parts.len(),
+                        record
+                    ),
+                });
+            }
+            // Trim each part: %H is followed by a literal `\n`, the
+            // sentinel is wrapped in `\n`s, so each `parts[i]` has
+            // newlines surrounding the payload.
+            let commit = parts[0].trim_matches('\n').to_owned();
+            let author = parts[1].trim_matches('\n').to_owned();
+            let timestamp = parts[2].trim_matches('\n').to_owned();
+            let message = parts[3].trim_matches('\n').to_owned();
+            out.push(WalkedCommit {
+                commit,
+                author,
+                timestamp,
+                message,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// One commit on a per-issue ref's chain. Returned by
+/// [`GitRepo::walk_commits`]. Field shapes mirror the v2
+/// `history::HistoryEntry` per-commit fields so the read-path consumer
+/// can produce the same `HistoryEntry`s in either mode.
+#[derive(Debug, Clone)]
+pub(crate) struct WalkedCommit {
+    /// Full hex commit oid.
+    pub(crate) commit: String,
+    /// Rendered as `Name <email>` (git's standard).
+    pub(crate) author: String,
+    /// Author timestamp as git's `%aI` (RFC 3339 with offset).
+    /// Consumers that want UTC seconds normalize themselves; the
+    /// op-replay cross-check uses the trailer's `Jjf-At:` for the
+    /// LWW key, falling back only when no stamp is present.
+    pub(crate) timestamp: String,
+    /// Raw `%B` — commit summary + blank line + body + trailer block.
+    /// Passed verbatim to the trailer parser.
+    pub(crate) message: String,
 }
 
 /// Typed error from the git CLI wrapper. Mirrors the shape of
