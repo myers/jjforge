@@ -245,27 +245,22 @@ copy of pre-cutover history; once gone, it's gone.
 ## Subagent discipline
 
 When dispatching a subagent to work an issue, the
-**`subagent-working-a-git-bug-issue`** skill auto-loads on
-keywords like "issue" or "git-bug". It enforces:
+**`subagent-working-a-jjforge-issue`** skill auto-loads on
+keywords like "issue", "ticket", "jjforge", or "jjf". It enforces:
 
 - The closing comment uses the four-section recipe: Findings,
   Recommendation, Confidence, Open follow-ups.
-- The agent closes the issue when work is complete, or leaves it
-  open with the Findings explaining why.
+- The agent closes the issue when work is complete, marks it
+  blocked with a reason, or leaves it open with the Findings
+  explaining why.
 - The agent does not edit the original body, does not touch other
   issues unless cross-link is warranted, and does not push.
 - The closing return-value to the orchestrator is under 200
   words.
 
-**Heads-up (2026-06-22):** the skill's *body* still talks about
-`git-bug` commands and `refs/bugs/*` semantics — it's stale
-post-cutover. The closure recipe is still correct; the verb
-shape needs updating to `jjf comment`, `jjf close`, etc. A
-follow-up to rewrite this skill is tracked under
-`epic:agent-ergonomics` (`5a755ec`) as `ergo-subagent-skill`.
-Until that lands: the skill auto-loads and gives the right
-discipline, but mentally translate `git-bug X` → `jjf X` when
-following its instructions.
+The skill knows about `JJF_ALLOW_SELF_HOST=1` and the HEAD-recovery
+dance for mutating calls from inside the source tree. Dispatch
+prompts don't need to re-explain that; the skill carries it.
 
 ## User-facing prompts
 
@@ -541,11 +536,11 @@ When dispatching a subagent on an issue, include:
   from experiment dirs.
 - An explicit "report back under 200 words" cap.
 
-The `subagent-working-a-git-bug-issue` skill auto-loads from
-keywords ("issue" most reliably) and enforces the four-section
-closing-comment recipe. Don't re-explain that in the dispatch
-prompt; let the skill carry it. (See "Subagent discipline"
-above for the stale-name note.)
+The `subagent-working-a-jjforge-issue` skill auto-loads from
+keywords ("issue" / "ticket" / "jjforge" / "jjf") and enforces
+the four-section closing-comment recipe. Don't re-explain that
+in the dispatch prompt; let the skill carry it. (See "Subagent
+discipline" above.)
 
 ## What's next
 

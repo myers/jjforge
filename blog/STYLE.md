@@ -204,11 +204,13 @@ This blog narrates building **jjforge**, a jj-native, agent-first
 issue tracker. CLI is `jjf`. Posts cover the research, design, and
 shipping work as it happens, not retroactively.
 
-Issue ids in this project are git-bug ids — short hex strings like
-`2130de1`, `dcd4b57`. They're stable across the issue's life. When
-a post in prose has to name one (rare; see "Issue ids live in the
-Links section"), the first mention gets a one-line gloss describing
-what the issue was about.
+Issue ids in this project are jjforge ids — 7-character lowercase
+hex strings like `2130de1`, `dcd4b57`. They're stable across the
+issue's life. (Pre-cutover posts used git-bug ids in the same
+shape; that's intentional — same 7-hex format, different storage
+substrate.) When a post in prose has to name one (rare; see "Issue
+ids live in the Links section"), the first mention gets a one-line
+gloss describing what the issue was about.
 
 ## Code-fence languages
 

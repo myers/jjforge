@@ -125,8 +125,7 @@ that the agent will produce a structured outcome the user can read,
 not just a dump.
 
 **Surface:** dispatch from the parent agent; the
-`subagent-working-a-git-bug-issue` skill (or its jjforge successor)
-enforces the closure recipe.
+`subagent-working-a-jjforge-issue` skill enforces the closure recipe.
 
 **Status:** agents.
 

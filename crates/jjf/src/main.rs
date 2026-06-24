@@ -272,9 +272,9 @@ enum Commands {
     /// `Issue` records (the same shape `show --json` emits per
     /// element). Empty result is exit 0 with no output.
     Ls {
-        /// Filter by status. `open` is the default (matches git-bug
-        /// and the "lists are about what's actionable" convention).
-        /// `all` shows every issue regardless of status.
+        /// Filter by status. `open` is the default (the "lists are
+        /// about what's actionable" convention). `all` shows every
+        /// issue regardless of status.
         #[arg(long, value_enum, default_value_t = StatusFilter::Open)]
         status: StatusFilter,
 
