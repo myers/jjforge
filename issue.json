@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "id": "43c7615",
+  "title": "'jjf dep add' accepts cycles silently; cycled issues vanish from 'jjf ready'",
+  "slug": "dep-cycle-undetected",
+  "body": "# Symptom\n\n`jjf dep add` accepts edges that close dependency cycles. The\nissues caught in the cycle become permanently invisible to\n`jjf ready` (all are \"blocked\") with no diagnostic ever firing.\n\n# Repro\n\n```\n$ A=$(jjf new --json -t A -F /dev/null | jq -r .id)\n$ B=$(jjf new --json -t B -d $A -F /dev/null | jq -r .id)\n$ C=$(jjf new --json -t C -d $B -F /dev/null | jq -r .id)\n$ jjf dep add $A $C       # closes the cycle: A -> C -> B -> A\ndep added: blocks A -> C\n$ echo $?\n0\n$ jjf ready               # A, B, C all hidden — no warning\n(no output)\n```\n\nSelf-deps ARE blocked at write time (good). Multi-step cycles\naren't.\n\n# Risk profile\n\nWith 10 projects × multiple agents × dep edges set both via\n`jjf new -d` and `jjf dep add`, accidental cycles will happen.\nThe failure mode is silent (issues disappear from `ready`),\nwhich is the worst kind for an automation system.\n\n# Fix candidates\n\n1. `jjf dep add` refuses to add an edge that would create a\n   cycle (preflight DFS from the target back to the source).\n2. `jjf ready` detects unreachable open issues caused by\n   cycles and logs a warning (with the involved ids) on stderr.\n\nBoth are useful; (1) prevents, (2) recovers.\n\n# Confidence\n\nReproducible 100%. Tested in `scratchpad/qa/r06-deps/`.\n",
+  "status": "open",
+  "block_reason": null,
+  "type": "bug",
+  "labels": [
+    "epic:multi-project-readiness"
+  ],
+  "dependencies": [
+    {
+      "target": "52ee82d",
+      "kind": "blocks"
+    }
+  ],
+  "assignee": null,
+  "created_at": "2026-06-24T17:33:17Z",
+  "updated_at": "2026-06-24T17:33:17Z"
+}
