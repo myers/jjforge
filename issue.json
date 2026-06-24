@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "id": "cc2fa96",
+  "title": "host-asterinas-migrate: Haiku fan-out import of the markdown tree",
+  "slug": "host-asterinas-migrate",
+  "body": "# Goal\n\nMigrate the asterinas-workspace markdown tree (~968\nissues, ~122 directories) into jjforge using a fan-out\nof Haiku agents.\n\nEnd state: every issue in\n`~/p/asterinas-workspace/issues/` is on a jjforge\n`issues` bookmark in a clone of the asterinas-workspace\nrepo; `jjf ready` against it returns sensible answers;\nthe markdown tree stays in place as a read-only archive.\n\n# Why now\n\nBlocked on `host-asterinas-audit` (`1588625`) and on\nwhatever feature tickets that audit identifies. Filed\nsketched so the shape is in view; concrete scope locks\nin once the audit doc lands and the feature tickets are\neither shipped or explicitly skipped.\n\n# Approach\n\nHaiku fan-out. Many small parallel agents over disjoint\nslices.\n\nEach agent gets:\n- A slice of the markdown tree (e.g. one phase's epic,\n  or one cross-cutting subdir).\n- The audit doc (`docs/host-asterinas-audit.md`) as its\n  mapping reference.\n- Instructions to read each file, apply the mapping\n  rules, and emit `jjf new` calls.\n\nSlices are disjoint by slug-prefix so two agents don't\nrace on the bookmark. Each Haiku agent claims a slice\nvia `jjf claim <id> --reason \"haiku-slice-X\"` or\nsimilar atomic primitive (TBD by audit).\n\n# Scope\n\n## Slicing strategy\n\nSketched, refined by audit:\n- One agent per `phase-N-<theme>/epic-NN-<name>/`\n  subdir. ~30 epics in the asterinas tree → ~30\n  parallel slices.\n- Cross-cutting issues get their own agent.\n\n## Per-agent contract\n\nEach Haiku gets a prompt that says:\n\n- Read every `.md` file under <slice-path>.\n- For each file, apply the mapping rules in\n  `docs/host-asterinas-audit.md`:\n  - Title from the first H1.\n  - Slug from the filename (already kebab-case).\n  - Type per the audit's status-tag rule.\n  - Labels per the audit's tag rules.\n  - Status open/closed/blocked/in-progress per the\n    audit's `**Status:**` parser.\n  - Block reason if applicable (jjf block).\n  - Parent-child edge to the phase/epic parent (the\n    enclosing directory's README maps to an epic).\n- Emit `jjf new` per file. Capture the returned id.\n- After the slice is done, write a one-paragraph\n  closing comment per slice with: files processed,\n  files skipped (and why), follow-up tickets filed\n  for ambiguous cases.\n\n## Orchestrator (us)\n\n- File a parent ticket per slice via `jjf new`.\n- Dispatch the Haiku per slice, isolated worktree.\n- Aggregate the per-slice reports.\n- Spot-check N random imports against their source\n  markdown.\n\n## Cutover\n\n- The asterinas markdown tree stays in place as a\n  read-only archive for 30 days post-migration.\n- A note appended to `~/p/asterinas-workspace/issues/README.md`\n  pointing operators at `jjf ready`.\n- The asterinas-side CLAUDE.md gets an update too.\n\n# Acceptance\n\n- [ ] Every asterinas issue in the tree has a\n  corresponding jjforge ticket (modulo explicit skips\n  documented in the audit).\n- [ ] `jjf ready` in the asterinas clone returns\n  sensible answers.\n- [ ] The phase → epic → ticket hierarchy is expressed\n  via parent-child dep edges.\n- [ ] Cross-cutting label-encoding lossless or\n  documented losses.\n- [ ] A migration report doc at\n  `docs/host-asterinas-migration-report.md` lists\n  files-processed / skipped / follow-ups per slice.\n\n# Out of scope\n\n- Custom Python or Rust import tooling. We're using\n  Haiku agents as the import tooling.\n- Editing the source asterinas tree.\n- The orchestration thesis (`585b84b`) — that's the\n  next epic, kicks in after this one closes.\n\n# Blocked by\n\n- `1588625 host-asterinas-audit` and whatever\n  implementation tickets it identifies.\n",
+  "status": "open",
+  "block_reason": null,
+  "type": "feature",
+  "labels": [
+    "epic:host-asterinas"
+  ],
+  "dependencies": [
+    {
+      "target": "1588625",
+      "kind": "blocks"
+    }
+  ],
+  "assignee": null,
+  "created_at": "2026-06-23T13:48:24Z",
+  "updated_at": "2026-06-23T13:48:24Z"
+}
