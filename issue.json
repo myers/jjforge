@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "id": "5d524bf",
+  "title": "test snapshot-cache",
+  "slug": "snapshot-test",
+  "body": "",
+  "status": "open",
+  "type": "bug",
+  "labels": [],
+  "dependencies": [],
+  "assignee": null,
+  "created_at": "2026-06-23T05:24:09Z",
+  "updated_at": "2026-06-23T05:24:09Z"
+}
