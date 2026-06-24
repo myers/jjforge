@@ -2,8 +2,10 @@
   "version": 1,
   "id": "54caedd",
   "title": "Epic: mvp-sync — distributed edit + merge driver",
+  "slug": "mvp-sync",
   "body": "Goal: two clones can both edit bugs while offline, `jjf push` /\n`jjf pull` round-trip the `bugs` bookmark via standard git\ntransport, and `jjf sync` resolves any conflicts automatically\nwithout human intervention.\n\n# Approach\n\nThe big surprise from research (`8d3e045`, archived): jj's automatic\ncontent merge isn't enough for bug data. The moment two clones touch\nnearby lines in the same bug file (title vs status, status vs a new\ncomment), jj's content merge produces conflicts. The natural\nsingle-line-per-key JSON layout puts fields one line apart, well\ninside the merger's \"too close\" threshold.\n\nThe original fix was a **file-bytes merge driver** that parsed jj's\nconflict markers and ran a per-field policy. Later (in\n`sync-conflict-fallback`) this was superseded by an **op-space\nresolver** in `crates/jjf-storage/src/merge_ops.rs` — the file is a\ndeterministic projection of the op chain, divergence resolves in\nop-space, conflicts cannot surface.\n\nPer-field policy (final, see `docs/storage-format.md` §6):\n\n- **Scalars** (status, title, assignee, body): last-write-wins by\n  `Jjf-At:` trailer timestamp.\n- **Sets** (labels, dependencies): causal — each add/remove\n  tracked per key; final state is `present` iff the last write for\n  that key was an add.\n- **Comments**: union by `comment_id`; comments are append-only.\n\n`jjf push` / `pull` are wrappers over `jj git push --bookmark bugs` /\n`jj git fetch`, plus the op-space resolver hook on fetch divergence.\n\n# Child tickets (all shipped during git-bug-era)\n\n- `e2e473b` — file-bytes merge driver (legacy, library stays in workspace).\n- `07780aa` — `sync-remote-setup`: `jjf remote add|ls|rm` wraps `jj git remote`.\n- `ed7f46b` — `sync-push-pull`: push/pull verbs end-to-end.\n- `bfc732b` — `sync-conflict-fallback`: op-space resolver replaces file-bytes path.\n\n# Depends on\n\n- `mvp-storage` (defines the on-disk file format the merge driver works against).\n\n# Blocks\n\n- `multi-client` (the daemon model assumes cross-machine sync works).\n\n# Status\n\n**Feature-complete** as of 2026-06-22. The full push/pull/merge loop works\nend-to-end with op-space resolution (the file-as-projection model). Epic re-filed\nin jjforge 2026-06-22 during the git-bug cutover (decision in archived `d12031c`).\nFull status-comment history with subagent findings lives in archived git-bug —\nuse `git-bug bug show 436ac0a` against `refs/bugs/*`.\n\nSubagent flagged three non-blocking follow-ups (storage-side unit tests for\n`resolve_divergence`, the now-redundant filter-on-both-files workaround at\n`history.rs:62-69`, and the `OpView::touched_by_merge` flag in `read.rs` that\ncould be re-enabled with op-space) — see the archived ticket for context. Surface\nto a future storage-tuning ticket if they don't dissolve on their own.\n",
   "status": "open",
+  "type": "epic",
   "labels": [
     "epic",
     "epic:mvp-sync"
@@ -11,5 +13,5 @@
   "dependencies": [],
   "assignee": null,
   "created_at": "2026-06-22T14:48:18Z",
-  "updated_at": "2026-06-22T14:48:18Z"
+  "updated_at": "2026-06-22T19:05:17Z"
 }
