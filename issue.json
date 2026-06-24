@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "id": "a5f8122",
+  "title": "Epic: mvp-cli — the jjf Rust binary",
+  "body": "Goal: a single static binary at `target/release/jjf` that does what\n`git-bug` does plus what we know we need on top. Covers create / read /\nlist / update / comment / close on bugs, with `--json` on every command\nand no interactive prompts ever.\n\n# Approach\n\nThe CLI surface, in rough order of expected use:\n\n- `jjf new -t \"<title>\" -F -` — create a bug from stdin body.\n- `jjf show <id>` — print a single bug, plain text or `--json`.\n- `jjf ls [--status open] [--label X]` — list, filter.\n- `jjf update <id> --status closed --title \"...\"` — mutate scalar fields.\n- `jjf comment <id> -F -` — append a comment from stdin.\n- `jjf close <id>` / `jjf open <id>` — convenience for status.\n- `jjf label add <id> <label>` / `jjf label rm <id> <label>`.\n\nAll commands take `--json` and emit one structured object (or array).\nNo `--interactive`, no prompts, no editor invocations. Mutations resolve\nthrough the storage layer (`mvp-storage` epic) and end up as `Jjf-Op:`\ntrailers in jj commit descriptions.\n\nCLI parsing: `clap` derive, one verb per subcommand. Errors via\n`thiserror`; exit codes follow common conventions (2 for arg errors,\n1 for runtime failure). JSON contract pinned in `docs/cli-json.md`.\n\n# Child tickets\n\n- `cli-skeleton` — Cargo workspace, `clap` scaffolding (shipped).\n- `cli-new` / `cli-show` / `cli-ls` / `cli-status` / `cli-comment` /\n  `cli-label` / `cli-update` — all shipped.\n- `cli-json-output` — `--json` audit and `docs/cli-json.md` (shipped).\n- `cli-replace-shim` — drop `bin/jjf` the shell script. **Still open.**\n  Unblocked as of the git-bug cutover (`176f3c6` in archived refs).\n\n# Depends on\n\n- `mvp-storage` (write/read of bugs as `Jjf-Op:`-trailered commits).\n\n# Blocks\n\n- `agent-ergonomics` (which adds `ready`, `remember`, `claim` on top).\n- `multi-client` (which exposes the same operations over an HTTP/WS API).\n\n# Status\n\nVerb set complete and JSON contract pinned. Only `cli-replace-shim` remains:\nflip `bin/jjf` from a `git-bug` shell shim into a thin wrapper that exec's\nthe Rust `jjf` binary (or drops the shim entirely). Epic re-filed in jjforge\n2026-06-22 during the git-bug cutover; full status-comment history including\nthe migration design call (option B = start fresh) lives in archived git-bug —\nuse `git-bug bug show c4f7fcb` against `refs/bugs/*`, and `git-bug bug show\nd12031c` for the cutover decision.\n",
+  "status": "open",
+  "labels": [
+    "epic",
+    "epic:mvp-cli"
+  ],
+  "dependencies": [],
+  "assignee": null,
+  "created_at": "2026-06-22T14:48:48Z",
+  "updated_at": "2026-06-22T14:48:48Z"
+}
