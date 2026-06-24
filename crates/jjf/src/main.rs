@@ -1146,6 +1146,25 @@ enum CliError {
     #[allow(dead_code)]
     #[error("issue already claimed by {by:?}")]
     AlreadyClaimed { by: String },
+
+    /// A concurrent jjforge writer landed first; the storage layer's
+    /// 4-CLI dance hit jj's "Concurrent checkout" conflict. Runtime
+    /// failure (exit 1): the command was well-formed, the loser just
+    /// has to re-run. Storage already auto-retried once for non-
+    /// slug-claim mutations before surfacing this — if you see it,
+    /// the race repeated, or the variant was a fail-fast slug-claim
+    /// create (where retry wouldn't help). The `hint` field is the
+    /// operator-facing message rendered verbatim by the text
+    /// renderer; the JSON envelope surfaces it as `details.hint`.
+    /// v2.x (`qa-concurrent-write-ux`, issue `277f559`).
+    ///
+    /// In practice the storage layer's
+    /// [`StorageError::ConcurrentWrite`] surfaces this case — the
+    /// CLI-side variant stays defined so future callers can
+    /// construct it directly without going through `Storage`.
+    #[allow(dead_code)]
+    #[error("concurrent write conflict; {hint}")]
+    ConcurrentWrite { hint: String },
 }
 
 impl CliError {
@@ -1163,6 +1182,7 @@ impl CliError {
             CliError::Storage(StorageError::SlugNotFound { .. }) => 2,
             CliError::Storage(StorageError::AlreadyClaimed { .. }) => 2,
             CliError::Storage(StorageError::SelfDependency { .. }) => 2,
+            CliError::Storage(StorageError::ConcurrentWrite { .. }) => 1,
             CliError::Cwd(_) => 2,
             CliError::BodyRead { .. } => 2,
             CliError::BadDepId { .. } => 2,
@@ -1187,6 +1207,7 @@ impl CliError {
             CliError::NoCurrentUser => 2,
             CliError::ClaimRequiresLimitOne => 2,
             CliError::AlreadyClaimed { .. } => 2,
+            CliError::ConcurrentWrite { .. } => 1,
             CliError::Probe(_) => 1,
             CliError::JjGitRemote(_) => 1,
             // Sync verbs: the user typed a well-formed command; the
@@ -1229,6 +1250,7 @@ impl CliError {
             CliError::Storage(StorageError::SlugNotFound { .. }) => "slug_not_found",
             CliError::Storage(StorageError::AlreadyClaimed { .. }) => "already_claimed",
             CliError::Storage(StorageError::SelfDependency { .. }) => "self_dependency",
+            CliError::Storage(StorageError::ConcurrentWrite { .. }) => "concurrent_write",
             CliError::InvalidSlug { .. } => "invalid_slug",
             CliError::InvalidTitle { .. } => "invalid_title",
             CliError::SelfDependency { .. } => "self_dependency",
@@ -1264,6 +1286,7 @@ impl CliError {
             CliError::NoCurrentUser => "no_current_user",
             CliError::ClaimRequiresLimitOne => "claim_requires_limit_one",
             CliError::AlreadyClaimed { .. } => "already_claimed",
+            CliError::ConcurrentWrite { .. } => "concurrent_write",
         }
     }
 
@@ -1352,6 +1375,8 @@ impl CliError {
                 json!({ "id": id.as_str() })
             }
             CliError::SelfDependency { id } => json!({ "id": id }),
+            CliError::Storage(StorageError::ConcurrentWrite { hint })
+            | CliError::ConcurrentWrite { hint } => json!({ "hint": hint }),
             _ => serde_json::Value::Null,
         }
     }

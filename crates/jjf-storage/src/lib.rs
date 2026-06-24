@@ -216,6 +216,82 @@ pub enum Error {
     /// (`qa-dep-validation`, issue `d1a01f0`).
     #[error("issue {id} cannot depend on itself")]
     SelfDependency { id: IssueId },
+
+    /// A concurrent jjforge writer landed first and the 4-CLI dance's
+    /// `jj new bookmarks(issues)` snapshot is now stale, surfacing
+    /// from jj as an "Internal error: Failed to check out commit …
+    /// Caused by: Concurrent checkout" cascade. Translated at the
+    /// storage layer to a clean typed error rather than the raw
+    /// jj-internal 12-line vomit.
+    ///
+    /// Non-slug-claim mutations (comments, updates, status changes)
+    /// auto-retry once with a fresh head-commit before this surfaces;
+    /// if the retry also races, the loser sees this error. Slug-claim
+    /// creates do NOT retry — retrying would re-race the same slot
+    /// indefinitely — and the post-failure probe upgrades the more
+    /// specific race-with-known-winner case to
+    /// [`Error::SlugCollision`].
+    ///
+    /// The `hint` field is a one-line operator-facing message; the
+    /// CLI's `concurrent_write` envelope renders it verbatim.
+    /// v2.x (`qa-concurrent-write-ux`, issue `277f559`).
+    #[error("concurrent write conflict; {hint}")]
+    ConcurrentWrite { hint: String },
+}
+
+/// Predicate on a [`crate::Error`]: does the underlying cause look
+/// like a concurrent-write conflict (jj's "Concurrent checkout"
+/// fingerprint), as opposed to its translated
+/// [`Error::ConcurrentWrite`] form?
+///
+/// Used by the commit-dance translation in
+/// [`Storage::commit_record_change`] / [`Storage::commit_memory_change`]
+/// to decide whether to map the underlying [`Error::Jj`] to a typed
+/// [`Error::ConcurrentWrite`] for downstream callers.
+///
+/// Also used by the caller-side retry helpers
+/// ([`Storage::mutate`], [`Storage::add_comment`],
+/// [`Storage::create_issue`]) which match on
+/// [`Error::ConcurrentWrite`] directly after translation.
+fn is_concurrent_write(e: &Error) -> bool {
+    match e {
+        Error::Jj(je) => je.is_concurrent_write(),
+        _ => false,
+    }
+}
+
+/// Predicate on a [`crate::Error`]: is it the typed
+/// [`Error::ConcurrentWrite`] surfaced by the translation layer? This
+/// is what the higher-level retry helpers match on (they never see the
+/// raw [`Error::Jj`] form — the translation in `commit_record_change`
+/// has already happened).
+fn is_typed_concurrent_write(e: &Error) -> bool {
+    matches!(e, Error::ConcurrentWrite { .. })
+}
+
+/// Sleep for a small jittered interval before retrying a concurrent-
+/// write conflict. The retry path is "the winner is mid-dance; let it
+/// finish so our re-attempt sees the post-race head and lands cleanly."
+/// A flat sleep would cause two simultaneous racers to keep colliding
+/// on every retry; the jitter (per-thread PID + nanosecond clock) gives
+/// each racer a slightly different schedule so one of them lands ahead
+/// of the other on the second attempt.
+///
+/// Magnitude (15-50ms) is dominated by jj's own ~100ms-per-call
+/// overhead — small enough not to bloat the steady-state path, large
+/// enough that the winner has plenty of time to complete its
+/// remaining `jj bookmark set` / `jj new root()` calls.
+fn jittered_retry_sleep() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Cheap jitter: low bits of the wall-clock nanos XOR'd with the
+    // PID (so siblings in the same process tree get different seeds).
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let jitter_ms = (nanos ^ pid) % 36; // 0..=35
+    std::thread::sleep(std::time::Duration::from_millis(15 + u64::from(jitter_ms)));
 }
 
 /// Filter bundle for [`Storage::list_ready`].
@@ -1162,15 +1238,41 @@ impl Storage {
                 assignee: Some(assignee.clone()),
             });
         }
-        self.commit_record_change(&summary, &ops, |wc_root| {
+        let claimed_slug = record.slug.clone();
+        let commit_result = self.commit_record_change(&summary, &ops, |wc_root| {
             write_record_json(&wc_root.join(issue_json_relpath(&id)), &record)?;
             // Comments file: create empty so readers don't trip on
             // ENOENT for new issues. Spec §4 allows empty == no comments.
             write_comments_jsonl(&wc_root.join(issue_comments_relpath(&id)), &[])?;
             Ok(())
-        })?;
+        });
 
-        Ok(id)
+        match commit_result {
+            Ok(()) => Ok(id),
+            Err(e) if is_typed_concurrent_write(&e) => {
+                // Slug-claim races MUST fail fast — a retry would
+                // re-race the same slug indefinitely. Probe the
+                // post-race bookmark: if the slug is now taken by
+                // another open issue, the more-specific
+                // [`Error::SlugCollision`] is the better surface for
+                // the operator. Otherwise (no slug, or slug genuinely
+                // free), the typed ConcurrentWrite is the right
+                // signal to retry the command.
+                self.invalidate_snapshot_memo();
+                if let Some(slug) = claimed_slug.as_deref() {
+                    if let Ok(Some(holder)) =
+                        self.find_open_slug_collision(slug, None)
+                    {
+                        return Err(Error::SlugCollision {
+                            slug: slug.to_owned(),
+                            conflicts_with: holder,
+                        });
+                    }
+                }
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Replace the title.
@@ -1833,10 +1935,56 @@ impl Storage {
     /// the issue record's `updated_at`. Returns the freshly-generated
     /// comment id so callers (notably `jjf comment`) can surface it in
     /// machine-readable output.
+    ///
+    /// On a concurrent-write race (another writer landed first), this
+    /// auto-retries ONCE with a fresh re-read of the comments file —
+    /// crucial to preserve the racer's comment: if we naïvely retried
+    /// with the stale `existing_comments` snapshot, we'd clobber it.
+    /// The retry path re-reads the comments file, re-appends OUR new
+    /// comment, and re-commits — both comments land.
     pub fn add_comment(&self, id: &IssueId, body: &str, author: &str) -> Result<IssueId> {
         if author.trim().is_empty() {
             return Err(Error::Invalid("comment author must not be empty".into()));
         }
+        let comment_id = IssueId::random();
+        match self.add_comment_once(id, body, author, &comment_id) {
+            Ok(()) => Ok(comment_id),
+            Err(e) if is_typed_concurrent_write(&e) => {
+                // Invalidate the memo so the retry's re-read picks up
+                // the winner's comment (and updated record). Sleep a
+                // jittered short interval so two simultaneous retries
+                // don't immediately re-collide on the working-copy
+                // checkout lock.
+                self.invalidate_snapshot_memo();
+                jittered_retry_sleep();
+                match self.add_comment_once(id, body, author, &comment_id) {
+                    Ok(()) => Ok(comment_id),
+                    Err(e2) if is_typed_concurrent_write(&e2) => {
+                        Err(Error::ConcurrentWrite {
+                            hint: "another writer landed first; retried once and still raced. Retry your command.".into(),
+                        })
+                    }
+                    Err(e2) => Err(e2),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Single attempt of [`Storage::add_comment`]: read the record and
+    /// existing comments from the bookmark, append a fresh comment,
+    /// and commit. Returns a typed [`Error::ConcurrentWrite`] if the
+    /// commit dance races. The retry wrapper in `add_comment` re-runs
+    /// this against the post-race bookmark state — crucial: both
+    /// readers see the WINNER's comments now, so re-appending OUR
+    /// comment preserves the racer's comment alongside ours.
+    fn add_comment_once(
+        &self,
+        id: &IssueId,
+        body: &str,
+        author: &str,
+        comment_id: &IssueId,
+    ) -> Result<()> {
         let id = id.clone();
         let body = body.to_owned();
         let author = author.to_owned();
@@ -1846,7 +1994,6 @@ impl Storage {
         let mut record = self.read_record_from_bookmark(&id)?;
         let existing_comments = self.read_comments_from_bookmark(&id)?;
         record.updated_at = now_rfc3339()?;
-        let comment_id = IssueId::random();
         let comment = Comment {
             id: comment_id.clone(),
             author,
@@ -1871,7 +2018,7 @@ impl Storage {
                 Ok(())
             },
         )?;
-        Ok(comment_id)
+        Ok(())
     }
 
     /// Write a persistent memory keyed by `key`. Upsert semantics: if a
@@ -2521,14 +2668,55 @@ impl Storage {
     /// at the bookmark.
     fn mutate<F>(&self, id: &IssueId, summary: &str, f: F) -> Result<()>
     where
-        F: FnOnce(&mut IssueRecord) -> Result<Vec<Op>>,
+        F: Fn(&mut IssueRecord) -> Result<Vec<Op>>,
+    {
+        // Run the read + mutate + commit cycle. On a typed
+        // ConcurrentWrite, re-read the record from the (now-updated)
+        // bookmark and re-apply the user's mutation against it. Slug
+        // claims are pre-validated against an open collision before
+        // the dance, so a race that lands here is genuinely
+        // recoverable — and per `qa-concurrent-write-ux`, one retry
+        // is the v1 policy.
+        match self.mutate_once(id, summary, &f) {
+            Ok(()) => Ok(()),
+            Err(e) if is_typed_concurrent_write(&e) => {
+                // Drop the memo so the retry's read sees the racer's
+                // landed commit, not the pre-race snapshot. Sleep a
+                // jittered short interval so two simultaneous retries
+                // don't immediately re-collide on the working-copy
+                // checkout lock.
+                self.invalidate_snapshot_memo();
+                jittered_retry_sleep();
+                match self.mutate_once(id, summary, &f) {
+                    Ok(()) => Ok(()),
+                    Err(e2) if is_typed_concurrent_write(&e2) => {
+                        Err(Error::ConcurrentWrite {
+                            hint: "another writer landed first; retried once and still raced. Retry your command.".into(),
+                        })
+                    }
+                    Err(e2) => Err(e2),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Single attempt of [`Storage::mutate`]: read the record from the
+    /// bookmark, run the user's op-producing closure, and commit the
+    /// resulting changes. Returns a typed [`Error::ConcurrentWrite`]
+    /// if the commit dance races. Doesn't retry — the caller
+    /// (`mutate`) wraps with retry logic that re-reads state on each
+    /// attempt.
+    fn mutate_once<F>(&self, id: &IssueId, summary: &str, f: &F) -> Result<()>
+    where
+        F: Fn(&mut IssueRecord) -> Result<Vec<Op>>,
     {
         let mut record = self.read_record_from_bookmark(id)?;
         let ops = f(&mut record)?;
         record.updated_at = now_rfc3339()?;
-        let id = id.clone();
+        let id_clone = id.clone();
         self.commit_record_change(summary, &ops, |wc_root| {
-            write_record_json(&wc_root.join(issue_json_relpath(&id)), &record)?;
+            write_record_json(&wc_root.join(issue_json_relpath(&id_clone)), &record)?;
             Ok(())
         })
     }
@@ -2586,10 +2774,24 @@ impl Storage {
         Ok(out)
     }
 
-    /// Run the 4-CLI dance. `summary` is the human-readable first line
-    /// of the commit message; `ops` becomes the `Jjf-Op:` trailer
+    /// Run the 4-CLI dance once. `summary` is the human-readable first
+    /// line of the commit message; `ops` becomes the `Jjf-Op:` trailer
     /// stanza; `apply` is the closure that mutates files inside the
     /// working copy (relative to `wc_root`, which is the repo root).
+    ///
+    /// On any jj failure whose stderr matches the concurrent-write
+    /// fingerprint, this surfaces [`Error::ConcurrentWrite`] with a
+    /// hint string. The caller is responsible for the retry decision
+    /// — most mutations re-read state on retry (so a stale snapshot
+    /// doesn't clobber a concurrent writer's landed work), which has
+    /// to happen in the higher-level mutator (`mutate`, `add_comment`,
+    /// `create_issue`), not here.
+    ///
+    /// On non-conflict failures the underlying [`Error`] surfaces
+    /// unchanged.
+    ///
+    /// In either failure case the snapshot memo is invalidated so a
+    /// subsequent retry / probe sees fresh state.
     fn commit_record_change<F>(
         &self,
         summary: &str,
@@ -2607,38 +2809,31 @@ impl Storage {
         let jjf_at = now_rfc3339_nanos()?;
         let msg = build_commit_message(summary, ops, &jjf_at);
 
-        // 1. jj new bookmarks(issues) -m '<msg>'
-        self.repo.run(&["new", ISSUES_BOOKMARK_REVSET, "-m", &msg])?;
-
-        // 2. Edit the working copy. jj snapshots on the next command.
-        apply(self.repo.root())?;
-
-        // 3. jj bookmark set issues -r @ --allow-backwards
-        self.repo.run(&[
-            "bookmark",
-            "set",
-            ISSUES_BOOKMARK,
-            "-r",
-            "@",
-            "--allow-backwards",
-        ])?;
-
-        // 4. jj new root() — step @ off the bookmark.
-        self.repo.run(&["new", "root()"])?;
-
-        // Drop the in-process snapshot memo. The on-disk cache file
-        // stays put; the next read probes the head, sees the new
-        // commit, and rebuilds.
-        self.invalidate_snapshot_memo();
-
-        Ok(())
+        match self.try_commit_dance(&msg, apply) {
+            Ok(()) => {
+                self.invalidate_snapshot_memo();
+                Ok(())
+            }
+            Err(e) if is_concurrent_write(&e) => {
+                self.invalidate_snapshot_memo();
+                Err(Error::ConcurrentWrite {
+                    hint: "another writer landed first. Retry your command.".into(),
+                })
+            }
+            Err(e) => {
+                self.invalidate_snapshot_memo();
+                Err(e)
+            }
+        }
     }
 
-    /// Run the 4-CLI dance for a memory mutation. Memory commits carry
-    /// a single `Jjf-Op: set-memory` or `unset-memory` trailer (no
-    /// `Jjf-Issue:`), so we build the message directly rather than via
-    /// [`build_commit_message`] (which assumes per-issue ops).
-    fn commit_memory_change<F>(&self, msg: &str, apply: F) -> Result<()>
+    /// Inner helper for `commit_record_change`: runs the 4-CLI dance
+    /// once with an `apply` closure that takes a `&Path`. Returns the
+    /// raw `Result<(), Error>` so the caller can decide on retry vs.
+    /// translation. Doesn't invalidate the snapshot memo — the caller
+    /// is responsible (so failure paths can re-probe consistent
+    /// state).
+    fn try_commit_dance<F>(&self, msg: &str, apply: F) -> Result<()>
     where
         F: FnOnce(&Path) -> Result<()>,
     {
@@ -2661,11 +2856,42 @@ impl Storage {
         // 4. jj new root() — step @ off the bookmark.
         self.repo.run(&["new", "root()"])?;
 
-        // Drop the in-process snapshot memo so the next read picks
-        // up the new memory record.
-        self.invalidate_snapshot_memo();
-
         Ok(())
+    }
+
+    /// Run the 4-CLI dance for a memory mutation. Memory commits carry
+    /// a single `Jjf-Op: set-memory` or `unset-memory` trailer (no
+    /// `Jjf-Issue:`), so we build the message directly rather than via
+    /// [`build_commit_message`] (which assumes per-issue ops).
+    ///
+    /// Concurrent-write failures are translated to typed
+    /// [`Error::ConcurrentWrite`] for clean operator UX (rather than
+    /// the raw jj-internal vomit). Memory mutations are scalar LWW
+    /// writes per spec — the resolver will pick whichever stamp lands
+    /// later — so no in-storage retry is necessary; an operator that
+    /// races their own `jjf remember` can retry the command. Out of
+    /// scope for the v1 auto-retry policy per
+    /// `qa-concurrent-write-ux`.
+    fn commit_memory_change<F>(&self, msg: &str, apply: F) -> Result<()>
+    where
+        F: FnOnce(&Path) -> Result<()>,
+    {
+        match self.try_commit_dance(msg, apply) {
+            Ok(()) => {
+                self.invalidate_snapshot_memo();
+                Ok(())
+            }
+            Err(e) if is_concurrent_write(&e) => {
+                self.invalidate_snapshot_memo();
+                Err(Error::ConcurrentWrite {
+                    hint: "another writer landed first. Retry your command.".into(),
+                })
+            }
+            Err(e) => {
+                self.invalidate_snapshot_memo();
+                Err(e)
+            }
+        }
     }
 
     /// Read a single `memories/<key>.json` from the bookmark tip.

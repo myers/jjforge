@@ -467,6 +467,7 @@ from plain-text mode (see the top comment in `main.rs`: `0` success,
 | `no_current_user`            | 2    | `NoCurrentUser`               | —                        |
 | `claim_requires_limit_one`   | 2    | `ClaimRequiresLimitOne`       | —                        |
 | `self_dependency`            | 2    | `Storage::SelfDependency` / `SelfDependency` | `id`                 |
+| `concurrent_write`           | 1    | `Storage::ConcurrentWrite` / `ConcurrentWrite` | `hint`             |
 
 Adding a new variant to `CliError`? Pick a stable kind, add it to
 the `kind()` match in `main.rs`, add a row above, and add a
@@ -553,6 +554,53 @@ $ jjf --json new -t "child" -d deadbee -F -
 `jjf dep rm` is intentionally permissive against phantom
 targets — removing an edge that doesn't exist is a useful
 cleanup primitive and never lands a dangling edge.
+
+### Note on `concurrent_write`
+
+Emitted by any mutating verb (`new`, `update`, `comment`, `close`,
+`open`, `block`, `unblock`, `label add|rm`, `dep add|rm`,
+`remember`, `forget`) when a sibling jjforge writer landed first
+and the 4-CLI write dance hit jj's "Concurrent checkout" failure.
+Runtime failure (exit 1): the command was well-formed, the loser
+just has to re-run.
+
+The storage layer auto-retries ONCE on non-slug-claim mutations
+(comments, updates, status changes, etc.) before surfacing this
+— the dominant race shape is a single sibling racer that
+completes its dance in the time it takes us to spin our retry
+back up, and the retry re-reads bookmark state so any landed
+content is preserved (the concurrent-comment test pins this).
+If you see `concurrent_write` despite the retry, either both
+attempts raced (rare) or the failure was a slug-claim create
+(where retry would re-race the same slug indefinitely and the
+fail-fast surface is preferred).
+
+For slug-claim creates, the post-failure probe upgrades this to
+the more-specific `slug_collision` envelope when the failure
+race was specifically two writers fighting for the same slug
+slot and the slug is now visibly taken. The fallback to
+`concurrent_write` happens when the probe timing missed the
+winner's commit (legitimate concurrent failure without an
+identifiable winner yet).
+
+`details.hint` carries an operator-facing one-line message,
+rendered verbatim by the text renderer. The hint distinguishes
+"first attempt raced; retry" from "auto-retry exhausted; retry
+the command yourself."
+
+Added in `qa-concurrent-write-ux` (issue `277f559`) after a QA
+red-team round found the loser of a concurrent `jjf new --slug
+<s>` saw a 12-line jj-internal cascade including "Internal
+error: Failed to check out commit … Caused by: Concurrent
+checkout" — useless to an agent in an automated loop.
+
+```sh
+$ jjf --json comment a3f9c01 -F -    # sibling write raced and retry also raced
+{"ok":false,"error":{"kind":"concurrent_write","message":"concurrent write conflict; another writer landed first; retried once and still raced. Retry your command.","details":{"hint":"another writer landed first; retried once and still raced. Retry your command."}}}
+
+$ jjf --json new -t winner --slug taken    # slug-claim race upgraded to slug_collision
+{"ok":false,"error":{"kind":"slug_collision","message":"slug \"taken\" already in use by open issue a3f9c01","details":{"slug":"taken","conflicts_with":"a3f9c01"}}}
+```
 
 ### Note on `self_hosted_write_refused`
 
