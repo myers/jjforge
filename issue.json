@@ -1,0 +1,23 @@
+{
+  "version": 2,
+  "id": "53f9728",
+  "title": "storage-v3 #7: test sweep to v3 assertions",
+  "slug": "v3-test-sweep",
+  "body": "# Goal\n\nPort the 421-test workspace from v2-shape assertions to\nv3-shape assertions. Audit every test that pokes at the\n`issues` bookmark or asserts on commit-on-bookmark behavior,\nupdate it to assert on per-issue-ref shape instead.\n\nEnd state: `cargo nextest run --workspace` returns 421+ tests\npassing on a v3-only codebase (after this ticket lands, no\ntest still asserts the v2 dance is in use).\n\n# Why now\n\nTicket 7 of 8 in the v3 storage epic (`bd98097`). Depends on\ntickets 1–6. After this ticket lands, the v3 implementation is\nend-to-end green; ticket 8 (guard removal + CLAUDE.md rewrite)\ncan ship without test-suite risk.\n\n# Approach\n\nThe 421 tests split roughly into:\n\n**Tier A: CLI-surface tests.** Drive `jjf` verbs and assert on\nthe `--json` output or stdout/stderr. These should stay green\nWITHOUT change — the CLI surface doesn't move in v3. If any\nbreak, that's a sign tickets 1–6 leaked behavior changes into\nthe surface. Investigate and fix the underlying code, not the\ntest.\n\n**Tier B: Storage-internal tests.** Reach into `Storage::*`\nmethods directly and assert on internal shape — bookmark name,\nfile paths, commit count, trailer shape. Audit each:\n\n- If it asserts `bookmark exists` or `jj file show\n  -r bookmarks(issues)` or `issues/<id>.json` paths → port\n  to assert `refs/jjf/issues/<id>` exists and has the right\n  blob.\n- If it asserts on trailer-block shape → leave alone (the\n  trailer format doesn't change in v3).\n- If it asserts on op-replay correctness → port the chain\n  walk to the per-issue ref.\n\n**Tier C: Migration tests.** Specifically\n`v1_to_v2_migration_preserves_history`. Add a sibling test\n`v2_to_v3_migration_preserves_history` modeled on it.\n\n**Tier D: HEAD-drift tests.** Any test that asserted \"after a\nmutation, jj working copy is at root() or descendant\" → invert\nthe assertion: \"after a mutation, jj working copy is unchanged\nand git HEAD is unchanged.\" This is the safety net for the\ncore property v3 delivers.\n\n# Scope\n\nIn scope:\n- Grep the test tree for `bookmarks(issues)`, `issues/`,\n  `try_commit_dance`, `bugs bookmark`, and similar substrings\n  → audit each hit.\n- Port Tier B and Tier C tests.\n- Add the v2 → v3 migration test.\n- Add a regression test for HEAD-no-drift on every v3\n  mutation kind (Tier D).\n- Remove tests that assert on v2 behavior we explicitly want\n  gone (e.g. tests that assert the 4-CLI dance runs the\n  expected jj subcommands).\n\nOut of scope:\n- New test infrastructure. Reuse the existing\n  `IntegrationFixture` / temp-repo helpers.\n- Performance tests beyond the existing\n  `cache_hit_avoids_rebuild_n_issues`.\n\n# Acceptance\n\n- [ ] `cargo nextest run --workspace` green on v3-only code\n      (no fallback to v2 dance for fresh repos).\n- [ ] No test still asserts the v2 dance is invoked.\n- [ ] At least one test per v3 mutation kind asserts\n      \"HEAD does not drift, jj working copy is clean.\"\n- [ ] A v2 → v3 migration integration test exists and passes.\n- [ ] Test count is >= 421 (we add a few, port the rest).\n\n# Pointers\n\n- v1 → v2 reference test:\n  `v1_to_v2_migration_preserves_history`.\n- Cache test: `cache_hit_avoids_rebuild_n_issues`.\n- Trailer test: `trailer_block_shape_walker_finds_no_orphans_on_real_bookmark`\n  — this one likely needs a v3 sibling.\n- Design doc: `docs/storage-out-of-tree.md`.\n\n# Out-of-scope reminder\n\nDo NOT update tests by silencing them\n(e.g. `#[ignore]`). Either port them or delete with a one-line\nexplanation. The test suite is the spec of behavior; weakening\nit weakens the contract.\n",
+  "status": "open",
+  "block_reason": null,
+  "type": "feature",
+  "labels": [
+    "epic:mvp-storage",
+    "epic:storage-v3-out-of-tree"
+  ],
+  "dependencies": [
+    {
+      "target": "aa915fe",
+      "kind": "blocks"
+    }
+  ],
+  "assignee": null,
+  "created_at": "2026-06-23T23:38:28Z",
+  "updated_at": "2026-06-23T23:38:28Z"
+}
