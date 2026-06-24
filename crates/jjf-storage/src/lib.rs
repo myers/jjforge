@@ -61,6 +61,7 @@
 #![forbid(unsafe_code)]
 
 mod cache;
+mod git;
 mod history;
 mod id;
 mod jj;
@@ -70,9 +71,11 @@ mod op;
 mod read;
 mod record;
 mod trailer;
+mod v3_write;
 
 use std::path::{Path, PathBuf};
 
+pub use git::GitError;
 pub use history::HistoryEntry;
 pub use id::{IdError, IssueId};
 pub use jj::JjError;
@@ -134,6 +137,18 @@ use jj::JjRepo;
 pub enum Error {
     #[error("jj cli: {0}")]
     Jj(#[from] JjError),
+    /// A `git` subprocess failure on the v3 write path. Distinct from
+    /// [`Error::Jj`] so callers can tell "the jj dance failed" from
+    /// "the git-only write path failed" — same shape (typed stderr +
+    /// status), different CLI.
+    ///
+    /// Concurrent-write conflicts on the v3 path don't surface here;
+    /// they get translated to [`Error::ConcurrentWrite`] before the
+    /// raw [`GitError`] would bubble up. This variant only carries
+    /// non-CAS git failures (network, parse, missing object, etc.).
+    /// v3-storage (`docs/storage-out-of-tree.md`, ticket `eb42f50`).
+    #[error("git cli: {0}")]
+    Git(#[from] GitError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
@@ -256,6 +271,13 @@ pub enum Error {
 fn is_concurrent_write(e: &Error) -> bool {
     match e {
         Error::Jj(je) => je.is_concurrent_write(),
+        // The v3 write path translates CAS failures to
+        // `Error::ConcurrentWrite` at the boundary in `v3_write.rs`,
+        // so raw `Error::Git` here represents a non-CAS git failure.
+        // Returning `false` keeps the translation symmetric with the
+        // v2 path (only the jj-side cascade is auto-recognized as
+        // concurrent on the inner Result).
+        Error::Git(_) => false,
         _ => false,
     }
 }
@@ -746,18 +768,81 @@ pub struct DepTree {
     pub root: DepTreeNode,
 }
 
-/// A handle to a repo whose `issues` bookmark exists. Use
-/// [`Storage::init`] to create the bookmark (idempotent) in a fresh
-/// repo, or [`Storage::open`] when you know the bookmark is already
-/// in place.
+/// On-disk storage shape this `Storage` is operating against.
+///
+/// Detected at [`Storage::open`] time and pinned for the life of the
+/// handle. Drives the write-path dispatch in
+/// [`Storage::commit_record_change`] / `commit_memory_change` and the
+/// create-path probes (id collision, slug collision).
+///
+/// - [`StorageMode::V2`]: the on-disk shape pinned by
+///   `docs/storage-format.md` v2. Issues live as `issues/<id>.json`
+///   files on the `issues` jj bookmark; writes go through the 4-CLI
+///   working-copy dance. This is the original shape; the bulk of the
+///   v2 codebase is here.
+/// - [`StorageMode::V3`]: the on-disk shape pinned by
+///   `docs/storage-out-of-tree.md`. Each issue lives at
+///   `refs/jjf/issues/<id>` with a commit-chain of op-packs; each
+///   memory at `refs/jjf/memories/<key>`. Writes use git-only
+///   subprocess calls (`hash-object`, `mktree`, `commit-tree`,
+///   `update-ref`); the jj working copy is never touched.
+///
+/// **Detection.** v3 mode is selected iff
+/// [`v3_write::refs::FORMAT_VERSION_REF`] resolves to a commit. The
+/// presence of the ref is the marker; the ref's pointed-at tree
+/// carries a self-describing `version` blob but reads don't inspect
+/// it. A fresh-init repo today still gets v2 mode because
+/// `Storage::init` writes the v2 bookmark (ticket `add0646` will
+/// rewrite init for v3); a manually-planted sentinel ref upgrades
+/// detection to v3 even on a v1/v2-shape repo. The integration tests
+/// in this ticket use the planted-sentinel approach to exercise the
+/// v3 write path before the migrator (ticket `c14e1c1`) lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StorageMode {
+    V2,
+    V3,
+}
+
+/// Probe `refs/jjf/meta/format-version`. Returns
+/// [`StorageMode::V3`] iff the sentinel ref resolves to a commit;
+/// otherwise [`StorageMode::V2`].
+///
+/// Failure modes: a real git failure (corrupt repo, missing object,
+/// IO error) bubbles up as [`Error::Git`]. A simply-absent ref is
+/// NOT a failure — it's the v2 case, so we return `V2`.
+///
+/// This is the v3 vs v2 discriminator on every `Storage::open` and
+/// `Storage::init`. Cheap: one `git rev-parse --verify --quiet` call.
+fn detect_storage_mode(git: &git::GitRepo) -> Result<StorageMode> {
+    match git.resolve_ref(v3_write::refs::FORMAT_VERSION_REF) {
+        Ok(Some(_)) => Ok(StorageMode::V3),
+        Ok(None) => Ok(StorageMode::V2),
+        Err(e) => Err(Error::Git(e)),
+    }
+}
+
+/// A handle to a repo whose issue storage is initialized. Use
+/// [`Storage::init`] to create the storage (idempotent) in a fresh
+/// repo, or [`Storage::open`] when you know it's already in place.
 ///
 /// Carries a per-instance snapshot cache memo so multiple read calls
 /// within one CLI invocation share the head-probe + cache load. The
 /// memo is invalidated on writes (the mutator drops it), so the next
 /// read sees fresh state.
+///
+/// Also carries a [`StorageMode`] discriminator that pins which write
+/// path mutating methods take. Detected at `open` / `init` time and
+/// stable for the life of the handle.
 #[derive(Debug, Clone)]
 pub struct Storage {
     repo: JjRepo,
+    /// Git wrapper used by the v3 write path. Built alongside `repo`
+    /// in `open` / `init`; coexists with the jj wrapper. v2-mode
+    /// callers don't touch it.
+    git: git::GitRepo,
+    /// V2 vs V3 — pinned at open time, drives every write-path
+    /// dispatch.
+    mode: StorageMode,
     /// In-process snapshot cache memo. Lazily populated on first
     /// read; cleared by every mutator so the next read sees the
     /// post-write bookmark state. `Arc<Mutex<...>>` so clones share
@@ -787,11 +872,25 @@ impl Storage {
                 root.display()
             )));
         }
+        let git = git::GitRepo::open(root.clone());
+        // Detect on-disk shape before running the v1→v2 migration
+        // (which only fires on v2-shape data). If the v3 sentinel ref
+        // exists, we're already on v3 and the v1→v2 dance must NOT
+        // run (it would write a v2 bookmark on a v3 repo, scrambling
+        // the source of truth). For now the only writer of the
+        // sentinel is `v3_write::write_format_version_sentinel` —
+        // used by tests in this ticket and (eventually) by the v2→v3
+        // migrator in ticket `c14e1c1`.
+        let mode = detect_storage_mode(&git)?;
         let storage = Self {
             repo: JjRepo::open(root),
+            git,
+            mode,
             snapshot_memo: Default::default(),
         };
-        storage.maybe_migrate_v1_to_v2()?;
+        if storage.mode == StorageMode::V2 {
+            storage.maybe_migrate_v1_to_v2()?;
+        }
         Ok(storage)
     }
 
@@ -824,6 +923,7 @@ impl Storage {
             )));
         }
         let repo = JjRepo::open(root.clone());
+        let git = git::GitRepo::open(root.clone());
 
         // Probe: are we inside a jj repo at all? `jj workspace root`
         // is cheap and its failure mode is unambiguous (stderr starts
@@ -839,14 +939,33 @@ impl Storage {
             return Err(Error::Jj(e));
         }
 
-        // v1 → v2 migration first. If a `bugs` bookmark exists and
-        // `issues` doesn't, rename. After this point, the bookmark
-        // probe below will succeed if migration ran.
+        // Detect v3 mode (sentinel ref present) BEFORE running the
+        // v1→v2 migration. On a v3 repo `init` is a near-no-op: the
+        // v3 sentinel ref already exists, the per-issue refs are
+        // already in place, and the v2 bookmark-bootstrap step would
+        // scramble the source of truth. Ticket `add0646` will rewrite
+        // init for v3-fresh repos; this ticket just preserves the
+        // existing v2 init shape when mode is V2.
+        let mode = detect_storage_mode(&git)?;
+
+        // v1 → v2 migration first (V2 mode only). If a `bugs` bookmark
+        // exists and `issues` doesn't, rename. After this point, the
+        // bookmark probe below will succeed if migration ran.
         let storage = Self {
             repo: repo.clone(),
+            git: git.clone(),
+            mode,
             snapshot_memo: Default::default(),
         };
-        storage.maybe_migrate_v1_to_v2()?;
+        if storage.mode == StorageMode::V2 {
+            storage.maybe_migrate_v1_to_v2()?;
+        } else {
+            // V3 fresh repo: nothing left to bootstrap here. The
+            // sentinel ref is already in place; per-issue refs are
+            // owned by the write path. Return early so we don't
+            // accidentally create the v2 `issues` bookmark.
+            return Ok(storage);
+        }
 
         // Probe: does the `issues` bookmark already exist? `jj bookmark
         // list -T 'name ++ "\n"' issues` prints just `issues\n` to
@@ -1239,13 +1358,23 @@ impl Storage {
             });
         }
         let claimed_slug = record.slug.clone();
-        let commit_result = self.commit_record_change(&summary, &ops, |wc_root| {
-            write_record_json(&wc_root.join(issue_json_relpath(&id)), &record)?;
-            // Comments file: create empty so readers don't trip on
-            // ENOENT for new issues. Spec §4 allows empty == no comments.
-            write_comments_jsonl(&wc_root.join(issue_comments_relpath(&id)), &[])?;
-            Ok(())
-        });
+        let commit_result = if self.mode == StorageMode::V3 {
+            // V3 write path: build the trailer block + commit, land
+            // it on `refs/jjf/issues/<id>` via git-only calls. No
+            // working-copy edits; no jj subprocess. Comments file is
+            // omitted from the tree at create time (the design's "if
+            // any" semantics) — the first `add_comment` will plant
+            // the blob in the tree, not the create.
+            self.commit_record_v3(&id, &record, None, &summary, &ops)
+        } else {
+            self.commit_record_change(&summary, &ops, |wc_root| {
+                write_record_json(&wc_root.join(issue_json_relpath(&id)), &record)?;
+                // Comments file: create empty so readers don't trip on
+                // ENOENT for new issues. Spec §4 allows empty == no comments.
+                write_comments_jsonl(&wc_root.join(issue_comments_relpath(&id)), &[])?;
+                Ok(())
+            })
+        };
 
         match commit_result {
             Ok(()) => Ok(id),
@@ -2003,21 +2132,33 @@ impl Storage {
         let summary = format!("jjf: issue {} - comment-add", id);
         let mut all_comments = existing_comments;
         all_comments.push(comment);
-        self.commit_record_change(
-            &summary,
-            &[Op::CommentAdd {
-                issue_id: id.clone(),
-                comment_id: comment_id.clone(),
-            }],
-            |wc_root| {
+        let ops = vec![Op::CommentAdd {
+            issue_id: id.clone(),
+            comment_id: comment_id.clone(),
+        }];
+        if self.mode == StorageMode::V3 {
+            // V3: write the new record + the full comments stream to
+            // the per-issue ref's tree in one commit. The comments
+            // file is always present on a v3 commit-with-comments —
+            // we read the existing stream above, appended ours, and
+            // pass the full slice through.
+            self.commit_record_v3(
+                &id,
+                &record,
+                Some(&all_comments),
+                &summary,
+                &ops,
+            )?;
+        } else {
+            self.commit_record_change(&summary, &ops, |wc_root| {
                 write_record_json(&wc_root.join(issue_json_relpath(&id)), &record)?;
                 write_comments_jsonl(
                     &wc_root.join(issue_comments_relpath(&id)),
                     &all_comments,
                 )?;
                 Ok(())
-            },
-        )?;
+            })?;
+        }
         Ok(())
     }
 
@@ -2066,6 +2207,9 @@ impl Storage {
         let summary = format!("jjf: memory {} - set", key);
         let jjf_at = now_rfc3339_nanos()?;
         let msg = memory::build_set_memory_commit_message(&summary, key, value, &jjf_at);
+        if self.mode == StorageMode::V3 {
+            return self.commit_memory_v3(key, Some(&record), &msg);
+        }
         let key_owned = key.to_owned();
         self.commit_memory_change(&msg, |wc_root| {
             write_memory_json(&wc_root.join(memory::memory_json_relpath(&key_owned)), &record)
@@ -2095,6 +2239,9 @@ impl Storage {
         let summary = format!("jjf: memory {} - unset", key);
         let jjf_at = now_rfc3339_nanos()?;
         let msg = memory::build_unset_memory_commit_message(&summary, key, &jjf_at);
+        if self.mode == StorageMode::V3 {
+            return self.commit_memory_v3(key, None, &msg);
+        }
         let key_owned = key.to_owned();
         self.commit_memory_change(&msg, |wc_root| {
             let path = wc_root.join(memory::memory_json_relpath(&key_owned));
@@ -2217,6 +2364,9 @@ impl Storage {
         slug: &str,
         self_id: Option<&IssueId>,
     ) -> Result<Option<IssueId>> {
+        if self.mode == StorageMode::V3 {
+            return self.find_open_slug_collision_v3(slug, self_id);
+        }
         // Snapshot cache: the cache's slug_index only carries
         // ACTIVE (Open / InProgress) slug holders by construction
         // (see `cache::SnapshotCache::from_parts`). One HashMap
@@ -2237,6 +2387,50 @@ impl Storage {
                     }
                     Status::Closed => return Ok(None),
                 }
+            }
+        }
+        Ok(None)
+    }
+
+    /// V3-mode slug-collision probe. Walks every
+    /// `refs/jjf/issues/<id>` ref and reads its tip `issue.json` blob,
+    /// looking for an ACTIVE (Open / Blocked / InProgress) issue
+    /// whose slug equals `slug`. Excludes `self_id` so an `update`
+    /// path that re-sets an issue's existing slug doesn't
+    /// self-conflict.
+    ///
+    /// Pre-snapshot-cache shape: O(N) git calls (one per ref). The
+    /// v3 read-path ticket (`6e2c843`) ports the snapshot cache over
+    /// to v3 refs and this probe becomes a single HashMap lookup
+    /// again. For now the brute-force walk is fine — the live
+    /// planner has ~30 issues and the test fixtures have <10.
+    fn find_open_slug_collision_v3(
+        &self,
+        slug: &str,
+        self_id: Option<&IssueId>,
+    ) -> Result<Option<IssueId>> {
+        for id in v3_write::list_issue_ids_v3(&self.git)? {
+            if Some(&id) == self_id {
+                continue;
+            }
+            let record = match v3_write::read_record_v3(&self.git, &id) {
+                Ok(r) => r,
+                // A ref that exists but whose tip has no `issue.json`
+                // blob is corrupt; skip it rather than crash the
+                // probe. The v3 invariant says every issue ref's tip
+                // carries a record, so this branch is unreachable in
+                // a healthy repo.
+                Err(Error::IssueNotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            if record.slug.as_deref() != Some(slug) {
+                continue;
+            }
+            match record.status {
+                Status::Open | Status::Blocked | Status::InProgress => {
+                    return Ok(Some(id));
+                }
+                Status::Closed => continue,
             }
         }
         Ok(None)
@@ -2714,6 +2908,23 @@ impl Storage {
         let mut record = self.read_record_from_bookmark(id)?;
         let ops = f(&mut record)?;
         record.updated_at = now_rfc3339()?;
+        if self.mode == StorageMode::V3 {
+            // V3: build the new tree from the mutated record. The
+            // existing comments stream stays in the tree byte-for-
+            // byte; we re-read it and pass it back so the new commit
+            // carries the same `comments.jsonl` blob as the previous
+            // tip. Re-reading vs. structurally re-pointing matters
+            // because git computes the tree oid from the blob set —
+            // and a tree that "preserves" comments must literally
+            // re-list the blob.
+            let existing_comments = self.read_comments_from_bookmark(id)?;
+            let comments: Option<&[Comment]> = if existing_comments.is_empty() {
+                None
+            } else {
+                Some(existing_comments.as_slice())
+            };
+            return self.commit_record_v3(id, &record, comments, summary, &ops);
+        }
         let id_clone = id.clone();
         self.commit_record_change(summary, &ops, |wc_root| {
             write_record_json(&wc_root.join(issue_json_relpath(&id_clone)), &record)?;
@@ -2721,8 +2932,16 @@ impl Storage {
         })
     }
 
-    /// Read the current `issues/<id>.json` from the bookmark tip.
+    /// Read the current record for `id` from authoritative storage.
+    ///
+    /// In V2 mode this reads `issues/<id>.json` at the `issues`
+    /// bookmark tip. In V3 mode this reads `issue.json` from the tip
+    /// commit's tree on `refs/jjf/issues/<id>`. Either way, returns
+    /// [`Error::IssueNotFound`] if the issue doesn't exist.
     fn read_record_from_bookmark(&self, id: &IssueId) -> Result<IssueRecord> {
+        if self.mode == StorageMode::V3 {
+            return v3_write::read_record_v3(&self.git, id);
+        }
         let relpath = issue_json_relpath(id);
         let text = match self.repo.run(&[
             "file",
@@ -2743,10 +2962,14 @@ impl Storage {
         Ok(serde_json::from_str(&text)?)
     }
 
-    /// Read the current `issues/<id>.comments.jsonl` from the bookmark
-    /// tip. Returns an empty vec if the file is empty (the writer
-    /// creates an empty file at issue-create time).
+    /// Read the current comments stream for `id` from authoritative
+    /// storage. Returns an empty vec if no comments file is present
+    /// (the writer creates an empty file at issue-create time in V2;
+    /// in V3, the file is only present once the first comment lands).
     fn read_comments_from_bookmark(&self, id: &IssueId) -> Result<Vec<Comment>> {
+        if self.mode == StorageMode::V3 {
+            return v3_write::read_comments_v3(&self.git, id);
+        }
         let relpath = issue_comments_relpath(id);
         let text = match self.repo.run(&[
             "file",
@@ -2779,6 +3002,58 @@ impl Storage {
     /// stanza; `apply` is the closure that mutates files inside the
     /// working copy (relative to `wc_root`, which is the repo root).
     ///
+    /// V3 counterpart to [`Storage::commit_record_change`].
+    ///
+    /// Builds the trailer block, lands a commit on
+    /// `refs/jjf/issues/<id>` via [`v3_write::commit_record_v3`], and
+    /// runs the same post-write bookkeeping (snapshot memo
+    /// invalidation, concurrent-write translation). Zero `jj` calls.
+    ///
+    /// The CAS failure inside `v3_write::commit_record_v3` is
+    /// already translated to [`Error::ConcurrentWrite`], so the
+    /// retry policy in [`Storage::mutate`] / [`Storage::add_comment`]
+    /// / [`Storage::create_issue`] recognizes it unchanged.
+    fn commit_record_v3(
+        &self,
+        id: &IssueId,
+        record: &IssueRecord,
+        comments: Option<&[Comment]>,
+        summary: &str,
+        ops: &[Op],
+    ) -> Result<()> {
+        // Stamp every op stanza in this commit with the same nano-
+        // precision op-time (spec §5). Same shape as the v2 path.
+        let jjf_at = now_rfc3339_nanos()?;
+        let msg = build_commit_message(summary, ops, &jjf_at);
+        let result = v3_write::commit_record_v3(&self.git, id, record, comments, &msg);
+        // Invalidate the snapshot memo on both success and failure —
+        // the v3 read path lands in a later ticket, but the memo
+        // pattern matches v2 (lib.rs's `commit_record_change`): every
+        // mutation drops it so the next read re-probes. The v2-shape
+        // snapshot cache only loads on V2-mode reads (`snapshot()`
+        // hits the `issues` bookmark), so this invalidation is a no-
+        // op on a v3-mode repo today; it's symmetric for clarity.
+        self.invalidate_snapshot_memo();
+        result.map(|_| ())
+    }
+
+    /// V3 counterpart to [`Storage::commit_memory_change`]. Same
+    /// shape as [`Storage::commit_record_v3`] but routes to
+    /// [`v3_write::commit_memory_v3`] (the per-memory ref namespace).
+    ///
+    /// `memory = None` is the unset case: the tree is empty, the
+    /// commit's trailer carries `Jjf-Op: unset-memory`.
+    fn commit_memory_v3(
+        &self,
+        key: &str,
+        memory: Option<&Memory>,
+        msg: &str,
+    ) -> Result<()> {
+        let result = v3_write::commit_memory_v3(&self.git, key, memory, msg);
+        self.invalidate_snapshot_memo();
+        result.map(|_| ())
+    }
+
     /// On any jj failure whose stderr matches the concurrent-write
     /// fingerprint, this surfaces [`Error::ConcurrentWrite`] with a
     /// hint string. The caller is responsible for the retry decision
@@ -2894,10 +3169,14 @@ impl Storage {
         }
     }
 
-    /// Read a single `memories/<key>.json` from the bookmark tip.
-    /// Returns `Ok(None)` if the file is absent (the key doesn't
-    /// exist, or `unset_memory` cleared it).
+    /// Read a single memory by key from authoritative storage.
+    /// Returns `Ok(None)` if the key doesn't exist (V2: no
+    /// `memories/<key>.json`; V3: no `refs/jjf/memories/<key>`, or
+    /// the ref's tip carries an empty tree from an `unset` op).
     fn read_memory_from_bookmark(&self, key: &str) -> Result<Option<Memory>> {
+        if self.mode == StorageMode::V3 {
+            return v3_write::read_memory_v3(&self.git, key);
+        }
         let relpath = memory::memory_json_relpath(key);
         let text = match self.repo.run(&[
             "file",
@@ -2954,9 +3233,13 @@ impl Storage {
         Ok(keys)
     }
 
-    /// Does this issue id already have a record on the bookmark? Used
-    /// for the collision retry in `create_issue`.
+    /// Does this issue id already have a record in authoritative
+    /// storage? Used for the collision retry in `create_issue` and
+    /// for phantom-dep validation at draft time.
     fn issue_exists_on_bookmark(&self, id: &IssueId) -> Result<bool> {
+        if self.mode == StorageMode::V3 {
+            return v3_write::issue_exists_v3(&self.git, id);
+        }
         let relpath = issue_json_relpath(id);
         // `jj file show` exits non-zero if the path is absent at the
         // requested revision. We don't distinguish "missing file" from

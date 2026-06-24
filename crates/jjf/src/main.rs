@@ -1244,6 +1244,10 @@ impl CliError {
             CliError::Storage(StorageError::Io(_)) => "io_error",
             CliError::Storage(StorageError::Json(_)) => "json_error",
             CliError::Storage(StorageError::Jj(_)) => "jj_error",
+            // v3 storage (`docs/storage-out-of-tree.md`, ticket
+            // `eb42f50`): the v3 write path spawns `git` directly
+            // rather than `jj`. A non-CAS git failure surfaces here.
+            CliError::Storage(StorageError::Git(_)) => "git_error",
             CliError::Storage(StorageError::InvalidSlug { .. }) => "invalid_slug",
             CliError::Storage(StorageError::InvalidTitle { .. }) => "invalid_title",
             CliError::Storage(StorageError::SlugCollision { .. }) => "slug_collision",
