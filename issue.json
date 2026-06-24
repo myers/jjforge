@@ -10,8 +10,13 @@
   "labels": [
     "epic:host-asterinas"
   ],
-  "dependencies": [],
+  "dependencies": [
+    {
+      "target": "ec5a0a8",
+      "kind": "parent-child"
+    }
+  ],
   "assignee": null,
   "created_at": "2026-06-23T15:05:49Z",
-  "updated_at": "2026-06-23T15:05:49Z"
+  "updated_at": "2026-06-23T15:06:36Z"
 }
