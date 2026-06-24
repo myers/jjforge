@@ -9,13 +9,8 @@
   "labels": [
     "epic:agent-ergonomics"
   ],
-  "dependencies": [
-    {
-      "target": "5a755ec",
-      "kind": "parent-child"
-    }
-  ],
+  "dependencies": [],
   "assignee": null,
   "created_at": "2026-06-23T02:03:41Z",
-  "updated_at": "2026-06-23T03:59:26Z"
+  "updated_at": "2026-06-23T03:59:48Z"
 }
