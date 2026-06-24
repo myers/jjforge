@@ -62,11 +62,13 @@ pub(crate) fn jj_repo(cwd: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Probe that (a) `cwd` is inside a jj repo and (b) the `issues`
-/// bookmark exists on it. Both checks shell out to `jj` directly
-/// (mirroring what `Storage::init` does internally) so we can surface
-/// distinct preflight-error variants rather than the storage layer's
-/// generic `Jj` runtime error.
+/// Probe that (a) `cwd` is inside a jj repo and (b) the repo is
+/// `jjf init`-ed — meaning either the v2 `issues` bookmark exists or
+/// the v3 `refs/jjf/meta/format-version` sentinel ref resolves.
+///
+/// Both checks shell out directly so we can surface distinct
+/// preflight-error variants rather than the storage layer's generic
+/// `Jj` runtime error.
 ///
 /// Most read/write verbs (`jjf new`, `jjf show`, `jjf ls`, etc.) call
 /// this. The `jjf remote *` verbs use the simpler [`jj_repo`] probe
@@ -76,8 +78,14 @@ pub(crate) fn issues_bookmark(cwd: &Path) -> Result<(), CliError> {
     // reuse it so the two probes stay in sync.
     jj_repo(cwd)?;
 
-    // Check 2: does `issues` bookmark exist? `jj bookmark list`
-    // exits 0 either way; we key off stdout content.
+    // Check 2a: v3 sentinel? Cheapest probe — one `git rev-parse`.
+    // If present, the repo is v3-init'd and we're done.
+    if git_ref_exists(cwd, "refs/jjf/meta/format-version")? {
+        return Ok(());
+    }
+
+    // Check 2b: does the v2 `issues` bookmark exist? `jj bookmark
+    // list` exits 0 either way; we key off stdout content.
     let out = Command::new("jj")
         .arg("--repository")
         .arg(cwd)
@@ -92,12 +100,12 @@ pub(crate) fn issues_bookmark(cwd: &Path) -> Result<(), CliError> {
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     if !stdout.lines().any(|l| l.trim() == ISSUES_BOOKMARK) {
-        // `issues` is absent. Before refusing, check if the v1
-        // `bugs` bookmark is present — if so, this is a v1 repo
-        // that hasn't been migrated yet; calling `Storage::open`
+        // Neither v3 sentinel nor v2 bookmark. Before refusing, check
+        // if the v1 `bugs` bookmark is present — if so, this is a v1
+        // repo that hasn't been migrated yet; calling `Storage::open`
         // triggers the inline v1→v2 rename in the storage layer.
-        // After the migration commits, `issues` exists and the
-        // verb proceeds normally on the next call.
+        // After the migration commits, `issues` exists and the verb
+        // proceeds normally on the next call.
         let v1_out = Command::new("jj")
             .arg("--repository")
             .arg(cwd)
@@ -115,6 +123,19 @@ pub(crate) fn issues_bookmark(cwd: &Path) -> Result<(), CliError> {
         return Err(CliError::MissingIssuesBookmark(cwd.to_owned()));
     }
     Ok(())
+}
+
+/// Cheap check: does a git ref resolve in `cwd`? Used by
+/// [`issues_bookmark`] to detect v3-shape repos via the sentinel ref.
+fn git_ref_exists(cwd: &Path, ref_name: &str) -> Result<bool, CliError> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--verify", "--quiet", ref_name])
+        .output()
+        .map_err(CliError::Probe)?;
+    // `--quiet` makes a missing ref exit 1 with empty stdout.
+    Ok(out.status.success())
 }
 
 /// Environment variable that bypasses the [`refuse_self_hosted_write`]

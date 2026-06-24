@@ -56,6 +56,39 @@ fn must_succeed(out: &Output, what: &str) {
     );
 }
 
+/// Replacement for `run_jjf(&dir, &["init"])` in the v2 push/pull
+/// tests: lays down the v2 `issues` bookmark (seed commit + bookmark
+/// at the new commit + step @ off) directly via jj, bypassing
+/// `jjf init`.
+///
+/// **Why this exists.** Post-v3 (`add0646`), `jjf init` plants the v3
+/// `refs/jjf/meta/format-version` sentinel and does NOT create the
+/// v2 `issues` bookmark. The push/pull verbs in this file still
+/// push the v2 bookmark refspec; until ticket 5 (`9eef3df`) lands
+/// the v3 `refs/jjf/*` push/pull refspecs, we plant the v2
+/// bookmark explicitly to keep the existing transport coverage
+/// alive.
+fn plant_v2_bookmark(repo: &Path) {
+    let out = Command::new("jj")
+        .args(["new", "root()", "-m", "jjf: seed issues bookmark"])
+        .current_dir(repo)
+        .output()
+        .expect("jj new root() -m");
+    must_succeed(&out, "jj new root() -m (seed)");
+    let out = Command::new("jj")
+        .args(["bookmark", "create", "issues", "-r", "@"])
+        .current_dir(repo)
+        .output()
+        .expect("jj bookmark create");
+    must_succeed(&out, "jj bookmark create issues");
+    let out = Command::new("jj")
+        .args(["new", "root()"])
+        .current_dir(repo)
+        .output()
+        .expect("jj new root()");
+    must_succeed(&out, "jj new root() (step off)");
+}
+
 /// Stand up a bare git repo at `<root>/remote.git` and (optionally)
 /// one jj clone per name in `clones`. Returns the root.
 ///
@@ -109,7 +142,7 @@ fn push_pull_single_clone_round_trip() {
     let bob = root.join("bob");
 
     // Alice inits + creates + pushes.
-    must_succeed(&run_jjf(&alice, &["init"]), "jjf init (alice)");
+    plant_v2_bookmark(&alice);
     let new_out = run_jjf(&alice, &["new", "-t", "shared title"]);
     must_succeed(&new_out, "jjf new (alice)");
     let id = String::from_utf8_lossy(&new_out.stdout).trim().to_owned();
@@ -143,7 +176,7 @@ fn push_pull_single_clone_round_trip() {
 fn push_json_envelope_shape() {
     let root = setup("push_json", &["alice"]);
     let alice = root.join("alice");
-    must_succeed(&run_jjf(&alice, &["init"]), "init");
+    plant_v2_bookmark(&alice);
     must_succeed(&run_jjf(&alice, &["new", "-t", "x"]), "new");
     let out = run_jjf(&alice, &["--json", "push", "origin"]);
     must_succeed(&out, "push --json");
@@ -206,7 +239,7 @@ fn pull_two_clones_same_field_lww_converges() {
     let alice = root.join("alice");
     let bob = root.join("bob");
 
-    must_succeed(&run_jjf(&alice, &["init"]), "init alice");
+    plant_v2_bookmark(&alice);
     let new_out = run_jjf(&alice, &["new", "-t", "shared"]);
     must_succeed(&new_out, "new (alice)");
     let id = String::from_utf8_lossy(&new_out.stdout).trim().to_owned();
@@ -264,7 +297,7 @@ fn pull_two_clones_different_fields_both_survive() {
     let alice = root.join("alice");
     let bob = root.join("bob");
 
-    must_succeed(&run_jjf(&alice, &["init"]), "init alice");
+    plant_v2_bookmark(&alice);
     let new_out = run_jjf(&alice, &["new", "-t", "shared"]);
     must_succeed(&new_out, "new (alice)");
     let id = String::from_utf8_lossy(&new_out.stdout).trim().to_owned();
@@ -303,7 +336,7 @@ fn pull_two_clones_different_fields_both_survive() {
 fn push_unknown_remote_exits_two_with_remote_not_found_kind() {
     let root = setup("push_unknown", &["alice"]);
     let alice = root.join("alice");
-    must_succeed(&run_jjf(&alice, &["init"]), "init");
+    plant_v2_bookmark(&alice);
     must_succeed(&run_jjf(&alice, &["new", "-t", "x"]), "new");
     let out = run_jjf(&alice, &["--json", "push", "nope"]);
     assert!(!out.status.success(), "push to unknown remote should fail");
@@ -434,7 +467,7 @@ fn pull_first_time_tracks_and_materializes_local_bugs() {
     let root = setup("round_trip_track", &["alice", "bob"]);
     let alice = root.join("alice");
     let bob = root.join("bob");
-    must_succeed(&run_jjf(&alice, &["init"]), "init alice");
+    plant_v2_bookmark(&alice);
     must_succeed(&run_jjf(&alice, &["new", "-t", "from alice"]), "new alice");
     must_succeed(&run_jjf(&alice, &["push", "origin"]), "push alice");
 

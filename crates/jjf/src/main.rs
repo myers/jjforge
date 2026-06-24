@@ -1566,13 +1566,26 @@ enum DepOp {
 /// `jjf init` — wrap `Storage::init` against the cwd. Idempotent;
 /// emits either a one-line success message or, with `--json`, the
 /// ticket-spec `{"ok": true, "bookmark": "issues"}`.
+///
+/// Post-v3 (`add0646`), init on a fresh repo plants the v3
+/// `refs/jjf/meta/format-version` sentinel ref — no `issues`
+/// bookmark, no jj working-copy mutation. The `bookmark` field in
+/// the JSON envelope stays for backward compatibility (existing
+/// scripts read it); on a v3-fresh repo it names the bookmark that
+/// WOULD have been written under v2 init, which is also the
+/// (pre-migration) name a v2-shape repo carries forward. The
+/// post-migration v3 repo has no bookmark, but no caller is
+/// expected to act on the value besides logging it.
 fn run_init(json: bool) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     // Refuse to run from inside the jjforge source repo (colocate
-    // drift guard — see preflight::refuse_self_hosted_write). Init is
-    // a mutating verb: it runs the 4-CLI seed dance, which flips git
-    // HEAD onto refs/jj/root in a colocated repo. `JJF_ALLOW_SELF_HOST=1`
-    // bypasses with a loud stderr line.
+    // drift guard — see preflight::refuse_self_hosted_write). The
+    // pre-v3 init went through the 4-CLI seed dance which drove HEAD
+    // drift in colocated repos. v3 init writes one ref via git and
+    // is drift-free, but the v1-shape path still calls the v1→v2
+    // migrator which uses the dance. Until the migrator goes away
+    // (ticket `c14e1c1`'s v2→v3 migrator + cleanup), keep the
+    // guard.
     let cwd_canon = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
     preflight::refuse_self_hosted_write(&cwd_canon, json)?;
     Storage::init(&cwd)?;
@@ -1587,7 +1600,7 @@ fn run_init(json: bool) -> Result<(), CliError> {
         });
         println!("{out}");
     } else {
-        println!("jjf: initialized bookmark `{ISSUES_BOOKMARK}`");
+        println!("jjf: initialized");
     }
     Ok(())
 }

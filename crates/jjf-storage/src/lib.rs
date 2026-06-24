@@ -894,24 +894,37 @@ impl Storage {
         Ok(storage)
     }
 
-    /// Open or create a storage handle, bootstrapping the `issues`
-    /// bookmark per spec §1.1 if absent. Idempotent: calling twice
-    /// against the same repo is a no-op the second time.
+    /// Open or create a storage handle, planting the v3
+    /// `refs/jjf/meta/format-version` sentinel ref on a fresh repo.
+    /// Idempotent: calling twice against the same repo is a no-op the
+    /// second time.
     ///
-    /// Three distinct outcomes:
+    /// Four distinct outcomes:
     ///
     /// - `repo_root` is not a jj repo at all → [`Error::NotAJjRepo`].
-    /// - `repo_root` is a jj repo and `issues` is missing → create an
-    ///   empty seed commit (description: [`ISSUES_SEED_DESCRIPTION`]),
-    ///   point the `issues` bookmark at it, step `@` off the bookmark
-    ///   (so the first subsequent mutation's `jj new bookmarks(issues)`
-    ///   doesn't snapshot stale working-copy state). Return Storage.
-    /// - `repo_root` is a jj repo and `issues` already exists → return
-    ///   Storage with no repo-side changes.
+    /// - `repo_root` is a v3-shape repo (the sentinel ref already
+    ///   resolves) → no-op; return Storage with `mode = V3`.
+    /// - `repo_root` is a v2-shape repo (the `issues` bookmark exists,
+    ///   no v3 sentinel) → no-op; return Storage with `mode = V2`. The
+    ///   v2 → v3 migrator (ticket `c14e1c1`) runs at the next
+    ///   [`Storage::open`], not here.
+    /// - `repo_root` is a v1-shape repo (the `bugs` bookmark exists,
+    ///   no `issues` bookmark, no v3 sentinel) → run the v1 → v2
+    ///   migration (matching today's behavior); the repo ends v2-shape
+    ///   and a follow-up `Storage::open` will hand the v2 → v3
+    ///   migration. `mode = V2` is returned.
+    /// - `repo_root` is a brand-new jj+git repo (no `bugs`, no
+    ///   `issues`, no v3 sentinel) → plant the v3 sentinel ref via
+    ///   [`v3_write::write_format_version_sentinel`]. Zero jj calls,
+    ///   zero bookmark mutations, zero working-copy mutations.
+    ///   `mode = V3`.
     ///
-    /// **v1 → v2 inline migration.** If the v1 `bugs` bookmark is
-    /// present and `issues` is not, `init` runs the migration before
-    /// returning. Subsequent calls are no-ops.
+    /// **v3 init contract.** A fresh init writes EXACTLY one ref
+    /// (`refs/jjf/meta/format-version`) under `refs/jjf/`. No
+    /// `issues` bookmark is created, no seed commit lands, `git HEAD`
+    /// is unchanged, and the jj working copy is untouched. This is
+    /// the fix for the colocated-repo HEAD-drift footgun
+    /// (`docs/storage-out-of-tree.md` §"TL;DR").
     ///
     /// The `mvp-cli` `jjf init` verb is a thin wrapper over this.
     pub fn init(repo_root: impl Into<PathBuf>) -> Result<Self> {
@@ -939,33 +952,37 @@ impl Storage {
             return Err(Error::Jj(e));
         }
 
-        // Detect v3 mode (sentinel ref present) BEFORE running the
-        // v1→v2 migration. On a v3 repo `init` is a near-no-op: the
-        // v3 sentinel ref already exists, the per-issue refs are
-        // already in place, and the v2 bookmark-bootstrap step would
-        // scramble the source of truth. Ticket `add0646` will rewrite
-        // init for v3-fresh repos; this ticket just preserves the
-        // existing v2 init shape when mode is V2.
+        // Detection: presence of the v3 sentinel ref ⇒ V3, otherwise
+        // V2. Cheap (`git rev-parse --verify --quiet`). Idempotency
+        // for v3 repos is implicit — `mode == V3` short-circuits the
+        // bookmark probe below.
         let mode = detect_storage_mode(&git)?;
-
-        // v1 → v2 migration first (V2 mode only). If a `bugs` bookmark
-        // exists and `issues` doesn't, rename. After this point, the
-        // bookmark probe below will succeed if migration ran.
         let storage = Self {
             repo: repo.clone(),
             git: git.clone(),
             mode,
             snapshot_memo: Default::default(),
         };
-        if storage.mode == StorageMode::V2 {
-            storage.maybe_migrate_v1_to_v2()?;
-        } else {
-            // V3 fresh repo: nothing left to bootstrap here. The
-            // sentinel ref is already in place; per-issue refs are
-            // owned by the write path. Return early so we don't
-            // accidentally create the v2 `issues` bookmark.
+
+        // V3 mode — sentinel already planted. Idempotent no-op; the
+        // per-issue refs are owned by the write path, and creating a
+        // v2 `issues` bookmark here would scramble the source of
+        // truth.
+        if mode == StorageMode::V3 {
             return Ok(storage);
         }
+
+        // V2 mode. The repo can be shaped three ways here:
+        //   1. v1 (bugs bookmark, no issues): run v1 → v2 migrator.
+        //      After migration, issues bookmark exists ⇒ idempotent.
+        //   2. v2 (issues bookmark already present): idempotent.
+        //   3. fresh (no bugs, no issues): plant the v3 sentinel and
+        //      flip mode to V3. This is the new v3 init contract.
+        //
+        // Step 1 first — the migrator is also called by Storage::open
+        // and is a no-op when no v1 bookmark exists, so this is
+        // safe to call unconditionally before the v2 probe.
+        storage.maybe_migrate_v1_to_v2()?;
 
         // Probe: does the `issues` bookmark already exist? `jj bookmark
         // list -T 'name ++ "\n"' issues` prints just `issues\n` to
@@ -980,18 +997,25 @@ impl Storage {
             ISSUES_BOOKMARK,
         ])?;
         if stdout.lines().any(|line| line.trim() == ISSUES_BOOKMARK) {
-            // Already initialized (or just-migrated); nothing to do.
+            // Already initialized as v2 (either pre-existing or just
+            // migrated from v1). Idempotent no-op. The v2 → v3
+            // migrator (ticket `c14e1c1`) will pick this up at the
+            // next `Storage::open`.
             return Ok(storage);
         }
 
-        // Bootstrap. Three jj calls: branch a fresh empty change off
-        // root() with the seed description, point the bookmark at it,
-        // then step @ off the bookmark.
-        repo.run(&["new", "root()", "-m", ISSUES_SEED_DESCRIPTION])?;
-        repo.run(&["bookmark", "create", ISSUES_BOOKMARK, "-r", "@"])?;
-        repo.run(&["new", "root()"])?;
+        // Brand-new repo: no bookmarks, no sentinel. Plant the v3
+        // sentinel ref. This is the new init contract: zero jj calls,
+        // zero bookmarks, zero working-copy mutations, zero HEAD
+        // drift. Just one `git update-ref` under `refs/jjf/`.
+        v3_write::write_format_version_sentinel(&git)?;
 
-        Ok(storage)
+        Ok(Self {
+            repo,
+            git,
+            mode: StorageMode::V3,
+            snapshot_memo: storage.snapshot_memo,
+        })
     }
 
     /// If a v1 `bugs` bookmark is present and the v2 `issues`
@@ -1986,10 +2010,16 @@ impl Storage {
         // more — but we need the full deps field of every candidate
         // to find children.
         //
-        // Snapshot cache (per `docs/storage-index-design.md`)
-        // replaces the prior N-spawn `read()` loop.
-        let snapshot = self.snapshot()?;
-        let all: Vec<Issue> = snapshot.issues.values().cloned().collect();
+        // V2: snapshot cache (per `docs/storage-index-design.md`)
+        // replaces the prior N-spawn `read()` loop. V3: enumerate
+        // `refs/jjf/issues/*` and read each directly (same shape
+        // as `list_ready`).
+        let all: Vec<Issue> = if self.mode == StorageMode::V3 {
+            self.list_all_issues_v3()?
+        } else {
+            let snapshot = self.snapshot()?;
+            snapshot.issues.values().cloned().collect()
+        };
 
         // Build a child index: for each `parent-child` edge X →
         // target, register X as a child of `target`. Iterating the

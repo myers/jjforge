@@ -82,12 +82,27 @@ fn bugs_bookmark_present(repo: &Path) -> bool {
         .any(|l| l.trim() == "issues")
 }
 
+/// Convenience: does `refs/jjf/meta/format-version` resolve? Used by
+/// the v3-init tests to assert the sentinel ref was planted.
+fn v3_sentinel_present(repo: &Path) -> bool {
+    let out = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", "refs/jjf/meta/format-version"])
+        .current_dir(repo)
+        .output()
+        .expect("spawn git rev-parse");
+    out.status.success()
+}
+
 #[test]
-fn init_on_fresh_jj_repo_succeeds_and_creates_bookmark() {
+fn init_on_fresh_jj_repo_succeeds_and_plants_v3_sentinel() {
     let repo = make_jj_repo("init_fresh");
     assert!(
         !bugs_bookmark_present(&repo),
         "precondition: issues bookmark must not exist before init"
+    );
+    assert!(
+        !v3_sentinel_present(&repo),
+        "precondition: v3 sentinel must not exist before init"
     );
 
     let out = run_jjf(&repo, &["init"]);
@@ -99,13 +114,17 @@ fn init_on_fresh_jj_repo_succeeds_and_creates_bookmark() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("issues"),
-        "expected human-readable output to mention `bugs`, got: {stdout}"
+        stdout.contains("initialized"),
+        "expected human-readable output to mention `initialized`, got: {stdout}"
     );
 
     assert!(
-        bugs_bookmark_present(&repo),
-        "init should create the issues bookmark"
+        v3_sentinel_present(&repo),
+        "init should plant the v3 sentinel ref"
+    );
+    assert!(
+        !bugs_bookmark_present(&repo),
+        "v3 init must NOT create the v2 issues bookmark"
     );
 }
 
@@ -147,7 +166,7 @@ fn init_is_idempotent_when_run_twice() {
         "first init failed: {}",
         String::from_utf8_lossy(&first.stderr)
     );
-    assert!(bugs_bookmark_present(&repo));
+    assert!(v3_sentinel_present(&repo), "first init should plant the v3 sentinel");
 
     let second = run_jjf(&repo, &["init"]);
     assert!(
@@ -156,8 +175,12 @@ fn init_is_idempotent_when_run_twice() {
         String::from_utf8_lossy(&second.stderr)
     );
     assert!(
-        bugs_bookmark_present(&repo),
-        "bookmark should still be present after second init"
+        v3_sentinel_present(&repo),
+        "sentinel should still be present after second init"
+    );
+    assert!(
+        !bugs_bookmark_present(&repo),
+        "v3 init must not create a bookmark, even on the second run"
     );
 }
 

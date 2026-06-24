@@ -225,8 +225,8 @@ fn init_bypassed_when_jjf_allow_self_host_env_set() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("issues"),
-        "init should still mention the issues bookmark, got: {stdout}"
+        stdout.contains("initialized"),
+        "init should still mention success, got: {stdout}"
     );
 }
 

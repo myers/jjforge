@@ -15,19 +15,35 @@ use jjf_storage::{
 };
 use serde::Serialize;
 
-/// Build a scratch jj repo with a seeded `issues` bookmark. Returns the
-/// absolute path to the repo root.
+/// Build a scratch jj repo with a seeded v2 `issues` bookmark.
+/// Returns the absolute path to the repo root.
 ///
-/// Bootstrap is delegated to `Storage::init` — that's the function
-/// under test for the `storage-bootstrap` ticket, and using it here
-/// means every other integration test exercises it incidentally.
+/// **Why not `Storage::init` anymore.** After the v3 init rewrite
+/// (ticket `add0646`), `Storage::init` on a fresh repo plants the v3
+/// sentinel ref and does NOT create the v2 `issues` bookmark. The
+/// integration tests in this file all assert v2-shape details
+/// (file paths on the bookmark tip, descriptions of bookmark
+/// commits, etc.), so we set up the v2 bookmark by hand to keep the
+/// v2 write-path coverage alive until the v2 → v3 migrator
+/// (ticket `c14e1c1`) lands and these tests can move to v3-shape.
+///
+/// The bootstrap commands here mirror the pre-v3 `Storage::init`
+/// body byte-for-byte: seed commit description per spec §1.1, the
+/// final `jj new root()` to step `@` off the bookmark so the
+/// writer dance doesn't snapshot stale working-copy state.
 fn make_scratch_repo(name: &str) -> PathBuf {
     let abs = make_empty_jj_repo(name);
-    // `init` is idempotent and produces the seed commit + `bugs`
-    // bookmark in one call; the storage crate's first `jj new
-    // bookmarks(issues)` then branches from that seed cleanly.
-    Storage::init(&abs).expect("Storage::init on fresh repo");
+    plant_v2_bookmark(&abs);
     abs
+}
+
+/// Plant the v2 `issues` bookmark with the spec-§1.1 seed commit on
+/// a fresh jj repo. Lifts the pre-v3 `Storage::init` body so the v2
+/// integration tests can keep exercising v2 paths.
+fn plant_v2_bookmark(repo: &Path) {
+    sh("jj", &["new", "root()", "-m", "jjf: seed issues bookmark"], repo);
+    sh("jj", &["bookmark", "create", "issues", "-r", "@"], repo);
+    sh("jj", &["new", "root()"], repo);
 }
 
 /// Build a scratch directory that's a jj repo but has no `bugs`
@@ -844,141 +860,195 @@ fn update_with_no_fields_is_an_error() {
 }
 
 // ---------------------------------------------------------------------
-// Bootstrap-path tests (issue 8b12f9d).
+// Bootstrap-path tests (issue 8b12f9d, rewritten for v3 init by
+// ticket add0646).
 //
-// `Storage::init` bootstraps the `issues` bookmark idempotently. Spec
-// §1.1 pins the seed-commit description; the three distinct failure
-// shapes (not-a-jj-repo, bookmark-missing, bookmark-present) all need
-// coverage.
+// `Storage::init` now plants the v3 `refs/jjf/meta/format-version`
+// sentinel ref on a fresh repo. Three invariants the v3 init
+// contract pins:
+//   - Exactly one ref under `refs/jjf/` post-init (the sentinel).
+//   - No `issues` bookmark exists.
+//   - Git HEAD does not move across init.
+//   - The jj working copy is unmoved (no descendant commits, @ stays
+//     where it was).
+//
+// Idempotency, error-shape, and round-trip-with-create-issue tests
+// follow. The v1 → v2 idempotency path stays covered by
+// `v1_to_v2_migration_preserves_history` further down.
 // ---------------------------------------------------------------------
 
+/// Capture the current value of a git ref, or "" if it doesn't
+/// resolve. Used by the v3 init tests to assert HEAD invariance and
+/// the presence / absence of the sentinel ref.
+fn git_rev_parse(repo: &Path, refname: &str) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", refname])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    // `--quiet` makes a missing ref exit 1 with empty stdout.
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// Enumerate the refs under `refs/jjf/` as `<name>\n` lines.
+fn list_jjf_refs(repo: &Path) -> Vec<String> {
+    let out = Command::new("git")
+        .args(["for-each-ref", "--format=%(refname)", "refs/jjf/"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|s| s.to_owned())
+        .collect()
+}
+
 #[test]
-fn init_on_fresh_jj_repo_creates_bookmark_with_seed_commit() {
+fn init_on_fresh_repo_plants_v3_sentinel_only() {
     let repo = make_empty_jj_repo("init_fresh");
 
-    // Pre-condition: no `issues` bookmark.
-    let pre = jj_capture(&["bookmark", "list", "-T", "name ++ \"\\n\""], &repo);
+    // Pre-condition: no `issues` bookmark, no `refs/jjf/*`, capture
+    // git HEAD for the invariance check below.
+    let pre_bookmarks =
+        jj_capture(&["bookmark", "list", "-T", "name ++ \"\\n\""], &repo);
     assert!(
-        !pre.lines().any(|l| l.trim() == "issues"),
-        "pre-condition: bookmark should not exist yet, got: {pre}"
+        !pre_bookmarks.lines().any(|l| l.trim() == "issues"),
+        "pre-condition: issues bookmark should not exist yet, got: {pre_bookmarks}"
+    );
+    assert!(
+        list_jjf_refs(&repo).is_empty(),
+        "pre-condition: refs/jjf/ should be empty before init"
+    );
+    let pre_head = git_rev_parse(&repo, "HEAD");
+
+    Storage::init(&repo).expect("Storage::init on fresh repo");
+
+    // Post-condition 1: exactly one ref under refs/jjf/, namely the
+    // sentinel.
+    let post_refs = list_jjf_refs(&repo);
+    assert_eq!(
+        post_refs,
+        vec!["refs/jjf/meta/format-version".to_string()],
+        "init must plant exactly the sentinel ref, got: {post_refs:?}"
+    );
+
+    // Post-condition 2: no issues bookmark.
+    let post_bookmarks =
+        jj_capture(&["bookmark", "list", "-T", "name ++ \"\\n\""], &repo);
+    assert!(
+        !post_bookmarks.lines().any(|l| l.trim() == "issues"),
+        "post-condition: issues bookmark must NOT exist, got: {post_bookmarks}"
+    );
+
+    // Post-condition 3: git HEAD is unchanged. The whole point of the
+    // v3 init is to not move the working copy / drift HEAD.
+    let post_head = git_rev_parse(&repo, "HEAD");
+    assert_eq!(
+        pre_head, post_head,
+        "git HEAD must not move across init: pre={pre_head:?} post={post_head:?}"
+    );
+
+    // Post-condition 4: jj working-copy @ stays put — the v3 init
+    // writes via git only and never calls `jj new` / `jj describe`,
+    // so the commit at @ must be the same one a freshly-init'd jj
+    // repo carries. (We can't assert "no commits under @ besides
+    // root" because `jj git init` itself materializes one
+    // working-copy commit.) See
+    // `init_on_fresh_repo_does_not_advance_jj_working_copy` for the
+    // before/after @ comparison.
+}
+
+#[test]
+fn init_on_fresh_repo_does_not_advance_jj_working_copy() {
+    let repo = make_empty_jj_repo("init_fresh_wc");
+
+    let pre_at = jj_capture(
+        &["log", "--no-graph", "-r", "@", "-T", "commit_id ++ \"\\n\""],
+        &repo,
     );
 
     Storage::init(&repo).expect("Storage::init on fresh repo");
 
-    // Post-condition: bookmark exists, points at one commit whose
-    // description matches the spec.
-    let post = jj_capture(&["bookmark", "list", "-T", "name ++ \"\\n\""], &repo);
-    assert!(
-        post.lines().any(|l| l.trim() == "issues"),
-        "post-condition: bookmark should exist, got: {post}"
-    );
-
-    let seed_desc = jj_capture(
-        &[
-            "log",
-            "--no-graph",
-            "-r",
-            "bookmarks(issues)",
-            "-T",
-            "description.first_line() ++ \"\\n\"",
-        ],
+    let post_at = jj_capture(
+        &["log", "--no-graph", "-r", "@", "-T", "commit_id ++ \"\\n\""],
         &repo,
     );
     assert_eq!(
-        seed_desc.trim(),
-        "jjf: seed issues bookmark",
-        "seed commit description must match spec §1.1, got: {seed_desc:?}"
-    );
-
-    // The bookmark should resolve to exactly one commit (no chain
-    // yet beyond the seed) when scoped to non-root().
-    let count = jj_capture(
-        &[
-            "log",
-            "--no-graph",
-            "-r",
-            "bookmarks(issues) ~ root()",
-            "-T",
-            "\"x\"",
-        ],
-        &repo,
-    );
-    assert_eq!(
-        count, "x",
-        "exactly one non-root commit on the bookmark expected, got: {count:?}"
-    );
-
-    // Step 3 of bootstrap (`jj new root()`) leaves @ off the bookmark,
-    // matching the invariant the writer dance relies on.
-    let at_bookmarks = jj_capture(
-        &["log", "--no-graph", "-r", "@", "-T", "bookmarks ++ \"\\n\""],
-        &repo,
-    );
-    assert!(
-        !at_bookmarks.contains("issues"),
-        "@ should not be on the issues bookmark after init, got: {at_bookmarks:?}"
+        pre_at.trim(),
+        post_at.trim(),
+        "init must NOT advance the jj working copy (pre={pre_at:?} post={post_at:?})"
     );
 }
 
 #[test]
-fn init_is_idempotent_when_called_twice() {
+fn init_is_idempotent_on_v3_repo() {
     let repo = make_empty_jj_repo("init_twice");
 
     Storage::init(&repo).expect("first init");
-
-    // Capture the bookmark's commit id after the first init so we can
-    // assert the second init didn't move it.
-    let first_tip = jj_capture(
-        &[
-            "log",
-            "--no-graph",
-            "-r",
-            "bookmarks(issues)",
-            "-T",
-            "commit_id ++ \"\\n\"",
-        ],
-        &repo,
-    );
+    let first_sentinel = git_rev_parse(&repo, "refs/jjf/meta/format-version");
     assert!(
-        !first_tip.trim().is_empty(),
-        "first init should have created a bookmark, got: {first_tip:?}"
+        !first_sentinel.is_empty(),
+        "first init must plant the sentinel"
     );
+    let first_head = git_rev_parse(&repo, "HEAD");
 
     Storage::init(&repo).expect("second init must be a no-op success");
 
-    let second_tip = jj_capture(
-        &[
-            "log",
-            "--no-graph",
-            "-r",
-            "bookmarks(issues)",
-            "-T",
-            "commit_id ++ \"\\n\"",
-        ],
-        &repo,
-    );
+    let second_sentinel = git_rev_parse(&repo, "refs/jjf/meta/format-version");
     assert_eq!(
-        first_tip, second_tip,
-        "second init must not move the bookmark: first={first_tip:?}, second={second_tip:?}"
+        first_sentinel, second_sentinel,
+        "second init must not rewrite the sentinel"
     );
 
-    // And exactly one commit (the seed) is reachable from the bookmark
-    // — the second init must not have produced another seed.
-    let non_root_count = jj_capture(
-        &[
-            "log",
-            "--no-graph",
-            "-r",
-            "ancestors(bookmarks(issues)) ~ root()",
-            "-T",
-            "\"x\\n\"",
-        ],
-        &repo,
-    );
+    let second_head = git_rev_parse(&repo, "HEAD");
     assert_eq!(
-        non_root_count.lines().count(),
-        1,
-        "exactly one non-root commit reachable from bookmark expected, got: {non_root_count:?}"
+        first_head, second_head,
+        "second init must not move HEAD: first={first_head:?} second={second_head:?}"
+    );
+
+    let refs = list_jjf_refs(&repo);
+    assert_eq!(
+        refs,
+        vec!["refs/jjf/meta/format-version".to_string()],
+        "still exactly one ref under refs/jjf/ after the second init: {refs:?}"
+    );
+}
+
+#[test]
+fn init_is_idempotent_on_v2_repo() {
+    // v2 repos already in the wild (bookmark exists, no sentinel)
+    // must keep working with the v2 write path until the v2→v3
+    // migrator (ticket c14e1c1) flips them on `Storage::open`. Init
+    // must NOT plant the sentinel on top of a v2 bookmark — that
+    // would silently switch the next reader to v3 mode against
+    // bookmark-shaped data.
+    let repo = make_scratch_repo("init_on_v2_repo");
+
+    // Pre-condition: v2 shape — bookmark present, no sentinel.
+    let pre_sentinel = git_rev_parse(&repo, "refs/jjf/meta/format-version");
+    assert!(
+        pre_sentinel.is_empty(),
+        "pre-condition: v2 repo must not have the v3 sentinel"
+    );
+
+    Storage::init(&repo).expect("init on v2-shape repo must succeed");
+
+    // Post-condition: still no sentinel; the v2→v3 migration is the
+    // job of ticket c14e1c1's `Storage::open` path, NOT `init`.
+    let post_sentinel = git_rev_parse(&repo, "refs/jjf/meta/format-version");
+    assert!(
+        post_sentinel.is_empty(),
+        "init must NOT plant the v3 sentinel on a v2-shape repo, got: {post_sentinel:?}"
+    );
+
+    // And the issues bookmark stays right where it was.
+    let post_bookmarks =
+        jj_capture(&["bookmark", "list", "-T", "name ++ \"\\n\""], &repo);
+    assert!(
+        post_bookmarks.lines().any(|l| l.trim() == "issues"),
+        "init must keep the v2 issues bookmark, got: {post_bookmarks}"
     );
 }
 
@@ -992,49 +1062,39 @@ fn init_outside_any_jj_repo_returns_typed_error() {
 }
 
 #[test]
-fn init_then_create_issue_lands_on_top_of_seed() {
-    // End-to-end: init bootstraps, then create_issue uses the bookmark
-    // just like every other test does. Confirms the seed commit is a
-    // viable parent for the first mutation.
+fn init_then_create_issue_round_trips_on_v3_repo() {
+    // Smoke test that tickets 1 + 2 + 3 compose: init plants the v3
+    // sentinel; create_issue routes through the v3 write path (per
+    // the StorageMode dispatch in commit_record_change); read finds
+    // the issue back. This is the v3 counterpart to the old
+    // `init_then_create_issue_lands_on_top_of_seed` test.
     let repo = make_empty_jj_repo("init_then_create");
-    let storage = Storage::init(&repo).unwrap();
+    let storage = Storage::init(&repo).expect("init plants sentinel");
 
     let id = storage
         .create_issue(&IssueDraft {
-            title: "first ever bug".into(),
+            title: "first ever v3 issue".into(),
             ..Default::default()
         })
-        .expect("create_issue on freshly-init'd repo");
+        .expect("create_issue on freshly-init'd v3 repo");
 
     let bug = storage.read(&id).expect("read after create");
-    assert_eq!(bug.title, "first ever bug");
+    assert_eq!(bug.title, "first ever v3 issue");
 
-    // The bookmark should now point at the create commit (not the
-    // seed); the seed is one parent back.
-    let chain = jj_capture(
-        &[
-            "log",
-            "--no-graph",
-            "-r",
-            "ancestors(bookmarks(issues)) ~ root()",
-            "-T",
-            "description.first_line() ++ \"\\n\"",
-        ],
-        &repo,
-    );
-    let descs: Vec<&str> = chain.lines().filter(|l| !l.is_empty()).collect();
-    assert_eq!(
-        descs.len(),
-        2,
-        "expected seed + 1 mutation on the chain, got: {chain:?}"
-    );
+    // The issue lives under `refs/jjf/issues/<id>`.
+    let issue_ref = format!("refs/jjf/issues/{}", id);
+    let tip = git_rev_parse(&repo, &issue_ref);
     assert!(
-        descs[0].contains(&format!("issue {}", id)),
-        "newest commit should be the create, got: {chain:?}"
+        !tip.is_empty(),
+        "create_issue must plant the per-issue ref {issue_ref}"
     );
-    assert_eq!(
-        descs[1], "jjf: seed issues bookmark",
-        "oldest commit should be the seed, got: {chain:?}"
+
+    // No v2 issues bookmark was created.
+    let post_bookmarks =
+        jj_capture(&["bookmark", "list", "-T", "name ++ \"\\n\""], &repo);
+    assert!(
+        !post_bookmarks.lines().any(|l| l.trim() == "issues"),
+        "v3 create must not create the v2 issues bookmark, got: {post_bookmarks}"
     );
 }
 

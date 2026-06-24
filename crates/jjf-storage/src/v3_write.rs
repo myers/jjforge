@@ -362,14 +362,9 @@ pub(crate) fn list_memory_keys_v3(repo: &GitRepo) -> Result<Vec<String>> {
 /// `version: 3\n`; only the ref's presence matters to the dispatch
 /// logic, but the blob makes the ref self-describing.
 ///
-/// **Test-fixture / migration use only.** This isn't called from the
-/// normal init path in this ticket — ticket `add0646` (init rewrite)
-/// owns wiring it into `Storage::init`. Tests plant the sentinel
-/// inline via raw `git` calls (so they exercise the same wire
-/// format an external migrator would produce); this function is
-/// kept around as the canonical Rust-side planter for the migrator
-/// ticket (`c14e1c1`) to call.
-#[allow(dead_code)]
+/// Called by [`crate::Storage::init`] on a fresh repo (post-ticket
+/// `add0646`) and (eventually) by the v2 → v3 migrator (ticket
+/// `c14e1c1`).
 pub(crate) fn write_format_version_sentinel(repo: &GitRepo) -> Result<()> {
     if repo
         .resolve_ref(refs::FORMAT_VERSION_REF)
