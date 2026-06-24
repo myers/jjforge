@@ -1,0 +1,17 @@
+{
+  "version": 2,
+  "id": "e726cde",
+  "title": "host-asterinas-stale: jjf stale --days N — issues not touched in N days",
+  "slug": "host-asterinas-stale",
+  "body": "# Goal\n\n`jjf stale --days N` — surface issues not touched in N days.\nBeads-style hygiene query for orchestrators working a large\nissue tree.\n\n# Why now\n\n`host-asterinas-audit` (1588625) identified this as one of two\nbeads primitives jjforge needs to host the 968-issue asterinas\ntree day-to-day. With 71 InProgress tickets currently open in\nthe asterinas tree, identifying abandoned work matters for the\norchestrator's loop — and the data is already there (the\n`updated_at` field on every issue).\n\n# Sketch\n\n## CLI\n\n```\njjf stale [--days N] [--status <s>] [--label <l>] [--type <t>] \\\n          [--limit N] [--json]\n```\n\nDefault `--days 14`. Filters compose AND-style.\n\n## Output\n\nPlain text: one line per stale issue, `id  age  title  status`.\nJSON: `[{id, title, status, updated_at, days_since_update}]`.\nSort ascending by `updated_at` (oldest first).\n\n## Storage\n\nTrivially derived from the existing snapshot: walk every issue,\ncompute `now - updated_at`, filter `>= N days`. No new fields,\nno new ops, no spec bump.\n\n# Out of scope\n\n- Auto-closing stale issues. (Hygiene query only.)\n- Slack/email pings. (Out-of-band notification.)\n- \"Stale by activity\" — comments don't bump `updated_at` today\n  (only mutating verbs do); that's a separate decision tracked\n  in the storage spec. This ticket uses the field as-is.\n\n# Acceptance\n\n- [ ] `jjf stale --days 14` returns issues with `updated_at`\n      older than 14 days, oldest first.\n- [ ] `--json` envelope returns `{ok: true, results: [...]}`.\n- [ ] `--status` / `--label` / `--type` filters compose with\n      the staleness threshold.\n- [ ] Closed issues excluded by default; `--status closed`\n      includes them.\n- [ ] Tests cover the boundary day, the empty-result case, and\n      filter composition.\n",
+  "status": "open",
+  "block_reason": null,
+  "type": "feature",
+  "labels": [
+    "epic:host-asterinas"
+  ],
+  "dependencies": [],
+  "assignee": null,
+  "created_at": "2026-06-23T15:08:06Z",
+  "updated_at": "2026-06-23T15:08:06Z"
+}
