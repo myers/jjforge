@@ -32,6 +32,15 @@ fn scratch(name: &str) -> PathBuf {
 fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
     Command::new(JJF_BIN)
         .env("JJF_ALLOW_SELF_HOST", "1")
+        // Opt out of the v2 → v3 auto-migration. This file's tests
+        // explicitly plant the v2 `issues` bookmark (see
+        // [`plant_v2_bookmark`]) to keep the v2 push/pull transport
+        // coverage alive until ticket 5 lands the v3 push/pull
+        // refspecs. Without the opt-out, `Storage::open` (which
+        // every mutating verb in `run_jjf` reaches into) auto-
+        // migrates the repo to v3, deleting the bookmark the push
+        // verb is trying to push.
+        .env("JJF_DISABLE_V2_TO_V3_MIGRATION", "1")
         .args(args)
         .current_dir(cwd)
         .output()

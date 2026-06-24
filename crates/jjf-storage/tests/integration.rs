@@ -32,6 +32,24 @@ use serde::Serialize;
 /// final `jj new root()` to step `@` off the bookmark so the
 /// writer dance doesn't snapshot stale working-copy state.
 fn make_scratch_repo(name: &str) -> PathBuf {
+    // Opt out of the v2 → v3 auto-migration so v2-internals
+    // integration tests (the ones that assert the v2 bookmark
+    // layout directly, the v2 cache schema, etc.) keep exercising
+    // the v2 paths. The migration auto-runs on real `Storage::open`
+    // in production; the test sweep ticket 7 of the v3 epic ports
+    // these v2 assertions to the v3 ref-layout shape, at which
+    // point this opt-out can disappear.
+    // `std::env::set_var` is `unsafe` under the Rust 2024 edition
+    // (one of the language-edition tightenings around process-wide
+    // env-state racing across threads). In the integration-test
+    // process this is safe: the tests run in a single process where
+    // we only ever SET this var (never unset, never read in
+    // contention), and the value is constant. The `unsafe` block is
+    // the language-edition-mandated acknowledgement of that
+    // contract.
+    unsafe {
+        std::env::set_var("JJF_DISABLE_V2_TO_V3_MIGRATION", "1");
+    }
     let abs = make_empty_jj_repo(name);
     plant_v2_bookmark(&abs);
     abs

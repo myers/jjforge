@@ -67,6 +67,7 @@ mod id;
 mod jj;
 mod memory;
 mod merge_ops;
+mod migrate_v2_v3;
 mod op;
 mod read;
 mod record;
@@ -943,12 +944,49 @@ impl Storage {
         let mode = detect_storage_mode(&git)?;
         let storage = Self {
             repo: JjRepo::open(root),
-            git,
+            git: git.clone(),
             mode,
             snapshot_memo: Default::default(),
         };
         if storage.mode == StorageMode::V2 {
+            // v1 → v2 first (renames `bugs/*` → `issues/*` on a
+            // single commit if the v1 bookmark is present). Idempotent;
+            // no-op on already-v2 repos.
             storage.maybe_migrate_v1_to_v2()?;
+            // v2 → v3 second. This walks every issue's op chain off
+            // `bookmarks(issues)` and re-lands each commit on
+            // `refs/jjf/issues/<id>`, then deletes the `issues`
+            // bookmark and plants the v3 sentinel ref. If the
+            // bookmark doesn't exist (a hypothetical "no issues at
+            // all" repo), the migrator's bookmark probe makes it a
+            // no-op and we leave the repo without a sentinel —
+            // matching the v2 behavior for that edge case.
+            //
+            // Test-only opt-out: `JJF_DISABLE_V2_TO_V3_MIGRATION=1`
+            // skips the migration so the v2-internals integration
+            // tests (the ones that assert the v2 bookmark layout
+            // directly) keep exercising the v2 read/write paths
+            // without modification. The test-sweep ticket 7 of the
+            // v3 epic ports those tests; once it lands, this opt-out
+            // can disappear. The env var is INTENTIONALLY undocumented
+            // outside this comment — there is no production reason
+            // to skip the migration.
+            if std::env::var_os("JJF_DISABLE_V2_TO_V3_MIGRATION").is_none() {
+                migrate_v2_v3::maybe_migrate_v2_to_v3(&storage.repo, &storage.git)?;
+                // Re-detect mode after migration. If the sentinel
+                // got planted, we're now V3 and subsequent reads
+                // must use the v3 path. Storage carries mode as an
+                // immutable field on the public type, so we rebuild
+                // it here rather than mutating in place — clones
+                // inherit the new mode.
+                let new_mode = detect_storage_mode(&git)?;
+                return Ok(Self {
+                    repo: storage.repo,
+                    git: storage.git,
+                    mode: new_mode,
+                    snapshot_memo: storage.snapshot_memo,
+                });
+            }
         }
         Ok(storage)
     }
