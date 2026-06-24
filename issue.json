@@ -2,8 +2,10 @@
   "version": 1,
   "id": "f21b950",
   "title": "Epic: mvp-storage — bug records on the bugs bookmark",
+  "slug": "mvp-storage",
   "body": "Goal: bugs live as commits on a `bugs` bookmark, every mutation lands\nas a `Jjf-Op:` git-trailer in the commit description, and\nreading per-bug history is `jj log <path> -T 'json(self)'` plus\ntrailer parsing.\n\n# Approach\n\nVerdicts pinned by the research done 2026-06-21 (archived in git-bug refs):\n\n- **Storage shape:** dedicated `bugs` bookmark, not files on\n  `main` and not side-channel jj op data. (Researched in\n  `dcd4b57` — see `git-bug bug show dcd4b57` against archived refs.)\n- **Audit log:** `Jjf-Op:` trailers in commit descriptions,\n  read via `jj log <path> -T 'json(self)'`. (Researched in\n  `a60bb95` — archived.)\n- **API:** shell out to `jj`, not link `jj-lib`. (Researched\n  in `2130de1` — archived.)\n\nConcrete pieces:\n\n- Per-bug file layout. JSON is the leading candidate. The body,\n  status, title, assignee, labels, dependencies all serialize\n  cleanly. Comments append in a separate JSON-Lines file (one\n  per comment) to reduce merge conflict surface.\n- File naming: `bugs/<id>.json` for the main record;\n  `bugs/<id>.comments.jsonl` for the comment thread.\n- `Jjf-Op:` trailer format: one line per mutation, key is the op\n  type (`create`, `set-status`, `set-title`, `comment-add`,\n  `label-add`, `label-rm`, `dep-add`, `dep-rm`), value is a JSON\n  payload. Multiple ops per commit are fine.\n- The 4-CLI working-copy dance (jj 0.40-0.42 has no `file write\n  -r <change>`): `jj new bookmarks(bugs)` → edit working copy →\n  `jj describe -m '...'` → `jj bookmark set bugs -r @`. Cost\n  ~60 ms per mutation, acceptable.\n- jj resolves file paths relative to cwd, not repo root. Use the\n  `root:` fileset prefix everywhere.\n\n# Child tickets (all shipped during git-bug-era; status comments live in archived refs)\n\n- `storage-format-spec` — write a short spec doc for the on-disk\n  shape: file layout, trailer schema, version field. Shipped as `docs/storage-format.md`.\n- `storage-write` — implement the write path (the 4-CLI dance)\n  in the `jjf` binary's storage module. Shipped as `crates/jjf-storage/`.\n- `storage-read-single` — read one bug, parse JSON + reconstruct\n  status from latest trailer.\n- `storage-read-history` — read full op history via\n  `jj log <path> -T 'json(self)'` and parse trailers.\n- `storage-bootstrap` — `jjf init` creates the `bugs` bookmark\n  on an existing jj repo if it doesn't exist.\n\n# Depends on\n\n- Nothing — this is foundational.\n\n# Blocks\n\n- `mvp-cli` — every CLI verb is a thin wrapper over a storage operation.\n- `mvp-sync` — the merge driver runs against the file format defined here.\n\n# Status\n\n**Feature-complete** as of 2026-06-21. The v1 storage contract surface is complete:\nwrite, read, history, bootstrap. Epic re-filed in jjforge 2026-06-22 during the\ngit-bug cutover (decision recorded in archived git-bug `d12031c`). Full\nstatus-comment history including subagent finds and follow-up flags lives in the\narchived git-bug ticket — use `git-bug bug show 72638a0` against `refs/bugs/*`.\n",
   "status": "open",
+  "type": "epic",
   "labels": [
     "epic",
     "epic:mvp-storage"
@@ -11,5 +13,5 @@
   "dependencies": [],
   "assignee": null,
   "created_at": "2026-06-22T14:47:41Z",
-  "updated_at": "2026-06-22T14:47:41Z"
+  "updated_at": "2026-06-22T19:05:30Z"
 }
