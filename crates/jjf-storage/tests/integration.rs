@@ -3354,3 +3354,463 @@ fn remove_dep_edge_against_phantom_target_is_no_op() {
         .remove_dep_edge(&id, &phantom, DepKind::Blocks)
         .expect("remove_dep_edge against phantom must not error");
 }
+
+// =====================================================================
+// `qa-trailer-injection` (issue `a902492`) — defensive tests.
+//
+// The strict write-boundary rejects every user-controlled string that
+// could split into a new trailer line. These tests pin that contract
+// from two angles:
+//
+// 1. A crafted-title injection attempt against a real victim must NOT
+//    mutate the victim's state.
+// 2. A bookmark-wide walker that asserts every `Jjf-Op:` stanza is
+//    well-formed — no orphan trailers, no extras.
+//
+// Path A vs Path B: we picked Path A (reject newlines at the write
+// boundary) because the asterinas migration doesn't need multi-line
+// titles, validate_title already enforces it, and the defense is
+// uniform across every free-form field (title, assignee, label,
+// block-reason). Path B (writer-side quoting/escaping) would be more
+// complex, require a parser-side dequoting step, and risk a
+// quote-aware-vs-permissive split between jjforge and any third-party
+// tool that grep'd the trailer block.
+// =====================================================================
+
+#[test]
+fn crafted_title_cannot_inject_set_status_against_victim() {
+    // End-to-end attack:
+    //
+    // 1. File a "victim" issue. Record its id.
+    // 2. Attempt to create an "attacker" issue whose title (before
+    //    validation) contains a forged `Jjf-Op: set-status` stanza
+    //    targeting the victim id, with status closed.
+    // 3. The create must fail with `InvalidTitle::Newline` — that
+    //    proves the title-validation gate catches the attack BEFORE
+    //    any commit lands.
+    // 4. As belt-and-braces, the victim's status must remain `Open`.
+    //
+    // This is the contract test for `qa-trailer-injection`: a hostile
+    // title cannot reach the writer.
+    let repo = make_scratch_repo("crafted_title_injection");
+    let storage = Storage::open(&repo).unwrap();
+
+    let victim = storage
+        .create_issue(&IssueDraft {
+            title: "victim".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(storage.read(&victim).unwrap().status, Status::Open);
+
+    let crafted_title = format!(
+        "innocuous\n\nJjf-Op: set-status\nJjf-Issue: {}\nJjf-Status: closed\n",
+        victim
+    );
+
+    let err = storage
+        .create_issue(&IssueDraft {
+            title: crafted_title.clone(),
+            ..Default::default()
+        })
+        .unwrap_err();
+    match err {
+        StorageError::InvalidTitle { reason, .. } => {
+            assert_eq!(reason, TitleInvalidReason::Newline);
+        }
+        other => panic!("expected InvalidTitle{{Newline}}, got {other:?}"),
+    }
+
+    // Victim is still open — no op slipped through.
+    assert_eq!(storage.read(&victim).unwrap().status, Status::Open);
+
+    // And as a stronger guarantee: the storage layer's `set_title`
+    // (bypassing IssueDraft) also rejects the crafted title.
+    let err = storage.set_title(&victim, &crafted_title).unwrap_err();
+    assert!(
+        matches!(err, StorageError::InvalidTitle { .. }),
+        "set_title bypass attempt should also be rejected, got {err:?}"
+    );
+    assert_eq!(storage.read(&victim).unwrap().status, Status::Open);
+}
+
+#[test]
+fn crafted_assignee_cannot_inject_trailer() {
+    // Same shape as the title test but via the assignee field. The
+    // writer's `Jjf-Assignee:` payload is single-line by contract; a
+    // multi-line value would split into a new trailer line.
+    let repo = make_scratch_repo("crafted_assignee_injection");
+    let storage = Storage::open(&repo).unwrap();
+    let victim = storage
+        .create_issue(&IssueDraft {
+            title: "victim".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let crafted = format!(
+        "alice\nJjf-Op: set-status\nJjf-Issue: {}\nJjf-Status: closed",
+        victim
+    );
+
+    // set_assignee path
+    let err = storage.set_assignee(&victim, Some(&crafted)).unwrap_err();
+    assert!(
+        matches!(err, StorageError::Invalid(_)),
+        "set_assignee with newlines should be rejected, got {err:?}"
+    );
+
+    // update(assignee=...) path
+    let err = storage
+        .update(
+            &victim,
+            UpdateFields {
+                assignee: Some(Some(crafted.clone())),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, StorageError::Invalid(_)),
+        "update(assignee=newline) should be rejected, got {err:?}"
+    );
+
+    // claim path (assignee comes via `who`)
+    let err = storage.claim(&victim, &crafted).unwrap_err();
+    assert!(
+        matches!(err, StorageError::Invalid(_)),
+        "claim(who=newline) should be rejected, got {err:?}"
+    );
+
+    // create_issue draft.assignee path
+    let err = storage
+        .create_issue(&IssueDraft {
+            title: "attacker".into(),
+            assignee: Some(crafted),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, StorageError::Invalid(_)),
+        "create_issue(draft.assignee=newline) should be rejected, got {err:?}"
+    );
+
+    // Victim untouched.
+    assert_eq!(storage.read(&victim).unwrap().status, Status::Open);
+    assert_eq!(storage.read(&victim).unwrap().assignee, None);
+}
+
+#[test]
+fn crafted_label_cannot_inject_trailer() {
+    // Labels are free-form (no charset constraint); a multi-line
+    // label would inject a trailer line. All three label write paths
+    // (`add_label`, `remove_label`, `create_issue(draft.labels)`) must
+    // reject.
+    let repo = make_scratch_repo("crafted_label_injection");
+    let storage = Storage::open(&repo).unwrap();
+    let victim = storage
+        .create_issue(&IssueDraft {
+            title: "victim".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let crafted = format!(
+        "wip\nJjf-Op: set-status\nJjf-Issue: {}\nJjf-Status: closed",
+        victim
+    );
+
+    let err = storage.add_label(&victim, &crafted).unwrap_err();
+    assert!(
+        matches!(err, StorageError::Invalid(_)),
+        "add_label with newlines should be rejected, got {err:?}"
+    );
+    let err = storage.remove_label(&victim, &crafted).unwrap_err();
+    assert!(
+        matches!(err, StorageError::Invalid(_)),
+        "remove_label with newlines should be rejected, got {err:?}"
+    );
+    let err = storage
+        .create_issue(&IssueDraft {
+            title: "attacker".into(),
+            labels: vec![crafted],
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, StorageError::Invalid(_)),
+        "create_issue(draft.labels with newline) should be rejected, got {err:?}"
+    );
+
+    // Victim untouched.
+    assert_eq!(storage.read(&victim).unwrap().status, Status::Open);
+    assert!(storage.read(&victim).unwrap().labels.is_empty());
+}
+
+// --- Trailer-block-shape walker ---------------------------------------
+//
+// Walks every commit on the `issues` bookmark and asserts each
+// `Jjf-Op:` stanza is structurally well-formed: every required sibling
+// trailer is present for the op kind, no extra `Jjf-*` lines are
+// orphaned outside an op stanza, and the carrier shape `Jjf-Op:` →
+// (`Jjf-Issue:` ...) holds. This is a generic invariant test: it
+// doesn't try to reason about op semantics, only about trailer
+// contiguity and the sibling-set contract for each op kind.
+
+/// Per spec §5.2: the required sibling-trailer keys for each op kind.
+/// `Jjf-Op`, `Jjf-Issue`, and `Jjf-At` are implicit (every stanza has
+/// them); `Jjf-Bug` is the v1 alias for `Jjf-Issue` (the walker accepts
+/// either). Optional trailers are listed in `optional_sibling_keys`.
+fn required_sibling_keys(op_type: &str) -> Option<&'static [&'static str]> {
+    Some(match op_type {
+        "create" => &["Jjf-Title", "Jjf-Status"],
+        "set-title" => &["Jjf-Title"],
+        "set-status" => &["Jjf-Status"],
+        "set-body" => &["Jjf-Body-Hash"],
+        "label-add" | "label-rm" => &["Jjf-Label"],
+        // Jjf-Dep-Kind is optional (defaults to `blocks` if absent
+        // per v1 forward-compat); only Jjf-Dep is REQUIRED. The
+        // optional set covers Jjf-Dep-Kind.
+        "dep-add" | "dep-rm" => &["Jjf-Dep"],
+        // Jjf-Assignee is required but may be empty (the empty-string
+        // form encodes `assignee: None`).
+        "set-assignee" => &["Jjf-Assignee"],
+        "set-type" => &["Jjf-Type"],
+        "set-slug" => &["Jjf-Slug"],
+        "set-block-reason" => &["Jjf-Reason"],
+        "comment-add" => &["Jjf-Comment-Id"],
+        // merge stanzas carry no payload trailers (spec §5.2).
+        "merge" => &[],
+        // Memory-space ops (spec v2.2 §10) — not per-issue, so they
+        // carry Memory-Key and (for set-memory) Memory-Value instead
+        // of Jjf-Issue. Listed here so the walker recognizes them.
+        "set-memory" => &["Jjf-Memory-Key", "Jjf-Memory-Value"],
+        "unset-memory" => &["Jjf-Memory-Key"],
+        // Unknown op-type: tolerate per spec §5.2. Caller treats this
+        // as "no required keys" — the stanza is opaque.
+        _ => return None,
+    })
+}
+
+fn optional_sibling_keys(op_type: &str) -> &'static [&'static str] {
+    match op_type {
+        "dep-add" | "dep-rm" => &["Jjf-Dep-Kind"],
+        _ => &[],
+    }
+}
+
+/// A stanza is "memory-space" if its op-type lives on the memory
+/// bookmark (no Jjf-Issue trailer per spec v2.2 §10). Walker uses
+/// this to skip the per-issue id check.
+fn is_memory_op(op_type: &str) -> bool {
+    matches!(op_type, "set-memory" | "unset-memory")
+}
+
+#[test]
+fn trailer_block_shape_walker_finds_no_orphans_on_real_bookmark() {
+    // Build a representative bookmark exercising every op kind we
+    // know how to write, then walk every commit and assert structural
+    // integrity.
+    let repo = make_scratch_repo("trailer_walker");
+    let storage = Storage::open(&repo).unwrap();
+
+    // create + slug + body + type + labels + dep + assignee in one
+    // multi-op stanza
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "alpha".into(),
+            slug: Some("alpha".into()),
+            body: "the body".into(),
+            type_: Some(IssueType::Bug),
+            labels: vec!["wip".into(), "p0".into()],
+            assignee: Some("alice".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let b = storage
+        .create_issue(&IssueDraft {
+            title: "beta".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    // Per-field mutators: set-title, set-status, set-body, label-add/rm,
+    // dep-add/rm, set-assignee (set + clear), set-type, set-slug,
+    // set-block-reason (block + unblock).
+    storage.set_title(&a, "alpha 2").unwrap();
+    storage.set_status(&a, Status::Closed).unwrap();
+    storage.set_status(&a, Status::Open).unwrap();
+    storage.set_body(&a, "new body").unwrap();
+    storage.add_label(&a, "needs-review").unwrap();
+    storage.remove_label(&a, "wip").unwrap();
+    storage.add_dependency(&a, &b).unwrap();
+    storage.remove_dependency(&a, &b).unwrap();
+    storage.add_dep_edge(&a, &b, DepKind::ParentChild).unwrap();
+    storage.remove_dep_edge(&a, &b, DepKind::ParentChild).unwrap();
+    storage.set_assignee(&a, Some("bob")).unwrap();
+    storage.set_assignee(&a, None).unwrap();
+    storage.block(&a, Some("waiting on signal")).unwrap();
+    storage.unblock(&a).unwrap();
+    storage.add_comment(&a, "a comment", "tester").unwrap();
+
+    // Memory ops: set + update + unset.
+    storage.set_memory("hello-world", "first value").unwrap();
+    storage.set_memory("hello-world", "second value").unwrap();
+    storage.unset_memory("hello-world").unwrap();
+
+    // Now walk every commit description and assert the trailer block
+    // structure. We use `jj log` with a template that emits just the
+    // description, one record per commit separated by a NUL marker
+    // we won't see in real descriptions.
+    let log = jj_capture(
+        &[
+            "log",
+            "-r",
+            "::bookmarks(issues)",
+            "--no-graph",
+            "-T",
+            r#"description ++ "\n----RECORD-SEP----\n""#,
+        ],
+        &repo,
+    );
+
+    let mut commit_count = 0;
+    let mut stanza_count = 0;
+    for desc in log.split("----RECORD-SEP----") {
+        let desc = desc.trim_end();
+        if desc.is_empty() {
+            continue;
+        }
+        commit_count += 1;
+        stanza_count += assert_trailer_block_shape(desc);
+    }
+    assert!(commit_count > 0, "expected non-zero commits to walk");
+    assert!(stanza_count > 0, "expected at least one Jjf-Op stanza");
+}
+
+/// Parse a commit description into trailer stanzas and assert each
+/// `Jjf-Op:` stanza is well-formed. Returns the count of `Jjf-Op:`
+/// stanzas asserted.
+///
+/// Rules enforced:
+///
+/// - Every `Jjf-Op:` line is followed by `Jjf-Issue:` (or `Jjf-Bug:`)
+///   OR is a memory-space op (`set-memory` / `unset-memory`) that
+///   carries `Jjf-Memory-Key:` instead.
+/// - Every required sibling trailer for the op kind is present.
+/// - No `Jjf-*:` trailer line appears OUTSIDE a `Jjf-Op:` stanza
+///   (no orphans).
+/// - Unknown op-types are tolerated (per spec §5.2) — the walker
+///   verifies trailer-block contiguity for them but doesn't enforce
+///   a sibling set.
+fn assert_trailer_block_shape(desc: &str) -> usize {
+    // Mini state machine: walk lines; track whether we're inside a
+    // Jjf-Op stanza; when the stanza ends, assert sibling-set
+    // completeness.
+    let mut stanzas_seen = 0;
+    let mut cur_op: Option<String> = None;
+    let mut cur_siblings: Vec<String> = Vec::new();
+
+    let close_stanza = |op: &str, siblings: &[String]| {
+        // Every stanza must carry an issue id OR be a memory-space op.
+        let has_issue =
+            siblings.iter().any(|s| s == "Jjf-Issue" || s == "Jjf-Bug");
+        if !is_memory_op(op) {
+            assert!(
+                has_issue,
+                "Jjf-Op: {op} stanza missing Jjf-Issue (siblings={siblings:?})"
+            );
+        }
+        if let Some(required) = required_sibling_keys(op) {
+            for key in required {
+                assert!(
+                    siblings.iter().any(|s| s == key),
+                    "Jjf-Op: {op} stanza missing required sibling {key} \
+                     (siblings={siblings:?})"
+                );
+            }
+            // Sanity: no UNKNOWN Jjf-* keys outside the required +
+            // optional + always-present set. We allow Jjf-At and
+            // Jjf-Issue/Jjf-Bug as implicit.
+            let always = ["Jjf-At", "Jjf-Issue", "Jjf-Bug"];
+            let optional = optional_sibling_keys(op);
+            for sib in siblings {
+                let ok = required.iter().any(|k| k == sib)
+                    || optional.iter().any(|k| k == sib)
+                    || always.iter().any(|k| k == sib);
+                assert!(
+                    ok,
+                    "Jjf-Op: {op} stanza has unexpected sibling {sib} \
+                     (siblings={siblings:?})"
+                );
+            }
+        }
+        // Unknown op-types (required is None) are tolerated.
+    };
+
+    for line in desc.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            // Blank line ends a stanza per RFC trailer rules.
+            if let Some(op) = cur_op.take() {
+                close_stanza(&op, &cur_siblings);
+                cur_siblings.clear();
+                stanzas_seen += 1;
+            }
+            continue;
+        }
+        if let Some(colon) = trimmed.find(':') {
+            let key = &trimmed[..colon];
+            // Real trailer keys are single-token, no spaces.
+            if key.is_empty() || key.contains(' ') {
+                // Not a trailer line. If we're in a stanza, end it.
+                if let Some(op) = cur_op.take() {
+                    close_stanza(&op, &cur_siblings);
+                    cur_siblings.clear();
+                    stanzas_seen += 1;
+                }
+                continue;
+            }
+            if key == "Jjf-Op" {
+                // New stanza starts.
+                if let Some(op) = cur_op.take() {
+                    close_stanza(&op, &cur_siblings);
+                    cur_siblings.clear();
+                    stanzas_seen += 1;
+                }
+                let value = trimmed[colon + 1..].trim_start();
+                cur_op = Some(value.to_owned());
+            } else if key.starts_with("Jjf-") {
+                // Sibling trailer. Must be inside a Jjf-Op stanza —
+                // an orphan Jjf-* is the injection-shape we're
+                // defending against.
+                assert!(
+                    cur_op.is_some(),
+                    "orphan Jjf-* trailer outside any Jjf-Op stanza: {trimmed:?}"
+                );
+                cur_siblings.push(key.to_owned());
+            } else if cur_op.is_some() {
+                // Non-Jjf trailer (e.g. Signed-off-by) closes the
+                // stanza (matches the parser's RFC behavior).
+                if let Some(op) = cur_op.take() {
+                    close_stanza(&op, &cur_siblings);
+                    cur_siblings.clear();
+                    stanzas_seen += 1;
+                }
+            }
+        } else if cur_op.is_some() {
+            // Non-trailer text mid-stanza: close it.
+            if let Some(op) = cur_op.take() {
+                close_stanza(&op, &cur_siblings);
+                cur_siblings.clear();
+                stanzas_seen += 1;
+            }
+        }
+    }
+    // Tail: close any open stanza.
+    if let Some(op) = cur_op.take() {
+        close_stanza(&op, &cur_siblings);
+        stanzas_seen += 1;
+    }
+    stanzas_seen
+}

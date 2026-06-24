@@ -539,6 +539,41 @@ pub fn validate_title(title: &str) -> std::result::Result<(), TitleInvalidReason
     Ok(())
 }
 
+/// Reject `\n` (U+000A) and `\r` (U+000D) in a free-form string
+/// that lands in a `Jjf-*:` trailer payload. Used as a write-boundary
+/// guard for fields the spec treats as opaque text but the trailer
+/// block treats as line-delimited: every embedded newline would split
+/// the value into a new trailer line, opening an op-injection vector
+/// (`qa-trailer-injection`, issue `a902492`).
+///
+/// Fields covered by this guard:
+///
+/// - `assignee` (Jjf-Assignee trailer payload)
+/// - `label` (Jjf-Label trailer payload on `label-add` / `label-rm`)
+///
+/// `block-reason` and `title` have their own (slightly different)
+/// validators; slug and memory-key already constrain charset to
+/// `[a-z0-9-]+` so newlines are structurally impossible. Memory value
+/// is sanitized at the writer (lf → space, plus trunc); the bare
+/// trailer-block parser is line-oriented (Rust's `str::lines()` only
+/// breaks on `\n` and `\r\n`), but we hold the line at "no `\n` or
+/// `\r` at all" so a future permissive parser, a hand-grep, or a third-
+/// party tool can't be fooled.
+///
+/// Returns `Ok(())` if neither `\n` nor `\r` appears; otherwise
+/// `Err(())` — the caller maps it to its preferred typed error (per
+/// field; the storage layer wraps with [`Error::Invalid`] today). The
+/// helper deliberately doesn't reject other control characters: a
+/// label like `wip:\t` is ugly but doesn't inject a trailer, and the
+/// assignee field is free-form by spec. Title-style strictness is too
+/// strong here; trailer-injection is the specific defense we want.
+pub fn validate_no_newlines(s: &str) -> std::result::Result<(), ()> {
+    if s.contains('\n') || s.contains('\r') {
+        return Err(());
+    }
+    Ok(())
+}
+
 /// Minimum slug length (inclusive). Spec v2.1 §3.1.
 pub const SLUG_MIN_LEN: usize = 3;
 
@@ -981,6 +1016,28 @@ impl Storage {
             });
         }
 
+        // Trailer-injection guards (`qa-trailer-injection`, issue
+        // `a902492`): every free-form string the create-time multi-op
+        // stanza interpolates into the trailer block must be single-
+        // line. Title is already covered by `validate_title`; slug is
+        // already constrained by `validate_slug`'s charset; block-
+        // reason isn't a draft field. The remaining free-form payload
+        // strings are assignee and each label.
+        if let Some(a) = &draft.assignee {
+            if validate_no_newlines(a).is_err() {
+                return Err(Error::Invalid(
+                    "assignee must not contain newlines".into(),
+                ));
+            }
+        }
+        for label in &draft.labels {
+            if validate_no_newlines(label).is_err() {
+                return Err(Error::Invalid(
+                    "label must not contain newlines".into(),
+                ));
+            }
+        }
+
         // Validate each dep target exists on the bookmark. The
         // child id isn't known yet (it's rerolled below), so
         // self-dep is structurally impossible at create time;
@@ -1159,7 +1216,19 @@ impl Storage {
     }
 
     /// Replace the assignee. `None` clears it.
+    ///
+    /// Rejects assignee values containing `\n` or `\r` with
+    /// [`Error::Invalid`] — those would inject extra lines into the
+    /// `Jjf-Assignee:` trailer, opening an op-injection vector
+    /// (`qa-trailer-injection`, issue `a902492`).
     pub fn set_assignee(&self, id: &IssueId, assignee: Option<&str>) -> Result<()> {
+        if let Some(a) = assignee {
+            if validate_no_newlines(a).is_err() {
+                return Err(Error::Invalid(
+                    "assignee must not contain newlines".into(),
+                ));
+            }
+        }
         let assignee = assignee.map(str::to_owned);
         self.mutate(id, &format!("jjf: issue {} - set-assignee", id), |rec| {
             rec.assignee = assignee.clone();
@@ -1209,6 +1278,17 @@ impl Storage {
                     title: title.clone(),
                     reason,
                 });
+            }
+        }
+        // Assignee newline-guard (`qa-trailer-injection`, issue
+        // `a902492`): a multi-line assignee would inject extra trailer
+        // lines into the commit description and forge a `Jjf-Op:`
+        // stanza. Reject at the boundary.
+        if let Some(Some(a)) = &fields.assignee {
+            if validate_no_newlines(a).is_err() {
+                return Err(Error::Invalid(
+                    "assignee must not contain newlines".into(),
+                ));
             }
         }
         // Pre-validate the slug, if any, BEFORE the storage-side
@@ -1322,6 +1402,11 @@ impl Storage {
         if who.is_empty() {
             return Err(Error::Invalid(
                 "claim: assignee must not be empty".into(),
+            ));
+        }
+        if validate_no_newlines(who).is_err() {
+            return Err(Error::Invalid(
+                "claim: assignee must not contain newlines".into(),
             ));
         }
         let current = self.read_record_from_bookmark(id)?;
@@ -1528,6 +1613,11 @@ impl Storage {
     /// Add a label. No-op (per spec §5.2) if already present, but the
     /// commit is still landed so the audit log records intent.
     pub fn add_label(&self, id: &IssueId, label: &str) -> Result<()> {
+        if validate_no_newlines(label).is_err() {
+            return Err(Error::Invalid(
+                "label must not contain newlines".into(),
+            ));
+        }
         let label = label.to_owned();
         self.mutate(id, &format!("jjf: issue {} - label-add", id), |rec| {
             if !rec.labels.iter().any(|l| l == &label) {
@@ -1543,6 +1633,11 @@ impl Storage {
 
     /// Remove a label. No-op (spec §5.2) if not present.
     pub fn remove_label(&self, id: &IssueId, label: &str) -> Result<()> {
+        if validate_no_newlines(label).is_err() {
+            return Err(Error::Invalid(
+                "label must not contain newlines".into(),
+            ));
+        }
         let label = label.to_owned();
         self.mutate(id, &format!("jjf: issue {} - label-rm", id), |rec| {
             rec.labels.retain(|l| l != &label);

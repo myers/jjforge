@@ -121,7 +121,16 @@ pub(crate) fn build_set_memory_commit_message(
     s.push_str(key);
     s.push('\n');
     s.push_str("Jjf-Memory-Value: ");
-    let one_line = value.replace('\n', " ");
+    // Collapse every newline shape — `\r\n`, `\r`, `\n` — into a
+    // single space so no embedded line break can split this trailer
+    // value into a separate trailer line (`qa-trailer-injection`,
+    // issue `a902492`). Order matters: `\r\n` first, then bare `\r`,
+    // then bare `\n`. The on-disk JSON file still holds the
+    // untouched value.
+    let one_line = value
+        .replace("\r\n", " ")
+        .replace('\r', " ")
+        .replace('\n', " ");
     let truncated: String = if one_line.chars().count() > TRAILER_VALUE_TRUNC {
         let mut t: String = one_line.chars().take(TRAILER_VALUE_TRUNC).collect();
         t.push_str("...");

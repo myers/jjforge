@@ -174,6 +174,19 @@ impl Op {
     /// stanza this writer emits; parsers tolerate absence for forward
     /// compatibility with older fixtures and pre-spec-bump data).
     pub fn to_trailer_block(&self, jjf_at: &str) -> String {
+        // Defense-in-depth: every free-form payload that lands in this
+        // stanza must be single-line, else it would forge a new trailer
+        // line and inject an op (`qa-trailer-injection`, issue
+        // `a902492`). The write-boundary validators (`validate_title`,
+        // `validate_no_newlines`, the slug/charset rules, the block-
+        // reason guard) are the primary defense; this `debug_assert`
+        // is the belt-and-braces check that catches new writer call
+        // sites that forget to pre-validate. Compiled out in release;
+        // the test suite always runs in debug mode and will trip it.
+        debug_assert!(
+            !jjf_at.contains('\n') && !jjf_at.contains('\r'),
+            "jjf_at contained a newline: {jjf_at:?}"
+        );
         let mut s = String::new();
         s.push_str("Jjf-Op: ");
         s.push_str(self.op_type());
@@ -186,6 +199,10 @@ impl Op {
         s.push('\n');
         match self {
             Op::Create { title, status, .. } => {
+                debug_assert!(
+                    !title.contains('\n') && !title.contains('\r'),
+                    "Op::Create title contained a newline: {title:?}"
+                );
                 s.push_str("Jjf-Title: ");
                 s.push_str(title);
                 s.push('\n');
@@ -194,6 +211,10 @@ impl Op {
                 s.push('\n');
             }
             Op::SetTitle { title, .. } => {
+                debug_assert!(
+                    !title.contains('\n') && !title.contains('\r'),
+                    "Op::SetTitle title contained a newline: {title:?}"
+                );
                 s.push_str("Jjf-Title: ");
                 s.push_str(title);
                 s.push('\n');
@@ -209,6 +230,10 @@ impl Op {
                 s.push('\n');
             }
             Op::LabelAdd { label, .. } | Op::LabelRm { label, .. } => {
+                debug_assert!(
+                    !label.contains('\n') && !label.contains('\r'),
+                    "label contained a newline: {label:?}"
+                );
                 s.push_str("Jjf-Label: ");
                 s.push_str(label);
                 s.push('\n');
@@ -222,8 +247,13 @@ impl Op {
                 s.push('\n');
             }
             Op::SetAssignee { assignee, .. } => {
+                let a = assignee.as_deref().unwrap_or("");
+                debug_assert!(
+                    !a.contains('\n') && !a.contains('\r'),
+                    "assignee contained a newline: {a:?}"
+                );
                 s.push_str("Jjf-Assignee: ");
-                s.push_str(assignee.as_deref().unwrap_or(""));
+                s.push_str(a);
                 s.push('\n');
             }
             Op::SetType { kind, .. } => {
@@ -232,8 +262,13 @@ impl Op {
                 s.push('\n');
             }
             Op::SetSlug { slug, .. } => {
+                let v = slug.as_deref().unwrap_or("");
+                debug_assert!(
+                    !v.contains('\n') && !v.contains('\r'),
+                    "slug contained a newline: {v:?}"
+                );
                 s.push_str("Jjf-Slug: ");
-                s.push_str(slug.as_deref().unwrap_or(""));
+                s.push_str(v);
                 s.push('\n');
             }
             Op::SetBlockReason { reason, .. } => {
@@ -243,8 +278,13 @@ impl Op {
                 // contract — the storage layer's `block` method
                 // rejects bodies containing newlines so the trailer
                 // round-trip stays clean.
+                let r = reason.as_deref().unwrap_or("");
+                debug_assert!(
+                    !r.contains('\n') && !r.contains('\r'),
+                    "block reason contained a newline: {r:?}"
+                );
                 s.push_str("Jjf-Reason: ");
-                s.push_str(reason.as_deref().unwrap_or(""));
+                s.push_str(r);
                 s.push('\n');
             }
             Op::CommentAdd { comment_id, .. } => {
