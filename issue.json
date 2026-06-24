@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "id": "db53a3e",
+  "title": "Doc updates from QA pass: --colocate, memory decay, multi-machine recipe, prefix contract",
+  "slug": "qa-doc-updates",
+  "body": "# Goal\n\nSeveral findings from the 2026-06-24 QA pass are pure\ndocumentation gaps that don't need code changes. Batch them\ninto one edit pass over `CLAUDE.md` and `docs/quickstart.md`.\n\n# Items\n\n## 1. Quickstart over-specifies `--colocate`\n\n`docs/quickstart.md` step 1 says:\n\n```\njj git init --colocate\n```\n\nOn jj 0.40 (and probably earlier), plain `jj git init` also\nproduces `.git/` + `.jj/` and works fine with `jjf`. The\n`--colocate` flag isn't required.\n\n**Fix:** drop the flag or note that on jj 0.40+ it's the\ndefault. (Picking what to do depends on jj's stability story\nfor the default — investigate before changing.)\n\n## 2. Memories don't auto-decay\n\nThe jjforge planner carries a memory about\n`JJF_ALLOW_SELF_HOST=1` (retired in v3 — confirmed via\n`52e5c49`). Stale memories drift like comments do.\n\n**Fix:** add a short paragraph to CLAUDE.md (in the memory\nsection) noting that memories need active pruning when the\nunderlying invariant changes, and mention `jjf forget <key>`\nin the quickstart memory section.\n\n## 3. Multi-machine setup recipe (depends on F-001 fix)\n\nOnce F-001 is fixed, the quickstart should grow a section\n\"Joining an existing project\" with the exact recipe (clone,\nthe auto-config, first pull, first push). The current\nquickstart only covers `mkdir my-project`.\n\n## 4. Prefix-id contract (depends on F-008 outcome)\n\nIf F-008 ends up \"docs are wrong, prefixes never worked,\"\nCLAUDE.md's \"often 4 characters is enough\" claim needs\nremoval. If F-008 restores the feature, the contract stays.\n\n## 5. No `jjf dep ls` (audit gap)\n\nCLAUDE.md's \"Filters jjforge doesn't yet ship\" list already\nmentions wanting a dep audit verb. F-009 raises this from\nnice-to-have to \"we'll hit the cycle-detection diagnostic gap\nwithout it.\" Update the wishlist note to flag the priority.\n\n# Confidence\n\nItems 1, 2, 5 are doc-only and can land immediately. Items 3\nand 4 are gated on F-001 and F-008 respectively.\n",
+  "status": "open",
+  "block_reason": null,
+  "type": "feature",
+  "labels": [
+    "epic:multi-project-readiness"
+  ],
+  "dependencies": [
+    {
+      "target": "52ee82d",
+      "kind": "blocks"
+    }
+  ],
+  "assignee": null,
+  "created_at": "2026-06-24T17:34:21Z",
+  "updated_at": "2026-06-24T17:34:21Z"
+}
