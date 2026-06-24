@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "id": "a105e0b",
+  "title": "Slug auto-recycles on close; new issue can shadow closed one for discovery",
+  "slug": "slug-recycle-policy",
+  "body": "# Symptom\n\nSlug uniqueness is enforced across OPEN issues only. Closing an\nissue silently frees its slug, so the next `jjf new --slug\n<freed-slug>` succeeds and shadows the closed one for\ndiscovery.\n\n# Repro\n\n```\n$ jjf new -t Roadmap1 --type roadmap --slug roadmap\n$ jjf new -t Roadmap2 --type roadmap --slug roadmap\n{\"ok\":false,\"error\":{\"kind\":\"slug_collision\", ...}}\n$ jjf close <roadmap1>\n$ jjf new -t Roadmap3 --type roadmap --slug roadmap\n{\"ok\":true, ...}    # the slug 'roadmap' now resolves to roadmap3\n$ jjf show roadmap\n# resolves to the new one; the old roadmap1 is harder to find\n```\n\n# Design call\n\nTwo reasonable policies:\n\n1. **Slug uniqueness across all statuses** (open + closed +\n   blocked). Closed issues retain their slug forever; new\n   tickets must pick a new one. Trades a small naming friction\n   for unambiguous discovery.\n2. **Warn-but-allow on re-use** (current behavior + warning).\n   `jjf new --slug roadmap` succeeds but prints `(slug\n   previously held by closed issue f2a71ff)` on stderr.\n\nEither is defensible; the current silent re-use is the wrong\ndefault for an audit-trail-flavored planner.\n\n# Confidence\n\nReproducible 100%. Tested in `scratchpad/qa/r08-roadmaps/`.\n",
+  "status": "open",
+  "block_reason": null,
+  "type": "bug",
+  "labels": [
+    "epic:multi-project-readiness"
+  ],
+  "dependencies": [
+    {
+      "target": "52ee82d",
+      "kind": "blocks"
+    }
+  ],
+  "assignee": null,
+  "created_at": "2026-06-24T17:33:58Z",
+  "updated_at": "2026-06-24T17:33:58Z"
+}
