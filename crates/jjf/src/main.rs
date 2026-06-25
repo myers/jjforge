@@ -27,11 +27,11 @@
 //!
 //! # What lives here vs. `jjf-storage`
 //!
-//! All the actual work — the 4-CLI dance, the trailers, the merge
-//! policy — lives in `jjf-storage` (and, for conflict-resolution,
-//! `jjf-merge`). This crate's only jobs are: parse args, hand the
-//! parsed shape to storage, render the result, map errors to exit
-//! codes. No business logic.
+//! All the actual work — the git-ref write path, the trailers,
+//! the merge policy — lives in `jjf-storage` (and, for
+//! conflict-resolution, `jjf-merge`). This crate's only jobs
+//! are: parse args, hand the parsed shape to storage, render the
+//! result, map errors to exit codes. No business logic.
 
 mod preflight;
 
@@ -989,24 +989,6 @@ enum CliError {
     #[error("jj git fetch failed: {0}")]
     JjGitFetch(String),
 
-    /// Refused to run a mutating verb from inside the jjforge source
-    /// repo. The colocated jj+git layout means the storage layer's
-    /// 4-CLI write dance moves git HEAD off `main` and onto a phantom
-    /// `refs/jj/root`, leaving the working tree apparently empty
-    /// against the new HEAD — destructive to recover from. Preflight
-    /// failure (exit 2) per the standard exit-code convention; the
-    /// operator can opt in via `JJF_ALLOW_SELF_HOST=1` if they
-    /// genuinely need to write from inside (e.g. orchestration
-    /// loops). See `crates/jjf/src/preflight.rs` for the marker-set
-    /// detection rationale.
-    #[error(
-        "refusing to write from inside the jjforge source repo at {path}; this would drift git HEAD onto refs/jj/root.\nhint: cd to a sibling working dir (e.g. ~/p/jjforge-data) and retry, or set JJF_ALLOW_SELF_HOST=1 to override"
-    )]
-    SelfHostedWriteRefused {
-        path: PathBuf,
-        markers: Vec<String>,
-    },
-
     /// Legacy v1 file-bytes merge driver failure: the issue record's
     /// body field had free-text conflicts the LWW/union policy
     /// couldn't dispatch. Runtime (exit 1). **As of the
@@ -1148,7 +1130,8 @@ enum CliError {
     AlreadyClaimed { by: String },
 
     /// A concurrent jjforge writer landed first; the storage layer's
-    /// 4-CLI dance hit jj's "Concurrent checkout" conflict. Runtime
+    /// CAS on the per-issue ref lost the race (v3) or jj's
+    /// "Concurrent checkout" conflict fired (v2). Runtime
     /// failure (exit 1): the command was well-formed, the loser just
     /// has to re-run. Storage already auto-retried once for non-
     /// slug-claim mutations before surfacing this — if you see it,
@@ -1205,7 +1188,6 @@ impl CliError {
             CliError::NoUpdateFields => 2,
             CliError::RemoteAlreadyExists(_) => 2,
             CliError::RemoteNotFound(_) => 2,
-            CliError::SelfHostedWriteRefused { .. } => 2,
             CliError::InvalidSlug { .. } => 2,
             CliError::InvalidTitle { .. } => 2,
             CliError::SelfDependency { .. } => 2,
@@ -1286,7 +1268,6 @@ impl CliError {
             CliError::NoUpdateFields => "no_update_fields",
             CliError::RemoteAlreadyExists(_) => "remote_already_exists",
             CliError::RemoteNotFound(_) => "remote_not_found",
-            CliError::SelfHostedWriteRefused { .. } => "self_hosted_write_refused",
             CliError::JjGitRemote(_) => "jj_git_remote_error",
             CliError::Probe(_) => "probe_error",
             CliError::PushNetworkFailure { .. } => "push_network_failure",
@@ -1337,10 +1318,6 @@ impl CliError {
             }
             CliError::RemoteAlreadyExists(name) => json!({ "name": name }),
             CliError::RemoteNotFound(name) => json!({ "name": name }),
-            CliError::SelfHostedWriteRefused { path, markers } => json!({
-                "path": path.display().to_string(),
-                "markers": markers,
-            }),
             CliError::PushNetworkFailure { remote, .. }
             | CliError::PushAuthFailure { remote, .. }
             | CliError::PushRejected { remote, .. }
@@ -1591,16 +1568,6 @@ enum DepOp {
 /// expected to act on the value besides logging it.
 fn run_init(json: bool) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
-    // Refuse to run from inside the jjforge source repo (colocate
-    // drift guard — see preflight::refuse_self_hosted_write). The
-    // pre-v3 init went through the 4-CLI seed dance which drove HEAD
-    // drift in colocated repos. v3 init writes one ref via git and
-    // is drift-free, but the v1-shape path still calls the v1→v2
-    // migrator which uses the dance. Until the migrator goes away
-    // (ticket `c14e1c1`'s v2→v3 migrator + cleanup), keep the
-    // guard.
-    let cwd_canon = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
-    preflight::refuse_self_hosted_write(&cwd_canon, json)?;
     Storage::init(&cwd)?;
     if json {
         // We hand-build this object rather than using `serde_json::json!`
@@ -1684,16 +1651,7 @@ fn run_new(
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
 
-    // 4. Preflight: refuse to run from inside the jjforge source repo
-    // (colocate drift guard — see `preflight::refuse_self_hosted_write`).
-    // Runs FIRST among the preflights so an operator inside the source
-    // tree gets the actionable "use a sibling working dir" message
-    // rather than a generic `MissingIssuesBookmark` (when they haven't
-    // run `jjf init` in that scratch dir yet, which is the common case
-    // since `jjf init` is also guarded).
-    preflight::refuse_self_hosted_write(&cwd, json)?;
-
-    // 5. Preflight: we're inside a jj repo AND the `issues` bookmark
+    // 4. Preflight: we're inside a jj repo AND the `issues` bookmark
     // exists. The storage layer doesn't distinguish missing-bookmark
     // today (see follow-ups in the cli-new/cli-show closing comments);
     // doing the probe here keeps the user-facing error precise without
@@ -1701,7 +1659,7 @@ fn run_new(
     // so the read verbs share the same code.
     preflight::issues_bookmark(&cwd)?;
 
-    // 6. Hand the draft to storage.
+    // 5. Hand the draft to storage.
     let storage = Storage::open(&cwd)?;
     let draft = IssueDraft {
         title,
@@ -1897,10 +1855,9 @@ fn run_remember(
         }
     };
 
-    // 3. Preflight cwd + bookmark + self-host guard.
+    // 3. Preflight cwd + bookmark.
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
-    preflight::refuse_self_hosted_write(&cwd, json)?;
     preflight::issues_bookmark(&cwd)?;
 
     // 4. Hand off to storage.
@@ -2019,7 +1976,6 @@ fn run_recall(json: bool, key: String) -> Result<(), CliError> {
 fn run_forget(json: bool, key: String) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
-    preflight::refuse_self_hosted_write(&cwd, json)?;
     preflight::issues_bookmark(&cwd)?;
     let storage = Storage::open(&cwd)?;
     // Probe up-front so we can surface `MemoryNotFound` rather than
@@ -2163,14 +2119,10 @@ fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
 
-    // 2. Preflight: refuse to run from the jjforge source repo
-    // (colocate drift guard). See `preflight::refuse_self_hosted_write`.
-    preflight::refuse_self_hosted_write(&cwd, json)?;
-
-    // 3. Preflight: jj repo + `issues` bookmark present.
+    // 2. Preflight: jj repo + `issues` bookmark present.
     preflight::issues_bookmark(&cwd)?;
 
-    // 4. Open storage, resolve the handle (`id`-or-`slug`), then
+    // 3. Open storage, resolve the handle (`id`-or-`slug`), then
     // hand off the mutation.
     let storage = Storage::open(&cwd)?;
     let issue_id = resolve_handle(&storage, &id)?;
@@ -2220,7 +2172,6 @@ fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError
 fn run_block(json: bool, id: String, reason: Option<String>) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
-    preflight::refuse_self_hosted_write(&cwd, json)?;
     preflight::issues_bookmark(&cwd)?;
 
     let storage = Storage::open(&cwd)?;
@@ -2269,7 +2220,6 @@ fn run_block(json: bool, id: String, reason: Option<String>) -> Result<(), CliEr
 fn run_unblock(json: bool, id: String) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
-    preflight::refuse_self_hosted_write(&cwd, json)?;
     preflight::issues_bookmark(&cwd)?;
 
     let storage = Storage::open(&cwd)?;
@@ -2319,14 +2269,10 @@ fn run_label(json: bool, id: String, label: String, op: LabelOp) -> Result<(), C
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
 
-    // 3. Preflight: refuse to run from the jjforge source repo
-    // (colocate drift guard). See `preflight::refuse_self_hosted_write`.
-    preflight::refuse_self_hosted_write(&cwd, json)?;
-
-    // 4. Preflight: jj repo + `issues` bookmark present.
+    // 3. Preflight: jj repo + `issues` bookmark present.
     preflight::issues_bookmark(&cwd)?;
 
-    // 5. Open storage, resolve handle (`id`-or-`slug`), then hand off.
+    // 4. Open storage, resolve handle (`id`-or-`slug`), then hand off.
     let storage = Storage::open(&cwd)?;
     let issue_id = resolve_handle(&storage, &id)?;
     match op {
@@ -2373,7 +2319,6 @@ fn run_dep(
 ) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
-    preflight::refuse_self_hosted_write(&cwd, json)?;
     preflight::issues_bookmark(&cwd)?;
 
     let storage = Storage::open(&cwd)?;
@@ -2710,14 +2655,10 @@ fn run_update(
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
 
-    // 4. Preflight: refuse to run from the jjforge source repo
-    // (colocate drift guard). See `preflight::refuse_self_hosted_write`.
-    preflight::refuse_self_hosted_write(&cwd, json)?;
-
-    // 5. Preflight: jj repo + `issues` bookmark present.
+    // 4. Preflight: jj repo + `issues` bookmark present.
     preflight::issues_bookmark(&cwd)?;
 
-    // 6. Open storage, resolve handle.
+    // 5. Open storage, resolve handle.
     let storage = Storage::open(&cwd)?;
     let issue_id = resolve_handle(&storage, &id)?;
 
@@ -2841,11 +2782,7 @@ fn run_comment(
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
 
-    // 3. Preflight: refuse to run from the jjforge source repo
-    // (colocate drift guard). See `preflight::refuse_self_hosted_write`.
-    preflight::refuse_self_hosted_write(&cwd, json)?;
-
-    // 4. Preflight: jj repo + `issues` bookmark present. We run this
+    // 3. Preflight: jj repo + `issues` bookmark present. We run this
     // BEFORE author resolution so a non-jj cwd surfaces the typed
     // "not a jj repo" error rather than the (correct but less useful)
     // "no comment author available" — the user almost always wants to
@@ -3074,14 +3011,8 @@ fn run_ready(
     }
 
     // Preflight: cwd is a jj repo AND `issues` bookmark exists.
-    // --claim is a mutating shape, so it also gets the self-host
-    // write guard (otherwise we'd silently drift git HEAD in the
-    // source repo).
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
-    if claim {
-        preflight::refuse_self_hosted_write(&cwd, json)?;
-    }
     preflight::issues_bookmark(&cwd)?;
 
     let storage = Storage::open(&cwd)?;
@@ -3240,10 +3171,6 @@ fn slug_matches(issue: &Issue, pattern: Option<&str>) -> bool {
 fn run_push(json: bool, remote: String) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
-    // Refuse to run from the jjforge source repo (colocate drift guard).
-    // Even v3 (where mutators are pure-git) keeps the guard for symmetry
-    // with the other mutating verbs; ticket 8 removes it.
-    preflight::refuse_self_hosted_write(&cwd, json)?;
     preflight::issues_bookmark(&cwd)?;
 
     // Storage::open detects v3 vs v2 from the sentinel ref. If the
@@ -3433,12 +3360,6 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
     // the verb that materializes them. Requiring the sentinel up front
     // would force an awkward `jjf init` on a clone whose remote already
     // has all the v3 refs we want to fetch.
-    //
-    // Refuse to run from the jjforge source repo (colocate drift guard).
-    // The v3 pull path is pure git ref ops (no `@` motion), so this is
-    // looser-than-needed in v3 — but kept for symmetry with the other
-    // mutating verbs. Ticket 8 removes it.
-    preflight::refuse_self_hosted_write(&cwd, json)?;
     preflight::jj_repo(&cwd)?;
 
     // Mode dispatch is best-effort: open Storage, and if it opens

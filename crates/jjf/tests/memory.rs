@@ -34,7 +34,6 @@ fn make_initialized(name: &str) -> PathBuf {
         .expect("spawn jj git init");
     assert!(out.status.success(), "jj git init failed");
     let init = Command::new(JJF_BIN)
-        .env("JJF_ALLOW_SELF_HOST", "1")
         .arg("init")
         .current_dir(&dir)
         .output()
@@ -49,7 +48,6 @@ fn make_initialized(name: &str) -> PathBuf {
 
 fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
     Command::new(JJF_BIN)
-        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(args)
         .current_dir(cwd)
         .output()
@@ -60,7 +58,6 @@ fn run_jjf_stdin(cwd: &Path, args: &[&str], stdin: &str) -> Output {
     use std::io::Write;
     use std::process::Stdio;
     let mut child = Command::new(JJF_BIN)
-        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())

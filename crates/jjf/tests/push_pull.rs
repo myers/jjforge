@@ -38,7 +38,6 @@ fn scratch(name: &str) -> PathBuf {
 
 fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
     Command::new(JJF_BIN)
-        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(args)
         .current_dir(cwd)
         .output()
@@ -431,7 +430,6 @@ fn push_without_init_exits_two_missing_marker() {
 fn pull_help_lists_remote_positional() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = Command::new(JJF_BIN)
-        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(["pull", "--help"])
         .current_dir(cwd)
         .output()
@@ -448,7 +446,6 @@ fn pull_help_lists_remote_positional() {
 fn push_help_lists_remote_positional() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = Command::new(JJF_BIN)
-        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(["push", "--help"])
         .current_dir(cwd)
         .output()

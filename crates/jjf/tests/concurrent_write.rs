@@ -76,7 +76,6 @@ fn make_jj_repo(name: &str) -> PathBuf {
 fn make_initialized_repo(name: &str) -> PathBuf {
     let repo = make_jj_repo(name);
     let out = Command::new(JJF_BIN)
-        .env("JJF_ALLOW_SELF_HOST", "1")
         .arg("init")
         .current_dir(&repo)
         .output()
@@ -92,7 +91,6 @@ fn make_initialized_repo(name: &str) -> PathBuf {
 
 fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
     Command::new(JJF_BIN)
-        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(args)
         .current_dir(cwd)
         .output()
@@ -101,7 +99,6 @@ fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
 
 fn run_jjf_with_stdin(cwd: &Path, args: &[&str], stdin_bytes: &[u8]) -> Output {
     let mut child = Command::new(JJF_BIN)
-        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -132,9 +129,6 @@ fn create_issue(repo: &Path, title: &str) -> String {
 /// Parse a `--json` error envelope from a process's stderr (one JSON
 /// object per line). Returns the LAST line's parsed envelope, or
 /// `None` if no line was a valid JSON object with an `error` field.
-/// (Stderr may also carry an unrelated stderr line from the
-/// `JJF_ALLOW_SELF_HOST=1` bypass announcement; the envelope is on
-/// its own line.)
 fn parse_error_envelope(stderr: &[u8]) -> Option<serde_json::Value> {
     let text = String::from_utf8_lossy(stderr);
     for line in text.lines().rev() {

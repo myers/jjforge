@@ -440,7 +440,6 @@ from plain-text mode (see the top comment in `main.rs`: `0` success,
 | `no_update_fields`           | 2    | `NoUpdateFields`              | —                        |
 | `remote_already_exists`      | 2    | `RemoteAlreadyExists`         | `name`                   |
 | `remote_not_found`           | 2    | `RemoteNotFound`              | `name`                   |
-| `self_hosted_write_refused`  | 2    | `SelfHostedWriteRefused`      | `path`, `markers`        |
 | `body_read_error`            | 2    | `BodyRead`                    | `from`                   |
 | `cwd_error`                  | 2    | `Cwd`                         | —                        |
 | `probe_error`                | 1    | `Probe`                       | —                        |
@@ -600,30 +599,6 @@ $ jjf --json comment a3f9c01 -F -    # sibling write raced and retry also raced
 
 $ jjf --json new -t winner --slug taken    # slug-claim race upgraded to slug_collision
 {"ok":false,"error":{"kind":"slug_collision","message":"slug \"taken\" already in use by open issue a3f9c01","details":{"slug":"taken","conflicts_with":"a3f9c01"}}}
-```
-
-### Note on `self_hosted_write_refused`
-
-Emitted by every mutating verb (`init`, `new`, `update`, `comment`,
-`close`, `open`, `label add|rm`, `push`, `pull`) when the working
-directory is inside the jjforge source repo (detected by the
-presence of both `crates/jjf/Cargo.toml` and `docs/storage-format.md`
-at some ancestor). The colocate-drift guard refuses these calls
-because the storage layer's 4-CLI write dance moves git HEAD onto
-`refs/jj/root` in a colocated repo, leaving the working tree
-apparently empty against HEAD.
-
-Bypass: set `JJF_ALLOW_SELF_HOST=1` in the environment. In text
-mode the bypass emits a stderr line announcing itself; in `--json`
-mode the bypass is silent so the verb's own envelope is the only
-thing on stderr/stdout.
-
-Read verbs (`show`, `ls`, `remote ls`) are never guarded — they
-don't trigger the drift.
-
-```sh
-$ jjf --json init    # cwd is inside the source tree
-{"ok":false,"error":{"kind":"self_hosted_write_refused","message":"refusing to write from inside the jjforge source repo at /home/u/jjforge; this would drift git HEAD onto refs/jj/root.\nhint: cd to a sibling working dir (e.g. ~/p/jjforge-data) and retry, or set JJF_ALLOW_SELF_HOST=1 to override","details":{"path":"/home/u/jjforge","markers":["crates/jjf/Cargo.toml","docs/storage-format.md"]}}}
 ```
 
 ## Per-verb examples

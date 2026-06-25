@@ -52,7 +52,6 @@ fn make_jj_repo(name: &str) -> PathBuf {
 fn make_initialized_repo(name: &str) -> PathBuf {
     let repo = make_jj_repo(name);
     let out = Command::new(JJF_BIN)
-        .env("JJF_ALLOW_SELF_HOST", "1")
         .arg("init")
         .current_dir(&repo)
         .output()
@@ -67,7 +66,6 @@ fn make_initialized_repo(name: &str) -> PathBuf {
 
 fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
     Command::new(JJF_BIN)
-        .env("JJF_ALLOW_SELF_HOST", "1")
         .args(args)
         .current_dir(cwd)
         .output()

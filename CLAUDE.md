@@ -258,10 +258,6 @@ keywords like "issue", "ticket", "jjforge", or "jjf". It enforces:
 - The closing return-value to the orchestrator is under 200
   words.
 
-The skill knows about `JJF_ALLOW_SELF_HOST=1` and the HEAD-recovery
-dance for mutating calls from inside the source tree. Dispatch
-prompts don't need to re-explain that; the skill carries it.
-
 ## User-facing prompts
 
 When asking the user a multiple-choice question, **label options
@@ -476,50 +472,12 @@ Code and experiments do not.
 
 ### Operating in a colocated jj+git repo
 
-This repo is colocated (`jj git init --colocate` was run during
-the cutover). The colocate setup creates a footgun: the storage
-layer's 4-CLI write dance moves the jj working copy onto an
-empty descendant of the `issues` bookmark, which in a colocated
-repo also drives **git** HEAD onto `refs/jj/root` — a phantom
-empty root commit. Recovery is destructive
-(`git symbolic-ref HEAD refs/heads/main && git reset --hard main`)
-and the symptoms (whole tree shows as deleted, `git commit` lands
-on a phantom root) cost two recovery rounds before the guard
-landed.
-
-**The guard.** Per issue `08cf14b`, every mutating `jjf` verb
-(`init`, `new`, `update`, `comment`, `close`, `open`, `label`,
-`push`, `pull`) refuses to run from inside the source repo —
-detected by the presence of both `crates/jjf/Cargo.toml` and
-`docs/storage-format.md` at some ancestor of cwd. The refusal
-is a typed preflight error (`self_hosted_write_refused`, exit 2).
-Read verbs (`show`, `ls`, `remote ls`) pass through unguarded.
-
-**Canonical operator pattern: sibling working dir.** Clone the
-repo into a second location (e.g. `~/p/jjforge-data`), `cd`
-there, and run mutating `jjf` verbs against that sibling. The
-`bugs` bookmark refs live in the underlying git database and
-travel between siblings via `jjf push` / `jjf pull` (or via a
-shared remote). This keeps the source tree's HEAD on `main`
-where the rust workspace expects it.
-
-**Bypass (orchestrator authorized).** When the orchestrator
-*genuinely* needs to write from inside the source repo (e.g. to
-file a status comment on a roadmap ticket as part of a dispatch
-cycle), set `JJF_ALLOW_SELF_HOST=1` in the environment. The
-bypass emits a stderr line announcing itself (text mode only;
-silent under `--json`), and the drift WILL happen — so after the
-mutating verb completes, restore git HEAD:
-
-```bash
-git symbolic-ref HEAD refs/heads/main
-git reset --hard main
-```
-
-Note: `jj edit main` rebases the descendant chain and re-SHAs
-the commits we just landed; **do not** use it as the recovery
-step on the orchestrator's own commits. The git-symbolic-ref +
-reset path is the correct recovery.
+jjforge v3 writes to `refs/jjf/*` via plain git plumbing and
+never moves git HEAD. No special handling is needed for any
+host repo, including jjforge's own source tree. Mutating verbs
+(`new`, `update`, `comment`, `close`, ...) run from inside this
+repo without drift; no env-var opt-in, no sibling working dir,
+no HEAD recovery dance.
 
 ### Dispatch prompt template
 
