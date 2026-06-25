@@ -15,11 +15,13 @@ first.**
 ## Project shape today
 
 - **Status:** post-MVP. The Rust binary at `crates/jjf/` covers
-  the full v1 verb set (`init`, `new`, `show`, `ls`, `update`,
-  `comment`, `close`/`open`, `label add|rm`, `remote add|ls|rm`,
-  `push`, `pull`) with `--json` on every verb. Storage spec
+  the full verb set (`init`, `new`, `show`, `ls`, `ready`,
+  `update`, `comment`, `close`/`open`, `block`/`unblock`,
+  `abandon`, `label add|rm`, `dep add|rm|tree`,
+  `remote add|ls|rm`, `push`, `pull`, `remember`/`memories`/
+  `recall`/`forget`) with `--json` on every verb. Storage spec
   pinned in `docs/storage-format.md`; CLI output contract in
-  `docs/cli-json.md`. 178 workspace tests green.
+  `docs/cli-json.md`.
 - **Planning surface:** `jjforge` itself, on the `issues` bookmark
   in this repo. As of 2026-06-22 the project's own planning runs
   on `jjf`. Pre-cutover history lives in archived git-bug refs
@@ -77,6 +79,13 @@ would otherwise re-derive (a non-obvious workflow rule, a
 gotcha in the codebase, a constraint that's not visible from
 the code alone). Memories are project-scoped; do not save
 operator preferences here — those go in `~/.claude/projects/`.
+
+**Memories don't auto-decay.** When an invariant they
+describe gets refactored away (e.g. an env var retired, a
+workflow rule lifted, a file path moved), `jjf forget <key>`
+is the right move. Skim the memory list when you finish a
+session that touched anything load-bearing; a stale memory
+is worse than no memory.
 
 To navigate from the roadmap, see the Queries section at the
 bottom of this file.
@@ -583,10 +592,12 @@ agent-ergonomics tickets when needed):
   query language; jjforge has none yet.
 - `--unblocked-by <id>`: "tell me what would become ready if X
   closes." Useful follow-up to `jjf ready` for planning.
-- CLI verbs for declaring dependency edges (`jjf dep add|rm`).
-  The storage layer has `Storage::add_dependency`; the CLI
-  doesn't expose it yet, so dep edges currently get set via
-  `jjf new -d <id>` only.
+- `jjf dep ls <id>` — flat list of an issue's edges, by kind.
+  `jjf dep tree` walks parent-child only; auditing `blocks`
+  edges currently requires `jjf show` per issue. With
+  `dep-cycle-undetected` (`43c7615`) now rejecting cycles at
+  write time, this is mostly a diagnostic aid for understanding
+  why something is blocked; still worth filing.
 
 If a useful filter isn't here, add it. If `jjf` can't express
 it, that's a feature request — file it.

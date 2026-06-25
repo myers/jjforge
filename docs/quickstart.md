@@ -19,16 +19,18 @@ command below was run end-to-end against a throwaway repo on
 ## 1. Create the repo
 
 `jjf` writes to a `refs/jjf/*` namespace on an existing jj repo;
-it does not create a repo for you. A **colocated** jj+git repo is
-the most common shape (you keep `git push`/`pull`, and `jjf push`
-rides the same remote):
+it does not create a repo for you. On jj 0.40+, `jj git init`
+produces a colocated jj+git repo by default — you get `.git/`
+and `.jj/` side-by-side, and `git push`/`pull` and `jjf push`
+share the same remote:
 
 ```bash
 mkdir my-project && cd my-project
-jj git init --colocate
+jj git init
 ```
 
-You now have `.git/` and `.jj/` side-by-side.
+(Older jj's `--colocate` flag still works; it's just the default
+now.)
 
 ## 2. Initialize jjforge
 
@@ -40,7 +42,11 @@ Output: `jjf: initialized`.
 
 Idempotent — running it again on the same repo is a no-op
 (`jjf: initialized` again, no error). This step creates the
-`refs/jjf/issues` ref that holds every issue, comment, and memory.
+`refs/jjf/meta/format-version` sentinel ref AND, if a git remote
+is already configured, writes
+`+refs/jjf/*:refs/remotes/<remote>/jjf/*` into `.git/config`
+so subsequent `git fetch` and `jjf pull` round-trip the
+namespace.
 
 ## 3. File a roadmap
 
@@ -139,9 +145,22 @@ If you don't pass `--key`, the key is auto-slugged from the first
 jjf remember "Build is 3x faster with sccache enabled in CI." --key sccache-ci
 ```
 
+When a memory's underlying invariant changes (an env var
+retires, a file moves, a workflow rule is lifted), prune it:
+
+```bash
+jjf forget sccache-ci
+```
+
+Stale memories drift like stale comments do — review them on
+your way out of a session that touched anything load-bearing.
+
 ## 7. Push to a remote (optional)
 
-`jjf` rides standard git transport — no special refspec config:
+`jjf` rides standard git transport. `jjf remote add` writes
+the `refs/jjf/*` fetch refspec into `.git/config` for you, so
+plain `git fetch` and `jjf pull` both round-trip the namespace
+afterwards:
 
 ```bash
 jjf remote add origin git@example.com:me/my-project.git
@@ -154,14 +173,34 @@ Pulling merges any divergence with the built-in merge driver:
 jjf pull origin
 ```
 
+## 8. Joining an existing project
+
+When you (or a collaborator) clone a jjforge project on a new
+machine, the planner refs don't ride along by default — git's
+default fetch refspec only covers `refs/heads/*`. The recipe:
+
+```bash
+jj git clone <url> <dir>
+cd <dir>
+jjf init               # writes the refs/jjf/* fetch refspec
+jjf pull origin        # fetches issues, memories, sentinel
+jjf ls                 # see the project's open issues
+```
+
+`jjf init` on an existing clone is idempotent — it doesn't
+overwrite local state, it just plants the refspec (and the
+sentinel ref if missing). After `jjf pull origin`, the
+collaborator's planner mirrors the remote and subsequent
+pushes / pulls round-trip cleanly.
+
 ## Verified output
 
-The transcript below was captured on 2026-06-24 running the
+The transcript below was captured on 2026-06-25 running the
 exact commands above against an empty directory.  IDs will
 differ in your run; everything else should match.
 
 ```
-$ jj git init --colocate
+$ jj git init
 Initialized repo in "."
 
 $ jjf init
@@ -171,21 +210,21 @@ $ jjf init        # idempotent
 jjf: initialized
 
 $ jjf ls          # after creating roadmap + epic + bug + feature
-0f07bdf  open  0L  Roadmap: demo project
-3764c4b  open  1L  Backend handler crashes on empty input
-6dbb571  open  1L  Write the README
-6f227f7  open  1L  Epic: ship v1
+1245ac9  open  1L  Write the README
+86417df  open  1L  Epic: ship v1
+f42490c  open  1L  Backend handler crashes on empty input
+a4025c4  open  0L  Roadmap: demo project
 
 $ jjf ready       # README is hidden — blocked on the bug
-3764c4b  open  1L  Backend handler crashes on empty input
-6f227f7  open  1L  Epic: ship v1
+f42490c  open  1L  Backend handler crashes on empty input
+86417df  open  1L  Epic: ship v1
 
-$ jjf close 3764c4b
-closed 3764c4b
+$ jjf close f42490c
+closed f42490c
 
 $ jjf ready       # bug closed → README unblocked
-6dbb571  open  1L  Write the README
-6f227f7  open  1L  Epic: ship v1
+1245ac9  open  1L  Write the README
+86417df  open  1L  Epic: ship v1
 ```
 
 ## Where to go next
