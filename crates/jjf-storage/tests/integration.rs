@@ -1633,7 +1633,7 @@ fn resolve_accepts_id_and_slug() {
     assert_eq!(storage.resolve(id.as_str()).unwrap(), id);
     // Slug path.
     assert_eq!(storage.resolve("resolvable-slug").unwrap(), id);
-    // Unknown handle.
+    // Unknown handle (non-hex).
     let err = storage.resolve("no-such-handle").unwrap_err();
     match err {
         StorageError::SlugNotFound { handle } => {
@@ -1641,6 +1641,200 @@ fn resolve_accepts_id_and_slug() {
         }
         other => panic!("expected SlugNotFound, got {other:?}"),
     }
+}
+
+/// `prefix-lookup-broken`: every id-taking verb routes through
+/// `Storage::resolve`. CLAUDE.md documents "any unambiguous prefix
+/// (often 4 chars is enough)"; before this ticket, the storage layer
+/// required a full 7-char id and any prefix surfaced as
+/// `SlugNotFound`. This block of tests pins the new behavior:
+///
+/// 1. A unique prefix resolves to its id.
+/// 2. An ambiguous prefix surfaces `AmbiguousPrefix` carrying every
+///    candidate id.
+/// 3. A hex prefix that matches no id surfaces `IdNotFound` (NOT
+///    `SlugNotFound` — hex-shaped misses route to the id-flavored
+///    error so the operator's mental model isn't subverted).
+/// 4. A non-hex handle still routes to the slug resolver and surfaces
+///    `SlugNotFound` on a miss.
+/// 5. The full-id fast path still works (no regression).
+/// 6. Closed issues participate in the prefix match (same scope as
+///    the slug resolver), so a 4-char prefix of a closed issue still
+///    resolves.
+
+/// Mint `count` issues and return their ids. Used by the
+/// prefix-collision tests where we need a population large enough
+/// for a 1-char-hex collision to be virtually certain.
+fn mint_issues(storage: &Storage, count: usize) -> Vec<IssueId> {
+    let mut ids = Vec::with_capacity(count);
+    for i in 0..count {
+        let id = storage
+            .create_issue(&IssueDraft {
+                title: format!("issue-{i}"),
+                ..Default::default()
+            })
+            .unwrap();
+        ids.push(id);
+    }
+    ids
+}
+
+/// Walk the 16 single-hex-digit prefixes and return one that's a
+/// prefix of two-or-more ids in `ids`. Panics if none exists (call
+/// site is responsible for minting enough ids that a collision is
+/// near-certain). Returns the prefix and the sorted list of matching
+/// ids — handy for the ambiguous-prefix assertion that follows.
+fn pick_ambiguous_1char_prefix(ids: &[IssueId]) -> (String, Vec<IssueId>) {
+    for c in (b'0'..=b'9').chain(b'a'..=b'f') {
+        let p = (c as char).to_string();
+        let mut matches: Vec<IssueId> =
+            ids.iter().filter(|i| i.as_str().starts_with(&p)).cloned().collect();
+        if matches.len() >= 2 {
+            matches.sort();
+            return (p, matches);
+        }
+    }
+    panic!("no ambiguous 1-char hex prefix among {} ids", ids.len());
+}
+
+#[test]
+fn resolve_unique_prefix_returns_full_id() {
+    let repo = make_scratch_repo("resolve_unique_prefix");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "uniquely-prefixed".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    // 4-char prefix is the canonical "often enough" length per
+    // CLAUDE.md. With only one issue in the repo, any prefix of any
+    // length resolves uniquely.
+    let prefix = &id.as_str()[..4];
+    assert_eq!(storage.resolve(prefix).unwrap(), id);
+    // 1-char prefix also resolves (only one issue exists).
+    let one = &id.as_str()[..1];
+    assert_eq!(storage.resolve(one).unwrap(), id);
+    // 6-char prefix still resolves (the longest valid prefix).
+    let six = &id.as_str()[..6];
+    assert_eq!(storage.resolve(six).unwrap(), id);
+}
+
+#[test]
+fn resolve_full_id_still_works() {
+    // Regression guard for the 7-char fast path — pre-ticket behavior
+    // must not break.
+    let repo = make_scratch_repo("resolve_full_id");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "full-id".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(storage.resolve(id.as_str()).unwrap(), id);
+}
+
+#[test]
+fn resolve_ambiguous_prefix_surfaces_typed_error_with_candidates() {
+    let repo = make_scratch_repo("resolve_ambiguous_prefix");
+    let storage = Storage::open(&repo).unwrap();
+    // Mint enough issues that a 1-char hex-prefix collision is
+    // virtually certain (16 buckets, 24 ids → birthday-paradox
+    // p(collision) ≈ 1 - 16!/(16-24)! ... actually trivially 1.0
+    // by pigeonhole). Then pick the colliding prefix and probe.
+    // 20 ids → P(no 1-char-prefix collision) = 16!/((16-20)!·16^20) is
+    // ill-defined; with 20 draws into 16 buckets, pigeonhole
+    // guarantees at least one bucket has 2+ entries. Keep the
+    // population modest to bound the scratch-dir size on macOS
+    // (each issue creates one v3 ref + commit).
+    let ids = mint_issues(&storage, 20);
+    let (prefix, expected) = pick_ambiguous_1char_prefix(&ids);
+    let err = storage.resolve(&prefix).unwrap_err();
+    match err {
+        StorageError::AmbiguousPrefix { handle, matches } => {
+            assert_eq!(handle, prefix);
+            assert_eq!(matches, expected);
+            assert!(matches.len() >= 2);
+        }
+        other => panic!("expected AmbiguousPrefix, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_unknown_hex_prefix_surfaces_id_not_found() {
+    let repo = make_scratch_repo("resolve_unknown_hex_prefix");
+    let storage = Storage::open(&repo).unwrap();
+    // Mint one issue so the snapshot isn't empty.
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "anchor".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    // Pick a 4-char hex string guaranteed not to be a prefix of `id`.
+    let first = id.as_str().as_bytes()[0];
+    let other = if first == b'0' { "ffff" } else { "0000" };
+    let err = storage.resolve(other).unwrap_err();
+    match err {
+        StorageError::IdNotFound { handle } => assert_eq!(handle, other),
+        other => panic!("expected IdNotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_non_hex_handle_still_routes_to_slug_lookup() {
+    let repo = make_scratch_repo("resolve_non_hex_routes_to_slug");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "slug-test".into(),
+            slug: Some("the-slug".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    // Non-hex handle: routes to slug resolver, finds the issue.
+    assert_eq!(storage.resolve("the-slug").unwrap(), id);
+    // Non-hex handle with no matching slug surfaces SlugNotFound
+    // (not IdNotFound — the operator typed something slug-shaped).
+    let err = storage.resolve("not-a-slug").unwrap_err();
+    match err {
+        StorageError::SlugNotFound { handle } => assert_eq!(handle, "not-a-slug"),
+        other => panic!("expected SlugNotFound, got {other:?}"),
+    }
+    // A handle with a hyphen is non-hex by construction, even if the
+    // chars on either side are hex digits.
+    let err = storage.resolve("ab-cd").unwrap_err();
+    match err {
+        StorageError::SlugNotFound { .. } => {}
+        other => panic!("expected SlugNotFound for hyphenated handle, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_prefix_includes_closed_issues() {
+    // Same scope as the slug resolver: prefix match scans open AND
+    // closed issues.
+    let repo = make_scratch_repo("resolve_prefix_closed");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "to-be-closed".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage
+        .update(
+            &id,
+            UpdateFields {
+                status: Some(Status::Closed),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // Closed issue still resolvable by its prefix.
+    let prefix = &id.as_str()[..4];
+    assert_eq!(storage.resolve(prefix).unwrap(), id);
 }
 
 #[test]

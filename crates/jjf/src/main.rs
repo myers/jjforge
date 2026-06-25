@@ -247,9 +247,13 @@ enum Commands {
     /// verbatim (no envelope — the issue IS the payload). Requires
     /// `jjf init` to have been run first.
     Show {
-        /// Issue handle (7-char hex id OR a slug). Slugs resolve
-        /// across both open and closed issues. A handle that's
-        /// neither a parseable id nor a known slug is exit 2
+        /// Issue handle: a full 7-char hex id, a unique hex prefix
+        /// (1–6 chars), or a slug. Prefix and slug lookups scan
+        /// both open and closed issues. A hex prefix that matches
+        /// no id is exit 2 (`id_not_found`); a hex prefix that
+        /// matches two-or-more ids is exit 2 (`ambiguous_prefix`,
+        /// `details.matches` lists the candidates); a non-hex
+        /// handle with no matching slug is exit 2
         /// (`slug_not_found`); a parseable id with no matching
         /// record on the bookmark is exit 1 (`issue_not_found`).
         id: String,
@@ -1075,10 +1079,31 @@ enum CliError {
     },
 
     /// `Storage::resolve` couldn't translate the handle the operator
-    /// supplied: it wasn't a parseable 7-hex id and no open-or-closed
-    /// issue carries that slug. Preflight failure (exit 2).
+    /// supplied: it wasn't a parseable 7-hex id, wasn't a hex prefix
+    /// (those route to `IdNotFound`), and no open-or-closed issue
+    /// carries that slug. Preflight failure (exit 2).
     #[error("no issue with handle {handle:?}")]
     SlugNotFound { handle: String },
+
+    /// `Storage::resolve` was handed a hex-shaped handle (1–7 chars
+    /// of lowercase hex, full id OR prefix) that doesn't match any
+    /// known issue id. Distinct from `slug_not_found` so the
+    /// operator can tell "I typed an id, it doesn't exist" from
+    /// "I typed something else, it doesn't exist as a slug
+    /// either." Preflight failure (exit 2). (`prefix-lookup-broken`.)
+    #[error("no issue with id prefix {handle:?}")]
+    IdNotFound { handle: String },
+
+    /// `Storage::resolve` was handed a hex-shaped prefix shorter
+    /// than the full id that matches two or more issue ids.
+    /// `matches` carries every candidate so the operator can pick a
+    /// longer prefix. Preflight failure (exit 2).
+    /// (`prefix-lookup-broken`.)
+    #[error("id prefix {handle:?} matches {} issues; supply more characters", matches.len())]
+    AmbiguousPrefix {
+        handle: String,
+        matches: Vec<String>,
+    },
 
     /// `jjf remember` ran with no value source — neither a positional
     /// arg nor `-F`. Preflight failure (exit 2).
@@ -1173,6 +1198,8 @@ impl CliError {
             CliError::Storage(StorageError::InvalidTitle { .. }) => 2,
             CliError::Storage(StorageError::SlugCollision { .. }) => 2,
             CliError::Storage(StorageError::SlugNotFound { .. }) => 2,
+            CliError::Storage(StorageError::IdNotFound { .. }) => 2,
+            CliError::Storage(StorageError::AmbiguousPrefix { .. }) => 2,
             CliError::Storage(StorageError::AlreadyClaimed { .. }) => 2,
             CliError::Storage(StorageError::SelfDependency { .. }) => 2,
             CliError::Storage(StorageError::ConcurrentWrite { .. }) => 1,
@@ -1193,6 +1220,8 @@ impl CliError {
             CliError::SelfDependency { .. } => 2,
             CliError::SlugCollision { .. } => 2,
             CliError::SlugNotFound { .. } => 2,
+            CliError::IdNotFound { .. } => 2,
+            CliError::AmbiguousPrefix { .. } => 2,
             CliError::MissingMemoryValue => 2,
             CliError::EmptyMemoryKey { .. } => 2,
             CliError::MemoryNotFound { .. } => 1,
@@ -1245,6 +1274,8 @@ impl CliError {
             CliError::Storage(StorageError::InvalidTitle { .. }) => "invalid_title",
             CliError::Storage(StorageError::SlugCollision { .. }) => "slug_collision",
             CliError::Storage(StorageError::SlugNotFound { .. }) => "slug_not_found",
+            CliError::Storage(StorageError::IdNotFound { .. }) => "id_not_found",
+            CliError::Storage(StorageError::AmbiguousPrefix { .. }) => "ambiguous_prefix",
             CliError::Storage(StorageError::AlreadyClaimed { .. }) => "already_claimed",
             CliError::Storage(StorageError::SelfDependency { .. }) => "self_dependency",
             CliError::Storage(StorageError::ConcurrentWrite { .. }) => "concurrent_write",
@@ -1253,6 +1284,8 @@ impl CliError {
             CliError::SelfDependency { .. } => "self_dependency",
             CliError::SlugCollision { .. } => "slug_collision",
             CliError::SlugNotFound { .. } => "slug_not_found",
+            CliError::IdNotFound { .. } => "id_not_found",
+            CliError::AmbiguousPrefix { .. } => "ambiguous_prefix",
             CliError::MissingMemoryValue => "missing_memory_value",
             CliError::EmptyMemoryKey { .. } => "empty_memory_key",
             CliError::MemoryNotFound { .. } => "memory_not_found",
@@ -1360,6 +1393,16 @@ impl CliError {
             }
             CliError::Storage(StorageError::SlugNotFound { handle })
             | CliError::SlugNotFound { handle } => json!({ "handle": handle }),
+            CliError::Storage(StorageError::IdNotFound { handle })
+            | CliError::IdNotFound { handle } => json!({ "handle": handle }),
+            CliError::Storage(StorageError::AmbiguousPrefix { handle, matches }) => json!({
+                "handle": handle,
+                "matches": matches.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+            }),
+            CliError::AmbiguousPrefix { handle, matches } => json!({
+                "handle": handle,
+                "matches": matches,
+            }),
             CliError::EmptyMemoryKey { value } => json!({ "value": value }),
             CliError::MemoryNotFound { key } => json!({ "key": key }),
             CliError::Storage(StorageError::AlreadyClaimed { by })
@@ -1718,6 +1761,11 @@ fn run_new(
 fn resolve_handle(storage: &Storage, handle: &str) -> Result<IssueId, CliError> {
     storage.resolve(handle).map_err(|e| match e {
         StorageError::SlugNotFound { handle } => CliError::SlugNotFound { handle },
+        StorageError::IdNotFound { handle } => CliError::IdNotFound { handle },
+        StorageError::AmbiguousPrefix { handle, matches } => CliError::AmbiguousPrefix {
+            handle,
+            matches: matches.into_iter().map(|id| id.as_str().to_owned()).collect(),
+        },
         other => CliError::Storage(other),
     })
 }

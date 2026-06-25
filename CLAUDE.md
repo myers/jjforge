@@ -202,9 +202,17 @@ on the roadmap announcing the change is courtesy, not contract.
 jjforge ids are **7-character lowercase hex** by design (28 bits,
 generated at create time per `docs/storage-format.md` §2). The
 displayed id IS the full id — there is no prefix convention to
-worry about, no SHA stem to lengthen. CLI verbs accept any
-unambiguous prefix (often 4 characters is enough), but the
-canonical id is the 7-char string `jjf ls` prints.
+worry about, no SHA stem to lengthen.
+
+CLI verbs accept any unambiguous prefix of lowercase hex (1–6
+chars) in place of the full id. 4 chars is usually enough in a
+project of this size. If the prefix matches two-or-more ids the
+verb fails fast with exit 2 and a JSON `ambiguous_prefix` error
+envelope whose `details.matches` array lists every candidate; if
+it matches none it fails with `id_not_found`. (Implemented in
+`prefix-lookup-broken`, ticket `4940d78`.) The canonical id is
+still the 7-char string `jjf ls` prints — abbreviate at the
+keyboard, never in stored data.
 
 ### Push / pull
 

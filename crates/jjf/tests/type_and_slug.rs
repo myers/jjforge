@@ -399,3 +399,112 @@ fn comment_stdin_via_slug_for_completeness() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// --- prefix-lookup-broken (ticket `4940d78`) ---
+//
+// Restored behavior: every id-taking verb accepts an unambiguous hex
+// prefix (1–6 chars) in place of the full 7-char id. The CLI tests
+// here pin the JSON error envelope shapes for `id_not_found` and
+// `ambiguous_prefix`, and the happy-path resolves via `show`.
+
+#[test]
+fn show_resolves_unique_prefix_to_full_id() {
+    let repo = make_initialized_repo("prefix_show_unique");
+    let out = run_jjf(&repo, &["new", "-t", "prefix-me"]);
+    assert!(out.status.success());
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    let prefix = &id[..4];
+    let show = run_jjf(&repo, &["--json", "show", prefix]);
+    assert!(
+        show.status.success(),
+        "show <prefix> failed; stderr: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&show.stdout).trim()).unwrap();
+    assert_eq!(v["id"], id);
+}
+
+#[test]
+fn show_unknown_hex_prefix_surfaces_id_not_found_envelope() {
+    let repo = make_initialized_repo("prefix_show_unknown_hex");
+    // Plant one issue so the snapshot isn't empty; the prefix below
+    // is guaranteed not to match it because the first hex char
+    // differs (we pick whichever of 0000 or ffff doesn't match).
+    let out = run_jjf(&repo, &["new", "-t", "anchor"]);
+    assert!(out.status.success());
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    let probe = if id.starts_with('0') { "ffff" } else { "0000" };
+    let show = run_jjf(&repo, &["--json", "show", probe]);
+    assert_eq!(show.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&show.stderr);
+    let v: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["kind"], "id_not_found");
+    assert_eq!(v["error"]["details"]["handle"], probe);
+}
+
+#[test]
+fn show_ambiguous_prefix_surfaces_envelope_with_matches() {
+    // Mint enough issues to virtually guarantee at least one 1-char
+    // hex-prefix collision (16 buckets; with 32 issues the
+    // birthday-paradox argument says collisions are overwhelming).
+    // Then iterate the 16 single-hex-digit prefixes until we find one
+    // with two+ matches and assert the envelope shape on that
+    // ambiguous probe.
+    let repo = make_initialized_repo("prefix_show_ambiguous");
+    let mut ids = Vec::new();
+    for i in 0..32 {
+        let out = run_jjf(&repo, &["new", "-t", &format!("issue-{i}")]);
+        assert!(out.status.success());
+        ids.push(String::from_utf8_lossy(&out.stdout).trim().to_owned());
+    }
+    // Find a 1-char prefix that matches 2+ ids.
+    let probe = (b'0'..=b'9')
+        .chain(b'a'..=b'f')
+        .map(|b| (b as char).to_string())
+        .find(|p| ids.iter().filter(|i| i.starts_with(p)).count() >= 2)
+        .expect("expected at least one ambiguous single-hex-char prefix in 32 ids");
+    let expected_matches: Vec<String> = {
+        let mut m: Vec<String> = ids
+            .iter()
+            .filter(|i| i.starts_with(&probe))
+            .cloned()
+            .collect();
+        m.sort();
+        m
+    };
+
+    let show = run_jjf(&repo, &["--json", "show", &probe]);
+    assert_eq!(show.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&show.stderr);
+    let v: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["kind"], "ambiguous_prefix");
+    assert_eq!(v["error"]["details"]["handle"], probe);
+    let got_matches: Vec<String> = v["error"]["details"]["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(got_matches, expected_matches);
+}
+
+#[test]
+fn show_full_id_still_resolves_post_prefix_change() {
+    // Regression guard: the 7-char fast path can't have been broken
+    // by the prefix-resolve refactor.
+    let repo = make_initialized_repo("prefix_show_full_id");
+    let out = run_jjf(&repo, &["new", "-t", "full-id"]);
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    let show = run_jjf(&repo, &["--json", "show", &id]);
+    assert!(
+        show.status.success(),
+        "show <id> failed; stderr: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&show.stdout).trim()).unwrap();
+    assert_eq!(v["id"], id);
+}
