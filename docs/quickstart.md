@@ -126,7 +126,133 @@ jjf ready
 
 The README ticket is now unblocked.
 
-## 6. Remember something for next session
+## 6. Scale up: epics with deps
+
+The simple case above scales. For real projects you'll want
+**epics** (the top-level goals) with **child issues** (the
+units of work), `blocks` edges to enforce ordering, and
+`parent-child` edges to nest children under their epic so
+the cascade reaches them. `jjf ready` walks both, so
+"what's next?" stays honest.
+
+Set up two epics — backend then frontend — with the frontend
+gated on the backend, and a few children each:
+
+```bash
+# Two epics. -d EPIC_A on the frontend epic means
+# "frontend is blocked by backend until backend closes."
+EPIC_A=$(jjf new --json -t "Epic: backend rewrite" --type epic \
+    --slug backend -l epic -F /dev/null | jq -r .id)
+EPIC_B=$(jjf new --json -t "Epic: frontend ship" --type epic \
+    --slug frontend -l epic -d $EPIC_A -F /dev/null | jq -r .id)
+
+# Backend children — chained with `blocks` so they run in order.
+DB=$(jjf new --json -t "Migrate auth tables" --type bug \
+    --slug migrate-auth -l epic:backend -F /dev/null | jq -r .id)
+API=$(jjf new --json -t "Rewrite /login handler" --type feature \
+    --slug rewrite-login -l epic:backend -d $DB -F /dev/null | jq -r .id)
+TESTS=$(jjf new --json -t "Backend integration tests" --type feature \
+    --slug backend-tests -l epic:backend -d $API -F /dev/null | jq -r .id)
+
+# Frontend children — parallel, no inter-child ordering.
+LOGIN=$(jjf new --json -t "Rewrite login page" --type feature \
+    --slug login-page -l epic:frontend -F /dev/null | jq -r .id)
+SETTINGS=$(jjf new --json -t "Settings page polish" --type feature \
+    --slug settings-page -l epic:frontend -F /dev/null | jq -r .id)
+
+# Attach every child to its epic with a `parent-child` edge.
+# This is what lets `jjf ready` cascade an epic's blocked state
+# down to its children.
+for c in $DB $API $TESTS; do jjf dep add --kind parent-child $c $EPIC_A; done
+for c in $LOGIN $SETTINGS; do jjf dep add --kind parent-child $c $EPIC_B; done
+```
+
+Two edge kinds, two roles:
+
+- **`blocks`** (the default for `jjf new -d` and `jjf dep add`)
+  — ordering constraint. The owner is blocked until the
+  target closes. Drives `jjf ready`.
+- **`parent-child`** — hierarchy. The owner is a CHILD of the
+  target. `jjf ready` propagates the parent's blocked state
+  to the child (fixpoint cascade). Used to nest children
+  under epics, so when the epic is blocked the whole subtree
+  is blocked too.
+
+Inspect the hierarchy:
+
+```bash
+jjf dep tree $EPIC_A   # walks parent-child in the CHILD direction
+jjf dep tree $EPIC_B
+```
+
+```
+2e285eb [open] Epic: backend rewrite
+  23ff23e [open] Backend integration tests
+  3d1b6b7 [open] Rewrite /login handler
+  47b6357 [open] Migrate auth tables
+
+680fac8 [open] Epic: frontend ship
+  37d6730 [open] Rewrite login page
+  53c00ce [open] Settings page polish
+```
+
+Now ask "what's workable right now?":
+
+```bash
+jjf ready
+```
+
+```
+47b6357  open  1L  Migrate auth tables
+2e285eb  open  1L  Epic: backend rewrite
+```
+
+Only two items — out of eight open issues. The backend epic
+has no deps, so it's surfaced as a meta-task. The migration
+ticket is the leaf of the backend chain. Everything else is
+blocked: the API rewrite waits on the migration (`blocks`),
+the tests wait on the API (`blocks`), the frontend epic
+waits on the backend epic (`blocks`), and the two frontend
+children inherit the frontend epic's blocked state through
+their `parent-child` edges.
+
+Scope `ready` to one epic with `--label`:
+
+```bash
+jjf ready --label epic:backend   # 1 result: the migration
+jjf ready --label epic:frontend  # empty — everything cascaded blocked
+```
+
+Close the migration, watch the chain advance:
+
+```bash
+jjf close $DB
+jjf ready
+```
+
+```
+3d1b6b7  open  1L  Rewrite /login handler
+2e285eb  open  1L  Epic: backend rewrite
+```
+
+The API rewrite is now unblocked. Close it and tests appear;
+close tests and the backend epic itself can close; then the
+frontend epic stops being blocked and both frontend children
+appear in `ready` together (they're parallel — no `blocks`
+edges between them).
+
+**`jjf` rejects dependency cycles at write time.** If you
+try to add an edge that would close a cycle in the
+`blocks` graph, the command exits 2 with a
+`dependency_cycle` envelope listing the offending chain —
+no silent "issue vanished from ready" failure mode:
+
+```bash
+$ jjf dep add $API $TESTS    # TESTS already blocks-depends on API
+jjf: adding blocks-edge 3d1b6b7 -> 23ff23e would close a dependency cycle
+```
+
+## 7. Remember something for next session
 
 Persistent memories travel with the `issues` bookmark — they
 round-trip via `jjf push`/`pull` and are surfaced by
@@ -155,7 +281,7 @@ jjf forget sccache-ci
 Stale memories drift like stale comments do — review them on
 your way out of a session that touched anything load-bearing.
 
-## 7. Push to a remote (optional)
+## 8. Push to a remote (optional)
 
 `jjf` rides standard git transport. `jjf remote add` writes
 the `refs/jjf/*` fetch refspec into `.git/config` for you, so
@@ -173,7 +299,7 @@ Pulling merges any divergence with the built-in merge driver:
 jjf pull origin
 ```
 
-## 8. Joining an existing project
+## 9. Joining an existing project
 
 When you (or a collaborator) clone a jjforge project on a new
 machine, the planner refs don't ride along by default — git's
