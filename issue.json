@@ -4,7 +4,7 @@
   "title": "Corrupt issue ref silently disappears from 'jjf ls' (no diagnostic)",
   "slug": "corrupt-ref-silent-drop",
   "body": "# Symptom\n\nIf a `refs/jjf/issues/<id>` ref gets pointed at something that\nisn't a valid issue commit (corrupt fetch, accidental\n`git update-ref`, etc.), `jjf ls` silently omits that issue\nfrom its output with no warning. `jjf show <id>` reports\n\"issue not found in working copy\" — indistinguishable from a\ngenuinely missing issue.\n\n# Repro\n\n```\n$ jjf ls           # 2 issues\need62d7  ...\n34a30c5  ...\n$ git update-ref refs/jjf/issues/eed62d7 \\\n    $(git hash-object -w --stdin <<<\"junk\")\n$ jjf ls\n34a30c5  ...   # eed62d7 silently gone, no warning\n$ jjf show eed62d7\njjf: issue not found in working copy: eed62d7\n```\n\n# Risk profile\n\nAcross 10 projects this is unlikely to fire often, but when it\ndoes it's the kind of failure that erodes trust (\"where did my\nticket go?\"). The data IS still in the repo (the ref still\nexists, just doesn't parse) — recovery is possible if you can\ndiagnose.\n\n# Fix candidate\n\nA `jjf doctor` verb that:\n- counts `refs/jjf/issues/*` and `refs/jjf/memories/*`,\n- diffs against what the storage layer can parse,\n- reports unreadable refs with their SHA,\n- optionally suggests `git update-ref -d` to clear them.\n\nLighter alternative: `jjf ls` exits 0 but prints a final\nstderr line `(1 ref unreadable; run jjf doctor)` when it\nskips any. Cheap to add, immediately surfaces the problem.\n\n# Confidence\n\nReproducible 100%. Tested in `scratchpad/qa/r07b-corrupt2/`.\n",
-  "status": "open",
+  "status": "closed",
   "block_reason": null,
   "type": "bug",
   "labels": [
@@ -18,5 +18,5 @@
   ],
   "assignee": null,
   "created_at": "2026-06-24T17:33:57Z",
-  "updated_at": "2026-06-25T01:17:20Z"
+  "updated_at": "2026-06-25T01:17:28Z"
 }
