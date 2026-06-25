@@ -121,6 +121,37 @@ impl GitRepo {
         Ok(oid)
     }
 
+    /// Hash `bytes` without writing the object into the database.
+    /// Returns the same hex oid `hash_object` would, minus the
+    /// write-side effect. Used by the v3 snapshot cache's
+    /// `probe_ref_set_key_v3` to fingerprint the ref-set without
+    /// polluting the object DB with cache-key blobs.
+    pub(crate) fn hash_object_no_write(&self, bytes: &[u8]) -> Result<String, GitError> {
+        let mut child = self
+            .cmd(&["hash-object", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(GitError::Io)?;
+        {
+            let stdin = child
+                .stdin
+                .as_mut()
+                .expect("hash-object child stdin piped");
+            stdin.write_all(bytes).map_err(GitError::Io)?;
+        }
+        let out = child.wait_with_output().map_err(GitError::Io)?;
+        if !out.status.success() {
+            return Err(GitError::Cli {
+                cmd: "git hash-object --stdin".into(),
+                status: out.status.code(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    }
+
     /// Assemble a tree from `entries` and return its hex object id.
     ///
     /// Each entry is `(mode, name, oid)`. `mktree` reads stdin in the
@@ -358,6 +389,46 @@ impl GitRepo {
             .collect();
         refs.sort();
         Ok(refs)
+    }
+
+    /// List every ref under any of `prefixes`, returning `(refname,
+    /// objectname)` pairs sorted ascending by refname. Empty result
+    /// is normal — a fresh v3 repo with no issues and no memories has
+    /// no refs under either prefix.
+    ///
+    /// Used by the v3 snapshot cache (`cache.rs::probe_ref_set_key`)
+    /// to fingerprint the full ref-set for invalidation. The fields
+    /// are space-separated by `--format='%(refname) %(objectname)'`;
+    /// the parser splits on the first ASCII space and tolerates
+    /// trailing whitespace.
+    pub(crate) fn for_each_ref_with_oid(
+        &self,
+        prefixes: &[&str],
+    ) -> Result<Vec<(String, String)>, GitError> {
+        let mut args: Vec<&str> = vec![
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname) %(objectname)",
+        ];
+        args.extend_from_slice(prefixes);
+        let out = self.run(&args)?;
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for line in out.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let (name, oid) = match line.split_once(' ') {
+                Some(parts) => parts,
+                None => continue,
+            };
+            pairs.push((name.to_owned(), oid.to_owned()));
+        }
+        // `--sort=refname` already orders by refname ascending; keep
+        // the result stable even if a future git emits unsorted output
+        // by re-sorting here.
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(pairs)
     }
 
     /// Walk the commit chain ending at `ref_name`, oldest-first. Each

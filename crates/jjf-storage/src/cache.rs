@@ -52,9 +52,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::git::GitRepo;
 use crate::id::IssueId;
 use crate::jj::JjRepo;
 use crate::record::{Comment, Issue, IssueRecord, Memory};
+use crate::v3_write;
 use crate::{Error, Result, ISSUES_BOOKMARK_REVSET};
 
 /// On-disk schema version. Bump when the [`SnapshotCache`] shape
@@ -76,6 +78,28 @@ const CACHE_TEMP_SUFFIX: &str = ".tmp";
 /// legitimate JSON / JSONL line accidentally matches it.
 const REBUILD_SENTINEL: &str = "--JJF-CACHE-SEP--";
 
+/// On-disk discriminator for the storage layout a given cache file
+/// was built against. Persisted as a string for forward-compat —
+/// adding a future shape ("v4") doesn't have to invalidate existing
+/// v2/v3 caches via a schema bump.
+///
+/// A cache file built on a v2-shape repo carries `"v2"`; a cache file
+/// built on a v3-shape repo carries `"v3"`. On read, if the
+/// `format_kind` doesn't match the current repo's storage shape the
+/// cache is discarded and rebuilt — the two key spaces are not
+/// comparable (a bookmark-tip sha and a ref-set sha are different
+/// strings even for the same logical content).
+pub(crate) const FORMAT_KIND_V2: &str = "v2";
+pub(crate) const FORMAT_KIND_V3: &str = "v3";
+
+/// `serde(default = ...)` requires a function reference, not a const,
+/// so name the default explicitly. Old cache files (written before this
+/// field existed) load as v2-shape — which matches their actual
+/// provenance, since v3 caches didn't exist pre-cutover.
+fn default_format_kind() -> String {
+    FORMAT_KIND_V2.to_owned()
+}
+
 /// Full snapshot of the `issues` bookmark tip.
 ///
 /// Read-path callers materialize one of these per call (or per
@@ -86,9 +110,31 @@ const REBUILD_SENTINEL: &str = "--JJF-CACHE-SEP--";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SnapshotCache {
     pub schema_version: u32,
-    /// jj commit-id (long form) of the `issues` bookmark tip at the
-    /// time this snapshot was built. Probed via
-    /// `jj log -r bookmarks(issues) -T commit_id --limit 1`.
+    /// Which storage layout this cache was built against —
+    /// [`FORMAT_KIND_V2`] or [`FORMAT_KIND_V3`]. `#[serde(default)]`
+    /// makes pre-v3 cache files (which have no field) load as v2,
+    /// preserving the operator's warm cache through the v3 upgrade.
+    #[serde(default = "default_format_kind")]
+    pub format_kind: String,
+    /// Invalidation key for this cache.
+    ///
+    /// **V2 (`format_kind == "v2"`):** the jj commit-id (long form) of
+    /// the `issues` bookmark tip at the time this snapshot was built.
+    /// Probed via `jj log -r bookmarks(issues) -T commit_id --limit 1`.
+    ///
+    /// **V3 (`format_kind == "v3"`):** the SHA-1 hex of the concatenated
+    /// `<refname> <objectname>\n` lines (sorted ascending by refname)
+    /// for every ref under `refs/jjf/issues/` and `refs/jjf/memories/`.
+    /// Probed via `git hash-object --stdin` over the
+    /// `git for-each-ref --sort=refname --format='%(refname) %(objectname)' …`
+    /// output. The sentinel ref `refs/jjf/meta/format-version` is
+    /// excluded because it's planted once and never moves — including
+    /// it would buy us nothing and complicate the rebuild story.
+    ///
+    /// The field name stays `head_commit` for backwards-compat with
+    /// existing serialized cache files (renaming would invalidate
+    /// every warm cache). The doc-string is the source of truth for
+    /// its dual meaning.
     pub head_commit: String,
     /// Every `Issue` on the bookmark, keyed by id. Each Issue carries
     /// its comments inline (the same shape `Storage::read` returns).
@@ -102,9 +148,25 @@ pub(crate) struct SnapshotCache {
 }
 
 impl SnapshotCache {
-    /// In-memory build from a head + parsed issues + parsed memories.
-    /// Used by both the rebuild path and the tests.
+    /// In-memory build for a V2-shape cache. Thin wrapper over
+    /// [`SnapshotCache::from_parts_with_kind`] that pins the
+    /// `format_kind` to [`FORMAT_KIND_V2`].
     pub(crate) fn from_parts(
+        head_commit: String,
+        issues: Vec<Issue>,
+        memories: Vec<Memory>,
+    ) -> Self {
+        Self::from_parts_with_kind(FORMAT_KIND_V2.to_owned(), head_commit, issues, memories)
+    }
+
+    /// In-memory build from a format_kind + head + parsed issues +
+    /// parsed memories. `format_kind` carries [`FORMAT_KIND_V2`] for
+    /// caches built off the v2 `issues` bookmark or [`FORMAT_KIND_V3`]
+    /// for caches built off the v3 `refs/jjf/*` set.
+    ///
+    /// Used by both the rebuild paths and the tests.
+    pub(crate) fn from_parts_with_kind(
+        format_kind: String,
         head_commit: String,
         issues: Vec<Issue>,
         memories: Vec<Memory>,
@@ -141,6 +203,7 @@ impl SnapshotCache {
             memories.into_iter().map(|m| (m.key.clone(), m)).collect();
         SnapshotCache {
             schema_version: CACHE_SCHEMA_VERSION,
+            format_kind,
             head_commit,
             issues: issues_map,
             memories: memories_map,
@@ -293,13 +356,153 @@ pub(crate) fn load_or_rebuild(
 ) -> Result<SnapshotCache> {
     let head = probe_head_commit(repo)?;
     if let Some(cache) = try_load_from_disk(repo_root) {
-        if cache.head_commit == head {
+        if cache.format_kind == FORMAT_KIND_V2 && cache.head_commit == head {
             return Ok(cache);
         }
     }
     let cache = rebuild(repo, &head)?;
     try_persist_to_disk(repo_root, &cache);
     Ok(cache)
+}
+
+/// V3 counterpart to [`load_or_rebuild`]: probe the ref-set
+/// fingerprint, load `.jj/jjforge-cache.json` on a key-match (and a
+/// matching `format_kind`), rebuild via direct `git cat-file` reads
+/// otherwise.
+///
+/// **Key.** SHA-1 hex of the sorted `<refname> <objectname>\n` lines
+/// for every `refs/jjf/issues/*` and `refs/jjf/memories/*`. See
+/// [`probe_ref_set_key_v3`]. The sentinel ref
+/// `refs/jjf/meta/format-version` is deliberately excluded — it's
+/// planted once and never moves, so including it would buy us
+/// nothing.
+///
+/// **Cache file path.** Same `.jj/jjforge-cache.json` as v2 — the
+/// `format_kind` field in the JSON discriminates the two key spaces.
+/// A v2-shape cache file lying around on disk will be discarded
+/// (key shape doesn't match v3's) and replaced atomically by the
+/// rebuild's write.
+///
+/// **Persistence failure** is non-fatal: the in-memory cache is
+/// returned, the next read pays the rebuild cost again, and stderr
+/// carries the diagnostic line. Same shape as v2.
+pub(crate) fn load_or_rebuild_v3(
+    git: &GitRepo,
+    repo_root: &Path,
+) -> Result<SnapshotCache> {
+    let key = probe_ref_set_key_v3(git)?;
+    if let Some(cache) = try_load_from_disk(repo_root) {
+        if cache.format_kind == FORMAT_KIND_V3 && cache.head_commit == key {
+            return Ok(cache);
+        }
+    }
+    let cache = rebuild_v3(git, &key)?;
+    try_persist_to_disk(repo_root, &cache);
+    Ok(cache)
+}
+
+/// Compute the v3 cache's invalidation key: SHA-1 hex of the
+/// concatenated `<refname> <objectname>\n` lines (sorted ascending by
+/// refname) for every `refs/jjf/issues/*` and `refs/jjf/memories/*`.
+///
+/// Uses `git hash-object --stdin` (no `-w`) so the key derivation
+/// doesn't pollute the object database with cache-key blobs. The hash
+/// is whatever git's content-addressed function is on this repo
+/// (SHA-1 today, SHA-256 on `extensions.objectFormat = sha256` repos);
+/// we treat it as an opaque fingerprint and only ever compare strings
+/// for equality.
+///
+/// On a fresh repo with no issue refs and no memory refs the
+/// for-each-ref output is empty. We still hash the empty input — git
+/// hashes the empty blob to a deterministic oid — so the "no refs"
+/// state has a stable cache key (`e69de29bb…` for SHA-1).
+pub(crate) fn probe_ref_set_key_v3(git: &GitRepo) -> Result<String> {
+    let pairs = git
+        .for_each_ref_with_oid(&[v3_write::refs::ISSUES_PREFIX, v3_write::refs::MEMORIES_PREFIX])
+        .map_err(Error::Git)?;
+    let mut buf = String::with_capacity(pairs.len() * 90);
+    for (name, oid) in &pairs {
+        buf.push_str(name);
+        buf.push(' ');
+        buf.push_str(oid);
+        buf.push('\n');
+    }
+    git.hash_object_no_write(buf.as_bytes()).map_err(Error::Git)
+}
+
+/// Rebuild the v3 cache by enumerating `refs/jjf/issues/*` +
+/// `refs/jjf/memories/*` and reading each ref's tree blobs directly
+/// via `git cat-file`.
+///
+/// Cost: one `for-each-ref` enumeration + N `cat-file` calls per
+/// issue ref (one for `issue.json`, one for `comments.jsonl`) + M
+/// `cat-file` calls per memory ref. For the ~30-issue planner this is
+/// ~60 git spawns and lands under 200ms; for a 1000-issue corpus the
+/// spawn cost dominates at ~1–2s. The follow-up optimization (Option
+/// 2 in the ticket body) would replace the N `cat-file` calls with
+/// one `cat-file --batch` pipeline; not yet — file as a future
+/// ticket if the rebuild cost matters.
+///
+/// Missing-file tolerance: a v3 issue ref MUST carry `issue.json`,
+/// but a corrupt repo or mid-write race could surface an absent
+/// blob. We skip such records silently — the read path's `read::read`
+/// will surface the issue-not-found error at the per-id call site.
+pub(crate) fn rebuild_v3(git: &GitRepo, key: &str) -> Result<SnapshotCache> {
+    // Issues: one ref per id, blob `issue.json` is required, blob
+    // `comments.jsonl` is optional (absent ⇒ no comments yet).
+    let issue_ids = v3_write::list_issue_ids_v3(git)?;
+    let mut issues: Vec<Issue> = Vec::with_capacity(issue_ids.len());
+    for id in issue_ids {
+        // `read_record_v3` returns `IssueNotFound` when the blob is
+        // missing — treat as a skip rather than a hard error so a
+        // half-written ref doesn't crash the rebuild.
+        let record: IssueRecord = match v3_write::read_record_v3(git, &id) {
+            Ok(r) => r,
+            Err(Error::IssueNotFound(_)) => continue,
+            Err(e) => return Err(e),
+        };
+        let mut comments = v3_write::read_comments_v3(git, &id)?;
+        comments.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        let mut labels = record.labels;
+        labels.sort();
+        labels.dedup();
+        let mut dependencies = record.dependencies;
+        dependencies.sort();
+        dependencies.dedup();
+        issues.push(Issue {
+            id: record.id,
+            title: record.title,
+            slug: record.slug,
+            body: record.body,
+            status: record.status,
+            block_reason: record.block_reason,
+            type_: record.type_,
+            labels,
+            dependencies,
+            assignee: record.assignee,
+            comments,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        });
+    }
+
+    // Memories: one ref per key, blob `memory.json` may be absent
+    // (post-unset tombstone) — skip those.
+    let memory_keys = v3_write::list_memory_keys_v3(git)?;
+    let mut memories: Vec<Memory> = Vec::with_capacity(memory_keys.len());
+    for key in memory_keys {
+        if let Some(mem) = v3_write::read_memory_v3(git, &key)? {
+            memories.push(mem);
+        }
+    }
+    memories.sort_by(|a, b| a.key.cmp(&b.key));
+
+    Ok(SnapshotCache::from_parts_with_kind(
+        FORMAT_KIND_V3.to_owned(),
+        key.to_owned(),
+        issues,
+        memories,
+    ))
 }
 
 /// Rebuild the cache from the bookmark tip.
