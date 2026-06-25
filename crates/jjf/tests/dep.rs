@@ -514,3 +514,54 @@ fn ready_excludes_child_of_blocked_parent_via_cascade() {
     assert!(!ids.contains(&parent.as_str()), "parent should NOT be ready, got: {ids:?}");
     assert!(!ids.contains(&child.as_str()), "child should NOT be ready (cascade), got: {ids:?}");
 }
+
+// ---- dep-cycle-undetected (43c7615) ---------------------------------
+// `jjf dep add` that would close a `blocks`-edge cycle exits 2 with
+// the `dependency_cycle` JSON envelope. Self-deps still surface as
+// `self_dependency` (more specific check, runs first).
+// ---------------------------------------------------------------------
+
+#[test]
+fn dep_add_blocks_cycle_exits_2_with_dependency_cycle() {
+    let repo = make_initialized_repo("dep_add_cycle");
+    let a = create_issue(&repo, "A");
+    let b = create_issue(&repo, "B");
+    let c = create_issue(&repo, "C");
+
+    // A -> B, B -> C. Then C -> A would close the cycle.
+    let out = run_jjf(&repo, &["dep", "add", &a, &b]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = run_jjf(&repo, &["dep", "add", &b, &c]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let out = run_jjf(&repo, &["--json", "dep", "add", &c, &a]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected exit 2, got code={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let v: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("json error envelope");
+    assert_eq!(v["error"]["kind"], "dependency_cycle");
+    assert_eq!(v["error"]["details"]["source"], c.as_str());
+    assert_eq!(v["error"]["details"]["target"], a.as_str());
+    // Walk from A (target): A -> B -> C. Path is [A, B, C].
+    let cycle: Vec<&str> = v["error"]["details"]["cycle"]
+        .as_array()
+        .expect("cycle is an array")
+        .iter()
+        .map(|x| x.as_str().expect("cycle entries are strings"))
+        .collect();
+    assert_eq!(cycle, vec![a.as_str(), b.as_str(), c.as_str()]);
+
+    // Verify the rejected edge did not land on C.
+    let show = run_jjf(&repo, &["show", &c]);
+    let show_out = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        !show_out.contains(&format!("blocks: {a}")),
+        "rejected cycle-closing edge must not land: {show_out}"
+    );
+}

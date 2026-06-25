@@ -3528,6 +3528,279 @@ fn create_issue_with_phantom_dep_target_rejects() {
     );
 }
 
+// ---------------------------------------------------------------------
+// dep-cycle-undetected (43c7615): the write path rejects `dep add` that
+// would close a cycle in the `blocks`-edge graph. Closed issues are
+// still graph nodes — the walk doesn't short-circuit on status. Only
+// the `blocks` kind is cycle-checked; the other kinds don't affect
+// `jjf ready`.
+// ---------------------------------------------------------------------
+
+#[test]
+fn add_dep_edge_direct_2_cycle_rejected() {
+    // A blocks B (A.deps += blocks:B). Then B blocks A would close
+    // a 2-cycle [A, B]. Reject; the chain in the error is the
+    // existing path from target back to source — here, from A
+    // (target) over A's blocks-deps back to B (source). A has one
+    // blocks-dep: B. So the cycle path is [A, B].
+    let repo = make_scratch_repo("dep_cycle_2");
+    let storage = Storage::open(&repo).unwrap();
+
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let b = storage
+        .create_issue(&IssueDraft {
+            title: "B".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    // A.deps += blocks:B  — fine, A is blocked by B.
+    storage.add_dep_edge(&a, &b, DepKind::Blocks).unwrap();
+
+    // B.deps += blocks:A  — would close the cycle.
+    let err = storage.add_dep_edge(&b, &a, DepKind::Blocks).unwrap_err();
+    match err {
+        StorageError::DependencyCycle {
+            from,
+            target,
+            cycle,
+        } => {
+            assert_eq!(from, b, "source field");
+            assert_eq!(target, a, "target field");
+            // Walk forward from A (target). A's only blocks-dep is B.
+            // B is the source. Path: [A, B].
+            assert_eq!(cycle, vec![a.clone(), b.clone()], "cycle path");
+        }
+        other => panic!("expected DependencyCycle, got {other:?}"),
+    }
+
+    // The rejected edge MUST NOT have landed on B.
+    let after = storage.read(&b).unwrap();
+    assert!(
+        after.dependencies.is_empty(),
+        "rejected dep-add must not land an edge: {:?}",
+        after.dependencies,
+    );
+}
+
+#[test]
+fn add_dep_edge_indirect_3_cycle_rejected() {
+    // A.deps += blocks:B, B.deps += blocks:C, then C.deps += blocks:A
+    // would close A -> B -> C -> A (path = [A, B, C]).
+    let repo = make_scratch_repo("dep_cycle_3");
+    let storage = Storage::open(&repo).unwrap();
+
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let b = storage
+        .create_issue(&IssueDraft {
+            title: "B".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let c = storage
+        .create_issue(&IssueDraft {
+            title: "C".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    storage.add_dep_edge(&a, &b, DepKind::Blocks).unwrap();
+    storage.add_dep_edge(&b, &c, DepKind::Blocks).unwrap();
+
+    let err = storage.add_dep_edge(&c, &a, DepKind::Blocks).unwrap_err();
+    match err {
+        StorageError::DependencyCycle {
+            from,
+            target,
+            cycle,
+        } => {
+            assert_eq!(from, c);
+            assert_eq!(target, a);
+            // Walk from A: A -> B -> C. Cycle path: [A, B, C].
+            assert_eq!(cycle, vec![a.clone(), b.clone(), c.clone()]);
+        }
+        other => panic!("expected DependencyCycle, got {other:?}"),
+    }
+}
+
+#[test]
+fn add_dep_edge_diamond_is_not_a_cycle() {
+    // A -> B, A -> C, B -> D, C -> D. No cycles. Then D -> A
+    // SHOULD be rejected (closes the cycle through both arms).
+    // Also, re-adding A -> B is idempotent and must not be
+    // flagged as a cycle.
+    let repo = make_scratch_repo("dep_diamond");
+    let storage = Storage::open(&repo).unwrap();
+
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let b = storage
+        .create_issue(&IssueDraft {
+            title: "B".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let c = storage
+        .create_issue(&IssueDraft {
+            title: "C".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let d = storage
+        .create_issue(&IssueDraft {
+            title: "D".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    storage.add_dep_edge(&a, &b, DepKind::Blocks).unwrap();
+    storage.add_dep_edge(&a, &c, DepKind::Blocks).unwrap();
+    storage.add_dep_edge(&b, &d, DepKind::Blocks).unwrap();
+    storage.add_dep_edge(&c, &d, DepKind::Blocks).unwrap();
+
+    // Idempotent re-add of A -> B: edge already present, must not
+    // be flagged as a cycle. (Edges already on the record are de-
+    // duped on the way in; the cycle walk skips them precisely so
+    // self-overlap doesn't false-positive.)
+    storage
+        .add_dep_edge(&a, &b, DepKind::Blocks)
+        .expect("re-adding an existing edge must not trip cycle check");
+
+    // D -> A would close the cycle (D -> A -> B -> D or
+    // D -> A -> C -> D).
+    let err = storage.add_dep_edge(&d, &a, DepKind::Blocks).unwrap_err();
+    assert!(
+        matches!(err, StorageError::DependencyCycle { .. }),
+        "expected DependencyCycle, got {err:?}",
+    );
+}
+
+#[test]
+fn dep_rm_then_dep_add_does_not_trip_cycle() {
+    // A -> B, B -> C, C -> ... no cycle. Add A -> B; remove A -> B;
+    // re-add A -> B. The re-add walks the post-rm graph and finds
+    // no path back to A, so it lands cleanly.
+    let repo = make_scratch_repo("dep_rm_then_add");
+    let storage = Storage::open(&repo).unwrap();
+
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let b = storage
+        .create_issue(&IssueDraft {
+            title: "B".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    storage.add_dep_edge(&a, &b, DepKind::Blocks).unwrap();
+    storage.remove_dep_edge(&a, &b, DepKind::Blocks).unwrap();
+    storage
+        .add_dep_edge(&a, &b, DepKind::Blocks)
+        .expect("re-adding after rm must succeed");
+
+    let after = storage.read(&a).unwrap();
+    assert_eq!(after.dependencies.len(), 1, "edge should be back");
+    assert_eq!(after.dependencies[0].target, b);
+    assert_eq!(after.dependencies[0].kind, DepKind::Blocks);
+}
+
+#[test]
+fn cycle_check_applies_only_to_blocks_kind() {
+    // `related` / `discovered-from` / `parent-child` edges have no
+    // ready-set effect; cycles among them aren't silent landmines.
+    // The check skips them. Confirm by setting up what WOULD be
+    // a `blocks` cycle and replaying it with each non-blocks kind.
+    let repo = make_scratch_repo("dep_cycle_non_blocks");
+    let storage = Storage::open(&repo).unwrap();
+
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let b = storage
+        .create_issue(&IssueDraft {
+            title: "B".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    // A -> B as `related` (no cycle effect).
+    storage.add_dep_edge(&a, &b, DepKind::Related).unwrap();
+    // B -> A as `related` — would be a 2-cycle if we cared. We
+    // don't (no ready-set impact); should be accepted.
+    storage
+        .add_dep_edge(&b, &a, DepKind::Related)
+        .expect("related cycle must not be rejected");
+
+    // Same for discovered-from.
+    storage
+        .add_dep_edge(&a, &b, DepKind::DiscoveredFrom)
+        .expect("discovered-from must not be cycle-checked");
+    storage
+        .add_dep_edge(&b, &a, DepKind::DiscoveredFrom)
+        .expect("discovered-from must not be cycle-checked");
+
+    // And parent-child. The ticket says we focus on blocks for now;
+    // parent-child cycle detection is a follow-up.
+    storage
+        .add_dep_edge(&a, &b, DepKind::ParentChild)
+        .expect("parent-child must not be cycle-checked (out of scope)");
+    storage
+        .add_dep_edge(&b, &a, DepKind::ParentChild)
+        .expect("parent-child must not be cycle-checked (out of scope)");
+}
+
+#[test]
+fn cycle_check_applies_even_when_issues_are_closed() {
+    // Closing a node doesn't open a backdoor to cycle creation:
+    // the graph walk treats closed issues as live nodes. A -> B
+    // (B closed), then B -> A still rejects.
+    let repo = make_scratch_repo("dep_cycle_closed");
+    let storage = Storage::open(&repo).unwrap();
+
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let b = storage
+        .create_issue(&IssueDraft {
+            title: "B".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    storage.add_dep_edge(&a, &b, DepKind::Blocks).unwrap();
+    storage.set_status(&a, Status::Closed).unwrap();
+
+    let err = storage.add_dep_edge(&b, &a, DepKind::Blocks).unwrap_err();
+    assert!(
+        matches!(err, StorageError::DependencyCycle { .. }),
+        "closed-node cycle must still be rejected: got {err:?}",
+    );
+}
+
 #[test]
 fn remove_dep_edge_against_phantom_target_is_no_op() {
     // `jjf dep rm` against a dep target that doesn't resolve is

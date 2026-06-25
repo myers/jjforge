@@ -1056,6 +1056,32 @@ enum CliError {
     #[error("issue {id} cannot depend on itself")]
     SelfDependency { id: String },
 
+    /// `jjf dep add <source> <target>` would close a cycle in the
+    /// `blocks`-edge graph. Issues caught in a `blocks` cycle are
+    /// permanently invisible to `jjf ready` (every node has at
+    /// least one active blocks-dep), so the boundary rejects the
+    /// write rather than land the silent landmine. Preflight failure
+    /// (exit 2). v2.6 (`dep-cycle-undetected`, issue `43c7615`).
+    ///
+    /// `cycle` is the chain `[target, ..., source]` — the existing
+    /// path that, combined with the proposed `source -> target`
+    /// edge, would close. Echoed back to the operator under
+    /// `details.cycle` so they can pinpoint which edges to break.
+    ///
+    /// In practice the storage layer's
+    /// [`StorageError::DependencyCycle`] surfaces this case — the
+    /// CLI-side variant stays defined so future callers (MCP
+    /// server, scripted batch creators) can construct it directly.
+    #[allow(dead_code)]
+    #[error(
+        "adding blocks-edge {from} -> {target} would close a dependency cycle"
+    )]
+    DependencyCycle {
+        from: String,
+        target: String,
+        cycle: Vec<String>,
+    },
+
     /// A slug write would collide with an existing open issue.
     /// Preflight failure (exit 2). `conflicts_with` is the id of
     /// the open issue already holding the slug.
@@ -1175,6 +1201,7 @@ impl CliError {
             CliError::Storage(StorageError::SlugNotFound { .. }) => 2,
             CliError::Storage(StorageError::AlreadyClaimed { .. }) => 2,
             CliError::Storage(StorageError::SelfDependency { .. }) => 2,
+            CliError::Storage(StorageError::DependencyCycle { .. }) => 2,
             CliError::Storage(StorageError::ConcurrentWrite { .. }) => 1,
             CliError::Cwd(_) => 2,
             CliError::BodyRead { .. } => 2,
@@ -1191,6 +1218,7 @@ impl CliError {
             CliError::InvalidSlug { .. } => 2,
             CliError::InvalidTitle { .. } => 2,
             CliError::SelfDependency { .. } => 2,
+            CliError::DependencyCycle { .. } => 2,
             CliError::SlugCollision { .. } => 2,
             CliError::SlugNotFound { .. } => 2,
             CliError::MissingMemoryValue => 2,
@@ -1247,10 +1275,12 @@ impl CliError {
             CliError::Storage(StorageError::SlugNotFound { .. }) => "slug_not_found",
             CliError::Storage(StorageError::AlreadyClaimed { .. }) => "already_claimed",
             CliError::Storage(StorageError::SelfDependency { .. }) => "self_dependency",
+            CliError::Storage(StorageError::DependencyCycle { .. }) => "dependency_cycle",
             CliError::Storage(StorageError::ConcurrentWrite { .. }) => "concurrent_write",
             CliError::InvalidSlug { .. } => "invalid_slug",
             CliError::InvalidTitle { .. } => "invalid_title",
             CliError::SelfDependency { .. } => "self_dependency",
+            CliError::DependencyCycle { .. } => "dependency_cycle",
             CliError::SlugCollision { .. } => "slug_collision",
             CliError::SlugNotFound { .. } => "slug_not_found",
             CliError::MissingMemoryValue => "missing_memory_value",
@@ -1368,6 +1398,20 @@ impl CliError {
                 json!({ "id": id.as_str() })
             }
             CliError::SelfDependency { id } => json!({ "id": id }),
+            CliError::Storage(StorageError::DependencyCycle {
+                from,
+                target,
+                cycle,
+            }) => json!({
+                "source": from.as_str(),
+                "target": target.as_str(),
+                "cycle": cycle.iter().map(IssueId::as_str).collect::<Vec<_>>(),
+            }),
+            CliError::DependencyCycle { from, target, cycle } => json!({
+                "source": from,
+                "target": target,
+                "cycle": cycle,
+            }),
             CliError::Storage(StorageError::ConcurrentWrite { hint })
             | CliError::ConcurrentWrite { hint } => json!({ "hint": hint }),
             CliError::ClaimRaceLost { id } => json!({ "id": id }),

@@ -1,5 +1,37 @@
 # `jjf --json` output contract
 
+## v2.5 → v2.6 changelog
+
+Backwards-compatible additions, landed in the
+`dep-cycle-undetected` ticket (`43c7615`).
+
+- **New error kind `dependency_cycle`** (preflight, exit 2):
+  `jjf dep add <source> <target>` would close a cycle in the
+  `blocks`-edge graph. Self-deps (`source == target`) still
+  surface as `self_dependency`; multi-step cycles surface as
+  the new kind. `details.source` is the proposed edge's source
+  id, `details.target` is the proposed target, and
+  `details.cycle` is the existing chain `[target, ..., source]`
+  that, combined with the new edge, would close. Echoed back
+  so an operator can pinpoint which existing edges to break.
+- **No new verbs.** Only `dep add` learned to reject cycles.
+  `dep rm` is unaffected (removing edges can't create them).
+  `jjf new -d` currently creates issues with their initial
+  dep set in a single commit — cycles there require two
+  pre-existing issues plus the new one, so the smallest
+  cycle reachable via `-d` is two-step and lands fine for
+  now (the new issue can't be the target of any pre-existing
+  edge before it's created). A follow-up may extend cycle
+  detection to the on-create path; out of scope for this
+  ticket.
+- **Scope: `blocks`-kind edges only.** `parent-child`,
+  `related`, and `discovered-from` edges are not cycle-
+  checked. `blocks` is the load-bearing case (`jjf ready`
+  walks `blocks`-deps), so a `blocks` cycle silently hides
+  every node in it from the ready set. The other kinds
+  don't affect ready computation; their cycles are a follow-
+  up if they ever become harmful.
+
 ## v2.4 → v2.5 changelog
 
 Backwards-compatible additions, landed in the
@@ -466,6 +498,7 @@ from plain-text mode (see the top comment in `main.rs`: `0` success,
 | `no_current_user`            | 2    | `NoCurrentUser`               | —                        |
 | `claim_requires_limit_one`   | 2    | `ClaimRequiresLimitOne`       | —                        |
 | `self_dependency`            | 2    | `Storage::SelfDependency` / `SelfDependency` | `id`                 |
+| `dependency_cycle`           | 2    | `Storage::DependencyCycle` / `DependencyCycle` | `source`, `target`, `cycle` |
 | `concurrent_write`           | 1    | `Storage::ConcurrentWrite` / `ConcurrentWrite` | `hint`             |
 
 Adding a new variant to `CliError`? Pick a stable kind, add it to
@@ -553,6 +586,40 @@ $ jjf --json new -t "child" -d deadbee -F -
 `jjf dep rm` is intentionally permissive against phantom
 targets — removing an edge that doesn't exist is a useful
 cleanup primitive and never lands a dangling edge.
+
+### Note on `dependency_cycle`
+
+Emitted by `jjf dep add <source> <target>` (v2.6,
+`dep-cycle-undetected`, issue `43c7615`) when adding the
+proposed `blocks`-edge would close a cycle in the existing
+`blocks`-edge graph. Preflight failure (exit 2). Added after
+QA found that `jjf dep add` silently accepted edges that
+closed multi-step cycles, hiding every node in the cycle
+from `jjf ready` with no diagnostic.
+
+Self-deps (`source == target`) still surface as
+`self_dependency`, not `dependency_cycle` — the older check
+runs first and is more specific.
+
+`details.source` and `details.target` are the proposed
+edge's endpoints (the values the operator passed to
+`jjf dep add`). `details.cycle` is the existing chain of ids
+`[target, ..., source]`: walking forward over `blocks`-deps
+from `target`, that's the path that ends at `source`. The
+proposed `source -> target` edge would extend it to
+`[source, target, ..., source]`, which is the back-edge.
+
+```sh
+$ jjf --json dep add a3f9c01 c001cab
+{"ok":false,"error":{"kind":"dependency_cycle","message":"adding blocks-edge a3f9c01 -> c001cab would close a dependency cycle","details":{"source":"a3f9c01","target":"c001cab","cycle":["c001cab","b00b00b","a3f9c01"]}}}
+```
+
+Scope: the check covers `--kind blocks` only. The other dep
+kinds (`parent-child`, `related`, `discovered-from`) don't
+affect `jjf ready` computation, so cycles among them aren't
+silent landmines. A future ticket may extend cycle detection
+to `parent-child` (which `jjf dep tree` recurses on, though
+that walker already has its own visited-set guard).
 
 ### Note on `concurrent_write`
 

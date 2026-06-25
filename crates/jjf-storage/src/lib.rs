@@ -275,6 +275,45 @@ pub enum Error {
     #[error("issue {id} cannot depend on itself")]
     SelfDependency { id: IssueId },
 
+    /// `Storage::add_dep_edge` was asked to add a `blocks`-kind edge
+    /// from `source` to `target` that would close a cycle in the
+    /// blocks-graph. The check walks forward from `target` over
+    /// existing `blocks` edges; if `source` is reachable, landing the
+    /// new edge would create a back-edge. Issues caught in a `blocks`
+    /// cycle are permanently invisible to `jjf ready` (every node in
+    /// the cycle has at least one active blocks-dep), so the boundary
+    /// rejects the write rather than land a silent landmine.
+    ///
+    /// `cycle` is the path that would close: `[target, ..., source]`.
+    /// Adding `source -> target` would extend it to
+    /// `[source, target, ..., source]`. The CLI's
+    /// `dependency_cycle` envelope echoes it back so the operator
+    /// can see which existing edges are involved.
+    ///
+    /// Closed issues are still nodes in the graph — the walk doesn't
+    /// short-circuit on `status == closed`. Reasoning: closing one
+    /// node in a cycle doesn't unblock the others (closed deps don't
+    /// block in `list_ready`, but a CLOSED dep target is still a real
+    /// edge that participates in any future cycle the operator might
+    /// inadvertently extend). Detecting cycles among closed nodes is
+    /// also harmless: the operator either re-opens them (and the
+    /// cycle becomes active) or leaves them alone (no edge ever
+    /// lands). Either way, refusing the write is the safe move.
+    ///
+    /// The CLI envelope kind is `dependency_cycle`. v2.6
+    /// (`dep-cycle-undetected`, issue `43c7615`).
+    #[error(
+        "adding blocks-edge {from} -> {target} would close a dependency cycle"
+    )]
+    DependencyCycle {
+        /// The new edge's source (the issue being given a new dep).
+        /// Named `from` to side-step thiserror's reserved `source`
+        /// field name (which it treats as the chained-cause field).
+        from: IssueId,
+        target: IssueId,
+        cycle: Vec<IssueId>,
+    },
+
     /// A concurrent jjforge writer landed first and the 4-CLI dance's
     /// `jj new bookmarks(issues)` snapshot is now stale, surfacing
     /// from jj as an "Internal error: Failed to check out commit …
@@ -2145,7 +2184,8 @@ impl Storage {
     /// but a fresh `dep-add` op still lands so the audit log records
     /// intent. v2.4 (`agent-dep-types`).
     ///
-    /// Validation (v2.x `qa-dep-validation`, issue `d1a01f0`):
+    /// Validation (v2.x `qa-dep-validation`, issue `d1a01f0`;
+    /// v2.6 `dep-cycle-undetected`, issue `43c7615`):
     ///
     /// - `child == target` is rejected with `Error::SelfDependency`
     ///   (self-deps make the issue permanently blocked by itself).
@@ -2153,6 +2193,17 @@ impl Storage {
     ///   present, return `Error::IssueNotFound { id: target }`. Both
     ///   checks happen before any mutating IO so a rejection leaves
     ///   the bookmark untouched.
+    /// - For `kind == DepKind::Blocks`, a forward DFS from `target`
+    ///   over existing `blocks` edges; if `id` is reachable, the new
+    ///   edge would close a cycle. Reject with
+    ///   `Error::DependencyCycle` carrying the path
+    ///   `[target, ..., id]`. The check covers `blocks` only — the
+    ///   one edge kind `jjf ready` walks — so an undetected `blocks`
+    ///   cycle would silently hide every node in it from the ready
+    ///   set. `parent-child` cycles are a follow-up (also harmful
+    ///   for `jjf dep tree` recursion, but `dep tree` already has a
+    ///   visited-set guard; the storage write-path check there is a
+    ///   future bug-fix ticket).
     pub fn add_dep_edge(
         &self,
         id: &IssueId,
@@ -2179,6 +2230,36 @@ impl Storage {
                 }
                 Err(e) => return MutateOutcome::Conflict(e),
             }
+            // Cycle preflight (v2.6, `43c7615`). `blocks` only — the
+            // one edge kind that participates in ready computation.
+            // Probed inside the closure so a CAS-loss retry re-walks
+            // the post-race graph: if another writer landed a cycle-
+            // closing edge between our attempts, we surface the
+            // cycle from the fresh state instead of compounding it.
+            //
+            // De-dup short-circuit: if the same `(target, kind)` edge
+            // is already on the record, the operation is a no-op
+            // (matches the post-MutateOutcome::Write branch below)
+            // and the cycle walk would falsely report the existing
+            // edge as a cycle. Skip the walk in that case.
+            if kind == DepKind::Blocks
+                && !rec
+                    .dependencies
+                    .iter()
+                    .any(|d| d.target == target && d.kind == DepKind::Blocks)
+            {
+                match self.find_blocks_cycle(&rec.id, &target) {
+                    Ok(Some(cycle)) => {
+                        return MutateOutcome::Conflict(Error::DependencyCycle {
+                            from: rec.id.clone(),
+                            target: target.clone(),
+                            cycle,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(e) => return MutateOutcome::Conflict(e),
+                }
+            }
             let edge = DepEdge {
                 target: target.clone(),
                 kind,
@@ -2198,6 +2279,73 @@ impl Storage {
             }])
         })
         .map(|_| ())
+    }
+
+    /// Walk the `blocks`-edge graph forward from `target`. If
+    /// `source` is reachable, returns the cycle path
+    /// `[target, ..., source]` — the nodes that would, together with
+    /// the new edge `source -> target`, form a back-edge.
+    ///
+    /// DFS with a visited set. Every issue on the bookmark is a node;
+    /// closed issues are NOT excluded (see `Error::DependencyCycle`
+    /// for the reasoning). Issues whose record is missing (a dangling
+    /// edge — possible after a `dep add` followed by the target
+    /// being deleted) are treated as leaves; we can't recurse without
+    /// data, but they also can't host a back-edge so the cycle
+    /// detection stays sound.
+    ///
+    /// Reads via the snapshot cache. v2.6 (`43c7615`).
+    fn find_blocks_cycle(
+        &self,
+        source: &IssueId,
+        target: &IssueId,
+    ) -> Result<Option<Vec<IssueId>>> {
+        let snapshot = self.snapshot()?;
+        // DFS frame: (node, iterator-over-children-already-consumed).
+        // We use an explicit stack so the chain can be reconstructed
+        // from the stack when the back-edge is hit, without a
+        // separate parent-pointer map.
+        let mut stack: Vec<IssueId> = vec![target.clone()];
+        let mut path: Vec<IssueId> = vec![target.clone()];
+        let mut visited: std::collections::HashSet<IssueId> =
+            std::collections::HashSet::new();
+        visited.insert(target.clone());
+
+        // Iterative DFS: pop a node, push every unvisited blocks-target.
+        // Track the active path so we can echo the cycle on hit.
+        // The stack-and-path split lets the path stay a clean chain.
+        while let Some(node) = stack.last().cloned() {
+            // Find next unvisited blocks-child of `node`. If none, pop
+            // the frame and shrink the path.
+            let next_child = match snapshot.issues.get(&node) {
+                Some(issue) => issue
+                    .dependencies
+                    .iter()
+                    .find(|e| {
+                        e.kind == DepKind::Blocks && !visited.contains(&e.target)
+                    })
+                    .map(|e| e.target.clone()),
+                None => None, // dangling target: leaf node
+            };
+            match next_child {
+                Some(child) => {
+                    if &child == source {
+                        // Found the back-edge: chain is
+                        // [target, ..., node, source].
+                        path.push(child);
+                        return Ok(Some(path));
+                    }
+                    visited.insert(child.clone());
+                    stack.push(child.clone());
+                    path.push(child);
+                }
+                None => {
+                    stack.pop();
+                    path.pop();
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Remove a typed dependency edge. Symmetric to
