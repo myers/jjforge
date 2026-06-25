@@ -259,6 +259,7 @@ fn parse_status(s: &str) -> Option<Status> {
         "blocked" => Some(Status::Blocked),
         "in-progress" => Some(Status::InProgress),
         "closed" => Some(Status::Closed),
+        "abandoned" => Some(Status::Abandoned),
         _ => None,
     }
 }

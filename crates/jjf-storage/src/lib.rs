@@ -636,15 +636,19 @@ fn compute_blocked_set(all: &[Issue]) -> std::collections::HashSet<IssueId> {
     let by_id: HashMap<IssueId, &Issue> = all.iter().map(|i| (i.id.clone(), i)).collect();
 
     // Helper: is `target` active (open, blocked, or in-progress)?
-    // Closed and dangling targets are NOT active and never block.
-    // A `Blocked` target (v2.5) is still ACTIVE — it's parked on
-    // an external signal, not done. A dep on a blocked issue still
-    // blocks the dependent (the work isn't complete).
+    // Closed, Abandoned, and dangling targets are NOT active and
+    // never block. A `Blocked` target (v2.5) is still ACTIVE — it's
+    // parked on an external signal, not done. A dep on a blocked
+    // issue still blocks the dependent (the work isn't complete).
+    // An `Abandoned` target (v2.7) behaves like Closed: the work
+    // will never be done so dependents are free of it. (Operators
+    // reviving an abandoned dep via `jjf update --status open` will
+    // see the dependent fall out of the ready set again.)
     let is_active = |target: &IssueId| -> bool {
         match by_id.get(target) {
             Some(i) => match i.status {
                 Status::Open | Status::Blocked | Status::InProgress => true,
-                Status::Closed => false,
+                Status::Closed | Status::Abandoned => false,
             },
             None => false, // dangling
         }
@@ -2015,6 +2019,16 @@ impl Storage {
                         "issue {id_owned} is closed; reopen before claiming"
                     )));
                 }
+                Status::Abandoned => {
+                    // v2.7: soft-deleted. Claiming would silently
+                    // resurrect the issue. Same shape as closed —
+                    // force an explicit `jjf update --status open`
+                    // to revive (the audit trail then carries
+                    // the intent).
+                    return MutateOutcome::Conflict(Error::Invalid(format!(
+                        "issue {id_owned} is abandoned; reopen before claiming"
+                    )));
+                }
                 Status::Blocked => {
                     // v2.5: parked on an external signal. Claiming a
                     // blocked issue would silently flip its status
@@ -2094,6 +2108,14 @@ impl Storage {
                     "issue {id_owned} is closed; nothing to unclaim"
                 )));
             }
+            if rec.status == Status::Abandoned {
+                // v2.7: abandoned terminal state. Unclaiming would
+                // silently flip to Open. Force the operator to
+                // `jjf update --status open` first.
+                return MutateOutcome::Conflict(Error::Invalid(format!(
+                    "issue {id_owned} is abandoned; nothing to unclaim"
+                )));
+            }
             if rec.status == Status::Open && rec.assignee.is_none() {
                 // No-op: already in the unclaimed state.
                 return MutateOutcome::Skip;
@@ -2168,6 +2190,14 @@ impl Storage {
                     "issue {id_owned} is closed; reopen before blocking"
                 )));
             }
+            if rec.status == Status::Abandoned {
+                // v2.7: abandoned terminal state. Same shape as
+                // the closed rejection — force an explicit revive
+                // (`jjf update --status open`) before blocking.
+                return MutateOutcome::Conflict(Error::Invalid(format!(
+                    "issue {id_owned} is abandoned; reopen before blocking"
+                )));
+            }
             rec.status = Status::Blocked;
             rec.block_reason = reason_owned.clone();
             MutateOutcome::Write(vec![
@@ -2208,6 +2238,14 @@ impl Storage {
             if rec.status == Status::Closed {
                 return MutateOutcome::Conflict(Error::Invalid(format!(
                     "issue {id_owned} is closed; nothing to unblock"
+                )));
+            }
+            if rec.status == Status::Abandoned {
+                // v2.7: abandoned terminal state. Same shape as
+                // closed — force an explicit revive before
+                // touching block state.
+                return MutateOutcome::Conflict(Error::Invalid(format!(
+                    "issue {id_owned} is abandoned; nothing to unblock"
                 )));
             }
             if rec.status == Status::Open && rec.block_reason.is_none() {
@@ -3012,7 +3050,11 @@ impl Storage {
                 Status::Open => true,
                 Status::Blocked => include_blocked,
                 Status::InProgress => include_claimed,
-                Status::Closed => false,
+                // v2.7 (`abandon-verb`): Abandoned is excluded
+                // unconditionally — abandoning means "this issue
+                // should never come up again." No override flag
+                // (unlike `include_blocked` / `include_claimed`).
+                Status::Closed | Status::Abandoned => false,
             })
             .filter(|i| i.type_ != IssueType::Roadmap)
             .filter(|i| !blocked.contains(&i.id))

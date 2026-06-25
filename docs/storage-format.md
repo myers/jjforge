@@ -1,6 +1,6 @@
-# jjforge on-disk storage format — v2.6
+# jjforge on-disk storage format — v2.7
 
-Status: v2.6, current. This is the contract every other crate
+Status: v2.7, current. This is the contract every other crate
 implements against. Verdicts pinned by:
 
 - `dcd4b57` — Shape A (dedicated bookmark for issue data).
@@ -8,6 +8,58 @@ implements against. Verdicts pinned by:
   audit surface.
 - `2130de1` — shell out to the `jj` CLI; do not link `jj-lib`.
 - `72638a0` — the `mvp-storage` epic.
+
+## v2.6 → v2.7 changelog
+
+Backwards-compatible additions, landed in the `abandon-verb`
+ticket (`c1ffea7`). v2.6 readers tolerate v2.7 commits only via
+the existing unknown-status failure mode: a `Jjf-Status:
+abandoned` trailer surfaces as a typed deserialize failure to
+older parsers — same contract as the v2.3 `in-progress` and
+v2.5 `blocked` additions. v2.7 readers tolerate v2.6 records
+identically (no record-shape change).
+
+- **New `status` value `abandoned`** — `Status::Abandoned`.
+  Wire spelling: `abandoned` (lowercase, via serde rename_all).
+  Semantically: soft-deleted. Mis-filed issues (typo, wrong
+  type, test ticket) live here instead of cluttering
+  `Status::Closed`. The issue stays in history (audit-trail
+  friendly), its slug stays claimed (see below), but it's
+  hidden from default listings.
+- **No on-record field changes, no new ops.** Abandoning lands
+  through the existing `set-status` op (payload
+  `Jjf-Status: abandoned`). The `Storage::set_status` mutator
+  is the only writer; there's no dedicated `Storage::abandon`
+  primitive — the CLI's `jjf abandon <id>` is a thin convenience
+  wrapper analogous to `jjf close`.
+- **`Storage::list_ready` excludes `Abandoned` UNCONDITIONALLY.**
+  Unlike `Blocked` (gated by `include_blocked`) and `InProgress`
+  (gated by `include_claimed`), there is no `include_abandoned`
+  flag on `ReadyFilter`. Abandoning means "this issue should
+  never come up again." Operators wanting to revive an
+  abandoned issue use `jjf update <id> --status open`
+  explicitly.
+- **Dep edges to an `Abandoned` target DO NOT block dependents.**
+  An abandoned dep behaves like a `Closed` dep in the blocked-
+  set fixpoint — the work will never be done, so the dependent
+  is free of it. (`Open` / `Blocked` / `InProgress` deps still
+  block.)
+- **Slug uniqueness keeps the slug claimed.** Spec §3.4 (v2.6
+  "all statuses including Closed") extends naturally to
+  Abandoned — the slug uniqueness probe in
+  `Storage::find_slug_collision` reads from the snapshot cache's
+  `slug_index`, which carries every slug holder regardless of
+  status. A new issue can't reuse an abandoned issue's slug.
+- **`claim` / `block` / `unblock` / `unclaim` reject `Abandoned`
+  targets** with `Error::Invalid`, same shape as the existing
+  `Closed`-target rejections. Operators must explicitly revive
+  via `jjf update --status open` first; this preserves the
+  audit trail and avoids silent resurrection of mis-filed
+  tickets.
+- **No `Status::Abandoned` inverse verb.** Asymmetry is
+  deliberate: abandon is a soft delete, not a parking lot. The
+  documented revival path is `jjf update <id> --status open`.
+  See `c1ffea7` for the rationale.
 
 ## v2.5 → v2.6 changelog
 
@@ -407,7 +459,7 @@ separate lines).
 | `title`        | string                | yes  | Single-line. Must not be empty.                                |
 | `slug`         | string \| null        | yes  | v2.1 — kebab-case orientation handle. Default `null`. See §3.4. |
 | `body`         | string                | yes  | Opening description. May be empty.                             |
-| `status`       | string enum           | yes  | `open` \| `blocked` \| `in-progress` \| `closed`. Default `open`. (v2.3 added `in-progress`; v2.5 added `blocked`.) |
+| `status`       | string enum           | yes  | `open` \| `blocked` \| `in-progress` \| `closed` \| `abandoned`. Default `open`. (v2.3 added `in-progress`; v2.5 added `blocked`; v2.7 added `abandoned`.) |
 | `block_reason` | string \| null        | yes  | v2.5 — free-text reason for the current `blocked` status. `null` when not blocked. Single-line. |
 | `type`         | string enum           | yes  | v2.1 — `bug` \| `feature` \| `epic` \| `research` \| `roadmap` \| `unspecified`. Default `unspecified`. |
 | `labels`       | array of string       | yes  | Sorted alphabetically. Empty array if none.                    |

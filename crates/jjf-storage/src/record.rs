@@ -176,18 +176,26 @@ pub(crate) mod dep_edges_serde {
 }
 
 /// Issue status. Spec §3 — `open`, `blocked`, `in-progress`,
-/// `closed`. v2.3 added [`Status::InProgress`] (spelled
-/// `in-progress` on the wire) as the "claimed by some agent"
-/// state. v2.5 added [`Status::Blocked`] (spelled `blocked` on
-/// the wire) as the "parked on an external signal" state —
-/// waiting on a PR, a timer, a human response. `Open`,
-/// `Blocked`, and `InProgress` are all "active" in the sense
-/// that the issue isn't terminal; only `Closed` is terminal.
-/// `jjf ready` excludes both `Blocked` and `InProgress` by
-/// default — neither is workable right now for an idle agent
-/// (blocked = waiting on an external signal; in-progress =
-/// already claimed). Variant declaration order matches the
-/// natural lifecycle: open → blocked → in-progress → closed.
+/// `closed`, `abandoned`. v2.3 added [`Status::InProgress`]
+/// (spelled `in-progress` on the wire) as the "claimed by some
+/// agent" state. v2.5 added [`Status::Blocked`] (spelled
+/// `blocked` on the wire) as the "parked on an external signal"
+/// state — waiting on a PR, a timer, a human response. v2.7
+/// added [`Status::Abandoned`] (`abandon-verb`) as the
+/// "mis-filed — soft-deleted" state: the issue stays in
+/// history (audit-trail friendly), the slug stays claimed
+/// (per spec §3.4 all-statuses uniqueness), but the ticket
+/// is excluded from `jjf ls` (default) and `jjf ready`
+/// (unconditionally). `Open`, `Blocked`, and `InProgress`
+/// are all "active" in the sense that the issue isn't
+/// terminal; `Closed` and `Abandoned` are both terminal —
+/// they don't count as work in flight for ready / dep
+/// computation. `jjf ready` excludes `Blocked` and
+/// `InProgress` by default (overridable via flags), and
+/// excludes `Abandoned` unconditionally (no override —
+/// abandoning means "never come up again"). Variant
+/// declaration order matches the natural lifecycle: open →
+/// blocked → in-progress → closed → abandoned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
@@ -203,6 +211,14 @@ pub enum Status {
     #[serde(rename = "in-progress")]
     InProgress,
     Closed,
+    /// Soft-deleted: mis-filed and intentionally hidden from
+    /// `jjf ls` (default) and `jjf ready` (unconditional).
+    /// Wire spelling: `abandoned`. v2.7 (`abandon-verb`,
+    /// issue `c1ffea7`). Slug stays claimed (spec §3.4
+    /// all-statuses uniqueness). Dep targets in this state
+    /// behave like `Closed` for blocked-set computation — an
+    /// abandoned target neither blocks dependents nor cascades.
+    Abandoned,
 }
 
 impl Status {
@@ -216,6 +232,7 @@ impl Status {
             Status::Blocked => "blocked",
             Status::InProgress => "in-progress",
             Status::Closed => "closed",
+            Status::Abandoned => "abandoned",
         }
     }
 }

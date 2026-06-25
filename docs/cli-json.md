@@ -1,5 +1,56 @@
 # `jjf --json` output contract
 
+## v2.7 → v2.8 changelog
+
+Backwards-compatible additions, landed in the `abandon-verb`
+ticket (`c1ffea7`). See `docs/storage-format.md` v2.6 → v2.7
+for the storage-layer contract.
+
+- **New verb `jjf abandon <id>`** — soft-delete an issue.
+  Lands one `set-status` op with payload
+  `Jjf-Status: abandoned` on a new commit. Same envelope shape
+  and non-idempotency rules as `jjf close`:
+
+  ```json
+  {"ok": true, "id": "aa6600b", "status": "abandoned"}
+  ```
+
+  Plain-text output: `abandoned <id>` — one line, no
+  decoration. Re-abandoning is idempotent at the data level
+  (status stays `abandoned`) but each call lands a fresh
+  trailer so the audit log records intent (matching `close`'s
+  contract).
+
+- **New status enum value `abandoned`** on every verb that emits
+  or accepts status. `Status::Abandoned` is wire-spelled
+  `abandoned`.
+
+  - `jjf show <id>` (and `--json`) reports `[abandoned]` /
+    `"status": "abandoned"` for abandoned issues — show still
+    works, so an operator can confirm what was abandoned.
+  - `jjf ls --status abandoned` lists only abandoned issues.
+  - `jjf ls --status all` includes them alongside everything
+    else.
+  - `jjf ls` (default `--status open`) HIDES them — abandoned
+    is meant as a soft delete; the listing should stay clean.
+  - `jjf update <id> --status abandoned` is the same write as
+    `jjf abandon <id>`; `--status open` on an abandoned issue
+    is the documented revival path (no `jjf unabandon` inverse
+    verb).
+
+- **`jjf ready` EXCLUDES abandoned issues UNCONDITIONALLY.** No
+  `--include-abandoned` flag (unlike `--include-blocked` /
+  `--include-claimed`). Abandoning means "never come up again."
+  Dep targets in the abandoned state behave like closed deps —
+  they don't block dependents.
+
+- **No new error kinds.** `claim` / `block` / `unblock` on an
+  abandoned issue surface the existing `invalid_input` kind
+  with a "reopen before …" / "nothing to …" hint, matching the
+  closed-issue rejection shape. `slug_collision` triggers on
+  attempts to reuse an abandoned issue's slug — the existing
+  v2.6 rule that slug uniqueness spans every status holds.
+
 ## v2.6 → v2.7 changelog
 
 Backwards-compatible additions, landed in the

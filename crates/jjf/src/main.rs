@@ -69,7 +69,8 @@ struct Cli {
 /// What `jjf ls --status <X>` accepts. Distinct from `Status` because
 /// `all` (no filter) is a CLI-only affordance with no storage-layer
 /// equivalent. v2.3 added `in-progress` mirroring `Status::InProgress`;
-/// v2.5 added `blocked` mirroring `Status::Blocked`.
+/// v2.5 added `blocked` mirroring `Status::Blocked`. v2.7 added
+/// `abandoned` mirroring `Status::Abandoned` (`abandon-verb`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum StatusFilter {
     Open,
@@ -77,6 +78,7 @@ enum StatusFilter {
     #[value(name = "in-progress")]
     InProgress,
     Closed,
+    Abandoned,
     All,
 }
 
@@ -92,6 +94,7 @@ enum StatusArg {
     #[value(name = "in-progress")]
     InProgress,
     Closed,
+    Abandoned,
 }
 
 impl From<StatusArg> for Status {
@@ -101,6 +104,7 @@ impl From<StatusArg> for Status {
             StatusArg::Blocked => Status::Blocked,
             StatusArg::InProgress => Status::InProgress,
             StatusArg::Closed => Status::Closed,
+            StatusArg::Abandoned => Status::Abandoned,
         }
     }
 }
@@ -504,6 +508,35 @@ enum Commands {
     /// Reopen an issue. Same shape and same non-idempotency rules as
     /// `close`, just lands `set-status=open`.
     Open {
+        /// Full 7-char hex issue id. A bad parse is a preflight
+        /// failure (exit 2); a well-formed id that doesn't exist on
+        /// the bookmark is a runtime failure (exit 1).
+        id: String,
+    },
+
+    /// Abandon an issue: soft-delete via `set-status=abandoned`.
+    /// v2.7 (`abandon-verb`, issue `c1ffea7`).
+    ///
+    /// Abandoned issues stay in history (audit-trail friendly), their
+    /// slug stays claimed (spec §3.4 — slug uniqueness spans every
+    /// status), but they're hidden from `jjf ls` by default
+    /// (`--status all` or `--status abandoned` to see them) and
+    /// excluded from `jjf ready` unconditionally (no override flag,
+    /// unlike `--include-blocked` / `--include-claimed`).
+    ///
+    /// Use this for mis-filed issues (typo, wrong type, test
+    /// ticket) instead of `close` — `close` keeps the issue
+    /// cluttering `--status all` and the ready set still sees it
+    /// shape-wise (as a closed dep). Abandoning is "never come up
+    /// again."
+    ///
+    /// Same shape and non-idempotency rules as `close`: each call
+    /// lands a fresh `set-status` trailer so the audit log records
+    /// every intent. To revive an abandoned issue, use
+    /// `jjf update <id> --status open` (no inverse `unabandon` —
+    /// the asymmetry is deliberate; abandon is meant as soft-
+    /// delete, not a parking lot).
+    Abandon {
         /// Full 7-char hex issue id. A bad parse is a preflight
         /// failure (exit 2); a well-formed id that doesn't exist on
         /// the bookmark is a runtime failure (exit 1).
@@ -1526,6 +1559,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
         ),
         Commands::Close { id } => run_set_status(cli.json, id, Status::Closed),
         Commands::Open { id } => run_set_status(cli.json, id, Status::Open),
+        Commands::Abandon { id } => run_set_status(cli.json, id, Status::Abandoned),
         Commands::Block { id, reason } => run_block(cli.json, id, reason),
         Commands::Unblock { id } => run_unblock(cli.json, id),
         Commands::Comment { id, file, author } => run_comment(cli.json, id, file, author),
@@ -2210,6 +2244,7 @@ fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError
             Status::Closed => "closed",
             Status::InProgress => "claimed",
             Status::Blocked => "blocked",
+            Status::Abandoned => "abandoned",
         };
         println!("{verb} {issue_id}");
     }
@@ -3325,7 +3360,8 @@ fn run_ready(
     Ok(())
 }
 
-/// `--status` predicate. `All` matches everything.
+/// `--status` predicate. `All` matches everything (including
+/// `Abandoned`).
 fn status_matches(issue: &Issue, filter: StatusFilter) -> bool {
     match filter {
         StatusFilter::All => true,
@@ -3333,6 +3369,7 @@ fn status_matches(issue: &Issue, filter: StatusFilter) -> bool {
         StatusFilter::Blocked => issue.status == Status::Blocked,
         StatusFilter::InProgress => issue.status == Status::InProgress,
         StatusFilter::Closed => issue.status == Status::Closed,
+        StatusFilter::Abandoned => issue.status == Status::Abandoned,
     }
 }
 

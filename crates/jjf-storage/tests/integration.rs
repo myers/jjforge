@@ -3055,6 +3055,214 @@ fn block_reason_lww_later_overwrites_earlier() {
 }
 
 // ============================================================
+// Abandoned status (v2.7 `abandon-verb`, ticket `c1ffea7`).
+// Soft-delete: stays in history, slug stays claimed, excluded
+// from `list_ready` unconditionally.
+// ============================================================
+
+#[test]
+fn status_abandoned_serializes_with_wire_spelling() {
+    // Wire spelling is `abandoned` (lowercase, via serde
+    // rename_all). Mirrors the block / in-progress checks; pins
+    // the trailer payload.
+    assert_eq!(Status::Abandoned.as_str(), "abandoned");
+    let v = serde_json::to_value(Status::Abandoned).unwrap();
+    assert_eq!(v, serde_json::json!("abandoned"));
+}
+
+#[test]
+fn set_status_to_abandoned_round_trips_via_read() {
+    // The minimal happy path: a `set_status(Abandoned)` lands
+    // and `Storage::read` reports the new value. Mirrors the
+    // shape of `block` / `unblock` round-trip tests.
+    let repo = make_scratch_repo("abandon_round_trip");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "soon to be abandoned".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.set_status(&id, Status::Abandoned).unwrap();
+    let issue = storage.read(&id).unwrap();
+    assert_eq!(issue.status, Status::Abandoned);
+}
+
+#[test]
+fn list_ready_excludes_abandoned_unconditionally() {
+    // Abandoned issues never appear in the ready set — even
+    // with `include_blocked` and `include_claimed` both set,
+    // unlike Blocked / InProgress which are gated by flags.
+    // Closed has the same "no override" semantics; this is the
+    // companion guarantee for Abandoned.
+    let repo = make_scratch_repo("ready_excludes_abandoned");
+    let storage = Storage::open(&repo).unwrap();
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+    let _b = storage
+        .create_issue(&IssueDraft {
+            title: "B".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.set_status(&a, Status::Abandoned).unwrap();
+
+    // Default filter: only B.
+    let ready = storage.list_ready(&ReadyFilter::default()).unwrap();
+    let ids: Vec<&IssueId> = ready.iter().map(|i| &i.id).collect();
+    assert!(!ids.contains(&&a), "abandoned A must not appear: {ids:?}");
+    assert_eq!(ready.len(), 1, "only B should be ready: {ready:#?}");
+
+    // Even with both flip-flags on, A stays out — there's no
+    // `include_abandoned` flag on `ReadyFilter` because the
+    // spec forbids it.
+    let ready = storage
+        .list_ready(&ReadyFilter {
+            include_blocked: true,
+            include_claimed: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let ids: Vec<&IssueId> = ready.iter().map(|i| &i.id).collect();
+    assert!(
+        !ids.contains(&&a),
+        "abandoned A must not appear even with include_blocked + include_claimed: {ids:?}"
+    );
+    assert_eq!(ready.len(), 1, "only B should be ready: {ready:#?}");
+}
+
+#[test]
+fn slug_uniqueness_blocks_against_abandoned_holder() {
+    // F-012 / spec §3.4 contract: slug uniqueness spans every
+    // status, including Abandoned. Abandoning an issue doesn't
+    // release its slug — a new ticket must pick a fresh one.
+    // The dual companion to `slug_uniqueness_scope_spans_all_statuses_including_closed`.
+    let repo = make_scratch_repo("slug_abandoned_holder");
+    let storage = Storage::open(&repo).unwrap();
+    let first = storage
+        .create_issue(&IssueDraft {
+            title: "first".into(),
+            slug: Some("mis-filed".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.set_status(&first, Status::Abandoned).unwrap();
+    let err = storage
+        .create_issue(&IssueDraft {
+            title: "second".into(),
+            slug: Some("mis-filed".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+    match err {
+        StorageError::SlugCollision { slug, conflicts_with } => {
+            assert_eq!(slug, "mis-filed");
+            assert_eq!(
+                conflicts_with, first,
+                "abandoned issue's id must be carried in conflicts_with"
+            );
+        }
+        other => panic!("expected SlugCollision against abandoned holder, got {other:?}"),
+    }
+}
+
+#[test]
+fn re_abandoning_lands_fresh_set_status_trailer_each_call() {
+    // Like close-twice: re-abandoning an already-abandoned
+    // issue is NOT a no-op at the commit level. It still lands
+    // a fresh `set-status` op so the audit log records the
+    // intent. Idempotent only at the data level (status stays
+    // Abandoned, no observable record change).
+    let repo = make_scratch_repo("abandon_twice");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "abandon me twice".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let baseline_set_status = storage
+        .read_history(&id)
+        .unwrap()
+        .into_iter()
+        .filter(|e| matches!(e.op, Op::SetStatus { .. }))
+        .count();
+    assert_eq!(
+        baseline_set_status, 0,
+        "fresh issue has no set-status ops"
+    );
+
+    storage.set_status(&id, Status::Abandoned).unwrap();
+    // Same-second guard, same rationale as close-twice.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    storage.set_status(&id, Status::Abandoned).unwrap();
+
+    let issue = storage.read(&id).unwrap();
+    assert_eq!(
+        issue.status,
+        Status::Abandoned,
+        "status is idempotent at the data level"
+    );
+
+    let set_status_count = storage
+        .read_history(&id)
+        .unwrap()
+        .into_iter()
+        .filter(|e| matches!(e.op, Op::SetStatus { .. }))
+        .count();
+    assert_eq!(
+        set_status_count, 2,
+        "two abandons must land two fresh set-status ops (non-idempotency)"
+    );
+}
+
+#[test]
+fn abandoned_dep_does_not_block_dependent_from_ready() {
+    // An abandoned dep is like a closed dep — the work will
+    // never be done, so dependents are free of it. Companion to
+    // `list_ready_closed_dependency_does_not_block`.
+    let repo = make_scratch_repo("ready_abandoned_dep_doesnt_block");
+    let storage = Storage::open(&repo).unwrap();
+    let parent = storage
+        .create_issue(&IssueDraft {
+            title: "parent".into(),
+            type_: Some(IssueType::Feature),
+            ..Default::default()
+        })
+        .unwrap();
+    let child = storage
+        .create_issue(&IssueDraft {
+            title: "child".into(),
+            type_: Some(IssueType::Feature),
+            dependencies: vec![DepEdge::blocks(parent.clone())],
+            ..Default::default()
+        })
+        .unwrap();
+    // With parent Open, child is blocked.
+    let ready = storage.list_ready(&ReadyFilter::default()).unwrap();
+    let ids: Vec<&IssueId> = ready.iter().map(|i| &i.id).collect();
+    assert!(!ids.contains(&&child), "open dep blocks child: {ids:?}");
+
+    storage.set_status(&parent, Status::Abandoned).unwrap();
+    let ready = storage.list_ready(&ReadyFilter::default()).unwrap();
+    let ids: Vec<&IssueId> = ready.iter().map(|i| &i.id).collect();
+    assert!(
+        ids.contains(&&child),
+        "abandoned dep should not block child: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&&parent),
+        "abandoned parent itself must be excluded from ready: {ids:?}"
+    );
+}
+
+// ============================================================
 // Snapshot cache (`docs/storage-index-design.md`, ticket `61e9a1c`).
 // ============================================================
 
