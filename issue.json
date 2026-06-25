@@ -4,7 +4,7 @@
   "title": "No 'jjf delete' / 'jjf abandon' verb — mis-filed issues can only be closed",
   "slug": "delete-or-abandon-verb",
   "body": "# Symptom\n\nThere is no `jjf delete <id>` or `jjf abandon <id>` verb. If\nyou create an issue by mistake (typo title, wrong type, test\nticket), the only options are:\n\n1. `jjf close <id>` — issue persists, clutters\n   `jjf ls --status all` and any history queries.\n2. `git update-ref -d refs/jjf/issues/<id>` — works but\n   bypasses the storage layer's audit trail.\n\n# Design call\n\nAppend-only history is a feature for an audit trail, so a hard\ndelete may be the wrong primitive. But mis-filed test issues\nwill accrete across 10 projects.\n\nThree options:\n\n1. **`jjf abandon <id>`** — sets a new status `abandoned`,\n   omitted from `jjf ls` and `jjf ready` by default but visible\n   under `--status all`. Audit-trail-friendly.\n2. **`jjf delete <id>`** — hard removes the ref. Recoverable\n   only via reflog. Loud confirmation prompt (`--yes` to skip).\n3. **Status quo + docs** — document that close is the only\n   primitive and explain the recovery path for accidents.\n\n(1) feels right for this codebase's append-only ethos.\n\n# Confidence\n\nVerified via `jjf --help` — no delete/abandon verb exists.\n",
-  "status": "open",
+  "status": "closed",
   "block_reason": null,
   "type": "feature",
   "labels": [
@@ -18,5 +18,5 @@
   ],
   "assignee": null,
   "created_at": "2026-06-24T17:33:59Z",
-  "updated_at": "2026-06-25T10:19:23Z"
+  "updated_at": "2026-06-25T10:19:29Z"
 }
