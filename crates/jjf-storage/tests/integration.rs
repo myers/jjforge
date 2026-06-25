@@ -4691,3 +4691,219 @@ fn exhausted_retry_hint_mentions_configured_count() {
         std::env::remove_var("JJF_RETRY_BASE_MS");
     }
 }
+
+// ---- unreadable-ref diagnostics (ticket `4928ae6`) -----------------
+//
+// The snapshot cache's v3 rebuild used to silently drop any
+// `refs/jjf/issues/*` whose tip didn't resolve to a commit carrying
+// `issue.json` — pointing a ref at a blob (the easy repro:
+// `git update-ref refs/jjf/issues/<id> $(git hash-object -w --stdin
+// <<<"junk")`) made the affected id vanish from `list_ids` /
+// `list_ready` with no diagnostic. Trust-eroding for the operator
+// ("where did my ticket go?") and indistinguishable from "issue
+// doesn't exist" via `jjf show <id>`.
+//
+// The fix records each unparseable ref into
+// `SnapshotCache::unreadable_refs` (exposed via
+// `Storage::unreadable_refs()`). The CLI's `ls` / `ready` verbs use
+// that vec to emit a stderr warning; here we exercise the storage
+// surface directly.
+
+/// Pointing an `refs/jjf/issues/<id>` ref at a blob (via plain
+/// `git update-ref` to a freshly-hashed blob oid) causes the v3
+/// rebuild to surface that ref in `unreadable_refs()` while leaving
+/// every unaffected issue listable. Headline repro from the ticket.
+#[test]
+fn unreadable_refs_surfaces_issue_ref_pointed_at_blob() {
+    let repo = make_scratch_repo("unreadable_issue_ref_blob");
+    let storage = Storage::open(&repo).expect("Storage::open");
+
+    let alive = storage
+        .create_issue(&IssueDraft {
+            title: "alive issue".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let corrupt = storage
+        .create_issue(&IssueDraft {
+            title: "soon-to-be-corrupt".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    // Hash a blob; point the corrupt issue's ref at it. From the
+    // snapshot's POV the ref now resolves to a blob, not a commit
+    // carrying `issue.json`.
+    let blob_oid = git_capture_with_stdin(
+        &["hash-object", "-w", "--stdin"],
+        b"junk content\n",
+        &repo,
+    );
+    let blob_oid = blob_oid.trim();
+    sh(
+        "git",
+        &[
+            "update-ref",
+            &format!("refs/jjf/issues/{}", corrupt),
+            blob_oid,
+        ],
+        &repo,
+    );
+
+    // Re-open so the snapshot memo doesn't carry the pre-corruption
+    // cache state.
+    drop(storage);
+    let storage = Storage::open(&repo).expect("Storage::open after corruption");
+
+    let ids = storage.list_ids().expect("list_ids");
+    assert!(
+        ids.contains(&alive),
+        "alive issue must remain enumerable: ids={ids:?}"
+    );
+    assert!(
+        !ids.contains(&corrupt),
+        "corrupt issue must NOT appear in list_ids: ids={ids:?}"
+    );
+
+    let unreadable = storage.unreadable_refs().expect("unreadable_refs");
+    assert_eq!(
+        unreadable.len(),
+        1,
+        "exactly one unreadable ref expected: {unreadable:?}"
+    );
+    let expected_name = format!("refs/jjf/issues/{}", corrupt);
+    assert_eq!(
+        unreadable[0].name, expected_name,
+        "unreadable ref name should be the corrupt issue's ref: got {:?}, expected {expected_name}",
+        unreadable[0].name
+    );
+    assert!(
+        !unreadable[0].reason.is_empty(),
+        "unreadable ref must carry a human-readable reason: {:?}",
+        unreadable[0],
+    );
+}
+
+/// Pointing a memory ref at a blob surfaces it as unreadable
+/// alongside issue-ref handling. The two namespaces share one fix.
+#[test]
+fn unreadable_refs_surfaces_memory_ref_pointed_at_blob() {
+    let repo = make_scratch_repo("unreadable_memory_ref_blob");
+    let storage = Storage::open(&repo).expect("Storage::open");
+
+    storage
+        .set_memory("alive-key", "alive value")
+        .expect("seed alive memory");
+    storage
+        .set_memory("corrupt-key", "soon to break")
+        .expect("seed corrupt-target memory");
+
+    // Repoint the corrupt memory's ref at a blob.
+    let blob_oid = git_capture_with_stdin(
+        &["hash-object", "-w", "--stdin"],
+        b"not a commit\n",
+        &repo,
+    );
+    let blob_oid = blob_oid.trim();
+    sh(
+        "git",
+        &[
+            "update-ref",
+            "refs/jjf/memories/corrupt-key",
+            blob_oid,
+        ],
+        &repo,
+    );
+
+    drop(storage);
+    let storage = Storage::open(&repo).expect("re-open after memory corruption");
+
+    let mems = storage.list_memories().expect("list_memories");
+    let keys: Vec<&str> = mems.iter().map(|m| m.key.as_str()).collect();
+    assert!(
+        keys.contains(&"alive-key"),
+        "alive memory should remain visible: keys={keys:?}"
+    );
+    assert!(
+        !keys.contains(&"corrupt-key"),
+        "corrupt memory should be omitted from list_memories: keys={keys:?}"
+    );
+
+    let unreadable = storage.unreadable_refs().expect("unreadable_refs");
+    assert_eq!(
+        unreadable.len(),
+        1,
+        "expected exactly one unreadable ref (the corrupt memory): {unreadable:?}"
+    );
+    assert_eq!(
+        unreadable[0].name, "refs/jjf/memories/corrupt-key",
+        "unreadable ref name must point at the corrupt memory: {:?}",
+        unreadable[0],
+    );
+}
+
+/// A normal, healthy repo with several issues and several memories
+/// reports `unreadable_refs() == []` — the no-warning baseline. If
+/// this ever returns non-empty the warning would fire spuriously on
+/// every clean call.
+#[test]
+fn unreadable_refs_empty_on_clean_repo() {
+    let repo = make_scratch_repo("unreadable_clean_repo");
+    let storage = Storage::open(&repo).expect("Storage::open");
+    for title in ["alpha", "beta", "gamma"] {
+        storage
+            .create_issue(&IssueDraft {
+                title: title.into(),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    storage.set_memory("rule-one", "value one").unwrap();
+    storage.set_memory("rule-two", "value two").unwrap();
+
+    let unreadable = storage.unreadable_refs().expect("unreadable_refs");
+    assert!(
+        unreadable.is_empty(),
+        "clean repo must report no unreadable refs; got {unreadable:?}"
+    );
+
+    // Sanity: the data we wrote is enumerable.
+    let ids = storage.list_ids().expect("list_ids");
+    assert_eq!(ids.len(), 3, "expected 3 issues to be listed: {ids:?}");
+    let mems = storage.list_memories().expect("list_memories");
+    assert_eq!(mems.len(), 2, "expected 2 memories to be listed: {mems:?}");
+}
+
+/// Helper for the unreadable-ref tests: pipe `stdin` into a `git`
+/// invocation under `cwd` and return its trimmed stdout (or the
+/// stderr-included assertion failure if git failed). Mirrors the
+/// pattern used in `v3_read_path.rs` so an upstream eye scanning the
+/// test suite recognizes the shape.
+fn git_capture_with_stdin(args: &[&str], stdin_bytes: &[u8], cwd: &Path) -> String {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn git");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin handle")
+        .write_all(stdin_bytes)
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait git");
+    assert!(
+        out.status.success(),
+        "`git {}` failed in {}:\nstdout: {}\nstderr: {}",
+        args.join(" "),
+        cwd.display(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}

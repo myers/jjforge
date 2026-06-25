@@ -390,6 +390,176 @@ fn ls_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
     );
 }
 
+/// Pipe `stdin_bytes` into a `git` invocation under `cwd` and return
+/// its trimmed stdout. Used by the corrupt-ref tests to hash a junk
+/// blob and then point an issue ref at the blob via plain
+/// `git update-ref`. Mirrors the helper of the same name in
+/// `crates/jjf-storage/tests/v3_read_path.rs` and `integration.rs`.
+fn git_capture_with_stdin(args: &[&str], stdin_bytes: &[u8], cwd: &Path) -> String {
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn git");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin handle")
+        .write_all(stdin_bytes)
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait git");
+    assert!(
+        out.status.success(),
+        "`git {}` failed in {}:\nstdout: {}\nstderr: {}",
+        args.join(" "),
+        cwd.display(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Repoint `refs/jjf/issues/<id>` at a junk blob. The simplest
+/// reproduction of the silent-drop bug from ticket `4928ae6`.
+fn corrupt_issue_ref(repo: &Path, id: &str) {
+    let blob_oid = git_capture_with_stdin(
+        &["hash-object", "-w", "--stdin"],
+        b"junk content\n",
+        repo,
+    );
+    let blob_oid = blob_oid.trim();
+    let refname = format!("refs/jjf/issues/{}", id);
+    let out = Command::new("git")
+        .args(["update-ref", &refname, blob_oid])
+        .current_dir(repo)
+        .output()
+        .expect("spawn git update-ref");
+    assert!(
+        out.status.success(),
+        "git update-ref {} {} failed: stderr={}",
+        refname,
+        blob_oid,
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[test]
+fn ls_warns_on_corrupt_issue_ref_plain_text() {
+    // Ticket `4928ae6`: pointing an issue ref at a non-commit object
+    // used to silently drop the issue from `jjf ls` with no
+    // diagnostic. The fix: stdout still shows the survivors, but
+    // stderr names the casualty via a `jjf: warning:` line.
+    let repo = make_initialized_repo("ls_warn_corrupt_issue");
+    let alive = create_issue(&repo, "alive issue", b"", &[]);
+    let corrupt = create_issue(&repo, "soon-to-be-corrupt", b"", &[]);
+
+    corrupt_issue_ref(&repo, &corrupt);
+
+    let out = run_jjf(&repo, &["ls"]);
+    assert!(
+        out.status.success(),
+        "ls must still exit 0 even with corrupt refs: code={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let rows = parse_ls_rows(&stdout);
+    let ids: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    assert!(ids.iter().any(|x| x == &alive), "alive issue must appear: {stdout:?}");
+    assert!(
+        !ids.iter().any(|x| x == &corrupt),
+        "corrupt issue must NOT appear in stdout: {stdout:?}"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("jjf: warning:"),
+        "stderr must carry the `jjf: warning:` header, got: {stderr:?}"
+    );
+    let expected_ref = format!("refs/jjf/issues/{}", corrupt);
+    assert!(
+        stderr.contains(&expected_ref),
+        "stderr must name the corrupt ref ({expected_ref}), got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("skipped from listing"),
+        "stderr must explain the consequence (`skipped from listing`), got: {stderr:?}"
+    );
+}
+
+#[test]
+fn ls_json_preserves_bare_array_with_warning_on_stderr() {
+    // Per ticket `4928ae6` design note: keep stdout's bare-array
+    // shape stable so existing `--json` consumers don't break.
+    // Warnings ride stderr as a one-line JSON envelope so the
+    // operator and a wrapping orchestrator can both pick them up
+    // without parsing the success stream.
+    let repo = make_initialized_repo("ls_warn_corrupt_json");
+    let alive = create_issue(&repo, "alive json", b"", &[]);
+    let corrupt = create_issue(&repo, "corrupt json", b"", &[]);
+    corrupt_issue_ref(&repo, &corrupt);
+
+    let out = run_jjf(&repo, &["--json", "ls"]);
+    assert!(
+        out.status.success(),
+        "ls --json must still exit 0: code={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // STDOUT: bare array of Issue records (back-compat shape).
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).expect("ls --json stdout must be valid JSON");
+    let arr = v.as_array().expect("ls --json stdout must remain a bare array");
+    assert_eq!(arr.len(), 1, "only the alive issue should appear: {stdout}");
+    assert_eq!(arr[0]["id"].as_str(), Some(alive.as_str()));
+
+    // STDERR: one JSON envelope per warning batch.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr_lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(
+        !stderr_lines.is_empty(),
+        "expected at least one stderr line, got nothing"
+    );
+    // Find the warning envelope. Tolerate other (non-warning)
+    // diagnostic lines that might land before it.
+    let envelope_line = stderr_lines
+        .iter()
+        .find(|l| l.contains("\"warning\""))
+        .unwrap_or_else(|| panic!("no warning envelope on stderr: {stderr:?}"));
+    let env: serde_json::Value =
+        serde_json::from_str(envelope_line).expect("warning envelope must be valid JSON");
+    assert_eq!(env["warning"].as_str(), Some("unreadable_refs"));
+    assert_eq!(env["count"].as_u64(), Some(1));
+    let refs = env["refs"].as_array().expect("envelope.refs must be an array");
+    let expected_ref = format!("refs/jjf/issues/{}", corrupt);
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].as_str(), Some(expected_ref.as_str()));
+}
+
+#[test]
+fn ls_no_warning_on_healthy_repo() {
+    // Baseline: a clean repo MUST NOT emit the warning. Pin this so
+    // a future refactor that fires the warning unconditionally is
+    // caught immediately.
+    let repo = make_initialized_repo("ls_no_warn_clean");
+    create_issue(&repo, "first", b"", &[]);
+    create_issue(&repo, "second", b"", &[]);
+
+    let out = run_jjf(&repo, &["ls"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("warning"),
+        "clean repo must not emit any warning, got stderr: {stderr:?}"
+    );
+}
+
 #[test]
 fn ls_help_documents_status_and_label_flags() {
     // --help should mention both --status and --label. Keeps the public

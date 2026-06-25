@@ -382,3 +382,81 @@ fn ready_help_documents_label_limit_and_type_flags() {
         "ready --help should mention --json (global), got: {help}"
     );
 }
+
+/// `jjf ready` exhibits the same silent-drop-fix behavior as `jjf
+/// ls`: a corrupt `refs/jjf/issues/<id>` ref drops out of the
+/// candidate set but stderr carries a `jjf: warning:` line naming
+/// the ref. Ticket `4928ae6`.
+#[test]
+fn ready_warns_on_corrupt_issue_ref() {
+    let repo = make_initialized_repo("ready_warn_corrupt_issue");
+    create_issue(&repo, "alive ticket", &[]);
+    let corrupt = create_issue(&repo, "corrupt ticket", &[]);
+
+    // Hash a junk blob and repoint the corrupt ticket's ref at it.
+    let mut child = Command::new("git")
+        .args(["hash-object", "-w", "--stdin"])
+        .current_dir(&repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn git hash-object");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin handle")
+        .write_all(b"junk\n")
+        .expect("write stdin");
+    let blob_out = child.wait_with_output().expect("wait git");
+    assert!(
+        blob_out.status.success(),
+        "git hash-object failed: {}",
+        String::from_utf8_lossy(&blob_out.stderr)
+    );
+    let blob_oid = String::from_utf8_lossy(&blob_out.stdout).trim().to_owned();
+
+    let refname = format!("refs/jjf/issues/{}", corrupt);
+    let upd = Command::new("git")
+        .args(["update-ref", &refname, &blob_oid])
+        .current_dir(&repo)
+        .output()
+        .expect("spawn git update-ref");
+    assert!(
+        upd.status.success(),
+        "git update-ref failed: {}",
+        String::from_utf8_lossy(&upd.stderr)
+    );
+
+    let out = run_jjf(&repo, &["ready"]);
+    assert!(
+        out.status.success(),
+        "ready must still exit 0: code={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("jjf: warning:"),
+        "ready stderr must carry the `jjf: warning:` header, got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains(&refname),
+        "ready stderr must name the corrupt ref ({refname}), got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("skipped from listing"),
+        "ready stderr must explain consequence, got: {stderr:?}"
+    );
+
+    // Stdout: alive ticket remains visible, corrupt one absent.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("alive ticket"),
+        "alive ticket should appear in ready output, got: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("corrupt ticket"),
+        "corrupt ticket title must NOT appear, got: {stdout:?}"
+    );
+}

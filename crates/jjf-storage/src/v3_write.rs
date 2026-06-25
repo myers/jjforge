@@ -408,9 +408,14 @@ pub(crate) fn issue_exists_v3(repo: &GitRepo, id: &IssueId) -> Result<bool> {
 }
 
 /// Enumerate every issue id present under `refs/jjf/issues/`. The
-/// returned ids are sorted ascending by hex. Used by the v3
-/// slug-collision probe and (eventually, ticket `6e2c843`) the read
-/// path.
+/// returned ids are sorted ascending by hex. Used to be the v3 read
+/// path's enumeration primitive; ticket `4928ae6` replaced the
+/// caller with `for_each_ref_with_type` so corrupt (non-commit)
+/// refs surface as `UnreadableRef` instead of being silently
+/// dropped at parse time. Kept for symmetry with `list_memory_keys_v3`
+/// and as a potential building block for `jjf doctor` (the heavier
+/// follow-up to the lighter ls/ready warning).
+#[allow(dead_code)]
 pub(crate) fn list_issue_ids_v3(repo: &GitRepo) -> Result<Vec<IssueId>> {
     let refs = repo
         .for_each_ref(refs::ISSUES_PREFIX)
@@ -429,8 +434,11 @@ pub(crate) fn list_issue_ids_v3(repo: &GitRepo) -> Result<Vec<IssueId>> {
 }
 
 /// Enumerate every memory key present under `refs/jjf/memories/`. The
-/// returned keys are sorted ascending. Used by the v3 read path
-/// (ticket `6e2c843`) to back `Storage::list_memories`.
+/// returned keys are sorted ascending. Same symmetric story as
+/// `list_issue_ids_v3`: superseded by the rebuild's direct
+/// `for_each_ref_with_type` probe (ticket `4928ae6`), kept available
+/// for future doctor-style verbs.
+#[allow(dead_code)]
 pub(crate) fn list_memory_keys_v3(repo: &GitRepo) -> Result<Vec<String>> {
     let refs = repo
         .for_each_ref(refs::MEMORIES_PREFIX)

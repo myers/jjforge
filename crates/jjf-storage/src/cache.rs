@@ -100,6 +100,37 @@ fn default_format_kind() -> String {
     FORMAT_KIND_V2.to_owned()
 }
 
+/// Diagnostic record for a single ref under `refs/jjf/issues/*` or
+/// `refs/jjf/memories/*` that the snapshot-cache rebuild could not
+/// turn into an [`Issue`] or [`Memory`].
+///
+/// Surfaces the silent-drop bug from ticket `4928ae6`: before this
+/// type, a corrupt ref (one that didn't resolve to a commit whose
+/// tree carried the expected blob) was simply skipped by `rebuild_v3`
+/// and the read paths would emit a result set missing the affected
+/// id — indistinguishable from the issue genuinely not existing.
+///
+/// The field shape is deliberately small: just the full ref name and
+/// a one-line human-readable reason. Callers (the `jjf ls` and `jjf
+/// ready` CLI verbs) format the list into a stderr warning so the
+/// operator can see which refs went missing without poring over `git
+/// for-each-ref` output.
+///
+/// `reason` is best-effort — it carries whatever the read path saw
+/// when the blob fetch failed (a `git cat-file` stderr, a
+/// `serde_json` parse error, a UTF-8 violation). It's diagnostic,
+/// not machine-parseable; treat it as a string for the human.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnreadableRef {
+    /// Full ref name (e.g. `refs/jjf/issues/eed62d7`).
+    pub name: String,
+    /// One-line human-readable reason. Pulled from the underlying
+    /// `git cat-file` / parse / UTF-8 error, trimmed to the first
+    /// line so multi-line stderr doesn't break the CLI's warning
+    /// layout.
+    pub reason: String,
+}
+
 /// Full snapshot of the `issues` bookmark tip.
 ///
 /// Read-path callers materialize one of these per call (or per
@@ -145,6 +176,19 @@ pub(crate) struct SnapshotCache {
     /// lookup. Built from the same Issue records — redundant data
     /// but cheap; the slug is a short string.
     pub slug_index: HashMap<String, IssueId>,
+    /// Per-ref diagnostics for refs under `refs/jjf/issues/*` /
+    /// `refs/jjf/memories/*` that the rebuild encountered but could
+    /// not parse into an [`Issue`] / [`Memory`]. Used by the CLI to
+    /// emit a stderr warning when one or more refs got dropped from
+    /// the result set (ticket `4928ae6`).
+    ///
+    /// `#[serde(default)]` and `skip_serializing_if = "Vec::is_empty"`
+    /// keep the on-disk cache file shape backwards-compatible: an
+    /// existing cache file with no `unreadable_refs` field loads as
+    /// empty, and a current rebuild that found no corrupt refs
+    /// doesn't write the field at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable_refs: Vec<UnreadableRef>,
 }
 
 impl SnapshotCache {
@@ -156,7 +200,13 @@ impl SnapshotCache {
         issues: Vec<Issue>,
         memories: Vec<Memory>,
     ) -> Self {
-        Self::from_parts_with_kind(FORMAT_KIND_V2.to_owned(), head_commit, issues, memories)
+        Self::from_parts_with_kind(
+            FORMAT_KIND_V2.to_owned(),
+            head_commit,
+            issues,
+            memories,
+            Vec::new(),
+        )
     }
 
     /// In-memory build from a format_kind + head + parsed issues +
@@ -164,12 +214,19 @@ impl SnapshotCache {
     /// caches built off the v2 `issues` bookmark or [`FORMAT_KIND_V3`]
     /// for caches built off the v3 `refs/jjf/*` set.
     ///
+    /// `unreadable_refs` carries any per-ref diagnostics the rebuild
+    /// accumulated for refs that couldn't be parsed into an
+    /// [`Issue`] / [`Memory`]. Pass `Vec::new()` for a clean cache;
+    /// the v3 rebuild populates this when it sees corrupt refs
+    /// (ticket `4928ae6`).
+    ///
     /// Used by both the rebuild paths and the tests.
     pub(crate) fn from_parts_with_kind(
         format_kind: String,
         head_commit: String,
         issues: Vec<Issue>,
         memories: Vec<Memory>,
+        unreadable_refs: Vec<UnreadableRef>,
     ) -> Self {
         // Slug index. We populate from ACTIVE issues (Open or
         // InProgress) first; closed issues only fill empty slots.
@@ -208,6 +265,7 @@ impl SnapshotCache {
             issues: issues_map,
             memories: memories_map,
             slug_index,
+            unreadable_refs,
         }
     }
 }
@@ -443,25 +501,130 @@ pub(crate) fn probe_ref_set_key_v3(git: &GitRepo) -> Result<String> {
 /// one `cat-file --batch` pipeline; not yet — file as a future
 /// ticket if the rebuild cost matters.
 ///
-/// Missing-file tolerance: a v3 issue ref MUST carry `issue.json`,
-/// but a corrupt repo or mid-write race could surface an absent
-/// blob. We skip such records silently — the read path's `read::read`
-/// will surface the issue-not-found error at the per-id call site.
+/// **Corrupt-ref diagnostics (ticket `4928ae6`).** A v3 issue ref
+/// MUST resolve to a commit whose tree carries `issue.json`. If a ref
+/// instead points at a blob, a commit with an empty tree, an
+/// out-of-spec record, or otherwise fails to parse, we capture an
+/// [`UnreadableRef`] on the cache rather than silently dropping the
+/// id from the result set. The CLI's `ls` / `ready` verbs surface
+/// these to stderr so an operator can see which refs went missing.
+/// Same handling for memory refs.
+///
+/// Note: a hard CLI error (e.g. `git cat-file` exits with an
+/// unrecognized stderr — neither "absent" nor a known parse failure)
+/// still bubbles up via `?` and aborts the rebuild — those indicate
+/// the repo itself is in trouble, not "one ref is bad".
 pub(crate) fn rebuild_v3(git: &GitRepo, key: &str) -> Result<SnapshotCache> {
+    let mut unreadable_refs: Vec<UnreadableRef> = Vec::new();
+
     // Issues: one ref per id, blob `issue.json` is required, blob
     // `comments.jsonl` is optional (absent ⇒ no comments yet).
-    let issue_ids = v3_write::list_issue_ids_v3(git)?;
+    //
+    // We enumerate with `%(objecttype)` so refs that point at a blob
+    // / tree (the "corrupt ref" repro from ticket `4928ae6`) get
+    // surfaced as unreadable up front, before we try to `cat-file`
+    // their tree. The `cat_blob` helper translates a missing-path
+    // result to `Ok(None)` for the legitimate "no comments yet" /
+    // "memory tombstone" cases, which makes it impossible to tell a
+    // blob-pointed ref from a healthy commit-pointed ref with an
+    // absent path — so we do the object-type discrimination here.
+    let issue_refs = git
+        .for_each_ref_with_type(v3_write::refs::ISSUES_PREFIX)
+        .map_err(Error::Git)?;
+    let mut issue_ids: Vec<IssueId> = Vec::with_capacity(issue_refs.len());
+    for (refname, objecttype) in issue_refs {
+        let Some(stem) = refname.strip_prefix(v3_write::refs::ISSUES_PREFIX) else {
+            continue;
+        };
+        let Ok(id) = IssueId::parse(stem) else {
+            // Refname doesn't parse as a v3 issue id (e.g. someone
+            // landed a stray ref under the prefix). Skip silently;
+            // mirror `list_issue_ids_v3`'s tolerance.
+            continue;
+        };
+        if objecttype != "commit" {
+            unreadable_refs.push(UnreadableRef {
+                name: refname.clone(),
+                reason: format!(
+                    "ref points at a {objecttype}, not a commit (expected a commit carrying issue.json)"
+                ),
+            });
+            continue;
+        }
+        issue_ids.push(id);
+    }
+    issue_ids.sort();
+    issue_ids.dedup();
     let mut issues: Vec<Issue> = Vec::with_capacity(issue_ids.len());
     for id in issue_ids {
         // `read_record_v3` returns `IssueNotFound` when the blob is
-        // missing — treat as a skip rather than a hard error so a
-        // half-written ref doesn't crash the rebuild.
+        // missing — most commonly because the ref doesn't resolve to
+        // a commit at all (e.g. points at a blob) or its tree lacks
+        // `issue.json`. Either way it's a corrupt ref from the
+        // snapshot's POV: surface it via `unreadable_refs` so the
+        // CLI can warn instead of silently dropping the id.
         let record: IssueRecord = match v3_write::read_record_v3(git, &id) {
             Ok(r) => r,
-            Err(Error::IssueNotFound(_)) => continue,
+            Err(Error::IssueNotFound(_)) => {
+                unreadable_refs.push(UnreadableRef {
+                    name: format!("{}{}", v3_write::refs::ISSUES_PREFIX, id),
+                    reason: "ref does not resolve to a commit carrying issue.json"
+                        .to_owned(),
+                });
+                continue;
+            }
+            Err(Error::Json(e)) => {
+                unreadable_refs.push(UnreadableRef {
+                    name: format!("{}{}", v3_write::refs::ISSUES_PREFIX, id),
+                    reason: format!("issue.json failed to parse: {}", first_line(&e.to_string())),
+                });
+                continue;
+            }
+            Err(Error::Invalid(msg)) => {
+                unreadable_refs.push(UnreadableRef {
+                    name: format!("{}{}", v3_write::refs::ISSUES_PREFIX, id),
+                    reason: format!("issue.json invalid: {}", first_line(&msg)),
+                });
+                continue;
+            }
+            Err(Error::Git(e)) => {
+                // Underlying `git cat-file` failure that the helper
+                // didn't translate to "absent". Most plausible cause
+                // here is a future ref-shape we don't expect; surface
+                // as unreadable so the rebuild doesn't crash on one
+                // odd ref.
+                unreadable_refs.push(UnreadableRef {
+                    name: format!("{}{}", v3_write::refs::ISSUES_PREFIX, id),
+                    reason: format!("git read failed: {}", first_line(&e.to_string())),
+                });
+                continue;
+            }
             Err(e) => return Err(e),
         };
-        let mut comments = v3_write::read_comments_v3(git, &id)?;
+        // Comments are optional; tolerate parse / utf-8 failure the
+        // same way — record the ref as unreadable but keep the
+        // issue itself (we already have the record).
+        let mut comments = match v3_write::read_comments_v3(git, &id) {
+            Ok(cs) => cs,
+            Err(Error::Json(e)) => {
+                unreadable_refs.push(UnreadableRef {
+                    name: format!("{}{}", v3_write::refs::ISSUES_PREFIX, id),
+                    reason: format!(
+                        "comments.jsonl failed to parse: {}",
+                        first_line(&e.to_string())
+                    ),
+                });
+                Vec::new()
+            }
+            Err(Error::Invalid(msg)) => {
+                unreadable_refs.push(UnreadableRef {
+                    name: format!("{}{}", v3_write::refs::ISSUES_PREFIX, id),
+                    reason: format!("comments.jsonl invalid: {}", first_line(&msg)),
+                });
+                Vec::new()
+            }
+            Err(e) => return Err(e),
+        };
         comments.sort_by(|a, b| a.created_at.cmp(&b.created_at));
         let mut labels = record.labels;
         labels.sort();
@@ -487,22 +650,93 @@ pub(crate) fn rebuild_v3(git: &GitRepo, key: &str) -> Result<SnapshotCache> {
     }
 
     // Memories: one ref per key, blob `memory.json` may be absent
-    // (post-unset tombstone) — skip those.
-    let memory_keys = v3_write::list_memory_keys_v3(git)?;
+    // (post-unset tombstone) — that's NOT a corrupt-ref signal, it's
+    // the documented "memory has been cleared" state. Parse failures
+    // and invalid-UTF8 on a present blob DO surface as unreadable.
+    //
+    // Same object-type up-front filter as the issue path: a memory
+    // ref pointing at a blob looks identical to a tombstone via
+    // `cat_blob` alone, so we discriminate here.
+    let memory_refs = git
+        .for_each_ref_with_type(v3_write::refs::MEMORIES_PREFIX)
+        .map_err(Error::Git)?;
+    let mut memory_keys: Vec<String> = Vec::with_capacity(memory_refs.len());
+    for (refname, objecttype) in memory_refs {
+        let Some(stem) = refname.strip_prefix(v3_write::refs::MEMORIES_PREFIX) else {
+            continue;
+        };
+        // Match `list_memory_keys_v3`'s shape filter — defensively
+        // skip anything with a `/` even though v3 keys don't carry them.
+        if stem.is_empty() || stem.contains('/') {
+            continue;
+        }
+        if objecttype != "commit" {
+            unreadable_refs.push(UnreadableRef {
+                name: refname.clone(),
+                reason: format!(
+                    "ref points at a {objecttype}, not a commit (expected a commit carrying memory.json)"
+                ),
+            });
+            continue;
+        }
+        memory_keys.push(stem.to_owned());
+    }
+    memory_keys.sort();
+    memory_keys.dedup();
     let mut memories: Vec<Memory> = Vec::with_capacity(memory_keys.len());
     for key in memory_keys {
-        if let Some(mem) = v3_write::read_memory_v3(git, &key)? {
-            memories.push(mem);
+        match v3_write::read_memory_v3(git, &key) {
+            Ok(Some(mem)) => memories.push(mem),
+            Ok(None) => { /* unset tombstone, not corrupt */ }
+            Err(Error::Json(e)) => {
+                unreadable_refs.push(UnreadableRef {
+                    name: format!("{}{}", v3_write::refs::MEMORIES_PREFIX, key),
+                    reason: format!(
+                        "memory.json failed to parse: {}",
+                        first_line(&e.to_string())
+                    ),
+                });
+            }
+            Err(Error::Invalid(msg)) => {
+                unreadable_refs.push(UnreadableRef {
+                    name: format!("{}{}", v3_write::refs::MEMORIES_PREFIX, key),
+                    reason: format!("memory.json invalid: {}", first_line(&msg)),
+                });
+            }
+            Err(Error::Git(e)) => {
+                // A `git cat-file` failure that isn't translated to
+                // "absent" by the cat_blob helper — e.g. the ref
+                // resolves to a blob, not a commit. Surface as
+                // unreadable rather than aborting the whole rebuild.
+                unreadable_refs.push(UnreadableRef {
+                    name: format!("{}{}", v3_write::refs::MEMORIES_PREFIX, key),
+                    reason: format!("git read failed: {}", first_line(&e.to_string())),
+                });
+            }
+            Err(e) => return Err(e),
         }
     }
     memories.sort_by(|a, b| a.key.cmp(&b.key));
+
+    // Stable order so warnings and tests don't churn on HashMap
+    // iteration order. Refnames are unique within the result set.
+    unreadable_refs.sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(SnapshotCache::from_parts_with_kind(
         FORMAT_KIND_V3.to_owned(),
         key.to_owned(),
         issues,
         memories,
+        unreadable_refs,
     ))
+}
+
+/// Return the first line of a multi-line error string, stripped of
+/// trailing whitespace. Used to keep the per-ref `reason` field
+/// single-line so the CLI's stderr warning doesn't fan out across
+/// the operator's terminal.
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or("").trim_end().to_owned()
 }
 
 /// Rebuild the cache from the bookmark tip.

@@ -77,6 +77,7 @@ mod v3_write;
 
 use std::path::{Path, PathBuf};
 
+pub use cache::UnreadableRef;
 pub use git::GitError;
 pub use history::HistoryEntry;
 pub use id::{IdError, IssueId};
@@ -1505,6 +1506,24 @@ impl Storage {
     /// The repo root this storage handle is rooted at.
     pub fn repo_root(&self) -> &Path {
         self.repo.root()
+    }
+
+    /// Per-ref diagnostics for refs under `refs/jjf/issues/*` /
+    /// `refs/jjf/memories/*` that the snapshot-cache rebuild could
+    /// not parse into an [`Issue`] / [`Memory`].
+    ///
+    /// Returns an empty vec when the cache is clean. Each entry
+    /// carries the full ref name and a one-line human-readable
+    /// reason. Used by the CLI's `ls` / `ready` verbs to emit a
+    /// stderr warning when one or more refs got dropped from the
+    /// result set (ticket `4928ae6` — silent-corrupt-ref bug).
+    ///
+    /// Cheap: routes through the same snapshot memo as the read
+    /// path, so calling this after a `list_ids` / `list_ready` is
+    /// effectively free.
+    pub fn unreadable_refs(&self) -> Result<Vec<UnreadableRef>> {
+        let snapshot = self.snapshot()?;
+        Ok(snapshot.unreadable_refs.clone())
     }
 
     /// True iff this handle was opened on a v3-shape repo (the

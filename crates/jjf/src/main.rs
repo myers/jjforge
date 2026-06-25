@@ -43,7 +43,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use jjf_storage::{
     ISSUES_BOOKMARK, ClaimResult, DepEdge, DepKind, DepTreeNode, Error as StorageError, IdError,
     Issue, IssueDraft, IssueId, IssueType, Memory, ReadyFilter, SlugInvalidReason, Status, Storage,
-    TitleInvalidReason, UpdateFields,
+    TitleInvalidReason, UnreadableRef, UpdateFields,
 };
 
 /// Top-level CLI shape. Subcommands live on the `Commands` enum; the
@@ -3031,6 +3031,67 @@ fn jj_config_get(key: &str) -> Result<Option<String>, CliError> {
     if val.is_empty() { Ok(None) } else { Ok(Some(val)) }
 }
 
+/// Cap on the number of unreadable-ref names listed inline in a
+/// stderr warning. Beyond this we elide with `… and N more` so an
+/// operator with a corrupted-ref pile-up still gets one screen of
+/// warning instead of a paragraph.
+const UNREADABLE_REFS_INLINE_CAP: usize = 5;
+
+/// Emit a stderr warning naming the unreadable refs the snapshot
+/// cache surfaced from this `Storage` instance. No-op when the list
+/// is empty.
+///
+/// Plain-text shape (`json = false`):
+/// ```text
+/// jjf: warning: 2 ref(s) unreadable: refs/jjf/issues/eed62d7,
+///   refs/jjf/memories/foo (skipped from listing)
+/// ```
+///
+/// JSON shape (`json = true`): one single-line JSON envelope on
+/// stderr, leaving stdout pristine for the machine-readable result.
+/// Per the ticket: keep stdout's bare-array shape stable rather than
+/// wrapping the envelope (which would break existing `--json`
+/// callers). Shape:
+/// ```json
+/// {"warning":"unreadable_refs","count":2,
+///  "refs":["refs/jjf/issues/eed62d7","refs/jjf/memories/foo"]}
+/// ```
+///
+/// The `refs` array always carries the full list (no inline cap)
+/// under `--json` — machines consume it; the cap only applies to
+/// the human-formatted plain text. Ticket `4928ae6`.
+fn emit_unreadable_warning(unreadable: &[UnreadableRef], json: bool) {
+    if unreadable.is_empty() {
+        return;
+    }
+    if json {
+        let refs: Vec<&str> = unreadable.iter().map(|u| u.name.as_str()).collect();
+        let envelope = serde_json::json!({
+            "warning": "unreadable_refs",
+            "count": unreadable.len(),
+            "refs": refs,
+        });
+        eprintln!("{envelope}");
+        return;
+    }
+    let count = unreadable.len();
+    let shown = unreadable.len().min(UNREADABLE_REFS_INLINE_CAP);
+    let names: Vec<&str> = unreadable
+        .iter()
+        .take(shown)
+        .map(|u| u.name.as_str())
+        .collect();
+    let tail = if count > shown {
+        format!(", ... and {} more", count - shown)
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "jjf: warning: {count} ref(s) unreadable: {names}{tail} (skipped from listing)",
+        names = names.join(", ")
+    );
+}
+
 /// `jjf ls [--status <S>] [--label <L>...] [--json]` — enumerate every
 /// issue on the `issues` bookmark, filter by status and labels (AND
 /// across labels), render newest-first.
@@ -3114,6 +3175,15 @@ fn run_ls(
             );
         }
     }
+
+    // Surface any refs the snapshot cache couldn't parse (e.g. a
+    // `refs/jjf/issues/<id>` pointed at a non-commit object). Stdout
+    // remains the survivor set; stderr names the casualties so an
+    // operator can tell silent corruption apart from "no such issue".
+    // Ticket `4928ae6`.
+    let unreadable = storage.unreadable_refs()?;
+    emit_unreadable_warning(&unreadable, json);
+
     Ok(())
 }
 
@@ -3243,6 +3313,14 @@ fn run_ready(
             );
         }
     }
+
+    // Surface any unreadable refs the snapshot cache encountered —
+    // same handling as `run_ls`. The ready set silently dropping an
+    // id is a worse failure mode than `ls` doing it, because `ready`
+    // is the agent's headline pick-next-work verb. Ticket `4928ae6`.
+    let unreadable = storage.unreadable_refs()?;
+    emit_unreadable_warning(&unreadable, json);
+
     Ok(())
 }
 

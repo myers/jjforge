@@ -391,6 +391,42 @@ impl GitRepo {
         Ok(refs)
     }
 
+    /// List every ref under `prefix`, returning `(refname,
+    /// objecttype)` pairs sorted ascending by refname. The
+    /// `objecttype` field is git's own classification of the pointed-at
+    /// object (typically `commit` for a healthy v3 ref; `blob` or
+    /// `tree` for the corrupt cases the snapshot-cache rebuild needs
+    /// to surface per ticket `4928ae6`).
+    ///
+    /// Used by the v3 snapshot cache to detect refs that don't point
+    /// at a commit before it spends a `cat-file blob` round-trip on
+    /// them — saves both the spawn and the per-object stderr
+    /// disambiguation.
+    pub(crate) fn for_each_ref_with_type(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, String)>, GitError> {
+        let out = self.run(&[
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname) %(objecttype)",
+            prefix,
+        ])?;
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for line in out.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let (name, ty) = match line.split_once(' ') {
+                Some(parts) => parts,
+                None => continue,
+            };
+            pairs.push((name.to_owned(), ty.to_owned()));
+        }
+        Ok(pairs)
+    }
+
     /// List every ref under any of `prefixes`, returning `(refname,
     /// objectname)` pairs sorted ascending by refname. Empty result
     /// is normal — a fresh v3 repo with no issues and no memories has

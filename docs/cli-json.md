@@ -1,5 +1,51 @@
 # `jjf --json` output contract
 
+## v2.6 → v2.7 changelog
+
+Backwards-compatible additions, landed in the
+`corrupt-ref-silent-drop` ticket (`4928ae6`).
+
+- **`jjf ls` and `jjf ready` now emit a ref-corruption warning
+  on stderr.** When the snapshot-cache rebuild encounters one
+  or more refs under `refs/jjf/issues/*` or `refs/jjf/memories/*`
+  that don't resolve to a commit carrying the expected blob
+  (e.g. a ref pointed at a blob by `git update-ref`, a commit
+  whose tree is empty, or a `serde_json` parse failure on the
+  record), the affected refs are dropped from the result set
+  but listed in a stderr warning. Exit status is still 0; the
+  warning is informational. Before this change the corrupt
+  ids vanished from `ls` / `ready` with no diagnostic
+  (indistinguishable from "issue genuinely doesn't exist").
+- **Plain-text stderr shape:**
+  ```text
+  jjf: warning: 2 ref(s) unreadable: refs/jjf/issues/eed62d7, refs/jjf/memories/foo (skipped from listing)
+  ```
+  Capped at 5 ref names inline; beyond that the tail elides
+  with `, ... and N more`. The warning is one line so it
+  composes cleanly with operator log capture.
+- **JSON stderr shape:** one single-line JSON envelope per
+  call, regardless of how many refs are unreadable:
+  ```json
+  {"warning":"unreadable_refs","count":2,"refs":["refs/jjf/issues/eed62d7","refs/jjf/memories/foo"]}
+  ```
+  The `refs` array always carries the full list (no inline
+  cap) under `--json` — machine consumers don't need elision.
+- **STDOUT shape unchanged.** `jjf ls --json` and `jjf ready
+  --json` still emit a bare array of `Issue` records on
+  stdout. Wrapping the success payload into a `{issues, warnings}`
+  envelope would have broken every existing `--json` caller
+  (`jq '.[] | .id'`, scripts using `--limit 1 | jq '.[0]'`,
+  etc.); riding the warning on stderr keeps stdout
+  back-compat-stable. Consumers that don't read stderr stay
+  oblivious; consumers that want the diagnostic parse one
+  extra JSON object per stream.
+- **Public storage API:** `Storage::unreadable_refs() ->
+  Result<Vec<UnreadableRef>>` returns the same per-ref
+  diagnostics. Each `UnreadableRef` carries `name` (full ref
+  name) and `reason` (one-line human-readable cause). The
+  CLI uses this; downstream tools (a future `jjf doctor`
+  verb) will too.
+
 ## v2.5 → v2.6 changelog
 
 Backwards-compatible additions, landed in the
