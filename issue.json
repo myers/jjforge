@@ -4,7 +4,7 @@
   "title": "Concurrent comments on same issue: storage retries once then gives up",
   "slug": "comment-retry-policy-too-eager",
   "body": "# Symptom\n\nv3's per-ref design correctly avoids races on DIFFERENT issues\n(5 concurrent `jjf new` all succeed). But N concurrent\n`jjf comment` on the SAME issue fall back to one storage-layer\nretry, then give up — 10 concurrent comments → ~2 land, ~8 lose\nwith `\"concurrent write conflict ... retried once and still\nraced. Retry your command.\"`.\n\n# Repro\n\n```\nTARGET=<some-issue-id>\nfor i in $(seq 1 10); do\n  (echo \"comment $i\" | jjf comment $TARGET -F -) &\ndone\nwait\n# Most exit 1 with the conflict message; only ~2 actually land.\n```\n\n# Risk profile\n\nPer-issue contention is realistic in multi-agent automation:\nsubagents posting status updates to the same epic, multiple\nclients reacting to a closed dep, dashboard auto-pollers. The\n\"retry your command\" guidance pushes a retry loop onto every\ncaller.\n\n# Fix candidates\n\n1. Exponential backoff with bounded retries inside the storage\n   layer (e.g. 3 retries with 10/40/160ms jitter). Most realistic\n   contention windows are short; this absorbs them silently.\n2. Surface a retry-policy knob (`JJF_RETRIES=N` env var or\n   `--retries N` flag) for callers that want different defaults.\n3. Promote the `concurrent_write` error to a documented retry\n   contract so agent runtimes can wrap consistently.\n\n(1) is probably enough — most callers don't need to think about\nthe retry policy.\n\n# Confidence\n\nReproducible 100% with 10 concurrent comments. Tested in\n`scratchpad/qa/r05-race/`.\n",
-  "status": "open",
+  "status": "closed",
   "block_reason": null,
   "type": "bug",
   "labels": [
@@ -18,5 +18,5 @@
   ],
   "assignee": null,
   "created_at": "2026-06-24T17:33:18Z",
-  "updated_at": "2026-06-25T00:58:21Z"
+  "updated_at": "2026-06-25T00:58:26Z"
 }
