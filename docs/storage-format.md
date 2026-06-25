@@ -1,6 +1,6 @@
-# jjforge on-disk storage format — v2.5
+# jjforge on-disk storage format — v2.6
 
-Status: v2.5, current. This is the contract every other crate
+Status: v2.6, current. This is the contract every other crate
 implements against. Verdicts pinned by:
 
 - `dcd4b57` — Shape A (dedicated bookmark for issue data).
@@ -8,6 +8,37 @@ implements against. Verdicts pinned by:
   audit surface.
 - `2130de1` — shell out to the `jj` CLI; do not link `jj-lib`.
 - `72638a0` — the `mvp-storage` epic.
+
+## v2.5 → v2.6 changelog
+
+Policy-only change, no wire-format or record-shape change.
+Landed in the `slug-recycle-policy` ticket (`a105e0b`). v2.5
+readers tolerate v2.6 commits because the on-disk shape is
+unchanged; v2.6 readers tolerate v2.5 records identically.
+
+- **Slug uniqueness widens from "active statuses" to "all
+  statuses including Closed."** Pre-v2.6 closed issues released
+  their slug, allowing a new ticket to silently claim and shadow
+  the closed one for slug-resolved discovery (`jjf show
+  roadmap` would resolve to the new issue, not the original).
+  v2.6 makes the slug uniqueness check span every issue
+  regardless of status: a closed issue retains its slug
+  forever and a new ticket must pick a fresh one. Matches the
+  operator mental model that "the slug names this issue,
+  forever."
+- **Backwards compatibility.** Existing repos may carry
+  duplicate slugs across an open/closed pair from before this
+  change. The storage layer does NOT panic or error on
+  `Storage::open` in that case — only the WRITE path enforces
+  the new rule. Reads of historical data with duplicate slugs
+  surface the active holder (the `slug_index` in the snapshot
+  cache puts active issues in first).
+- **No record-shape, op-vocabulary, or trailer change.** The
+  policy lives entirely in the write-path uniqueness probe
+  (`Storage::find_slug_collision`, formerly
+  `find_open_slug_collision`). §3.4's "Slug uniqueness is
+  enforced across OPEN issues" rule is replaced by "across
+  ALL issues regardless of status."
 
 ## v2.4 → v2.5 changelog
 
@@ -442,18 +473,27 @@ A non-null `slug` field must satisfy:
 - No trailing `-`.
 - No two consecutive hyphens (`--`).
 
-Slug uniqueness is enforced **across OPEN issues at write time**.
-Closing an issue releases its slug — a subsequent `jjf new` /
-`jjf update --slug` may take it. (Rationale: orientation handles
-are for the live workspace; archived issues don't need to hold
-the keyword space hostage.) Writers SHOULD pre-validate before
-constructing a commit; storage MUST validate and reject on the
-write boundary.
+Slug uniqueness is enforced **across ALL issues at write time
+regardless of status** (Open, InProgress, Blocked, Closed) per
+spec v2.6 (issue `a105e0b`). Closing an issue retains its slug
+forever — a subsequent `jjf new` / `jjf update --slug` must
+pick a fresh one. (Rationale: an audit-trail-flavored planner
+shouldn't silently shadow the closed issue for slug-resolved
+discovery; the slug names this issue forever.) Writers SHOULD
+pre-validate before constructing a commit; storage MUST
+validate and reject on the write boundary.
 
 Operators look up issues by id OR slug — `jjf show
-agent-ready` resolves the open issue whose slug is
-`agent-ready`. The id-or-slug resolver scans every issue
-(open and closed); only the uniqueness rule is open-only.
+agent-ready` resolves the issue whose slug is `agent-ready`,
+whether that issue is open or closed. The id-or-slug resolver
+scans every issue regardless of status.
+
+**Backwards compatibility.** Pre-v2.6 repos may carry
+duplicate slugs across an open/closed pair from when closed
+issues released their slug. Such repos load cleanly — only the
+write path enforces v2.6's tighter rule. The resolver
+surfaces the active holder for any duplicated slug it finds
+in legacy data.
 
 ---
 

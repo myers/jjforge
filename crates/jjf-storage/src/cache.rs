@@ -175,6 +175,13 @@ pub(crate) struct SnapshotCache {
     /// `slug → id` index so `Storage::resolve(slug)` is a HashMap
     /// lookup. Built from the same Issue records — redundant data
     /// but cheap; the slug is a short string.
+    ///
+    /// Carries EVERY issue's slug regardless of status (Open,
+    /// InProgress, Blocked, Closed) per spec v2.6: closed issues
+    /// retain their slug forever. Active issues (Open / InProgress
+    /// / Blocked) are inserted first so they win over a stale
+    /// closed homonym left over from a pre-v2.6 repo (see
+    /// "Backwards compatibility" in §3.4).
     pub slug_index: HashMap<String, IssueId>,
     /// Per-ref diagnostics for refs under `refs/jjf/issues/*` /
     /// `refs/jjf/memories/*` that the rebuild encountered but could
@@ -228,13 +235,13 @@ impl SnapshotCache {
         memories: Vec<Memory>,
         unreadable_refs: Vec<UnreadableRef>,
     ) -> Self {
-        // Slug index. We populate from ACTIVE issues (Open or
-        // InProgress) first; closed issues only fill empty slots.
-        // Spec v2.1: closed issues release their slug, so an open
-        // collision must win over a stale closed one. The
-        // `find_open_slug_collision` probe relies on this — it
-        // must see the OPEN holder, not whichever insertion order
-        // a HashMap happened to pick.
+        // Slug index. Spec v2.6: closed issues retain their slug
+        // forever — `find_slug_collision` rejects any new slug
+        // already in the index regardless of holder status. We
+        // still populate active issues first so that any LEGACY
+        // duplicate slugs (open + closed sharing one slug from a
+        // pre-v2.6 repo) resolve to the active holder, matching
+        // both the pre-v2.6 resolver behavior and operator intuition.
         let mut slug_index: HashMap<String, IssueId> =
             HashMap::with_capacity(issues.len());
         use crate::record::Status;
@@ -1025,5 +1032,45 @@ mod tests {
         assert_eq!(cache.issues.len(), 2);
         assert_eq!(cache.slug_index.get("slug-a"), Some(&id_a));
         assert_eq!(cache.slug_index.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_slug_index_carries_closed_issues() {
+        // Spec v2.6: closed issues retain their slug. The cache
+        // index must include both open AND closed slug holders so
+        // `find_slug_collision` is an O(1) lookup against the
+        // full history.
+        let head = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned();
+        let id_open = IssueId::parse("aabbccd").unwrap();
+        let id_closed = IssueId::parse("eeff001").unwrap();
+        let open_issue = Issue {
+            id: id_open.clone(),
+            title: "open".into(),
+            slug: Some("open-slug".into()),
+            body: String::new(),
+            status: crate::record::Status::Open,
+            block_reason: None,
+            type_: crate::record::IssueType::Unspecified,
+            labels: Vec::new(),
+            dependencies: Vec::new(),
+            assignee: None,
+            comments: Vec::new(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let closed_issue = Issue {
+            id: id_closed.clone(),
+            slug: Some("closed-slug".into()),
+            status: crate::record::Status::Closed,
+            ..open_issue.clone()
+        };
+        let cache = SnapshotCache::from_parts(
+            head,
+            vec![open_issue, closed_issue],
+            Vec::new(),
+        );
+        assert_eq!(cache.slug_index.get("open-slug"), Some(&id_open));
+        assert_eq!(cache.slug_index.get("closed-slug"), Some(&id_closed));
+        assert_eq!(cache.slug_index.len(), 2);
     }
 }

@@ -1082,9 +1082,10 @@ enum CliError {
         cycle: Vec<String>,
     },
 
-    /// A slug write would collide with an existing open issue.
-    /// Preflight failure (exit 2). `conflicts_with` is the id of
-    /// the open issue already holding the slug.
+    /// A slug write would collide with an existing issue (open,
+    /// in-progress, blocked, or closed — spec v2.6, issue
+    /// `a105e0b`). Preflight failure (exit 2). `conflicts_with`
+    /// is the id of the issue already holding the slug.
     ///
     /// In practice the storage layer's `Error::SlugCollision`
     /// surfaces this case — the CLI-side variant stays defined so
@@ -1093,7 +1094,7 @@ enum CliError {
     /// uniqueness checks).
     #[allow(dead_code)]
     #[error(
-        "slug {slug:?} already in use by open issue {conflicts_with}"
+        "slug {slug:?} already in use by issue {conflicts_with}"
     )]
     SlugCollision {
         slug: String,

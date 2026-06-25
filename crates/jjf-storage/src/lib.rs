@@ -230,13 +230,14 @@ pub enum Error {
 
     /// Two open issues can't share a slug. Surfaced from
     /// `Storage::create_issue` / `Storage::update` when an attempted
-    /// slug write collides with an existing OPEN issue's slug.
+    /// slug write collides with any existing issue's slug.
     /// `conflicts_with` carries the id of the issue already holding
-    /// the slug so the operator can disambiguate. Closed issues
-    /// release their slug; reusing a slug from a closed issue is
-    /// allowed.
+    /// the slug — open, in-progress, blocked, OR closed — so the
+    /// operator can disambiguate. Per spec v2.6 (issue `a105e0b`),
+    /// closed issues retain their slug forever; a new ticket must
+    /// pick a fresh one.
     #[error(
-        "slug {slug:?} already in use by open issue {conflicts_with}"
+        "slug {slug:?} already in use by issue {conflicts_with}"
     )]
     SlugCollision {
         slug: String,
@@ -1545,9 +1546,10 @@ impl Storage {
     /// vocabulary `create`.
     ///
     /// Validates `draft.slug` per spec v2.1 §3.1 if present
-    /// (`Error::InvalidSlug`); rejects a slug already in use by an
-    /// open issue (`Error::SlugCollision`). Closed issues release
-    /// their slug — reusing a closed issue's slug is allowed.
+    /// (`Error::InvalidSlug`); rejects a slug already in use by
+    /// ANY existing issue, regardless of status
+    /// (`Error::SlugCollision`). Spec v2.6: closed issues retain
+    /// their slug forever (issue `a105e0b`).
     pub fn create_issue(&self, draft: &IssueDraft) -> Result<IssueId> {
         if let Err(reason) = validate_title(&draft.title) {
             return Err(Error::InvalidTitle {
@@ -1602,13 +1604,13 @@ impl Storage {
                     reason,
                 });
             }
-            // Uniqueness across OPEN issues. Spec v2.1: slug
-            // collisions are forbidden among open issues; closed
-            // issues release their slug. The probe reads every open
-            // issue; for v2.1 N is small (the live planner has 10
-            // issues) so a read-all is fine. If N gets meaningfully
-            // bigger a slug-index (separate ticket) is the follow-up.
-            if let Some(conflict) = self.find_open_slug_collision(slug, None)? {
+            // Uniqueness across ALL issues. Spec v2.6: slug
+            // collisions are forbidden across the full history —
+            // closed issues retain their slug forever, so a new
+            // ticket must pick a fresh one (issue `a105e0b`).
+            // The probe is one HashMap lookup against the cache's
+            // pre-built `slug_index`.
+            if let Some(conflict) = self.find_slug_collision(slug, None)? {
                 return Err(Error::SlugCollision {
                     slug: slug.clone(),
                     conflicts_with: conflict,
@@ -1735,7 +1737,7 @@ impl Storage {
                 self.invalidate_snapshot_memo();
                 if let Some(slug) = claimed_slug.as_deref() {
                     if let Ok(Some(holder)) =
-                        self.find_open_slug_collision(slug, None)
+                        self.find_slug_collision(slug, None)
                     {
                         return Err(Error::SlugCollision {
                             slug: slug.to_owned(),
@@ -1888,13 +1890,14 @@ impl Storage {
         let id_owned = id.clone();
         self.mutate(id, &summary, |rec| {
             // Slug uniqueness probe: a non-`None` slug write must not
-            // collide with any OTHER open issue's slug. Probed on
-            // every retry against the fresh bookmark, so a racer that
-            // claims the slug between our attempts surfaces as a
-            // typed conflict instead of a duplicate write
+            // collide with any OTHER issue's slug (Open, InProgress,
+            // Blocked, or Closed — spec v2.6, issue `a105e0b`).
+            // Probed on every retry against the fresh bookmark, so a
+            // racer that claims the slug between our attempts surfaces
+            // as a typed conflict instead of a duplicate write
             // (`a6b8fb7`).
             if let Some(Some(new_slug)) = &fields.slug {
-                match self.find_open_slug_collision(new_slug, Some(&id_owned)) {
+                match self.find_slug_collision(new_slug, Some(&id_owned)) {
                     Ok(Some(conflict)) => {
                         return MutateOutcome::Conflict(Error::SlugCollision {
                             slug: new_slug.clone(),
@@ -2831,9 +2834,13 @@ impl Storage {
     /// Implementation is read-all-then-match: O(N) over every
     /// issue in the snapshot cache. For v3's small N this is fine.
     /// The match scans both open AND closed issues (so the
-    /// operator can `jjf show <slug>` against a closed handle —
-    /// slug uniqueness is enforced only across OPEN issues at
-    /// write time).
+    /// operator can `jjf show <slug>` against a closed handle).
+    /// Per spec v2.6, slug uniqueness is now enforced across the
+    /// full history at write time — but historical pre-v2.6 repos
+    /// may carry duplicate slugs across an open/closed pair. In
+    /// that case the resolver returns the ACTIVE holder (the
+    /// `slug_index` puts active issues in first; see
+    /// `cache::SnapshotCache::from_parts_with_kind`).
     pub fn resolve(&self, handle: &str) -> Result<IssueId> {
         // Id path: handle IS a full id. Existence check is the
         // caller's job via Storage::read.
@@ -2849,10 +2856,13 @@ impl Storage {
         if let Some(id) = snapshot.slug_index.get(handle) {
             return Ok(id.clone());
         }
-        // The slug_index only carries OPEN/InProgress slugs (per
-        // spec v2.1, closed issues release their slug). But the
-        // method contract says we scan closed issues too — fall
-        // back to a linear scan over the cache's full issue map.
+        // Defensive fallback: under spec v2.6 the slug_index
+        // carries every issue's slug regardless of status, so the
+        // HashMap lookup above should never miss. The linear scan
+        // remains for resilience against an unexpectedly stale
+        // index (e.g., a corrupt cache file the rebuild couldn't
+        // detect) and to surface duplicate-slug pre-v2.6 holders
+        // the HashMap might have de-duplicated.
         for issue in snapshot.issues.values() {
             if issue.slug.as_deref() == Some(handle) {
                 return Ok(issue.id.clone());
@@ -2863,45 +2873,37 @@ impl Storage {
         })
     }
 
-    /// Probe for a slug collision among ACTIVE (Open or
-    /// InProgress) issues. Returns `Some(id)` for the offending
-    /// active issue if any other active issue carries this exact
-    /// slug, `None` if the slug is free. `self_id` (if provided) is
-    /// excluded from the probe — used by the update path so
-    /// re-setting an issue's existing slug doesn't self-conflict.
+    /// Probe for a slug collision across ALL issues — Open,
+    /// InProgress, Blocked, AND Closed. Returns `Some(id)` for any
+    /// issue holding this exact slug, `None` if the slug is free.
+    /// `self_id` (if provided) is excluded from the probe — used by
+    /// the update path so re-setting an issue's existing slug
+    /// doesn't self-conflict.
     ///
-    /// Closed issues do NOT participate: spec v2.1 says closed
-    /// issues release their slug. v2.3: InProgress issues DO
-    /// participate — claiming doesn't free the slug.
-    fn find_open_slug_collision(
+    /// Spec v2.6 widened the scope to all statuses: closed issues
+    /// retain their slug forever. A new ticket must pick a fresh
+    /// one. The pre-v2.6 behavior (closed issues released their
+    /// slug, opening it for re-use) silently shadowed the closed
+    /// issue for slug-resolved discovery, which is the wrong
+    /// default for an audit-trail planner (issue `a105e0b`).
+    fn find_slug_collision(
         &self,
         slug: &str,
         self_id: Option<&IssueId>,
     ) -> Result<Option<IssueId>> {
-        // Snapshot cache: the cache's slug_index only carries
-        // ACTIVE (Open / InProgress) slug holders by construction
-        // (see `cache::SnapshotCache::from_parts_with_kind`). One
+        // Snapshot cache: the cache's slug_index carries EVERY
+        // slug holder regardless of status (see
+        // `cache::SnapshotCache::from_parts_with_kind`). One
         // HashMap lookup replaces the per-id direct-read loop.
         // V2 and V3 both route through here — the cache module
         // probes the appropriate invalidation key (bookmark head
         // vs ref-set sha) and rebuilds when stale.
         let snapshot = self.snapshot()?;
         if let Some(holder) = snapshot.slug_index.get(slug) {
-            // The slug_index may hold a closed issue if no active
-            // issue claims this slug. Re-check status to be
-            // tolerant of that case (defensive — `from_parts`
-            // populates active first).
             if Some(holder) == self_id {
                 return Ok(None);
             }
-            if let Some(issue) = snapshot.issues.get(holder) {
-                match issue.status {
-                    Status::Open | Status::Blocked | Status::InProgress => {
-                        return Ok(Some(holder.clone()));
-                    }
-                    Status::Closed => return Ok(None),
-                }
-            }
+            return Ok(Some(holder.clone()));
         }
         Ok(None)
     }

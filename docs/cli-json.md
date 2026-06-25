@@ -711,7 +711,7 @@ $ jjf --json comment a3f9c01 -F -    # sibling write raced and retry also raced
 {"ok":false,"error":{"kind":"concurrent_write","message":"concurrent write conflict; another writer landed first; retried once and still raced. Retry your command.","details":{"hint":"another writer landed first; retried once and still raced. Retry your command."}}}
 
 $ jjf --json new -t winner --slug taken    # slug-claim race upgraded to slug_collision
-{"ok":false,"error":{"kind":"slug_collision","message":"slug \"taken\" already in use by open issue a3f9c01","details":{"slug":"taken","conflicts_with":"a3f9c01"}}}
+{"ok":false,"error":{"kind":"slug_collision","message":"slug \"taken\" already in use by issue a3f9c01","details":{"slug":"taken","conflicts_with":"a3f9c01"}}}
 ```
 
 ## Per-verb examples

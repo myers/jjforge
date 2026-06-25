@@ -154,6 +154,48 @@ fn new_slug_collision_among_open_issues_is_exit_two() {
 }
 
 #[test]
+fn new_slug_collision_against_closed_holder_is_exit_two() {
+    // Spec v2.6 (issue `a105e0b`): closed issues retain their
+    // slug forever. `jjf new --slug X` after closing X-slugged
+    // issue must fail with slug_collision carrying the closed
+    // issue's id.
+    let repo = make_initialized_repo("type_and_slug_collision_closed");
+    let first_out = run_jjf(
+        &repo,
+        &["new", "-t", "first", "--slug", "kept-slug"],
+    );
+    assert!(first_out.status.success());
+    let first_id = String::from_utf8_lossy(&first_out.stdout).trim().to_owned();
+    let close_out = run_jjf(&repo, &["close", &first_id]);
+    assert!(
+        close_out.status.success(),
+        "jjf close failed: {}",
+        String::from_utf8_lossy(&close_out.stderr)
+    );
+
+    let second_out = run_jjf(
+        &repo,
+        &["--json", "new", "-t", "second", "--slug", "kept-slug"],
+    );
+    assert_eq!(
+        second_out.status.code(),
+        Some(2),
+        "expected exit 2; stderr: {}",
+        String::from_utf8_lossy(&second_out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&second_out.stderr);
+    let v: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("envelope must be json");
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["kind"], "slug_collision");
+    assert_eq!(v["error"]["details"]["slug"], "kept-slug");
+    assert_eq!(
+        v["error"]["details"]["conflicts_with"], first_id,
+        "envelope must carry the closed issue's id"
+    );
+}
+
+#[test]
 fn update_type_and_slug_lands_one_commit() {
     let repo = make_initialized_repo("type_and_slug_update");
     let new = run_jjf(&repo, &["new", "-t", "baseline"]);

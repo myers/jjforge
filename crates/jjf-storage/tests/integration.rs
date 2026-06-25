@@ -1528,9 +1528,13 @@ fn slug_collision_detected_among_open_issues() {
 }
 
 #[test]
-fn slug_uniqueness_scope_is_open_only() {
-    // Closed issues release their slug. Spec v2.1 §3.1.
-    let repo = make_scratch_repo("slug_open_only");
+fn slug_uniqueness_scope_spans_all_statuses_including_closed() {
+    // Spec v2.6 (issue `a105e0b`): closed issues retain their
+    // slug forever. A new ticket must pick a fresh one — silently
+    // re-using a closed issue's slug is the wrong default for an
+    // audit-trail planner because `jjf show <slug>` would
+    // resolve to the new issue, shadowing the closed one.
+    let repo = make_scratch_repo("slug_all_statuses");
     let storage = Storage::open(&repo).unwrap();
     let first = storage
         .create_issue(&IssueDraft {
@@ -1540,17 +1544,74 @@ fn slug_uniqueness_scope_is_open_only() {
         })
         .unwrap();
     storage.set_status(&first, Status::Closed).unwrap();
-    // Now the slug is free — a second open issue can take it.
-    let second = storage
+    // Closing the first issue MUST NOT release the slug.
+    let err = storage
         .create_issue(&IssueDraft {
             title: "second".into(),
             slug: Some("the-slug".into()),
             ..Default::default()
         })
+        .unwrap_err();
+    match err {
+        StorageError::SlugCollision { slug, conflicts_with } => {
+            assert_eq!(slug, "the-slug");
+            assert_eq!(
+                conflicts_with, first,
+                "the closed issue's id must be carried in conflicts_with"
+            );
+        }
+        other => panic!("expected SlugCollision against closed holder, got {other:?}"),
+    }
+}
+
+#[test]
+fn slug_uniqueness_blocks_against_blocked_holder() {
+    // Regression guard: the active-status path (Open / InProgress /
+    // Blocked) was always enforced. v2.6 widens to Closed; this
+    // ensures the v2.5 behavior for active statuses still holds.
+    let repo = make_scratch_repo("slug_blocked_holder");
+    let storage = Storage::open(&repo).unwrap();
+    let first = storage
+        .create_issue(&IssueDraft {
+            title: "first".into(),
+            slug: Some("active-slug".into()),
+            ..Default::default()
+        })
         .unwrap();
-    assert_ne!(first, second);
-    let issue = storage.read(&second).unwrap();
-    assert_eq!(issue.slug.as_deref(), Some("the-slug"));
+    storage.block(&first, Some("waiting on review")).unwrap();
+    let err = storage
+        .create_issue(&IssueDraft {
+            title: "second".into(),
+            slug: Some("active-slug".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+    match err {
+        StorageError::SlugCollision { slug, conflicts_with } => {
+            assert_eq!(slug, "active-slug");
+            assert_eq!(conflicts_with, first);
+        }
+        other => panic!("expected SlugCollision against blocked holder, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_still_finds_closed_issue_by_slug() {
+    // Regression guard: `jjf show <slug>` must still resolve a
+    // closed issue's slug. v2.6 changed the WRITE-path uniqueness
+    // rule, not the resolver.
+    let repo = make_scratch_repo("slug_resolve_closed");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "archived".into(),
+            slug: Some("ghost-slug".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.set_status(&id, Status::Closed).unwrap();
+    let resolved = storage.resolve("ghost-slug").unwrap();
+    assert_eq!(resolved, id);
 }
 
 #[test]
