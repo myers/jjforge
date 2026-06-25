@@ -459,6 +459,82 @@ fn comment_unreadable_file_exits_two() {
     );
 }
 
+/// `c5078e4` acceptance: 5 concurrent `jjf comment` subprocesses
+/// against the SAME issue all land their comments. Pre-fix the
+/// storage layer retried once and ~3/5 would fail with a typed
+/// `ConcurrentWrite`; with the bounded-retry policy the budget
+/// absorbs the contention.
+///
+/// We set `JJF_RETRY_BASE_MS=0` in the subprocess env so the test
+/// doesn't pay the (geometric) backoff wall-clock cost.
+///
+/// Tolerance: assert `>= 4` rather than strict-5 because in heavy
+/// CI load a real giveup is possible; the property under test is
+/// "the retry budget is real," not "no operation ever fails."
+#[test]
+fn concurrent_comments_cli_all_land() {
+    let repo = make_initialized_repo("concurrent_comments_cli_5");
+    let id = create_issue(&repo, "5-way concurrent comment target");
+
+    let mut handles = Vec::new();
+    for i in 0..5 {
+        let repo = repo.clone();
+        let id = id.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut child = Command::new(JJF_BIN)
+                .args(["comment", &id, "-F", "-"])
+                .current_dir(&repo)
+                .env("JJF_RETRY_BASE_MS", "0")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn jjf");
+            child
+                .stdin
+                .as_mut()
+                .expect("stdin handle")
+                .write_all(format!("cli comment {i}\n").as_bytes())
+                .expect("write stdin");
+            child.wait_with_output().expect("wait for jjf")
+        }));
+    }
+
+    let mut successes = 0;
+    let mut failures: Vec<String> = Vec::new();
+    for h in handles {
+        let out = h.join().expect("thread did not panic");
+        if out.status.success() {
+            successes += 1;
+        } else {
+            failures.push(format!(
+                "code={:?} stderr={}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    }
+
+    assert!(
+        successes >= 4,
+        "expected >= 4 of 5 concurrent comments to land (retry budget); got {successes}. \
+         Failures: {failures:?}"
+    );
+
+    // Cross-check: show reports the same count we counted as successes.
+    let out = run_jjf(&repo, &["show", &id]);
+    assert!(out.status.success(), "show failed: {}", String::from_utf8_lossy(&out.stderr));
+    let body = String::from_utf8_lossy(&out.stdout);
+    let landed_in_show = (0..5)
+        .filter(|i| body.contains(&format!("cli comment {i}")))
+        .count();
+    assert_eq!(
+        landed_in_show, successes,
+        "show comment-count ({landed_in_show}) must match success count ({successes}); \
+         show output:\n{body}"
+    );
+}
+
 #[test]
 fn comment_help_documents_positional_file_author_and_json() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));

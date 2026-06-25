@@ -373,29 +373,113 @@ fn is_typed_concurrent_write(e: &Error) -> bool {
     matches!(e, Error::ConcurrentWrite { .. })
 }
 
-/// Sleep for a small jittered interval before retrying a concurrent-
-/// write conflict. The retry path is "the winner is mid-dance; let it
-/// finish so our re-attempt sees the post-race head and lands cleanly."
-/// A flat sleep would cause two simultaneous racers to keep colliding
-/// on every retry; the jitter (per-thread PID + nanosecond clock) gives
-/// each racer a slightly different schedule so one of them lands ahead
-/// of the other on the second attempt.
+/// Retry policy for CAS-loss conflicts. Read once per retry-driver
+/// call from env so tests can pin specific behavior (e.g.
+/// `JJF_RETRY_BASE_MS=0` to skip the wall-clock wait;
+/// `JJF_MAX_RETRIES=0` to force first-conflict-wins).
 ///
-/// Magnitude (15-50ms) is dominated by jj's own ~100ms-per-call
-/// overhead — small enough not to bloat the steady-state path, large
-/// enough that the winner has plenty of time to complete its
-/// remaining `jj bookmark set` / `jj new root()` calls.
-fn jittered_retry_sleep() {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // Cheap jitter: low bits of the wall-clock nanos XOR'd with the
-    // PID (so siblings in the same process tree get different seeds).
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    let jitter_ms = (nanos ^ pid) % 36; // 0..=35
-    std::thread::sleep(std::time::Duration::from_millis(15 + u64::from(jitter_ms)));
+/// `max_retries` is the number of RETRY attempts after the initial
+/// try, so total attempts = `1 + max_retries`. A `max_retries` of 5
+/// (the default) means 6 total attempts before giving up.
+///
+/// `base_ms` is the leading-edge backoff (the delay before the FIRST
+/// retry). Subsequent delays grow geometrically (~2.5×) so the
+/// schedule for `base_ms = 10` is 10, 25, 60, 150, 350 ms. When
+/// `base_ms = 0`, no sleeps happen at all — useful in tests that
+/// want the retry budget without the wall-clock wait.
+#[derive(Debug, Clone, Copy)]
+struct RetryPolicy {
+    max_retries: u32,
+    base_ms: u64,
+}
+
+impl RetryPolicy {
+    fn from_env() -> Self {
+        let max_retries = std::env::var("JJF_MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|n| n.min(20))
+            .unwrap_or(5);
+        let base_ms = std::env::var("JJF_RETRY_BASE_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|n| n.min(10_000))
+            .unwrap_or(10);
+        RetryPolicy { max_retries, base_ms }
+    }
+
+    /// Geometric schedule with ~25% jitter. Attempt index is 1-based
+    /// (the FIRST retry is attempt 1). The base series at base_ms=10
+    /// is roughly [10, 25, 60, 150, 350]; jitter is added per call
+    /// so concurrent racers don't re-collide on the same wake tick.
+    fn sleep_before(&self, attempt: u32) {
+        if self.base_ms == 0 {
+            return;
+        }
+        // Geometric multipliers ~2.5× per step. Computed as a small
+        // table so we don't depend on libm and don't drift on f64
+        // rounding for the small attempt counts we use.
+        let multipliers: [u64; 6] = [1, 2, 6, 15, 35, 85];
+        let idx = (attempt as usize).saturating_sub(1).min(multipliers.len() - 1);
+        let base_delay = self.base_ms.saturating_mul(multipliers[idx]);
+        // ~25% jitter, derived from a cheap nondeterministic source
+        // (wall-clock nanos XOR pid) so we don't pull in `rand`.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        // jitter span = 25% of base_delay, half subtractive / half additive
+        let span = (base_delay / 4).max(1);
+        let jitter = (u64::from(nanos ^ pid)) % (2 * span + 1);
+        let delay = base_delay.saturating_add(jitter).saturating_sub(span);
+        std::thread::sleep(std::time::Duration::from_millis(delay));
+    }
+}
+
+/// Human-friendly hint for the `ConcurrentWrite` error after all
+/// retries are exhausted. Mentions the actual retry budget so the
+/// message stays honest when `JJF_MAX_RETRIES` is overridden.
+fn retries_exhausted_hint(max_retries: u32) -> String {
+    format!(
+        "another writer landed first; retried {max_retries} time{plural} and still raced. \
+         Retry your command.",
+        plural = if max_retries == 1 { "" } else { "s" },
+    )
+}
+
+/// Drive a CAS-loss retry loop: call `attempt` until it succeeds, a
+/// non-conflict error fires, or the configured retry budget is
+/// exhausted. Between attempts, invalidate the snapshot memo and
+/// sleep per the [`RetryPolicy`].
+///
+/// The closure is called once for the initial try (attempt 1) and
+/// then up to `max_retries` more times. After each ConcurrentWrite
+/// failure, `between` runs (snapshot invalidation) and the policy
+/// sleeps for the configured backoff.
+fn run_with_retry<T, A, B>(policy: RetryPolicy, mut attempt: A, mut between: B) -> Result<T>
+where
+    A: FnMut() -> Result<T>,
+    B: FnMut(),
+{
+    let mut last: Result<T> = attempt();
+    for retry_n in 1..=policy.max_retries {
+        match last {
+            Ok(_) => return last,
+            Err(ref e) if is_typed_concurrent_write(e) => {
+                between();
+                policy.sleep_before(retry_n);
+                last = attempt();
+            }
+            Err(_) => return last,
+        }
+    }
+    match last {
+        Err(e) if is_typed_concurrent_write(&e) => Err(Error::ConcurrentWrite {
+            hint: retries_exhausted_hint(policy.max_retries),
+        }),
+        other => other,
+    }
 }
 
 /// Outcome of [`Storage::claim`]. Distinguishes "I wrote the claim
@@ -2476,38 +2560,27 @@ impl Storage {
     /// machine-readable output.
     ///
     /// On a concurrent-write race (another writer landed first), this
-    /// auto-retries ONCE with a fresh re-read of the comments file —
-    /// crucial to preserve the racer's comment: if we naïvely retried
-    /// with the stale `existing_comments` snapshot, we'd clobber it.
-    /// The retry path re-reads the comments file, re-appends OUR new
-    /// comment, and re-commits — both comments land.
+    /// auto-retries with bounded exponential backoff. Each retry
+    /// re-reads the comments file so the racer's comment is preserved
+    /// alongside ours (naïve retry with the stale `existing_comments`
+    /// snapshot would clobber it).
+    ///
+    /// Retry budget is governed by [`RetryPolicy::from_env`] —
+    /// defaults to 5 retries (6 total attempts) with a 10/25/60/150/350
+    /// ms backoff. `JJF_MAX_RETRIES` and `JJF_RETRY_BASE_MS` env vars
+    /// tune this for tests.
     pub fn add_comment(&self, id: &IssueId, body: &str, author: &str) -> Result<IssueId> {
         if author.trim().is_empty() {
             return Err(Error::Invalid("comment author must not be empty".into()));
         }
         let comment_id = IssueId::random();
-        match self.add_comment_once(id, body, author, &comment_id) {
-            Ok(()) => Ok(comment_id),
-            Err(e) if is_typed_concurrent_write(&e) => {
-                // Invalidate the memo so the retry's re-read picks up
-                // the winner's comment (and updated record). Sleep a
-                // jittered short interval so two simultaneous retries
-                // don't immediately re-collide on the working-copy
-                // checkout lock.
-                self.invalidate_snapshot_memo();
-                jittered_retry_sleep();
-                match self.add_comment_once(id, body, author, &comment_id) {
-                    Ok(()) => Ok(comment_id),
-                    Err(e2) if is_typed_concurrent_write(&e2) => {
-                        Err(Error::ConcurrentWrite {
-                            hint: "another writer landed first; retried once and still raced. Retry your command.".into(),
-                        })
-                    }
-                    Err(e2) => Err(e2),
-                }
-            }
-            Err(e) => Err(e),
-        }
+        let policy = RetryPolicy::from_env();
+        run_with_retry(
+            policy,
+            || self.add_comment_once(id, body, author, &comment_id),
+            || self.invalidate_snapshot_memo(),
+        )
+        .map(|()| comment_id.clone())
     }
 
     /// Single attempt of [`Storage::add_comment`]: read the record and
@@ -3349,8 +3422,13 @@ impl Storage {
     {
         // Run the read + mutate + commit cycle. On a typed
         // ConcurrentWrite, re-read the record from the (now-updated)
-        // bookmark and re-evaluate the closure against it. Per
-        // `qa-concurrent-write-ux`, one retry is the v1 policy.
+        // bookmark and re-evaluate the closure against it (the
+        // closure-as-precondition contract from `a6b8fb7`).
+        //
+        // Retry budget is governed by [`RetryPolicy::from_env`] —
+        // defaults to 5 retries with geometric backoff so per-issue
+        // contention (N concurrent comments / mutations on the same
+        // id) is absorbed silently.
         //
         // Return value is `true` when a commit landed, `false` when
         // the closure returned [`MutateOutcome::Skip`] — callers that
@@ -3358,28 +3436,12 @@ impl Storage {
         // `Storage::claim`, to surface race-lost vs. fresh-claim to
         // the `ready --claim` CLI path) inspect this; callers that
         // don't can ignore it.
-        match self.mutate_once(id, summary, &f) {
-            Ok(landed) => Ok(landed),
-            Err(e) if is_typed_concurrent_write(&e) => {
-                // Drop the memo so the retry's read sees the racer's
-                // landed commit, not the pre-race snapshot. Sleep a
-                // jittered short interval so two simultaneous retries
-                // don't immediately re-collide on the working-copy
-                // checkout lock.
-                self.invalidate_snapshot_memo();
-                jittered_retry_sleep();
-                match self.mutate_once(id, summary, &f) {
-                    Ok(landed) => Ok(landed),
-                    Err(e2) if is_typed_concurrent_write(&e2) => {
-                        Err(Error::ConcurrentWrite {
-                            hint: "another writer landed first; retried once and still raced. Retry your command.".into(),
-                        })
-                    }
-                    Err(e2) => Err(e2),
-                }
-            }
-            Err(e) => Err(e),
-        }
+        let policy = RetryPolicy::from_env();
+        run_with_retry(
+            policy,
+            || self.mutate_once(id, summary, &f),
+            || self.invalidate_snapshot_memo(),
+        )
     }
 
     /// Single attempt of [`Storage::mutate`]: read the record from the
