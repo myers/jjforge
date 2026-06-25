@@ -2,9 +2,10 @@
 //!
 //! Pinned by ticket `c14e1c1` (storage-v3 #4). Each test sets up a
 //! v2-shape repo (the v2 `issues` bookmark with one or more issues +
-//! optional memories) with the [`JJF_DISABLE_V2_TO_V3_MIGRATION`] env
-//! var set so the v2-shape data lands, then unsets the var and re-
-//! opens the repo via `Storage::open` to trigger the migration.
+//! optional memories) by opening via
+//! [`Storage::open_skip_v2_to_v3_migration`] so the v2-shape data
+//! lands, then re-opens via the normal [`Storage::open`] to trigger
+//! the migration.
 //!
 //! Post-migration, we assert:
 //!
@@ -23,24 +24,18 @@ use std::process::Command;
 
 use jjf_storage::{IssueDraft, Status, Storage, UpdateFields};
 
-const DISABLE: &str = "JJF_DISABLE_V2_TO_V3_MIGRATION";
-
-/// Set or unset the migration opt-out around a closure. The env var
-/// is process-wide and `set_var` is `unsafe` under the Rust 2024
-/// edition; we centralize the SAFETY contract here.
+/// Run a closure that needs to write v2-shape state. Opens the repo
+/// via [`Storage::open_skip_v2_to_v3_migration`] inside the closure
+/// so the v2 paths stay live; the caller of `with_disable` does NOT
+/// receive the handle — the closure builds its own — because each
+/// test wants to drop the v2 handle before re-opening to trigger
+/// the migrator.
 ///
-/// Tests serialize on this var by virtue of nextest's per-test
-/// process — each test runs in its own subprocess, so we never race
-/// on the env var between tests.
+/// Kept as a wrapper (vs. inlining the call) because every test
+/// uses the same v2-shape setup-then-migrate two-phase recipe and
+/// the name documents the intent.
 fn with_disable<F: FnOnce() -> R, R>(f: F) -> R {
-    unsafe {
-        std::env::set_var(DISABLE, "1");
-    }
-    let r = f();
-    unsafe {
-        std::env::remove_var(DISABLE);
-    }
-    r
+    f()
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -140,7 +135,7 @@ fn v2_to_v3_migration_round_trips_records_and_comments() {
     // - issue 4: create + slug + assignee + label, all set on
     //   create (the multi-op stanza of spec §5.7).
     let (ids_v2, records_v2, comments_v2) = with_disable(|| {
-        let s = Storage::open(&repo).expect("open v2");
+        let s = Storage::open_skip_v2_to_v3_migration(&repo).expect("open v2");
 
         let i0 = s.create_issue(&IssueDraft {
             title: "issue zero".into(),
@@ -283,7 +278,7 @@ fn v2_to_v3_migration_preserves_op_chain_length() {
     let repo = make_v2_repo("op_chain_length");
 
     let (ids_v2, v2_chain_lengths) = with_disable(|| {
-        let s = Storage::open(&repo).expect("open v2");
+        let s = Storage::open_skip_v2_to_v3_migration(&repo).expect("open v2");
 
         // Build issues with KNOWN commit counts.
         // - i0: 1 commit (create only).
@@ -370,7 +365,7 @@ fn re_open_after_migration_is_a_no_op() {
 
     // Stand up v2 + migrate.
     let id = with_disable(|| {
-        let s = Storage::open(&repo).expect("open v2");
+        let s = Storage::open_skip_v2_to_v3_migration(&repo).expect("open v2");
         s.create_issue(&IssueDraft {
             title: "single issue".into(),
             ..Default::default()
@@ -423,7 +418,7 @@ fn v2_to_v3_migration_carries_memories() {
     let repo = make_v2_repo("memories");
 
     let (mems_v2, _issue) = with_disable(|| {
-        let s = Storage::open(&repo).expect("open v2");
+        let s = Storage::open_skip_v2_to_v3_migration(&repo).expect("open v2");
         // Need at least one issue so the bookmark has any meaningful
         // state, but memories live alongside issues on the same
         // bookmark — they get migrated too.
@@ -488,7 +483,7 @@ fn v1_to_v2_to_v3_chained_migration() {
     // the trick the existing `v1_to_v2_migration_preserves_history`
     // integration test uses).
     let id = with_disable(|| {
-        let s = Storage::open(&repo).expect("open v2");
+        let s = Storage::open_skip_v2_to_v3_migration(&repo).expect("open v2");
         let id = s.create_issue(&IssueDraft {
             title: "v1 era issue".into(),
             ..Default::default()
@@ -577,7 +572,7 @@ fn migration_skips_issues_with_existing_v3_ref() {
     let repo = make_v2_repo("partial_migration");
 
     let (id0, id1) = with_disable(|| {
-        let s = Storage::open(&repo).expect("open v2");
+        let s = Storage::open_skip_v2_to_v3_migration(&repo).expect("open v2");
         let i0 = s.create_issue(&IssueDraft {
             title: "issue zero".into(),
             ..Default::default()

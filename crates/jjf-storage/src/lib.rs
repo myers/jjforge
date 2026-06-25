@@ -997,32 +997,51 @@ impl Storage {
             // all" repo), the migrator's bookmark probe makes it a
             // no-op and we leave the repo without a sentinel —
             // matching the v2 behavior for that edge case.
-            //
-            // Test-only opt-out: `JJF_DISABLE_V2_TO_V3_MIGRATION=1`
-            // skips the migration so the v2-internals integration
-            // tests (the ones that assert the v2 bookmark layout
-            // directly) keep exercising the v2 read/write paths
-            // without modification. The test-sweep ticket 7 of the
-            // v3 epic ports those tests; once it lands, this opt-out
-            // can disappear. The env var is INTENTIONALLY undocumented
-            // outside this comment — there is no production reason
-            // to skip the migration.
-            if std::env::var_os("JJF_DISABLE_V2_TO_V3_MIGRATION").is_none() {
-                migrate_v2_v3::maybe_migrate_v2_to_v3(&storage.repo, &storage.git)?;
-                // Re-detect mode after migration. If the sentinel
-                // got planted, we're now V3 and subsequent reads
-                // must use the v3 path. Storage carries mode as an
-                // immutable field on the public type, so we rebuild
-                // it here rather than mutating in place — clones
-                // inherit the new mode.
-                let new_mode = detect_storage_mode(&git)?;
-                return Ok(Self {
-                    repo: storage.repo,
-                    git: storage.git,
-                    mode: new_mode,
-                    snapshot_memo: storage.snapshot_memo,
-                });
-            }
+            migrate_v2_v3::maybe_migrate_v2_to_v3(&storage.repo, &storage.git)?;
+            // Re-detect mode after migration. If the sentinel
+            // got planted, we're now V3 and subsequent reads
+            // must use the v3 path. Storage carries mode as an
+            // immutable field on the public type, so we rebuild
+            // it here rather than mutating in place — clones
+            // inherit the new mode.
+            let new_mode = detect_storage_mode(&git)?;
+            return Ok(Self {
+                repo: storage.repo,
+                git: storage.git,
+                mode: new_mode,
+                snapshot_memo: storage.snapshot_memo,
+            });
+        }
+        Ok(storage)
+    }
+
+    /// Like [`Storage::open`] but skips the v2 → v3 auto-migration.
+    /// Test-only — used by the v2 → v3 migration integration tests so
+    /// they can plant v2-shape state and then re-open without the
+    /// migrator running. Production code MUST NOT call this.
+    ///
+    /// Note: the v1 → v2 step still runs (the migration tests build
+    /// only v2 or v1 shapes and need v1 → v2 to land before they can
+    /// inspect or re-migrate to v3).
+    #[doc(hidden)]
+    pub fn open_skip_v2_to_v3_migration(repo_root: impl Into<PathBuf>) -> Result<Self> {
+        let root = repo_root.into();
+        if !root.is_absolute() {
+            return Err(Error::Invalid(format!(
+                "Storage::open requires an absolute path, got {}",
+                root.display()
+            )));
+        }
+        let git = git::GitRepo::open(root.clone());
+        let mode = detect_storage_mode(&git)?;
+        let storage = Self {
+            repo: JjRepo::open(root),
+            git: git.clone(),
+            mode,
+            snapshot_memo: Default::default(),
+        };
+        if storage.mode == StorageMode::V2 {
+            storage.maybe_migrate_v1_to_v2()?;
         }
         Ok(storage)
     }
@@ -1362,8 +1381,8 @@ impl Storage {
     /// True iff this handle was opened on a v3-shape repo (the
     /// `refs/jjf/meta/format-version` sentinel ref resolves). False
     /// means the repo is still v2-shape — only reachable in the test
-    /// suite via `JJF_DISABLE_V2_TO_V3_MIGRATION=1`. Production callers
-    /// see V3 unconditionally because the migrator runs at
+    /// suite via [`Storage::open_skip_v2_to_v3_migration`]. Production
+    /// callers see V3 unconditionally because the migrator runs at
     /// `Storage::open`.
     ///
     /// Used by the CLI's `push` / `pull` verbs to dispatch between the

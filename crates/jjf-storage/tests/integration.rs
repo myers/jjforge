@@ -18,46 +18,29 @@ use serde::Serialize;
 /// Build a scratch jj repo with a seeded v2 `issues` bookmark.
 /// Returns the absolute path to the repo root.
 ///
-/// **Why not `Storage::init` anymore.** After the v3 init rewrite
-/// (ticket `add0646`), `Storage::init` on a fresh repo plants the v3
-/// sentinel ref and does NOT create the v2 `issues` bookmark. The
-/// integration tests in this file all assert v2-shape details
-/// (file paths on the bookmark tip, descriptions of bookmark
-/// commits, etc.), so we set up the v2 bookmark by hand to keep the
-/// v2 write-path coverage alive until the v2 → v3 migrator
-/// (ticket `c14e1c1`) lands and these tests can move to v3-shape.
+/// **Why we still plant a v2 bookmark.** After the v3 init rewrite
+/// (ticket `add0646`), `Storage::init` plants only the v3 sentinel
+/// ref. The integration tests in this file are the v2 → v3 backstop:
+/// they plant a v2-shape repo by hand and then call `Storage::open`,
+/// which runs the v2 → v3 migrator. Post-migration, the data lives
+/// on `refs/jjf/issues/<id>` and the bookmark is gone. Assertions
+/// throughout this file use the v3 helpers ([`v3_blob_at`],
+/// [`git_log_v3_chain`]) to walk the per-issue ref instead of the
+/// bookmark.
 ///
 /// The bootstrap commands here mirror the pre-v3 `Storage::init`
 /// body byte-for-byte: seed commit description per spec §1.1, the
 /// final `jj new root()` to step `@` off the bookmark so the
 /// writer dance doesn't snapshot stale working-copy state.
 fn make_scratch_repo(name: &str) -> PathBuf {
-    // Opt out of the v2 → v3 auto-migration so v2-internals
-    // integration tests (the ones that assert the v2 bookmark
-    // layout directly, the v2 cache schema, etc.) keep exercising
-    // the v2 paths. The migration auto-runs on real `Storage::open`
-    // in production; the test sweep ticket 7 of the v3 epic ports
-    // these v2 assertions to the v3 ref-layout shape, at which
-    // point this opt-out can disappear.
-    // `std::env::set_var` is `unsafe` under the Rust 2024 edition
-    // (one of the language-edition tightenings around process-wide
-    // env-state racing across threads). In the integration-test
-    // process this is safe: the tests run in a single process where
-    // we only ever SET this var (never unset, never read in
-    // contention), and the value is constant. The `unsafe` block is
-    // the language-edition-mandated acknowledgement of that
-    // contract.
-    unsafe {
-        std::env::set_var("JJF_DISABLE_V2_TO_V3_MIGRATION", "1");
-    }
     let abs = make_empty_jj_repo(name);
     plant_v2_bookmark(&abs);
     abs
 }
 
 /// Plant the v2 `issues` bookmark with the spec-§1.1 seed commit on
-/// a fresh jj repo. Lifts the pre-v3 `Storage::init` body so the v2
-/// integration tests can keep exercising v2 paths.
+/// a fresh jj repo. Lifts the pre-v3 `Storage::init` body. The
+/// bookmark will be migrated to v3-shape refs by `Storage::open`.
 fn plant_v2_bookmark(repo: &Path) {
     sh("jj", &["new", "root()", "-m", "jjf: seed issues bookmark"], repo);
     sh("jj", &["bookmark", "create", "issues", "-r", "@"], repo);
@@ -107,19 +90,88 @@ fn sh(prog: &str, args: &[&str], cwd: &Path) {
     );
 }
 
-/// Read a file's contents from the `issues` bookmark tip.
-fn read_at_bookmark(repo: &Path, relpath: &str) -> String {
-    jj_capture(
+/// Read a blob from a v3 per-issue ref. The path is relative to the
+/// ref's tree root (e.g. `issue.json` or `comments.jsonl`).
+///
+/// V3 layout: each issue lives at `refs/jjf/issues/<id>` and its tip
+/// carries a single-directory tree with `issue.json` (always) and
+/// `comments.jsonl` (when comments exist). See
+/// `docs/storage-out-of-tree.md` §"Tree shape".
+fn read_at_issue_ref(repo: &Path, id: &str, path: &str) -> String {
+    let spec = format!("refs/jjf/issues/{}:{}", id, path);
+    let out = Command::new("git")
+        .args(["cat-file", "blob", &spec])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git cat-file {} failed:\nstderr: {}",
+        spec,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Read a memory's blob from the v3 per-memory ref. V3 layout:
+/// each memory lives at `refs/jjf/memories/<key>:memory.json`.
+fn read_at_memory_ref(repo: &Path, key: &str) -> String {
+    let spec = format!("refs/jjf/memories/{}:memory.json", key);
+    let out = Command::new("git")
+        .args(["cat-file", "blob", &spec])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git cat-file {} failed:\nstderr: {}",
+        spec,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Capture the commit-message descriptions on a v3 per-issue ref,
+/// newest-first (matches the historical `jj log` newest-first
+/// output that read_at_bookmark-era assertions consumed). Returns
+/// a single string joined by `\n----\n` between entries.
+fn git_log_v3_chain(repo: &Path, id: &str) -> String {
+    git_capture(
         &[
-            "file",
-            "show",
-            "-r",
-            "bookmarks(issues)",
-            &format!("root:{}", relpath),
+            "log",
+            "--format=%B%n----",
+            &format!("refs/jjf/issues/{}", id),
         ],
         repo,
     )
 }
+
+/// Capture stdout of a `git` invocation under `repo`. Mirror of
+/// `jj_capture`; we use it where we'd previously have shelled into
+/// `jj log -r bookmarks(issues)`.
+fn git_capture(args: &[&str], repo: &Path) -> String {
+    let out = Command::new("git").args(args).current_dir(repo).output().unwrap();
+    assert!(
+        out.status.success(),
+        "`git {}` failed in {}:\nstdout: {}\nstderr: {}",
+        args.join(" "),
+        repo.display(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The symbolic target of `HEAD` — `refs/heads/<branch>` in a normal
+/// repo, `refs/jj/root` if the v2 4-CLI dance drift hits. Returns the
+/// raw output without trailing newline. Test repos here are jj-only
+/// (no `--colocate` in `make_empty_jj_repo`), so HEAD never resolves
+/// to an oid until git records a commit — but the symbolic target
+/// IS present and IS the drift fingerprint we care about.
+fn git_symbolic_ref_head(repo: &Path) -> String {
+    git_capture(&["symbolic-ref", "HEAD"], repo).trim().to_owned()
+}
+
 
 fn jj_capture(args: &[&str], cwd: &Path) -> String {
     let out = Command::new("jj").args(args).current_dir(cwd).output().unwrap();
@@ -150,11 +202,10 @@ fn create_then_set_status_lands_two_commits_on_bookmark() {
     let id_s = id.to_string();
     assert_eq!(id_s.len(), 7);
 
-    // bugs/<id>.json exists at the bookmark tip with the schema fields.
-    // (The dance's step 4 — `jj new root()` — moves @ off the bookmark,
-    // so the file is not in the working copy. The authoritative copy
-    // lives at the bookmark; read via `jj file show`.)
-    let json_text = read_at_bookmark(&repo, &format!("issues/{}.json", id_s));
+    // V3 tree carries `issue.json` at the per-issue ref's tip with
+    // the schema fields. (The v3 write path is git-only; the working
+    // copy is never touched.) See `docs/storage-out-of-tree.md`.
+    let json_text = read_at_issue_ref(&repo, &id_s, "issue.json");
     let v: serde_json::Value = serde_json::from_str(&json_text).unwrap();
     assert_eq!(v["version"], 2);
     assert_eq!(v["id"], id_s);
@@ -170,37 +221,56 @@ fn create_then_set_status_lands_two_commits_on_bookmark() {
         "record must be pretty-printed with 2-space indent (spec §3): {json_text}"
     );
 
-    // Empty comments file exists at the bookmark.
-    let comments_text =
-        read_at_bookmark(&repo, &format!("issues/{}.comments.jsonl", id_s));
-    assert_eq!(comments_text, "");
+    // V3: comments.jsonl is absent in the tree when there are no
+    // comments. (V2 planted an empty file; v3 doesn't.)
+    let no_comments = Command::new("git")
+        .args([
+            "cat-file",
+            "blob",
+            &format!("refs/jjf/issues/{}:comments.jsonl", id_s),
+        ])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        !no_comments.status.success(),
+        "v3 create must NOT plant an empty comments.jsonl in the tree"
+    );
+
+    // Snapshot HEAD before set_status — v3 mutations MUST leave HEAD
+    // untouched (the original test asserted "@ off the bookmark";
+    // v3 inverts that to "HEAD does not drift").
+    //
+    // Use `symbolic-ref HEAD` rather than `rev-parse HEAD` because a
+    // jj-only repo (no `--colocate`) has no checked-out branch — HEAD
+    // is a symbolic ref pointing at `refs/heads/main` which itself has
+    // no oid until something is committed via git. The drift fingerprint
+    // we care about is HEAD's symbolic target getting re-pointed (e.g.
+    // to `refs/jj/root`), not the oid value. The companion v3 write-path
+    // tests (`v3_write_path.rs::git_head_symbolic`) use the same probe.
+    let head_sym_before_set = git_symbolic_ref_head(&repo);
+    let at_before_set = jj_capture(
+        &["log", "--no-graph", "-r", "@", "-T", "change_id"],
+        &repo,
+    );
 
     // set_status to closed.
     storage.set_status(&id, Status::Closed).expect("set_status");
 
-    // bugs/<id>.json at the bookmark reflects the new status.
-    let json_text = read_at_bookmark(&repo, &format!("issues/{}.json", id_s));
+    // V3 ref-tip `issue.json` reflects the new status.
+    let json_text = read_at_issue_ref(&repo, &id_s, "issue.json");
     let v: serde_json::Value = serde_json::from_str(&json_text).unwrap();
     assert_eq!(v["status"], "closed");
     assert_eq!(v["version"], 2);
 
-    // `jj log` for the file should show two mutating commits on top of
-    // the seed commit (which doesn't touch this path). Newest first.
-    let log = jj_capture(
-        &[
-            "log",
-            "--no-graph",
-            "-T",
-            "description ++ \"\\n----\\n\"",
-            &format!("root:issues/{}.json", id_s),
-        ],
-        &repo,
-    );
+    // `git log` for the per-issue ref should show two commits: the
+    // create commit and the set-status commit. Newest first.
+    let log = git_log_v3_chain(&repo, &id_s);
     let entries: Vec<&str> = log.split("\n----\n").filter(|s| !s.trim().is_empty()).collect();
     assert_eq!(
         entries.len(),
         2,
-        "expected 2 commits touching issues/{id_s}.json, got {}:\n{log}",
+        "expected 2 commits on refs/jjf/issues/{id_s}, got {}:\n{log}",
         entries.len()
     );
     // Newest first: set-status commit, then create commit.
@@ -237,39 +307,38 @@ fn create_then_set_status_lands_two_commits_on_bookmark() {
         "create commit missing Jjf-Status: open:\n{create_msg}"
     );
 
-    // The bookmark should now point at the latest mutation. Verify by
-    // checking `jj log -r bookmarks(issues)` shows the set-status commit.
-    let tip = jj_capture(
+    // The per-issue ref now points at the latest mutation (set-status).
+    let tip_msg = git_capture(
         &[
             "log",
-            "--no-graph",
-            "-r",
-            "bookmarks(issues)",
-            "-T",
-            "description.first_line() ++ \"\\n\"",
+            "-n",
+            "1",
+            "--format=%s",
+            &format!("refs/jjf/issues/{}", id_s),
         ],
         &repo,
     );
     assert!(
-        tip.contains("set-status"),
-        "issues bookmark should point at the set-status commit, got: {tip}"
+        tip_msg.contains("set-status"),
+        "refs/jjf/issues/{} should point at the set-status commit, got: {}",
+        id_s,
+        tip_msg
     );
 
-    // @ should not be on the bookmark (step 4 of the dance).
-    let at_at = jj_capture(
-        &[
-            "log",
-            "--no-graph",
-            "-r",
-            "@",
-            "-T",
-            "bookmarks ++ \"\\n\"",
-        ],
+    // V3 invariant: git HEAD does not drift across a mutation. jj's
+    // working-copy change id is also pinned.
+    let head_sym_after_set = git_symbolic_ref_head(&repo);
+    let at_after_set = jj_capture(
+        &["log", "--no-graph", "-r", "@", "-T", "change_id"],
         &repo,
     );
-    assert!(
-        !at_at.contains("issues"),
-        "@ should not be on the issues bookmark after a mutation, got: {at_at}"
+    assert_eq!(
+        head_sym_before_set, head_sym_after_set,
+        "git HEAD symbolic target must not move across a v3 mutation"
+    );
+    assert_eq!(
+        at_before_set, at_after_set,
+        "jj @ must not move across a v3 mutation"
     );
 }
 
@@ -289,7 +358,7 @@ fn add_comment_lands_jsonl_line_and_trailer() {
         .add_comment(&id, "first thought", "alice <alice@example.com>")
         .unwrap();
 
-    let body = read_at_bookmark(&repo, &format!("issues/{}.comments.jsonl", id_s));
+    let body = read_at_issue_ref(&repo, &id_s, "comments.jsonl");
     let lines: Vec<&str> = body.lines().collect();
     assert_eq!(lines.len(), 1, "exactly one comment line: {body:?}");
     let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
@@ -300,16 +369,16 @@ fn add_comment_lands_jsonl_line_and_trailer() {
         "comment id must be 7 hex chars: {body}"
     );
 
-    // The comment-add commit's description must carry the trailer +
-    // the Jjf-Comment-Id matching the line in jsonl.
-    let log = jj_capture(
+    // The comment-add commit's description (now at the per-issue ref
+    // tip) must carry the trailer + the Jjf-Comment-Id matching the
+    // line in jsonl.
+    let log = git_capture(
         &[
             "log",
-            "--no-graph",
-            "-r",
-            "bookmarks(issues)",
-            "-T",
-            "description ++ \"\\n\"",
+            "-n",
+            "1",
+            "--format=%B",
+            &format!("refs/jjf/issues/{}", id_s),
         ],
         &repo,
     );
@@ -437,7 +506,7 @@ fn read_then_serialize_byte_equals_on_disk_record() {
     storage.add_comment(&id, "hi", "alice <a@x>").unwrap();
 
     let id_s = id.to_string();
-    let on_disk = read_at_bookmark(&repo, &format!("issues/{}.json", id_s));
+    let on_disk = read_at_issue_ref(&repo, &id_s, "issue.json");
 
     // Re-serialize the Bug back through the same writer convention
     // (pretty-printed, 2-space indent, trailing newline) and the
@@ -488,8 +557,7 @@ fn read_then_serialize_byte_equals_on_disk_record() {
 
     // Same byte-equality contract for the comments file: each line is
     // a Comment serialized as compact JSON, terminated by `\n`.
-    let on_disk_comments =
-        read_at_bookmark(&repo, &format!("issues/{}.comments.jsonl", id_s));
+    let on_disk_comments = read_at_issue_ref(&repo, &id_s, "comments.jsonl");
     let mut reserialized_comments = String::new();
     for c in &bug.comments {
         reserialized_comments.push_str(&serde_json::to_string(c).unwrap());
@@ -1191,12 +1259,19 @@ fn list_ids_returns_three_bugs_sorted_with_no_duplicates() {
 /// chain and `read` failed with "no `create` op found."
 #[test]
 fn v1_to_v2_migration_preserves_history() {
+    // V3 era: this test exercises the v1 → v2 step (path rename
+    // bugs/* → issues/*), with v2 → v3 chained on top. We open via
+    // `open_skip_v2_to_v3_migration` while building the v1 shape so the
+    // auto-migrator doesn't pre-emptively re-shape the data into v3.
+    // Once the v1-shape has been laid down by hand, the production
+    // `Storage::open` runs v1 → v2 → v3 in sequence and we assert the
+    // issue's full op history is reachable post-migration.
     let repo = make_scratch_repo("v1_to_v2_migration_preserves_history");
 
     // Create an issue in v2 form so we have real `Jjf-Op:` trailers
     // and real on-disk record files. Land two ops (create + close)
     // so the history walker has a non-trivial chain to follow.
-    let storage = Storage::open(&repo).unwrap();
+    let storage = Storage::open_skip_v2_to_v3_migration(&repo).unwrap();
     let id = storage
         .create_issue(&IssueDraft {
             title: "synthetic v1 issue".into(),
@@ -1243,10 +1318,9 @@ fn v1_to_v2_migration_preserves_history() {
         "synthesized v1 must NOT have an `issues` bookmark, got:\n{bookmarks}"
     );
 
-    // The actual test: Storage::open detects v1, runs the migration,
-    // and Storage::read succeeds with the full chain (NOT just the
-    // migration commit — the original create + set-status ops must
-    // be found via the v1 path filter).
+    // The actual test: production Storage::open detects v1, runs
+    // v1 → v2 (rename), then v2 → v3 (per-issue refs + sentinel), and
+    // Storage::read succeeds with the full chain.
     let storage = Storage::open(&repo).expect("Storage::open must succeed on v1 repo");
     let bug = storage
         .read(&id)
@@ -1254,14 +1328,32 @@ fn v1_to_v2_migration_preserves_history() {
     assert_eq!(bug.title, "synthetic v1 issue");
     assert_eq!(bug.status, Status::Closed);
 
-    // Bookmark renamed.
-    let bookmarks_post = jj_capture(
-        &["bookmark", "list", "-T", "name ++ \"\\n\""],
-        &repo,
+    // Post v1 → v2 → v3, the bookmarks are gone (v3 layout) and the
+    // sentinel ref is planted. The per-issue ref carries the issue.
+    let head_refs_out = Command::new("git")
+        .args(["for-each-ref", "--format=%(refname)", "refs/heads/"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let head_refs = String::from_utf8_lossy(&head_refs_out.stdout);
+    assert!(
+        !head_refs.contains("refs/heads/issues"),
+        "post-v3 migration must NOT have an `issues` bookmark, got:\n{head_refs}"
     );
     assert!(
-        bookmarks_post.lines().any(|l| l.trim() == "issues"),
-        "post-migration must have an `issues` bookmark, got:\n{bookmarks_post}"
+        !head_refs.contains("refs/heads/bugs"),
+        "post-v3 migration must NOT have a `bugs` bookmark, got:\n{head_refs}"
+    );
+    let issue_ref = format!("refs/jjf/issues/{}", id);
+    assert!(
+        Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", &issue_ref])
+            .current_dir(&repo)
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "per-issue v3 ref {issue_ref} must exist post-migration"
     );
 
     // History reader sees the full chain (create + set-status +
@@ -1934,29 +2026,19 @@ fn list_ready_dangling_dependency_does_not_block() {
         .add_dep_edge(&depender, &target, DepKind::Blocks)
         .unwrap();
 
-    // Drop the target's record from the bookmark with a raw jj
-    // commit. This simulates the post-merge state where the
-    // target's file disappeared upstream (an admin force-cleaned
-    // a stale record, the merge driver dropped it, etc.). We
-    // mirror the 4-CLI dance the storage layer uses for writes.
+    // Drop the target's per-issue ref entirely. In v3 each issue's
+    // history lives on `refs/jjf/issues/<id>`; deleting that ref
+    // simulates the post-merge state where the target's record
+    // disappeared upstream (an admin force-cleaned a stale ref, a
+    // merge dropped it, etc.).
     sh(
-        "jj",
-        &["new", "bookmarks(issues)", "-m", "drop dangling target"],
+        "git",
+        &["update-ref", "-d", &format!("refs/jjf/issues/{}", target)],
         &repo,
     );
-    fs::remove_file(repo.join("issues").join(format!("{}.json", target))).unwrap();
-    // Snapshot the working copy into the new commit, then move
-    // the bookmark forward and step the working copy back to root
-    // so the next storage write doesn't snapshot stale state.
-    sh(
-        "jj",
-        &["bookmark", "set", "issues", "-r", "@", "--allow-backwards"],
-        &repo,
-    );
-    sh("jj", &["new", "root()"], &repo);
 
     // Re-open storage to drop the snapshot memo so the next read
-    // re-probes the bookmark and sees the dropped target.
+    // re-probes the refs and sees the dropped target.
     let storage = Storage::open(&repo).unwrap();
     let ready = storage.list_ready(&ReadyFilter::default()).unwrap();
     assert_eq!(ready.len(), 1, "expected only the depender: {ready:#?}");
@@ -2086,7 +2168,8 @@ fn set_memory_lands_file_under_memories_at_bookmark() {
         .set_memory("dolt-phantoms", "Dolt phantom DBs hide in three places")
         .expect("set_memory");
 
-    let text = read_at_bookmark(&repo, "memories/dolt-phantoms.json");
+    // V3: each memory lives at `refs/jjf/memories/<key>:memory.json`.
+    let text = read_at_memory_ref(&repo, "dolt-phantoms");
     let mem: jjf_storage::Memory = serde_json::from_str(&text).unwrap();
     assert_eq!(mem.key, "dolt-phantoms");
     assert_eq!(mem.value, "Dolt phantom DBs hide in three places");
@@ -2201,14 +2284,14 @@ fn set_memory_commit_carries_set_memory_trailer() {
     let repo = make_scratch_repo("memory_trailer_shape");
     let storage = Storage::open(&repo).expect("Storage::open");
     storage.set_memory("hello-world", "the value").unwrap();
-    let desc = jj_capture(
+    // V3: each memory's commit chain lives at `refs/jjf/memories/<key>`.
+    let desc = git_capture(
         &[
             "log",
-            "-r",
-            "bookmarks(issues)",
-            "--no-graph",
-            "-T",
-            "description",
+            "-n",
+            "1",
+            "--format=%B",
+            "refs/jjf/memories/hello-world",
         ],
         &repo,
     );
@@ -2237,15 +2320,10 @@ fn unset_memory_commit_carries_unset_memory_trailer() {
     let storage = Storage::open(&repo).expect("Storage::open");
     storage.set_memory("temp", "value").unwrap();
     storage.unset_memory("temp").unwrap();
-    let desc = jj_capture(
-        &[
-            "log",
-            "-r",
-            "bookmarks(issues)",
-            "--no-graph",
-            "-T",
-            "description",
-        ],
+    // V3: even after unset, the per-memory ref persists with the
+    // tombstone commit at its tip.
+    let desc = git_capture(
+        &["log", "-n", "1", "--format=%B", "refs/jjf/memories/temp"],
         &repo,
     );
     assert!(
@@ -3736,31 +3814,40 @@ fn trailer_block_shape_walker_finds_no_orphans_on_real_bookmark() {
     storage.set_memory("hello-world", "second value").unwrap();
     storage.unset_memory("hello-world").unwrap();
 
-    // Now walk every commit description and assert the trailer block
-    // structure. We use `jj log` with a template that emits just the
-    // description, one record per commit separated by a NUL marker
-    // we won't see in real descriptions.
-    let log = jj_capture(
+    // V3: enumerate every per-issue ref under `refs/jjf/issues/` and
+    // every per-memory ref under `refs/jjf/memories/`, then walk each
+    // ref's commit chain. The trailer-block shape rules apply to every
+    // commit description regardless of which ref carries it.
+    let refs_out = git_capture(
         &[
-            "log",
-            "-r",
-            "::bookmarks(issues)",
-            "--no-graph",
-            "-T",
-            r#"description ++ "\n----RECORD-SEP----\n""#,
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/jjf/issues/",
+            "refs/jjf/memories/",
         ],
         &repo,
     );
+    let refs: Vec<&str> = refs_out.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(!refs.is_empty(), "expected v3 per-item refs to walk");
 
     let mut commit_count = 0;
     let mut stanza_count = 0;
-    for desc in log.split("----RECORD-SEP----") {
-        let desc = desc.trim_end();
-        if desc.is_empty() {
-            continue;
+    for r in refs {
+        // `git log --format=%B%n----RECORD-SEP----` walks the chain
+        // and emits each commit's full description, separated by our
+        // sentinel marker.
+        let log = git_capture(
+            &["log", "--format=%B%n----RECORD-SEP----", r],
+            &repo,
+        );
+        for desc in log.split("----RECORD-SEP----") {
+            let desc = desc.trim_end();
+            if desc.is_empty() {
+                continue;
+            }
+            commit_count += 1;
+            stanza_count += assert_trailer_block_shape(desc);
         }
-        commit_count += 1;
-        stanza_count += assert_trailer_block_shape(desc);
     }
     assert!(commit_count > 0, "expected non-zero commits to walk");
     assert!(stanza_count > 0, "expected at least one Jjf-Op stanza");

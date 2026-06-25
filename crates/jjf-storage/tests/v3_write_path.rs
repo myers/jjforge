@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use jjf_storage::{
-    IssueDraft, Status, Storage, UpdateFields,
+    DepKind, IssueDraft, Status, Storage, UpdateFields,
 };
 
 /// Build a v3-shape scratch repo: a jj+git colocated repo with the
@@ -555,4 +555,189 @@ fn v3_concurrent_create_loses_to_cas_failure() {
         commit_count >= 3,
         "expected at least 3 commits on the chain (create, update, set_status); got {commit_count}\nlog:\n{log}"
     );
+}
+
+// ---------------------------------------------------------------------
+// Tier D — HEAD-drift regression matrix. Every v3 mutation kind must
+// leave git HEAD's symbolic target, git HEAD's resolved oid, and jj's
+// `@` change id unchanged. This is the safety net for v3's core
+// property: writes happen entirely under `refs/jjf/*` without touching
+// the working copy or any branch ref.
+//
+// Several other tests in this file already pin HEAD/`@` for individual
+// op families (create, set_status, add_comment, update, set_memory,
+// unset_memory). This matrix fills the remaining kinds called out by
+// ticket 7's acceptance: claim, unclaim, block, unblock, label add,
+// label rm, dep add, dep rm.
+//
+// The test wraps each mutation in a snapshot/assert helper so each row
+// names the kind and any failure points at exactly which kind drifted.
+// ---------------------------------------------------------------------
+
+/// Snapshot of the three identifiers that pin HEAD/working-copy for the
+/// v3 invariant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HeadSnapshot {
+    head_oid: String,
+    head_sym: String,
+    at_change_id: String,
+}
+
+fn snapshot_head(repo: &Path) -> HeadSnapshot {
+    HeadSnapshot {
+        head_oid: git_head(repo),
+        head_sym: git_head_symbolic(repo),
+        at_change_id: jj_at_change_id(repo),
+    }
+}
+
+/// Run `mutation`, then assert the HeadSnapshot is unchanged. `kind`
+/// names the mutation for failure messages.
+fn assert_no_drift<F: FnOnce()>(repo: &Path, kind: &str, mutation: F) {
+    let before = snapshot_head(repo);
+    mutation();
+    let after = snapshot_head(repo);
+    assert_eq!(
+        before.head_oid, after.head_oid,
+        "{kind}: git HEAD oid drifted"
+    );
+    assert_eq!(
+        before.head_sym, after.head_sym,
+        "{kind}: git HEAD symbolic target drifted (fingerprint of the v2 dance: refs/jj/root)"
+    );
+    assert_eq!(
+        before.at_change_id, after.at_change_id,
+        "{kind}: jj `@` change id drifted (working copy moved)"
+    );
+}
+
+#[test]
+fn v3_no_head_drift_across_full_mutation_matrix() {
+    let repo = make_v3_scratch_repo("v3_no_head_drift_matrix");
+    let storage = Storage::open(&repo).unwrap();
+
+    // Set up a primary issue plus a second issue that will be the
+    // dependency target. Both creates already exercise the create
+    // no-drift property — pinned again below via assert_no_drift.
+    let dep_target = assert_returns_no_drift(&repo, "create-target", || {
+        storage
+            .create_issue(&IssueDraft {
+                title: "dep target".into(),
+                ..Default::default()
+            })
+            .unwrap()
+    });
+    let id = assert_returns_no_drift(&repo, "create-primary", || {
+        storage
+            .create_issue(&IssueDraft {
+                title: "primary issue".into(),
+                ..Default::default()
+            })
+            .unwrap()
+    });
+
+    // close / open (set_status). Already covered indirectly by
+    // v3_mutate_preserves_head_and_chains_commits, but rep here so
+    // failure messages point at the precise verb.
+    assert_no_drift(&repo, "set_status(Closed) [close]", || {
+        storage.set_status(&id, Status::Closed).unwrap();
+    });
+    assert_no_drift(&repo, "set_status(Open) [open]", || {
+        storage.set_status(&id, Status::Open).unwrap();
+    });
+
+    // claim / unclaim.
+    assert_no_drift(&repo, "claim", || {
+        let _ = storage.claim(&id, "alice").unwrap();
+    });
+    assert_no_drift(&repo, "unclaim", || {
+        storage.unclaim(&id).unwrap();
+    });
+
+    // block / unblock.
+    assert_no_drift(&repo, "block", || {
+        storage.block(&id, Some("waiting on signal")).unwrap();
+    });
+    assert_no_drift(&repo, "unblock", || {
+        storage.unblock(&id).unwrap();
+    });
+
+    // label add / rm.
+    assert_no_drift(&repo, "add_label", || {
+        storage.add_label(&id, "needs-review").unwrap();
+    });
+    assert_no_drift(&repo, "remove_label", || {
+        storage.remove_label(&id, "needs-review").unwrap();
+    });
+
+    // dep add / rm (default Blocks edge via add_dependency).
+    assert_no_drift(&repo, "add_dependency", || {
+        storage.add_dependency(&id, &dep_target).unwrap();
+    });
+    assert_no_drift(&repo, "remove_dependency", || {
+        storage.remove_dependency(&id, &dep_target).unwrap();
+    });
+
+    // typed dep edge with explicit kind (parent-child).
+    assert_no_drift(&repo, "add_dep_edge(ParentChild)", || {
+        storage
+            .add_dep_edge(&id, &dep_target, DepKind::ParentChild)
+            .unwrap();
+    });
+    assert_no_drift(&repo, "remove_dep_edge(ParentChild)", || {
+        storage
+            .remove_dep_edge(&id, &dep_target, DepKind::ParentChild)
+            .unwrap();
+    });
+
+    // update — multi-op stanza in one commit. Re-asserted here so the
+    // matrix is exhaustive.
+    assert_no_drift(&repo, "update(title)", || {
+        storage
+            .update(
+                &id,
+                UpdateFields {
+                    title: Some("renamed primary".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    });
+
+    // add_comment.
+    assert_no_drift(&repo, "add_comment", || {
+        let _ = storage.add_comment(&id, "matrix test", "tester").unwrap();
+    });
+
+    // set_memory / unset_memory.
+    assert_no_drift(&repo, "set_memory", || {
+        storage.set_memory("matrix-rule", "first value").unwrap();
+    });
+    assert_no_drift(&repo, "set_memory [upsert]", || {
+        storage.set_memory("matrix-rule", "second value").unwrap();
+    });
+    assert_no_drift(&repo, "unset_memory", || {
+        storage.unset_memory("matrix-rule").unwrap();
+    });
+}
+
+/// Variant of `assert_no_drift` for mutations whose return value the
+/// caller wants to keep (e.g. `create_issue`).
+fn assert_returns_no_drift<F, R>(repo: &Path, kind: &str, mutation: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let before = snapshot_head(repo);
+    let r = mutation();
+    let after = snapshot_head(repo);
+    assert_eq!(before.head_oid, after.head_oid, "{kind}: git HEAD oid drifted");
+    assert_eq!(
+        before.head_sym, after.head_sym,
+        "{kind}: git HEAD symbolic target drifted"
+    );
+    assert_eq!(
+        before.at_change_id, after.at_change_id,
+        "{kind}: jj `@` change id drifted"
+    );
+    r
 }

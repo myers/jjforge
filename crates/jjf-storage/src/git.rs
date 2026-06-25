@@ -466,19 +466,16 @@ impl GitRepo {
         // (no `%` collisions, no shell metacharacters).
         let field_sep = "----JJF-V3-WALK-FIELD-c0ffee----";
         let record_sep = "----JJF-V3-WALK-REC-c0ffee----";
-        // %H: full commit hash. %an <%ae>: author "Name <email>". %aI:
-        // ISO-8601 strict author timestamp (RFC 3339). %B: raw subject
-        // + body (the commit message, including blank lines and any
-        // trailer block). We render the timestamp in the same shape
-        // the v2 history walker produces (`YYYY-MM-DDTHH:MM:SSZ`) by
-        // post-processing — `%aI` emits e.g. `2026-06-23T23:07:15-04:00`
-        // and we normalize via `chrono` if needed, but for the
-        // op-replay cross-check we only care about the trailer's
-        // `Jjf-At` (preferred) and the commit's relative ordering;
-        // the timestamp string is informational. We keep the raw
-        // `%aI` here and let the consumer normalize if it needs to.
+        // %H: full commit hash. %an <%ae>: author "Name <email>".
+        // `%ad` + `--date=format:...` lets us render the author date
+        // in our canonical `YYYY-MM-DDTHH:MM:SSZ` (UTC) shape — the
+        // same shape `history::read_history` produces from jj's
+        // `author.timestamp().utc()`. We force UTC by exporting
+        // `TZ=UTC` on the spawn so `--date=format:` doesn't smuggle
+        // a local-time offset back in. `%B`: raw subject + body
+        // (the commit message, including trailer block).
         let format = format!(
-            "%H%n{f}%n%an <%ae>%n{f}%n%aI%n{f}%n%B%n{r}",
+            "%H%n{f}%n%an <%ae>%n{f}%n%ad%n{f}%n%B%n{r}",
             f = field_sep,
             r = record_sep,
         );
@@ -489,12 +486,27 @@ impl GitRepo {
             return Ok(Vec::new());
         }
         let format_arg = format!("--format={}", format);
-        let raw = self.run(&[
-            "log",
-            "--reverse",
-            &format_arg,
-            ref_name,
-        ])?;
+        // We run a one-off command (not via `self.run`) so we can set
+        // `TZ=UTC` on the child without contaminating other git calls.
+        let out: Output = self
+            .cmd(&[
+                "log",
+                "--reverse",
+                "--date=format-local:%Y-%m-%dT%H:%M:%SZ",
+                &format_arg,
+                ref_name,
+            ])
+            .env("TZ", "UTC")
+            .output()
+            .map_err(GitError::Io)?;
+        if !out.status.success() {
+            return Err(GitError::Cli {
+                cmd: format!("git log --reverse {ref_name}"),
+                status: out.status.code(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+        let raw = String::from_utf8_lossy(&out.stdout).into_owned();
         let mut out = Vec::new();
         for record in raw.split(record_sep) {
             let record = record.trim_matches('\n');
