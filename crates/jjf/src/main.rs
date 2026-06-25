@@ -1569,6 +1569,17 @@ enum DepOp {
 fn run_init(json: bool) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     Storage::init(&cwd)?;
+
+    // Back-fill the v3 fetch refspec for every git remote already
+    // configured on this repo. If the user cloned first and is now
+    // running `jjf init`, the standard `+refs/heads/*:refs/remotes/.../*`
+    // refspec their `git clone` (or `jj git clone`) wrote does NOT
+    // carry `refs/jjf/*`. Add the jjforge namespace so subsequent
+    // `git fetch <remote>` round-trips it (ticket `eaf0674`).
+    if let Ok(canonical) = std::fs::canonicalize(&cwd) {
+        let _ = backfill_fetch_refspec_for_all_remotes(&canonical);
+    }
+
     if json {
         // We hand-build this object rather than using `serde_json::json!`
         // so the dep surface stays as narrow as possible — one tiny
@@ -2404,6 +2415,12 @@ fn render_dep_tree_text(node: &DepTreeNode, depth: usize) {
 ///
 /// Preflight is jj-repo-only (no `issues` bookmark required), because
 /// adding a remote is meaningful before `jjf init` runs.
+///
+/// After jj registers the remote we also add the v3 fetch refspec
+/// (`+refs/jjf/*:refs/remotes/<name>/jjf/*`) to `.git/config`. Without
+/// this, a plain `git fetch <name>` carries refs under `refs/heads/*`
+/// only and leaves the jjforge namespace empty on the new clone (see
+/// ticket `eaf0674`).
 fn run_remote_add(json: bool, name: String, url: String) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
@@ -2424,6 +2441,12 @@ fn run_remote_add(json: bool, name: String, url: String) -> Result<(), CliError>
         return Err(CliError::JjGitRemote(stderr.trim().to_owned()));
     }
 
+    // Best-effort: append the v3 fetch refspec. Failures here are not
+    // fatal (the remote IS added; the user can still `jjf pull` since
+    // that uses an explicit refspec), but they're worth surfacing as a
+    // hint.
+    let _ = ensure_jjf_fetch_refspec(&cwd, &name);
+
     if json {
         let out = serde_json::json!({
             "ok": true,
@@ -2433,6 +2456,78 @@ fn run_remote_add(json: bool, name: String, url: String) -> Result<(), CliError>
         println!("{out}");
     } else {
         println!("remote {name} added: {url}");
+    }
+    Ok(())
+}
+
+/// Iterate every git remote configured on `<cwd>` and call
+/// [`ensure_jjf_fetch_refspec`] for each. Best-effort — individual
+/// failures are logged-by-ignored; the caller (`jjf init`) doesn't
+/// want a stale refspec write to break init.
+fn backfill_fetch_refspec_for_all_remotes(cwd: &Path) -> std::io::Result<()> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["remote"])
+        .output()?;
+    if !out.status.success() {
+        return Ok(());
+    }
+    for name in String::from_utf8_lossy(&out.stdout).lines() {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let _ = ensure_jjf_fetch_refspec(cwd, name);
+    }
+    Ok(())
+}
+
+/// Ensure `+refs/jjf/*:refs/remotes/<remote>/jjf/*` is configured as a
+/// fetch refspec for `<remote>` in `<cwd>/.git/config`. Idempotent:
+/// re-runs are no-ops once the refspec is present.
+///
+/// Without this refspec, a plain `git fetch <remote>` only pulls
+/// `refs/heads/*`, so the jjforge `refs/jjf/*` namespace stays empty on
+/// a fresh clone — `jjf ls` then errors with "run jjf init first" even
+/// though the remote has every ref the local repo needs (ticket
+/// `eaf0674`). `jjf pull` itself uses an explicit refspec and works
+/// regardless, but downstream tooling (and curious users running raw
+/// git) expects fetch to carry the namespace.
+fn ensure_jjf_fetch_refspec(cwd: &Path, remote: &str) -> std::io::Result<()> {
+    let key = format!("remote.{}.fetch", remote);
+    let value = format!("+refs/jjf/*:refs/remotes/{}/jjf/*", remote);
+
+    // Check if this exact value is already present. `git config
+    // --get-all <key>` lists every value; bail if any equals our
+    // target.
+    let probe = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["config", "--get-all", &key])
+        .output()?;
+    if probe.status.success() {
+        let existing = String::from_utf8_lossy(&probe.stdout);
+        if existing.lines().any(|line| line.trim() == value) {
+            return Ok(());
+        }
+    }
+
+    // Append (don't replace). `git config --add` appends a new line to
+    // a multi-valued config key; the standard heads-only fetch refspec
+    // jj wrote at clone time stays in place.
+    let add = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["config", "--add", &key, &value])
+        .output()?;
+    if !add.status.success() {
+        return Err(std::io::Error::other(format!(
+            "git config --add {} {}: {}",
+            key,
+            value,
+            String::from_utf8_lossy(&add.stderr)
+        )));
     }
     Ok(())
 }
@@ -3433,6 +3528,14 @@ fn probe_pull_mode(cwd: &Path) -> PullMode {
 /// then per-ref five-scenario reconcile. Implementation in
 /// `jjf_storage::sync_v3`.
 fn run_pull_v3(json: bool, remote: &str, cwd: &Path) -> Result<(), CliError> {
+    // Lazy auto-config: a fresh clone may not have the jjforge fetch
+    // refspec wired up yet (the user skipped `jjf init` or added the
+    // remote outside `jjf remote add`). Pull is the first verb that
+    // actually wants the refspec, so plant it now if missing. Failures
+    // are tolerated — `sync_v3::pull_v3` uses an explicit refspec on
+    // the fetch CLI and will still work.
+    let _ = ensure_jjf_fetch_refspec(cwd, remote);
+
     match jjf_storage::pull_v3_bare(cwd, remote) {
         Ok(report) => {
             emit_pull_v3_success(json, remote, &report);

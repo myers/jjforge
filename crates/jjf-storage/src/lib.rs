@@ -3057,14 +3057,17 @@ impl Storage {
         Ok(())
     }
 
-    /// Push every `refs/jjf/*` ref to `remote` via standard git
-    /// transport (`git push <remote> 'refs/jjf/*:refs/jjf/*'`).
+    /// Push every issue and memory ref to `remote` via standard git
+    /// transport (`git push <remote> 'refs/jjf/issues/*:refs/jjf/issues/*'
+    /// 'refs/jjf/memories/*:refs/jjf/memories/*'`).
     ///
-    /// The push refspec covers `refs/jjf/issues/*`,
-    /// `refs/jjf/memories/*`, and `refs/jjf/meta/*` (the format-version
-    /// sentinel — idempotent to re-push; gives the remote a v3 marker
-    /// for replicas that pull from it later). Server-side config is
-    /// vanilla git — Forgejo / Gitea / GitLab / GitHub all accept this.
+    /// The push refspec deliberately excludes `refs/jjf/meta/*`. The
+    /// `format-version` sentinel is a per-clone presence flag; pushing
+    /// it would non-fast-forward whenever two peers each ran
+    /// `jjf init` (see ticket `95fb2d6` for the design call). The
+    /// remote acquires its sentinel from whoever ran `jjf init` against
+    /// it first. Server-side config is vanilla git — Forgejo / Gitea /
+    /// GitLab / GitHub all accept this.
     ///
     /// Returns a tally of refs submitted; the actual per-ref disposition
     /// (created / fast-forwarded / no-op) is opaque from this side.

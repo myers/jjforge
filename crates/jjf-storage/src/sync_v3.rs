@@ -43,9 +43,21 @@ use crate::{build_commit_message, now_rfc3339_nanos, Error, Memory, Result};
 /// We push and fetch every ref matching this prefix.
 const V3_REF_ROOT: &str = "refs/jjf/";
 
-/// Push refspec. Standard git transport — the wildcard covers issues,
-/// memories, and the format-version sentinel.
-const PUSH_REFSPEC: &str = "refs/jjf/*:refs/jjf/*";
+/// Push refspecs for the data refs (issues + memories). These are
+/// non-force: the per-ref CAS protocol guarantees fast-forward-only
+/// updates and we want a non-fast-forward to fail loud.
+const PUSH_REFSPEC_ISSUES: &str = "refs/jjf/issues/*:refs/jjf/issues/*";
+const PUSH_REFSPEC_MEMORIES: &str = "refs/jjf/memories/*:refs/jjf/memories/*";
+
+/// Push refspec for the `meta/*` sentinel namespace. **Force** (`+`
+/// prefix): every peer plants its own sentinel at `jjf init` time and
+/// the two are non-fast-forward against each other, but the sentinel
+/// is a presence flag whose content isn't validated (see ticket
+/// `95fb2d6` for the design call). Force-overwriting is safe: any peer
+/// that needs the sentinel acquires it from the next push, and the
+/// flag's only role is "this remote is v3-shape" — which any non-zero
+/// commit oid attests.
+const PUSH_REFSPEC_META: &str = "+refs/jjf/meta/*:refs/jjf/meta/*";
 
 /// Outcome of [`push_v3`]. Empty today; preserved for future per-ref
 /// reporting (e.g. count of refs pushed, refs rejected).
@@ -147,9 +159,20 @@ fn is_ancestor(git: &GitRepo, ancestor: &str, descendant: &str) -> Result<bool> 
     }))
 }
 
-/// Run `git push <remote> 'refs/jjf/*:refs/jjf/*'`. Counts the local
-/// refs at call time so the report carries a meaningful tally; the
-/// actual push is a single git invocation regardless of ref count.
+/// Run `git push <remote>` with three refspecs: non-force on
+/// `refs/jjf/issues/*` and `refs/jjf/memories/*`, force on
+/// `refs/jjf/meta/*`. Counts the local issue + memory refs at call
+/// time so the report carries a meaningful tally.
+///
+/// **Why force-push meta.** Every peer plants its own
+/// `refs/jjf/meta/format-version` at `jjf init` time, and those
+/// sentinels will be non-fast-forward against each other even though
+/// both sides represent v3. The sentinel is a presence flag — its
+/// content isn't validated by any reader (see ticket `95fb2d6` for the
+/// design call). Force-overwriting is therefore safe and matches the
+/// "either value is fine" semantics the pull-side merge driver now
+/// uses for meta divergence. Meta is excluded from `refs_pushed`
+/// because callers think of "refs pushed" as user data.
 ///
 /// Failures are translated to `Error::Git` with verbatim stderr; the
 /// CLI's typed push-error classifier runs on top.
@@ -157,26 +180,43 @@ pub(crate) fn push_v3(git: &GitRepo, remote: &str) -> Result<PushReportV3> {
     let local_refs = git
         .for_each_ref(V3_REF_ROOT)
         .map_err(Error::Git)?;
-    // The format-version sentinel counts as a local ref; we include it
-    // in `refs_pushed` because we DO push it (idempotent + makes the
-    // remote v3-detectable).
-    let refs_pushed = local_refs.len();
-    // No refs to push: skip the git call entirely. `git push` on an
-    // empty refspec match would emit "Everything up-to-date" or error
-    // depending on git version; explicit skip is cleaner.
-    if refs_pushed == 0 {
+    // Count only the data refs (issues + memories). The sentinel push
+    // is bookkeeping; we don't surface it in the tally.
+    let refs_pushed = local_refs
+        .iter()
+        .filter(|r| {
+            r.starts_with("refs/jjf/issues/") || r.starts_with("refs/jjf/memories/")
+        })
+        .count();
+    let has_meta = local_refs.iter().any(|r| r.starts_with("refs/jjf/meta/"));
+    // No refs to push at all (no data, no sentinel): skip the git call.
+    if refs_pushed == 0 && !has_meta {
         return Ok(PushReportV3 { refs_pushed: 0 });
     }
     // Direct shell-out because GitRepo::run wraps Command but doesn't
-    // expose a multi-arg-with-pipes helper. Standard `output()` is
-    // enough — the push is synchronous and we capture stderr.
+    // expose a multi-arg-with-pipes helper.
     let mut cmd = std::process::Command::new("git");
     cmd.arg("-C").arg(git.root());
-    cmd.args(["push", remote, PUSH_REFSPEC]);
+    cmd.args(["push", remote]);
+    cmd.arg(PUSH_REFSPEC_ISSUES);
+    cmd.arg(PUSH_REFSPEC_MEMORIES);
+    if has_meta {
+        cmd.arg(PUSH_REFSPEC_META);
+    }
     let out = cmd.output().map_err(|e| Error::Git(GitError::Io(e)))?;
     if !out.status.success() {
         return Err(Error::Git(GitError::Cli {
-            cmd: format!("git push {} {}", remote, PUSH_REFSPEC),
+            cmd: format!(
+                "git push {} {} {}{}",
+                remote,
+                PUSH_REFSPEC_ISSUES,
+                PUSH_REFSPEC_MEMORIES,
+                if has_meta {
+                    format!(" {}", PUSH_REFSPEC_META)
+                } else {
+                    String::new()
+                }
+            ),
             status: out.status.code(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         }));
@@ -218,7 +258,15 @@ pub(crate) fn pull_v3(git: &GitRepo, remote: &str) -> Result<PullReportV3> {
 /// `refs/remotes/<remote>/...` namespace, so later git commands (`log`,
 /// `merge-base`) treat them as normal remote-tracking branches.
 fn fetch_v3(git: &GitRepo, remote: &str) -> Result<()> {
-    let fetch_refspec = format!("refs/jjf/*:refs/remotes/{}/jjf/*", remote);
+    // Force-prefix (`+`) on the fetch refspec — the remote-tracking
+    // ref is local-only, so overwriting on non-fast-forward is safe;
+    // the per-ref reconciler in `pull_v3` then compares the new
+    // remote-tracking tip against the local data ref using the
+    // five-scenario classifier. Without the `+`, two peers each
+    // running `jjf init` (planting divergent `meta/format-version`
+    // commits) cause `git fetch` itself to reject — see ticket
+    // `0c0e7d8`.
+    let fetch_refspec = format!("+refs/jjf/*:refs/remotes/{}/jjf/*", remote);
     let mut cmd = std::process::Command::new("git");
     cmd.arg("-C").arg(git.root());
     cmd.args(["fetch", remote, &fetch_refspec]);
@@ -290,7 +338,13 @@ fn reconcile_one(
             let local_oid = local_tip
                 .expect("merge action requires both sides present");
             merge_diverged_ref(git, local_ref, stem, &local_oid, &remote_tip)?;
-            report.merged += 1;
+            // Meta refs (the `format-version` sentinel) take the no-op
+            // branch inside `merge_diverged_ref` — keep local, no merge
+            // commit lands. Don't count those as merges; the operator-
+            // facing tally should only reflect actual data-ref merges.
+            if !stem.starts_with("meta/") {
+                report.merged += 1;
+            }
         }
     }
     Ok(())
@@ -324,10 +378,20 @@ fn merge_diverged_ref(
         merge_memory_ref(git, key, local_oid, remote_oid)?;
         return Ok(());
     }
-    // Unknown / meta namespace. The format-version sentinel is the
-    // only meta ref we ship; if both sides have a sentinel but they're
-    // different commits, the safe thing is to refuse rather than land
-    // an undefined merge.
+    if stem.starts_with("meta/") {
+        // Meta refs (the `format-version` sentinel) are presence flags,
+        // not content-bearing — see `95fb2d6` for the design call. If
+        // both sides have a sentinel but they're different commits,
+        // either value is fine because the readers only check presence.
+        // Keep the local value; the operator is the side that ran
+        // `jjf init` locally, so their sentinel is what later writes on
+        // this clone will chain off.
+        let _ = (local_oid, remote_oid, local_ref);
+        return Ok(());
+    }
+    // Truly unknown namespace. We don't ship any other meta family
+    // today; if one appears here it's a forward-compat gap that should
+    // fail loud rather than land an undefined merge.
     Err(Error::Invalid(format!(
         "diverged ref {} not in a known v3 namespace (stem={}); refusing to merge",
         local_ref, stem

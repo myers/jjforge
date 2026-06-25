@@ -162,10 +162,13 @@ fn push_json_envelope_shape() {
         v["refs_pushed"].as_u64().is_some(),
         "push --json must carry refs_pushed; got: {stdout}"
     );
-    // At minimum, the sentinel + the one issue ref = 2 refs pushed.
+    // The one issue ref counts toward `refs_pushed`; the
+    // `meta/format-version` sentinel ref is force-pushed alongside but
+    // is not counted as a "data ref" (its content isn't validated;
+    // it's a presence flag — see ticket `95fb2d6`).
     assert!(
-        v["refs_pushed"].as_u64().unwrap() >= 2,
-        "expected >= 2 refs pushed, got {v}"
+        v["refs_pushed"].as_u64().unwrap() >= 1,
+        "expected >= 1 refs pushed, got {v}"
     );
 }
 
@@ -557,4 +560,284 @@ fn pull_clean_round_trip_is_fast_forwards_only() {
         ff >= 1,
         "expected at least one fast-forward for alice's update; got {v}"
     );
+}
+
+// ---------------------------------------------------------------
+// meta/* sentinel divergence cluster (tickets eaf0674 / 0c0e7d8 /
+// 8034dc1). Each peer plants its own sentinel at `jjf init` time;
+// pull must not error on the divergence and push must not exit 1 on
+// the resulting non-fast-forward against the remote sentinel.
+// ---------------------------------------------------------------
+
+/// Ticket `0c0e7d8` (F-002): `jjf pull` from a fresh clone that ran
+/// `jjf init` (which plants a fresh local sentinel) must return ok
+/// even when the remote's `refs/jjf/meta/format-version` resolves to
+/// a different commit than the local one. The pre-fix classifier
+/// routed `meta/*` divergence to the "refusing to merge" error path;
+/// after the fix it's a no-op (keep local).
+#[test]
+fn pull_meta_sentinel_divergence_is_noop_not_error() {
+    let root = setup("meta_divergence_pull", &["alice", "bob"]);
+    let alice = root.join("alice");
+    let bob = root.join("bob");
+
+    // Alice inits, creates an issue, pushes — remote now has a
+    // sentinel + one issue ref.
+    must_succeed(&run_jjf(&alice, &["init"]), "init (alice)");
+    let new_out = run_jjf(&alice, &["new", "-t", "alice's issue"]);
+    must_succeed(&new_out, "new (alice)");
+    let id = String::from_utf8_lossy(&new_out.stdout).trim().to_owned();
+    must_succeed(&run_jjf(&alice, &["push", "origin"]), "alice push");
+
+    // Bob runs `jjf init` on his fresh clone — this plants a LOCAL
+    // sentinel. To guarantee divergence with alice's sentinel in
+    // this test (otherwise wall-clock-coincident `git commit-tree`
+    // calls can produce identical OIDs), we then overwrite bob's
+    // sentinel with a hand-crafted commit that differs by message.
+    must_succeed(&run_jjf(&bob, &["init"]), "init (bob)");
+
+    // Build a divergent sentinel commit deterministically.
+    let blob_oid = {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&bob)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn hash-object");
+        use std::io::Write;
+        out.stdin
+            .as_ref()
+            .expect("stdin")
+            .write_all(b"version: 3\n")
+            .expect("write");
+        let o = out.wait_with_output().expect("hash-object wait");
+        must_succeed(&o, "hash-object");
+        String::from_utf8_lossy(&o.stdout).trim().to_owned()
+    };
+    let tree_oid = {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&bob)
+            .args(["mktree"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn mktree");
+        use std::io::Write;
+        out.stdin
+            .as_ref()
+            .expect("stdin")
+            .write_all(format!("100644 blob {blob_oid}\tversion\n").as_bytes())
+            .expect("write");
+        let o = out.wait_with_output().expect("mktree wait");
+        must_succeed(&o, "mktree");
+        String::from_utf8_lossy(&o.stdout).trim().to_owned()
+    };
+    let commit_oid = {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&bob)
+            .args(["commit-tree", &tree_oid, "-m", "bob's divergent sentinel"])
+            .env("GIT_AUTHOR_NAME", "bob")
+            .env("GIT_AUTHOR_EMAIL", "bob@example.com")
+            .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_NAME", "bob")
+            .env("GIT_COMMITTER_EMAIL", "bob@example.com")
+            .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
+            .output()
+            .expect("commit-tree");
+        must_succeed(&out, "commit-tree");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    let update = Command::new("git")
+        .arg("-C")
+        .arg(&bob)
+        .args(["update-ref", "refs/jjf/meta/format-version", &commit_oid])
+        .output()
+        .expect("update-ref");
+    must_succeed(&update, "update-ref bob sentinel");
+    let bob_local_oid = commit_oid;
+
+    // Now the pull. Pre-fix this exited 1 with "diverged ref ... not
+    // in a known v3 namespace; refusing to merge". Post-fix: exit 0.
+    let pull = run_jjf(&bob, &["pull", "origin"]);
+    must_succeed(&pull, "bob pull (diverged sentinel)");
+
+    // The data ref still landed: bob can show alice's issue.
+    let show = run_jjf(&bob, &["show", &id]);
+    must_succeed(&show, "bob show alice's issue");
+
+    // Local sentinel is preserved (we kept local on meta divergence).
+    let bob_local_after = Command::new("git")
+        .arg("-C")
+        .arg(&bob)
+        .args([
+            "rev-parse",
+            "--verify",
+            "refs/jjf/meta/format-version",
+        ])
+        .output()
+        .expect("git rev-parse bob local post-pull");
+    must_succeed(&bob_local_after, "git rev-parse bob local post-pull");
+    let bob_local_after_oid = String::from_utf8_lossy(&bob_local_after.stdout)
+        .trim()
+        .to_owned();
+    assert_eq!(
+        bob_local_oid, bob_local_after_oid,
+        "meta/* divergence should keep local sentinel unchanged"
+    );
+}
+
+/// Ticket `8034dc1` (F-003): `jjf push` from a fresh clone that ran
+/// `jjf init` must return ok even when the local sentinel is
+/// non-fast-forward against the remote sentinel. Pre-fix the push
+/// refspec was `refs/jjf/*:refs/jjf/*` (no force on meta/*) and the
+/// push exited 1 forever. Post-fix the meta refspec is `+`-prefixed
+/// (force) and data refs are non-force.
+#[test]
+fn push_meta_sentinel_non_fast_forward_succeeds_with_data() {
+    let root = setup("meta_divergence_push", &["alice", "bob"]);
+    let alice = root.join("alice");
+    let bob = root.join("bob");
+
+    must_succeed(&run_jjf(&alice, &["init"]), "init (alice)");
+    must_succeed(&run_jjf(&alice, &["new", "-t", "alice"]), "new (alice)");
+    must_succeed(&run_jjf(&alice, &["push", "origin"]), "alice push");
+
+    // Bob inits (fresh sentinel diverges from remote) and creates his
+    // own issue + memory locally.
+    must_succeed(&run_jjf(&bob, &["init"]), "init (bob)");
+    let new_out = run_jjf(&bob, &["new", "-t", "bob's issue"]);
+    must_succeed(&new_out, "new (bob)");
+    let bob_id = String::from_utf8_lossy(&new_out.stdout).trim().to_owned();
+    must_succeed(
+        &run_jjf(&bob, &["remember", "bob's note", "--key", "bob-note"]),
+        "bob remember",
+    );
+
+    // Push. Pre-fix this exited 1 with "non-fast-forward on
+    // refs/jjf/meta/format-version". Post-fix: exit 0.
+    let push = run_jjf(&bob, &["push", "origin"]);
+    must_succeed(&push, "bob push (diverged sentinel)");
+
+    // Alice pulls bob's push and can see both the issue and the
+    // memory.
+    must_succeed(&run_jjf(&alice, &["pull", "origin"]), "alice pull");
+    let show = run_jjf(&alice, &["show", &bob_id]);
+    must_succeed(&show, "alice show bob's issue");
+    let recall = run_jjf(&alice, &["recall", "bob-note"]);
+    must_succeed(&recall, "alice recall bob-note");
+    assert!(
+        String::from_utf8_lossy(&recall.stdout).contains("bob's note"),
+        "alice should see bob's memory after pull"
+    );
+
+    // A second push is also clean (no growing-state in the
+    // sentinel refspec — meta is force, idempotent).
+    let push2 = run_jjf(&bob, &["push", "origin"]);
+    must_succeed(&push2, "bob push #2");
+}
+
+/// Ticket `eaf0674` (F-001): after running `jjf init` on a freshly-
+/// cloned repo whose remote is already configured, the v3 fetch
+/// refspec gets written into `.git/config` so a plain `git fetch
+/// origin` carries `refs/jjf/*` into the local namespace. Without
+/// this, the operator must hand-write `git fetch origin
+/// 'refs/jjf/*:refs/jjf/*'` before `jjf ls` will work — the original
+/// papercut the ticket reports.
+#[test]
+fn init_writes_jjf_fetch_refspec_for_existing_remotes() {
+    let root = setup("init_writes_refspec", &["alice", "bob"]);
+    let alice = root.join("alice");
+    let bob = root.join("bob");
+
+    // Alice publishes some data so `git fetch origin` on bob actually
+    // has something to materialize.
+    must_succeed(&run_jjf(&alice, &["init"]), "init (alice)");
+    let new_out = run_jjf(&alice, &["new", "-t", "from alice"]);
+    must_succeed(&new_out, "new (alice)");
+    let id = String::from_utf8_lossy(&new_out.stdout).trim().to_owned();
+    must_succeed(&run_jjf(&alice, &["push", "origin"]), "alice push");
+
+    // Sanity: bob's fresh clone has the standard heads-only refspec
+    // and no jjf refspec.
+    let pre = Command::new("git")
+        .arg("-C")
+        .arg(&bob)
+        .args(["config", "--get-all", "remote.origin.fetch"])
+        .output()
+        .expect("git config probe");
+    let pre_text = String::from_utf8_lossy(&pre.stdout);
+    assert!(
+        !pre_text.contains("refs/jjf/*"),
+        "precondition: bob's clone should not have a jjforge fetch refspec yet; got:\n{pre_text}"
+    );
+
+    // `jjf init` should plant the refspec.
+    must_succeed(&run_jjf(&bob, &["init"]), "init (bob)");
+    let post = Command::new("git")
+        .arg("-C")
+        .arg(&bob)
+        .args(["config", "--get-all", "remote.origin.fetch"])
+        .output()
+        .expect("git config probe post-init");
+    let post_text = String::from_utf8_lossy(&post.stdout);
+    assert!(
+        post_text
+            .lines()
+            .any(|l| l.trim() == "+refs/jjf/*:refs/remotes/origin/jjf/*"),
+        "init should have planted the jjforge fetch refspec; got:\n{post_text}"
+    );
+
+    // Re-running `jjf init` is idempotent: the refspec is not
+    // duplicated.
+    must_succeed(&run_jjf(&bob, &["init"]), "init (bob) #2");
+    let after = Command::new("git")
+        .arg("-C")
+        .arg(&bob)
+        .args(["config", "--get-all", "remote.origin.fetch"])
+        .output()
+        .expect("git config probe after second init");
+    let after_text = String::from_utf8_lossy(&after.stdout);
+    let count = after_text
+        .lines()
+        .filter(|l| l.trim() == "+refs/jjf/*:refs/remotes/origin/jjf/*")
+        .count();
+    assert_eq!(
+        count, 1,
+        "second init must not duplicate the refspec; got:\n{after_text}"
+    );
+
+    // End-to-end: a plain `git fetch origin` on bob now materializes
+    // `refs/jjf/*` into the local namespace, which is the actual
+    // user-facing behavior the ticket cares about.
+    let fetch = Command::new("git")
+        .arg("-C")
+        .arg(&bob)
+        .args(["fetch", "origin"])
+        .output()
+        .expect("git fetch origin");
+    must_succeed(&fetch, "plain git fetch origin");
+    let issues_refs = Command::new("git")
+        .arg("-C")
+        .arg(&bob)
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/remotes/origin/jjf/issues/",
+        ])
+        .output()
+        .expect("git for-each-ref");
+    let s = String::from_utf8_lossy(&issues_refs.stdout);
+    assert!(
+        !s.trim().is_empty(),
+        "plain git fetch should have brought alice's issue ref under refs/remotes/origin/jjf/issues/; got:\n{s}"
+    );
+    // And `jjf show` finds alice's issue without any extra fetch.
+    let pull = run_jjf(&bob, &["pull", "origin"]);
+    must_succeed(&pull, "bob pull");
+    let show = run_jjf(&bob, &["show", &id]);
+    must_succeed(&show, "bob show alice's issue");
 }
