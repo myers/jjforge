@@ -3215,51 +3215,97 @@ fn slug_matches(issue: &Issue, pattern: Option<&str>) -> bool {
     }
 }
 
-/// `jjf push <remote>` — shell out to `jj git push --bookmark issues
-/// --remote <remote>` and translate known failure modes to typed
-/// errors.
+/// `jjf push <remote>` — push every `refs/jjf/*` ref to `<remote>` via
+/// standard git transport.
 ///
-/// jj's stderr for the relevant cases (observed against jj 0.40):
-/// - unknown remote: `Error: No git remote named '<name>'`.
-/// - network unreachable: contains "could not resolve" /
-///   "Connection refused" / "Failed to connect" / "No such device or
-///   address".
-/// - auth: contains "authentication" / "access denied" / "permission
-///   denied" / "could not read Username" / "401".
-/// - non-fast-forward / hook rejection: contains "Refusing to push" /
-///   "rejected" / "non-fast-forward".
+/// The v3 refspec is `refs/jjf/*:refs/jjf/*`, covering issues, memories,
+/// and the format-version sentinel. Server-side config is vanilla git —
+/// Forgejo / Gitea / GitLab / GitHub all accept this; no special
+/// permissions or hooks needed beyond push access to the repo.
 ///
-/// Anything else falls through to `jj_git_push_error` with jj's
-/// stderr verbatim in the message so the operator can diagnose.
+/// stderr classification mirrors `run_pull`: unknown remote / network
+/// unreachable / auth / non-fast-forward / catch-all. The patterns
+/// match libgit2's stable phrases so a stderr-format tweak on either
+/// side stays detectable.
 ///
-/// Preflight: full `issues_bookmark` probe — the bookmark must exist
-/// locally for there to be anything to push.
+/// **V2 fallback.** If the repo is still v2-shape (env-var opt-out of
+/// the migrator set in tests), this verb falls back to
+/// `jj git push --bookmark issues` — the v2 transport. Operators don't
+/// hit this in production; the migrator runs on every `Storage::open`
+/// and brings v2 repos forward.
+///
+/// Preflight: full `issues_bookmark` probe — either the v3 sentinel ref
+/// or the v2 bookmark must exist locally for there to be anything to
+/// push.
 fn run_push(json: bool, remote: String) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
     // Refuse to run from the jjforge source repo (colocate drift guard).
-    // Push doesn't directly drive the 4-CLI dance, but it's grouped
-    // with the other mutating verbs for consistency and because a
-    // future jj release could move `@` during push (jj has changed
-    // working-copy-touching semantics across versions before).
+    // Even v3 (where mutators are pure-git) keeps the guard for symmetry
+    // with the other mutating verbs; ticket 8 removes it.
     preflight::refuse_self_hosted_write(&cwd, json)?;
     preflight::issues_bookmark(&cwd)?;
 
+    // Storage::open detects v3 vs v2 from the sentinel ref. If the
+    // env-var opt-out is set (tests only), the migrator skips and we
+    // may land on V2 — fall back to the legacy `jj git push` path.
+    let storage = Storage::open(&cwd).map_err(CliError::Storage)?;
+    if storage.is_v3() {
+        return run_push_v3(json, &remote, &storage);
+    }
+    run_push_v2_legacy(json, &remote, &cwd)
+}
+
+/// v3 push — delegate to the storage layer, classify failures.
+fn run_push_v3(
+    json: bool,
+    remote: &str,
+    storage: &Storage,
+) -> Result<(), CliError> {
+    match storage.push_v3(remote) {
+        Ok(report) => {
+            if json {
+                let out = serde_json::json!({
+                    "ok": true,
+                    "remote": remote,
+                    "refs_pushed": report.refs_pushed,
+                });
+                println!("{out}");
+            } else {
+                println!(
+                    "pushed {} refs/jjf/* ref(s) -> {remote}",
+                    report.refs_pushed
+                );
+            }
+            Ok(())
+        }
+        Err(e) => Err(classify_storage_push_error(remote, e)),
+    }
+}
+
+/// v2 push — legacy `jj git push --bookmark issues --remote <remote>`.
+/// Only reachable when the V2→V3 migrator was disabled via env var (in
+/// the integration test suite). Kept until ticket 7 prunes the v2
+/// surface.
+fn run_push_v2_legacy(
+    json: bool,
+    remote: &str,
+    cwd: &Path,
+) -> Result<(), CliError> {
     let out = std::process::Command::new("jj")
         .arg("--repository")
-        .arg(&cwd)
-        .args(["git", "push", "--bookmark", "issues", "--remote", &remote])
+        .arg(cwd)
+        .args(["git", "push", "--bookmark", "issues", "--remote", remote])
         .output()
         .map_err(CliError::Probe)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        return Err(classify_push_error(&remote, stderr));
+        return Err(classify_push_error(remote, stderr));
     }
-
     if json {
         let out = serde_json::json!({
             "ok": true,
-            "remote": &remote,
+            "remote": remote,
             "bookmark": jjf_storage::ISSUES_BOOKMARK,
         });
         println!("{out}");
@@ -3269,13 +3315,43 @@ fn run_push(json: bool, remote: String) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Translate a storage-layer push failure into the typed CLI error
+/// kinds, by sniffing the embedded stderr. Mirrors
+/// [`classify_push_error`] (the v2 path's classifier); the substring
+/// matchers are the same since both code paths shell out to git
+/// transport ultimately.
+fn classify_storage_push_error(remote: &str, e: StorageError) -> CliError {
+    // Only `Error::Git` carries stderr we can classify; anything else
+    // falls through to the generic storage envelope.
+    let stderr = match &e {
+        StorageError::Git(g) => format!("{}", g),
+        _ => return CliError::Storage(e),
+    };
+    let parsed = classify_push_error(remote, stderr);
+    // If the classifier didn't match anything specific, keep the
+    // typed storage error so the envelope carries the storage::Error
+    // shape rather than a flattened string.
+    if matches!(parsed, CliError::JjGitPush(_)) {
+        return CliError::Storage(e);
+    }
+    parsed
+}
+
 /// Map jj-git-push stderr to a typed `CliError`. Keeps the
 /// substring-matching out of `run_push` proper so the dispatch logic
 /// stays scannable and so the matcher can be unit-tested directly.
 fn classify_push_error(remote: &str, stderr: String) -> CliError {
-    // Unknown remote — jj's canonical phrase. The `remote rm` verb's
-    // mapper uses the same phrase; we reuse the kind.
-    if stderr.contains("No git remote named") {
+    // Unknown remote — jj's canonical phrase ("No git remote named ..."),
+    // git's canonical phrase ("does not appear to be a git repository",
+    // "Could not read from remote repository", "remote ... not found"),
+    // any of which means the same thing operationally. The `remote rm`
+    // verb's mapper uses the jj phrase; we reuse the kind across the
+    // v2 / v3 transport split.
+    if stderr.contains("No git remote named")
+        || stderr.contains("does not appear to be a git repository")
+        || stderr.contains("Could not read from remote repository")
+        || stderr.contains("Repository not found")
+    {
         return CliError::RemoteNotFound(remote.to_owned());
     }
     // Authentication. jj surfaces git2's libcurl/libgit2 errors here;
@@ -3321,61 +3397,231 @@ fn classify_push_error(remote: &str, stderr: String) -> CliError {
     CliError::JjGitPush(stderr.trim().to_owned())
 }
 
-/// `jjf pull <remote>` — fetch the remote, track the `issues@<remote>`
-/// bookmark if needed, then resolve any divergence in op-space.
+/// `jjf pull <remote>` — fetch every `refs/jjf/*` from `<remote>` into
+/// the standard remote-tracking namespace
+/// (`refs/remotes/<remote>/jjf/*`), then reconcile each remote-tracking
+/// ref against its local `refs/jjf/<rest>` counterpart using the
+/// five-scenario merge algorithm.
 ///
-/// See the verb's doc-comment on `Commands::Pull` for the high-level
-/// flow. This function is the orchestrator; it shells out to `jj`
-/// directly (mirroring `run_push` / `run_remote_*`) and calls the
-/// storage layer's `resolve_divergence` + `record_merge_op_space`
-/// primitives for the merge pass.
+/// Five-scenario merge (per ref):
+/// 1. New (remote-only) → copy remote tip into local ref.
+/// 2. Identical → no-op.
+/// 3. Local ahead (remote is ancestor) → no-op.
+/// 4. Fast-forward → advance local ref to remote tip.
+/// 5. Diverged → land a 2-parent merge commit on the local ref whose
+///    tree carries the LWW-resolved record + comments and whose message
+///    has a `Jjf-Op: merge` trailer.
 ///
-/// As of `bfc732b` (sync-conflict-fallback), this verb no longer uses
-/// the v1 file-bytes merge driver (`jjf_merge::resolve`). The op-space
-/// resolver replays each head's op chain field-by-field per spec §6's
-/// LWW ordering tuple, then re-renders the merged file as a
-/// deterministic projection of the op stream. There is no human-surface
-/// "unmergeable" failure mode in this path — every divergence resolves.
-/// The `Unmergeable` / `CommentFileConflict` error kinds stay wired
-/// (they're reachable from external callers of `jjf_merge::resolve` and
-/// from the storage layer) but cannot arise from this v2 operator pull.
+/// **No content-level "unmergeable" failure mode.** The DAG IS the
+/// merge; the op-space LWW reducer always produces a valid resolved
+/// state. The legacy `Unmergeable` / `CommentFileConflict` error kinds
+/// stay wired for external callers but cannot arise from this verb in
+/// v3 mode.
+///
+/// stderr classification (auth / network / unknown remote / catch-all)
+/// mirrors the v2 path's `classify_fetch_error`.
+///
+/// **V2 fallback.** If the local repo is v2-shape (env-var opt-out of
+/// the migrator in tests), the verb falls back to the legacy pull flow
+/// (jj-git-fetch + op-space resolve + 4-CLI merge commit on the
+/// bookmark). Operators don't hit this in production.
 fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
-    // `pull` uses the jj-repo-only preflight: a fresh clone has
-    // `issues@<remote>` but no local `issues` yet, and `pull` is
-    // precisely the verb that materializes the local bookmark via
-    // `jj bookmark track`. Requiring the bookmark up front would
-    // force an awkward `jjf init` on a clone that already has the
-    // bookmark server-side. `push`, by contrast, requires the local
-    // bookmark (there's nothing to push without it).
+    // `pull` uses the jj-repo-only preflight: a fresh clone has no
+    // v3 sentinel ref and no v2 `issues` bookmark; `pull` is precisely
+    // the verb that materializes them. Requiring the sentinel up front
+    // would force an awkward `jjf init` on a clone whose remote already
+    // has all the v3 refs we want to fetch.
     //
     // Refuse to run from the jjforge source repo (colocate drift guard).
-    // Pull can land a merge commit via the 4-CLI dance on divergence;
-    // that path absolutely drifts `@` in a colocated repo.
+    // The v3 pull path is pure git ref ops (no `@` motion), so this is
+    // looser-than-needed in v3 — but kept for symmetry with the other
+    // mutating verbs. Ticket 8 removes it.
     preflight::refuse_self_hosted_write(&cwd, json)?;
     preflight::jj_repo(&cwd)?;
 
-    // 1. Fetch. Map known failures the same way push does.
+    // Mode dispatch is best-effort: open Storage, and if it opens
+    // cleanly (either v3 by sentinel, or v2 by bookmark), use the
+    // matching path. If `Storage::open` fails with `MissingIssuesBookmark`
+    // (a brand-new clone that's never seen issues data — neither v2
+    // bookmark nor v3 sentinel locally), assume v3 and route through
+    // the bare git fetch. The post-fetch state will have the sentinel
+    // landed locally, so subsequent `Storage::open` calls succeed
+    // without further ceremony.
+    let mode = probe_pull_mode(&cwd);
+    match mode {
+        PullMode::V3 | PullMode::V3Bootstrap => {
+            run_pull_v3(json, &remote, &cwd)
+        }
+        PullMode::V2 => run_pull_v2_legacy(json, &remote, &cwd),
+    }
+}
+
+/// What the `pull` verb learns about the local repo before deciding
+/// which transport to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PullMode {
+    /// Local repo already has the v3 sentinel ref → v3 transport.
+    V3,
+    /// Local repo has neither v3 sentinel nor v2 bookmark → assume v3
+    /// (post-fetch, the sentinel will land via the wildcard refspec).
+    V3Bootstrap,
+    /// Local repo is v2-shape (env-var opt-out only; production never
+    /// hits this).
+    V2,
+}
+
+/// Detect which pull transport to use. The probe runs without opening
+/// Storage so we don't crash on the `MissingIssuesBookmark` path the
+/// fresh-clone case would otherwise hit.
+fn probe_pull_mode(cwd: &Path) -> PullMode {
+    // V3 sentinel?
+    let sentinel = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/jjf/meta/format-version",
+        ])
+        .output();
+    if let Ok(o) = sentinel {
+        if o.status.success() {
+            return PullMode::V3;
+        }
+    }
+    // V2 bookmark?
+    let bm = std::process::Command::new("jj")
+        .arg("--repository")
+        .arg(cwd)
+        .args(["bookmark", "list", "-T", "name ++ \"\\n\"", "issues"])
+        .output();
+    if let Ok(o) = bm {
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        if stdout.lines().any(|l| l.trim() == "issues") {
+            return PullMode::V2;
+        }
+    }
+    // Neither — bootstrap as v3.
+    PullMode::V3Bootstrap
+}
+
+/// v3 pull — bare git fetch into the standard remote-tracking namespace,
+/// then per-ref five-scenario reconcile. Implementation in
+/// `jjf_storage::sync_v3`.
+fn run_pull_v3(json: bool, remote: &str, cwd: &Path) -> Result<(), CliError> {
+    match jjf_storage::pull_v3_bare(cwd, remote) {
+        Ok(report) => {
+            emit_pull_v3_success(json, remote, &report);
+            Ok(())
+        }
+        Err(e) => Err(classify_storage_pull_error(remote, e)),
+    }
+}
+
+/// Translate a storage-layer pull failure into typed CLI errors by
+/// sniffing the embedded stderr. Same matchers as `classify_fetch_error`
+/// since both paths shell to git transport.
+fn classify_storage_pull_error(remote: &str, e: StorageError) -> CliError {
+    let stderr = match &e {
+        StorageError::Git(g) => format!("{}", g),
+        _ => return CliError::Storage(e),
+    };
+    let parsed = classify_fetch_error(remote, stderr);
+    if matches!(parsed, CliError::JjGitFetch(_)) {
+        return CliError::Storage(e);
+    }
+    parsed
+}
+
+/// Emit the success envelope for a v3 pull. JSON shape carries the full
+/// per-scenario tally; the plain-text shape summarizes.
+fn emit_pull_v3_success(
+    json: bool,
+    remote: &str,
+    report: &jjf_storage::PullReportV3,
+) {
+    let total_refs = report.new_local
+        + report.identical
+        + report.local_ahead
+        + report.fast_forwards
+        + report.merged;
+    let remote_present = total_refs > 0;
+    if json {
+        let mut obj = serde_json::Map::new();
+        obj.insert("ok".into(), serde_json::Value::Bool(true));
+        obj.insert("remote".into(), serde_json::Value::String(remote.to_owned()));
+        // Keep the legacy `bookmark` key out of the v3 envelope — the
+        // v3 shape is per-ref, not bookmark-shaped. Tests for the v3
+        // path key off `refs_pushed` / `merged` etc.
+        obj.insert(
+            "remote_present".into(),
+            serde_json::Value::Bool(remote_present),
+        );
+        obj.insert(
+            "merge_strategy".into(),
+            serde_json::Value::String("per_ref_lww".into()),
+        );
+        obj.insert(
+            "new_local".into(),
+            serde_json::Value::from(report.new_local),
+        );
+        obj.insert(
+            "identical".into(),
+            serde_json::Value::from(report.identical),
+        );
+        obj.insert(
+            "local_ahead".into(),
+            serde_json::Value::from(report.local_ahead),
+        );
+        obj.insert(
+            "fast_forwards".into(),
+            serde_json::Value::from(report.fast_forwards),
+        );
+        obj.insert("merged".into(), serde_json::Value::from(report.merged));
+        // Compat alias: v2's `resolved_issues` was the number of issue
+        // refs that needed a merge. The v3 equivalent is `merged`; we
+        // surface both names so existing parsers don't break.
+        obj.insert(
+            "resolved_issues".into(),
+            serde_json::Value::from(report.merged),
+        );
+        let envelope = serde_json::Value::Object(obj);
+        println!("{envelope}");
+    } else if !remote_present {
+        println!("pulled {remote}: no jjf refs on remote yet");
+    } else if report.merged == 0 {
+        println!("pulled {} refs/jjf/* ref(s) <- {remote}", total_refs);
+    } else {
+        println!(
+            "pulled {} refs/jjf/* ref(s) <- {remote}; merged {} ref(s)",
+            total_refs, report.merged
+        );
+    }
+}
+
+/// v2 legacy pull — the old jj-bookmark-transport path. Only reachable
+/// when the V2→V3 migrator was disabled via env var (in the integration
+/// test suite). Kept until ticket 7 prunes the v2 surface.
+fn run_pull_v2_legacy(json: bool, remote: &str, cwd: &Path) -> Result<(), CliError> {
+    // 1. Fetch.
     let out = std::process::Command::new("jj")
         .arg("--repository")
-        .arg(&cwd)
-        .args(["git", "fetch", "--remote", &remote])
+        .arg(cwd)
+        .args(["git", "fetch", "--remote", remote])
         .output()
         .map_err(CliError::Probe)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        return Err(classify_fetch_error(&remote, stderr));
+        return Err(classify_fetch_error(remote, stderr));
     }
 
-    // 2. Probe for remote-bookmark presence. `jj bookmark list
-    // --all-remotes -T 'name ++ "@" ++ remote ++ "\n"' issues` lists
-    // one line per (local + each remote) view of the bookmark. If
-    // `issues@<remote>` is absent, the other side hasn't pushed yet —
-    // not an error.
+    // 2. Probe for remote-bookmark presence.
     let bm_out = std::process::Command::new("jj")
         .arg("--repository")
-        .arg(&cwd)
+        .arg(cwd)
         .args([
             "bookmark",
             "list",
@@ -3397,26 +3643,14 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
     let remote_present = bm_text.lines().any(|l| l.trim() == remote_marker);
 
     if !remote_present {
-        // No remote bookmark — fetch landed nothing for us. Exit 0;
-        // tests pin this case so callers can distinguish "first push
-        // hasn't happened" from network failure (also exit 0 would
-        // mask) by inspecting `remote_present` in the JSON envelope.
-        emit_pull_success(json, &remote, false, 0);
+        emit_pull_success(json, remote, false, 0);
         return Ok(());
     }
 
-    // 3. Track-if-absent. The first fetch on a fresh clone leaves
-    // `issues@<remote>` untracked; subsequent fetches see the bookmark
-    // as new remote bookmarks every time. We want it tracked so a
-    // divergent edit shows up as the conflicted-bookmark state we're
-    // here to resolve. `jj bookmark track` is idempotent in spirit —
-    // it returns success-ish when already tracked, but its stderr
-    // when "already tracked" is harmless; we treat any non-success
-    // that mentions "already tracked" as success and surface
-    // everything else as a generic probe error.
+    // 3. Track-if-absent.
     let track_out = std::process::Command::new("jj")
         .arg("--repository")
-        .arg(&cwd)
+        .arg(cwd)
         .args(["bookmark", "track", &remote_marker])
         .output()
         .map_err(CliError::Probe)?;
@@ -3431,36 +3665,18 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
         }
     }
 
-    // 4. Probe for divergence. `heads(bookmarks(issues))` returns one
-    // change per head; >1 means the bookmark is in the "conflicted"
-    // state our investigation in `experiments/sync-remote/` documented.
-    let storage = Storage::open(&cwd)?;
+    // 4. Probe for divergence.
+    let storage = Storage::open(cwd)?;
     let heads = storage.issues_heads()?;
     if heads.len() < 2 {
-        // Clean fetch — either nothing changed remotely (fast-forward
-        // already done) or there was no local divergence to resolve.
-        emit_pull_success(json, &remote, true, 0);
+        emit_pull_success(json, remote, true, 0);
         return Ok(());
     }
 
-    // 5. Op-space resolution. Walk each head's op chain per issue,
-    // reduce field-by-field per spec §6's LWW ordering tuple, and
-    // render the merged record + comments. No probe-merge commit is
-    // needed: the op-space driver reads pristine bytes from each head
-    // via `jj file show -r <head>` (see `crates/jjf-storage/src/
-    // merge_ops.rs`) and never touches the working copy with conflict
-    // markers. Body bytes come from whichever head's rendered file
-    // matches the winning `SetBody` op's `body_hash` (the §5.2
-    // body-hash join).
+    // 5. Op-space resolution.
     let report = storage.resolve_divergence()?;
 
     if report.issues.is_empty() {
-        // issues_heads said >=2 heads but no head touched any issue
-        // file we recognized. Defensive: in v1 storage every head
-        // exists because of an issue-mutating commit, so this branch
-        // is mostly unreachable. We still need to pin the bookmark so
-        // it stops being conflicted. Mirror the old clean-merge dance:
-        // jj-new across the heads, set the bookmark, step off.
         let merge_args = {
             let mut v: Vec<&str> = vec!["new"];
             for h in &heads {
@@ -3472,7 +3688,7 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
         };
         let merge_out = std::process::Command::new("jj")
             .arg("--repository")
-            .arg(&cwd)
+            .arg(cwd)
             .args(&merge_args)
             .output()
             .map_err(CliError::Probe)?;
@@ -3484,15 +3700,8 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
         }
         let bm_set = std::process::Command::new("jj")
             .arg("--repository")
-            .arg(&cwd)
-            .args([
-                "bookmark",
-                "set",
-                "issues",
-                "-r",
-                "@",
-                "--allow-backwards",
-            ])
+            .arg(cwd)
+            .args(["bookmark", "set", "issues", "-r", "@", "--allow-backwards"])
             .output()
             .map_err(CliError::Probe)?;
         if !bm_set.status.success() {
@@ -3503,7 +3712,7 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
         }
         let step = std::process::Command::new("jj")
             .arg("--repository")
-            .arg(&cwd)
+            .arg(cwd)
             .args(["new", "root()"])
             .output()
             .map_err(CliError::Probe)?;
@@ -3513,17 +3722,13 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
                 String::from_utf8_lossy(&step.stderr)
             ))));
         }
-        emit_pull_success(json, &remote, true, 0);
+        emit_pull_success(json, remote, true, 0);
         return Ok(());
     }
 
-    // Non-empty report: land the multi-parent merge commit with one
-    // `Jjf-Op: merge` trailer per resolved issue (spec §5.7) and write
-    // the merged record + comments files. The storage primitive owns
-    // the 4-CLI dance.
     let count = report.issues.len();
     storage.record_merge_op_space(&heads, &report)?;
-    emit_pull_success(json, &remote, true, count);
+    emit_pull_success(json, remote, true, count);
     Ok(())
 }
 
@@ -3538,6 +3743,9 @@ fn classify_fetch_error(remote: &str, stderr: String) -> CliError {
     // accept either canonical wording.
     if stderr.contains("No git remote named")
         || stderr.contains("No matching remotes for names")
+        || stderr.contains("does not appear to be a git repository")
+        || stderr.contains("Could not read from remote repository")
+        || stderr.contains("Repository not found")
     {
         return CliError::RemoteNotFound(remote.to_owned());
     }

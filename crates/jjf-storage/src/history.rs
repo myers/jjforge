@@ -94,8 +94,20 @@ pub(crate) fn read_history_at_v3(
     id: &IssueId,
 ) -> Result<Vec<HistoryEntry>> {
     let ref_name = v3_write::refs::issue_ref(id);
+    read_history_at_v3_rev(git, &ref_name, id)
+}
+
+/// Walk the per-issue op chain rooted at an arbitrary revision (commit
+/// oid or ref name). The pull-merge driver uses this with each parent's
+/// commit oid so it can reduce both sides' ops without re-pointing the
+/// local ref first. Same contract as [`read_history_at_v3`] otherwise.
+pub(crate) fn read_history_at_v3_rev(
+    git: &GitRepo,
+    rev: &str,
+    id: &IssueId,
+) -> Result<Vec<HistoryEntry>> {
     let walked = git
-        .walk_commits(&ref_name)
+        .walk_commits(rev)
         .map_err(Error::Git)?;
 
     if walked.is_empty() {

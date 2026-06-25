@@ -94,7 +94,7 @@ fn translate(e: crate::git::GitError) -> Error {
 /// tree. For issues that ever had a comment we still write the file
 /// (the writer might be removing the only comment); the caller passes
 /// `Some(vec![])` to force the file.
-fn build_issue_tree(
+pub(crate) fn build_issue_tree(
     repo: &GitRepo,
     record: &IssueRecord,
     comments: Option<&[Comment]>,
@@ -240,6 +240,104 @@ pub(crate) fn read_record_v3(
         ))
     })?;
     Ok(serde_json::from_str(&text)?)
+}
+
+/// Read `issue.json` from an arbitrary commit's tree (typically one of
+/// the two parents of a pending merge). Returns `Ok(None)` if the file
+/// is absent at that commit. Used by the pull-merge driver in
+/// [`crate::sync_v3`] to fetch each parent's snapshot before reducing.
+pub(crate) fn read_record_at_oid_v3(
+    repo: &GitRepo,
+    oid: &str,
+) -> Result<Option<IssueRecord>> {
+    let blob = repo
+        .cat_blob(oid, ISSUE_JSON_FILE)
+        .map_err(translate)?;
+    let Some(b) = blob else { return Ok(None) };
+    let text = String::from_utf8(b).map_err(|e| {
+        Error::Invalid(format!(
+            "issue.json on {} was not valid UTF-8: {e}",
+            oid
+        ))
+    })?;
+    Ok(Some(serde_json::from_str(&text)?))
+}
+
+/// Read `comments.jsonl` from an arbitrary commit's tree. Returns an
+/// empty vec if the file is absent (an issue with no comments at that
+/// revision). Companion to [`read_record_at_oid_v3`].
+pub(crate) fn read_comments_at_oid_v3(
+    repo: &GitRepo,
+    oid: &str,
+) -> Result<Vec<Comment>> {
+    let blob = match repo.cat_blob(oid, COMMENTS_JSONL_FILE).map_err(translate)? {
+        Some(b) => b,
+        None => return Ok(Vec::new()),
+    };
+    let text = String::from_utf8(blob).map_err(|e| {
+        Error::Invalid(format!(
+            "comments.jsonl on {} was not valid UTF-8: {e}",
+            oid
+        ))
+    })?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        out.push(serde_json::from_str(line)?);
+    }
+    Ok(out)
+}
+
+/// Build a multi-parent merge commit on a v3 issue ref carrying the
+/// LWW-resolved record + comments in its tree and a `Jjf-Op: merge`
+/// trailer in its message. CAS-updates `refs/jjf/issues/<id>` to point
+/// at the new commit. Used by the pull-merge driver in
+/// [`crate::sync_v3`] for the "diverged" scenario.
+///
+/// `parents` is the list of parent oids (typically `[local_tip,
+/// remote_tip]` — two-parent — but the helper supports n-parent in case
+/// a future caller wants multi-way merges). `record` and `comments`
+/// MUST be the post-reduce LWW state, not either parent's individual
+/// state — the read path's `cat_blob(<ref>, "issue.json")` reads the
+/// tip's tree, so the merge commit's tree IS the resolved snapshot.
+///
+/// `expected_old` is the CAS sentinel — the current local-tip oid.
+/// Concurrent writers landing between our read and our update-ref get
+/// translated to [`Error::ConcurrentWrite`] by the standard `translate`
+/// helper.
+pub(crate) fn commit_merge_v3(
+    repo: &GitRepo,
+    id: &IssueId,
+    record: &IssueRecord,
+    comments: &[Comment],
+    parents: &[&str],
+    message: &str,
+    expected_old: &str,
+) -> Result<String> {
+    let ref_name = refs::issue_ref(id);
+    // For a merge the tree is the resolved snapshot. We always carry a
+    // comments file (even if empty) so the merge commit looks
+    // consistent on a `cat-file blob` of `comments.jsonl`: the file
+    // either contains the unioned set or is empty. Passing `Some(&[])`
+    // would force an empty file in the tree; we prefer the more
+    // permissive "omit when empty" rule the writer already uses (no
+    // phantom blob), so we project `Some(cs)` when non-empty and
+    // `None` otherwise.
+    let comments_arg: Option<&[Comment]> = if comments.is_empty() {
+        None
+    } else {
+        Some(comments)
+    };
+    let tree_oid = build_issue_tree(repo, record, comments_arg)?;
+    let new_commit = repo
+        .commit_tree(&tree_oid, parents, message)
+        .map_err(translate)?;
+    repo.update_ref(&ref_name, &new_commit, expected_old)
+        .map_err(translate)?;
+    Ok(new_commit)
 }
 
 /// Read the current `comments.jsonl` blob from a v3 issue ref.

@@ -71,6 +71,7 @@ mod migrate_v2_v3;
 mod op;
 mod read;
 mod record;
+mod sync_v3;
 mod trailer;
 mod v3_write;
 
@@ -83,6 +84,41 @@ pub use jj::JjError;
 pub use memory::slugify;
 pub use merge_ops::{MergeReport, MergedIssue};
 pub use op::Op;
+pub use sync_v3::{PullReportV3, PushReportV3};
+
+/// Free-function entry point for the v3 push transport. Bypasses
+/// `Storage::open`'s mode dispatch so the CLI's `pull` verb can run on
+/// a fresh clone (which has no v3 sentinel and no v2 bookmark — but
+/// pull is precisely the verb that materializes those).
+///
+/// Wraps [`Storage::push_v3`] semantically — same refspec, same return
+/// shape — but takes a repo-root path and skips the mode probe so
+/// callers that want git-only transport without committing to a
+/// Storage handle (the fresh-clone bootstrap case) can avoid the
+/// preflight.
+///
+/// `repo_root` must be an absolute path to a colocated jj+git repo (or
+/// any directory `git -C <root>` will accept as a repo root, including
+/// a bare clone). See [`Storage::push_v3`] for the production-call
+/// path; this is the bootstrap variant.
+pub fn push_v3_bare(repo_root: &Path, remote: &str) -> Result<PushReportV3> {
+    let git = git::GitRepo::open(repo_root.to_owned());
+    sync_v3::push_v3(&git, remote)
+}
+
+/// Free-function entry point for the v3 pull transport. See
+/// [`push_v3_bare`] for the design rationale.
+///
+/// Returns a [`PullReportV3`] with per-scenario counts. Notably, on a
+/// fresh clone whose remote has a `refs/jjf/meta/format-version`
+/// sentinel, this function will land that sentinel locally as part of
+/// the reconcile (scenario 1 = new-local = copy), so a subsequent
+/// `Storage::open` against the same root sees the repo as v3-shape and
+/// the migrator skips.
+pub fn pull_v3_bare(repo_root: &Path, remote: &str) -> Result<PullReportV3> {
+    let git = git::GitRepo::open(repo_root.to_owned());
+    sync_v3::pull_v3(&git, remote)
+}
 pub use record::{
     Comment, DepEdge, DepKind, Issue, IssueDraft, IssueRecord, IssueType, Memory, Status,
 };
@@ -1314,6 +1350,20 @@ impl Storage {
     /// The repo root this storage handle is rooted at.
     pub fn repo_root(&self) -> &Path {
         self.repo.root()
+    }
+
+    /// True iff this handle was opened on a v3-shape repo (the
+    /// `refs/jjf/meta/format-version` sentinel ref resolves). False
+    /// means the repo is still v2-shape — only reachable in the test
+    /// suite via `JJF_DISABLE_V2_TO_V3_MIGRATION=1`. Production callers
+    /// see V3 unconditionally because the migrator runs at
+    /// `Storage::open`.
+    ///
+    /// Used by the CLI's `push` / `pull` verbs to dispatch between the
+    /// v3 git-transport path ([`Storage::push_v3`] /
+    /// [`Storage::pull_v3`]) and the legacy v2 bookmark-transport path.
+    pub fn is_v3(&self) -> bool {
+        matches!(self.mode, StorageMode::V3)
     }
 
     /// Create a new issue from a draft. Returns the freshly-minted
@@ -3080,6 +3130,74 @@ impl Storage {
         Ok(())
     }
 
+    /// Push every `refs/jjf/*` ref to `remote` via standard git
+    /// transport (`git push <remote> 'refs/jjf/*:refs/jjf/*'`).
+    ///
+    /// The push refspec covers `refs/jjf/issues/*`,
+    /// `refs/jjf/memories/*`, and `refs/jjf/meta/*` (the format-version
+    /// sentinel — idempotent to re-push; gives the remote a v3 marker
+    /// for replicas that pull from it later). Server-side config is
+    /// vanilla git — Forgejo / Gitea / GitLab / GitHub all accept this.
+    ///
+    /// Returns a tally of refs submitted; the actual per-ref disposition
+    /// (created / fast-forwarded / no-op) is opaque from this side.
+    /// Failures bubble up as `Error::Git` with verbatim stderr — the
+    /// CLI's typed-error classifier ([`crate::sync_v3::PushReportV3`]
+    /// docstring) sorts auth / network / non-fast-forward signals into
+    /// distinct surface errors.
+    ///
+    /// **v3-only.** Calling this on a v2-mode Storage returns
+    /// `Error::Invalid` — v2 push goes through the bookmark transport
+    /// in `crates/jjf/src/main.rs::run_push`. Mode is locked at
+    /// `Storage::open` time; a v2 → v3 migration runs on open if the
+    /// env-var opt-out isn't set, so under normal operator use mode is
+    /// always V3 here.
+    pub fn push_v3(&self, remote: &str) -> Result<PushReportV3> {
+        if self.mode != StorageMode::V3 {
+            return Err(Error::Invalid(
+                "push_v3 requires v3-shape storage; this repo is v2"
+                    .to_owned(),
+            ));
+        }
+        sync_v3::push_v3(&self.git, remote)
+    }
+
+    /// Pull every `refs/jjf/*` ref from `remote`. Runs
+    /// `git fetch <remote> 'refs/jjf/*:refs/remotes/<remote>/jjf/*'`,
+    /// then per-remote-tracking-ref reconciles with the corresponding
+    /// local `refs/jjf/<rest>` ref using git-bug's five-scenario merge
+    /// algorithm:
+    ///
+    /// 1. New (remote-only) → copy.
+    /// 2. Identical → no-op.
+    /// 3. Local ahead → no-op.
+    /// 4. Fast-forward → advance local ref.
+    /// 5. Diverged → land a 2-parent merge commit on the local ref
+    ///    whose tree is the LWW-resolved snapshot and whose message
+    ///    carries a `Jjf-Op: merge` trailer.
+    ///
+    /// Returns per-scenario counts so the CLI can emit a meaningful
+    /// summary in both plain-text and `--json` shapes. The post-pull
+    /// state is observable by re-reading any issue via `Storage::show`;
+    /// the read path's `cat-file blob` reads the new tip's tree, which
+    /// for a merge IS the resolved snapshot.
+    ///
+    /// **No content-level conflict markers.** The DAG IS the merge; the
+    /// LWW resolver replays both sides' op chains in spec §6 order and
+    /// writes the merged record into the merge commit's tree. There is
+    /// no human-surface "unmergeable" failure mode in this path.
+    ///
+    /// **v3-only.** See [`Storage::push_v3`] for the V2 fallback note.
+    pub fn pull_v3(&self, remote: &str) -> Result<PullReportV3> {
+        if self.mode != StorageMode::V3 {
+            return Err(Error::Invalid(
+                "pull_v3 requires v3-shape storage; this repo is v2"
+                    .to_owned(),
+            ));
+        }
+        sync_v3::pull_v3(&self.git, remote)
+    }
+
     /// Read the per-issue op chain rooted at an explicit revision
     /// rather than the bookmark tip. The default
     /// [`Storage::read_history`] is this with `rev = "bookmarks(issues)"`.
@@ -3747,7 +3865,7 @@ fn current_epoch_secs() -> Result<u64> {
 /// deterministically. The JSON record's `created_at`/`updated_at`
 /// continue to use [`now_rfc3339`] per spec §3.1 — only trailers get
 /// nanos.
-fn now_rfc3339_nanos() -> Result<String> {
+pub(crate) fn now_rfc3339_nanos() -> Result<String> {
     // When `JJF_TEST_CLOCK_SECS` is set, nanos resolve to live
     // sub-second so trailer ordering still works; only the second
     // component is pinned.
