@@ -997,10 +997,33 @@ enum CliError {
 
     /// `jjf push` reached the remote but the remote rejected the
     /// update (non-fast-forward, hook rejection, etc.). Runtime
-    /// (exit 1). The plain-text message includes a hint to `pull`
-    /// first.
-    #[error("push to {remote} rejected: {stderr}\nhint: run `jjf pull {remote}` first, then retry the push")]
-    PushRejected { remote: String, stderr: String },
+    /// (exit 1).
+    ///
+    /// The Display impl renders a short, deterministic, single-line
+    /// message — no raw git stderr, no version-dependent advisory
+    /// tokens (e.g. "fetch first", git's own multi-line `hint:`
+    /// preamble). The structured fields (`refs_rejected`, `hint`,
+    /// `stderr_raw`) go into the `--json` envelope's `details`. This
+    /// way the contract for scripts is the typed `details` keys —
+    /// not the message text and not raw git output.
+    ///
+    /// `refs_rejected` is the parsed list of refs git rejected
+    /// (e.g. `refs/jjf/issues/bfcfe03`) extracted from stderr lines
+    /// of the form `! [rejected]   <src> -> <dst> (fetch first)`.
+    /// Empty if parsing didn't recognise any line — surfaces as
+    /// `null` in the JSON envelope so callers can distinguish "no
+    /// rejected lines parsed" from "parsing succeeded but the list
+    /// happens to be empty". See `parse_rejected_refs`.
+    ///
+    /// `stderr_raw` keeps the original git stderr around for
+    /// debugging callers (and operators reading the human message)
+    /// without putting it on the contract surface.
+    #[error("push to {remote} rejected (non-fast-forward); the remote moved since you last pulled")]
+    PushRejected {
+        remote: String,
+        stderr: String,
+        refs_rejected: Vec<String>,
+    },
 
     /// `jjf push` shelled out and got a non-zero exit that wasn't
     /// one of the typed cases above. Runtime (exit 1).
@@ -1392,9 +1415,41 @@ impl CliError {
             CliError::RemoteNotFound(name) => json!({ "name": name }),
             CliError::PushNetworkFailure { remote, .. }
             | CliError::PushAuthFailure { remote, .. }
-            | CliError::PushRejected { remote, .. }
             | CliError::PullNetworkFailure { remote, .. }
             | CliError::PullAuthFailure { remote, .. } => json!({ "remote": remote }),
+            // `push_rejected` carries the structured advisory and
+            // (where parsable) the list of refs git rejected. The
+            // human-readable `hint` mirrors `concurrent_write`'s
+            // `details.hint` shape — callers that handle either
+            // path can read the same key. `refs_rejected` is the
+            // parsed-from-stderr ref list; `null` means parsing
+            // recognised no rejected lines (better to be honest
+            // than to ship an empty array that looks definitive).
+            // `stderr_raw` keeps the original git output for
+            // debugging out of the contract-mandated `message`
+            // field — see the `cli-json.md` push_rejected row.
+            CliError::PushRejected {
+                remote,
+                stderr,
+                refs_rejected,
+            } => {
+                let refs_value = if refs_rejected.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::Array(
+                        refs_rejected
+                            .iter()
+                            .map(|s| serde_json::Value::String(s.clone()))
+                            .collect(),
+                    )
+                };
+                json!({
+                    "remote": remote,
+                    "hint": format!("run `jjf pull {remote}` first, then retry the push"),
+                    "refs_rejected": refs_value,
+                    "stderr_raw": stderr,
+                })
+            }
             CliError::Unmergeable { issue_id, detail } => {
                 json!({ "issue_id": issue_id, "detail": detail })
             }
@@ -3560,15 +3615,21 @@ fn classify_push_error(remote: &str, stderr: String) -> CliError {
         };
     }
     // Non-fast-forward / rejected. The operator path here is "pull
-    // first then retry"; the message embeds that hint.
+    // first then retry"; the structured `hint` lives in
+    // `details.hint` on the `--json` envelope (see `CliError::
+    // details`). The Display impl is a short, deterministic, single
+    // line — raw stderr stays in `details.stderr_raw` rather than
+    // leaking into `message`.
     if lower.contains("refusing to push")
         || lower.contains("rejected")
         || lower.contains("non-fast-forward")
         || lower.contains("non fast-forward")
     {
+        let refs_rejected = parse_rejected_refs(&stderr);
         return CliError::PushRejected {
             remote: remote.to_owned(),
             stderr,
+            refs_rejected,
         };
     }
     // Network. Broad: any signal that we couldn't reach the remote.
@@ -3585,6 +3646,49 @@ fn classify_push_error(remote: &str, stderr: String) -> CliError {
         };
     }
     CliError::JjGitPush(stderr.trim().to_owned())
+}
+
+/// Parse the destination refs git reported as rejected from `git push`
+/// stderr. Looks for lines of the form (after whitespace):
+///
+/// ```text
+/// ! [rejected]        <src> -> <dst> (fetch first)
+/// ! [rejected]        <src> -> <dst> (non-fast-forward)
+/// ```
+///
+/// The destination ref (the right-hand side of the arrow) is what
+/// goes into `details.refs_rejected` — that's what a caller asking
+/// "which refs do I need to pull?" wants. The trailing parenthetical
+/// reason (`fetch first` / `non-fast-forward`) is dropped from the
+/// structured surface; it's available in `details.stderr_raw` if a
+/// caller really needs the disambiguation.
+///
+/// Best-effort: if no `! [rejected]` lines are present (or git's
+/// future stderr drifts from this format), returns an empty vec —
+/// the `details` formatter renders that as `null` so callers can
+/// distinguish "parser saw nothing" from "ship an empty array".
+fn parse_rejected_refs(stderr: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    for line in stderr.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("! [rejected]") {
+            continue;
+        }
+        // Strip the leading `! [rejected]` marker, then look for
+        // ` -> ` and take the next whitespace-delimited token as the
+        // destination ref.
+        let after_marker = trimmed.trim_start_matches("! [rejected]").trim_start();
+        let Some(arrow_idx) = after_marker.find("->") else {
+            continue;
+        };
+        let after_arrow = after_marker[arrow_idx + 2..].trim_start();
+        let dst = match after_arrow.split_whitespace().next() {
+            Some(s) => s,
+            None => continue,
+        };
+        refs.push(dst.to_owned());
+    }
+    refs
 }
 
 /// `jjf pull <remote>` — fetch every `refs/jjf/*` from `<remote>` into
@@ -4008,6 +4112,181 @@ fn emit_pull_success(json: bool, remote: &str, remote_present: bool, resolved_is
     } else {
         println!(
             "pulled issues <- {remote}; resolved {resolved_issues} issue(s) op-space"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the in-binary helpers — kept here so they can
+    //! reach private functions (`classify_push_error`,
+    //! `parse_rejected_refs`, the error envelope renderers) without
+    //! widening the visibility surface.
+    //!
+    //! Integration tests for full verb behaviour live under
+    //! `crates/jjf/tests/`.
+    use super::*;
+
+    /// Real stderr captured by `experiments/qa-redteam-2026-06-25/
+    /// .scratch/d3b/evidence/d3b-hint-snapshot.txt`: a single rejected
+    /// ref (`refs/jjf/issues/bfcfe03`), `(fetch first)` parenthetical,
+    /// followed by the multi-line `hint:` preamble git pastes in.
+    /// Pinning this exact shape so anything that drifts the parser
+    /// (rename / trim / regex tweak) trips a known-good case.
+    const REAL_D3B_STDERR: &str = "\
+To file:///Users/myers/p/jjforge/experiments/qa-redteam-2026-06-25/.scratch/d3b-bare.git\n\
+ ! [rejected]        refs/jjf/issues/bfcfe03 -> refs/jjf/issues/bfcfe03 (fetch first)\n\
+error: failed to push some refs to 'file:///Users/myers/p/jjforge/experiments/qa-redteam-2026-06-25/.scratch/d3b-bare.git'\n\
+hint: Updates were rejected because the remote contains work that you do not\n\
+hint: have locally. This is usually caused by another repository pushing to\n\
+hint: the same ref. If you want to integrate the remote changes, use\n\
+hint: 'git pull' before pushing again.\n\
+hint: See the 'Note about fast-forwards' in 'git push --help' for details.\n";
+
+    #[test]
+    fn parse_rejected_refs_single_ref() {
+        let refs = parse_rejected_refs(REAL_D3B_STDERR);
+        assert_eq!(refs, vec!["refs/jjf/issues/bfcfe03".to_owned()]);
+    }
+
+    #[test]
+    fn parse_rejected_refs_multiple() {
+        let stderr = "\
+To file:///some/bare.git\n\
+ ! [rejected]        refs/jjf/issues/aaaaaa1 -> refs/jjf/issues/aaaaaa1 (fetch first)\n\
+ ! [rejected]        refs/jjf/issues/bbbbbb2 -> refs/jjf/issues/bbbbbb2 (non-fast-forward)\n\
+ ! [rejected]        refs/jjf/memories/ccccc -> refs/jjf/memories/ccccc (fetch first)\n\
+error: failed to push some refs\n";
+        let refs = parse_rejected_refs(stderr);
+        assert_eq!(
+            refs,
+            vec![
+                "refs/jjf/issues/aaaaaa1".to_owned(),
+                "refs/jjf/issues/bbbbbb2".to_owned(),
+                "refs/jjf/memories/ccccc".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_rejected_refs_none_when_no_marker() {
+        // Catch-all stderr that doesn't carry git's `! [rejected]`
+        // line at all — parser must return empty (not panic, not
+        // hallucinate). The `details` formatter renders this as
+        // `null` in the JSON envelope.
+        let stderr = "error: failed to push some refs (remote hung up)\n";
+        let refs = parse_rejected_refs(stderr);
+        assert!(refs.is_empty(), "expected no refs, got {refs:?}");
+    }
+
+    #[test]
+    fn parse_rejected_refs_handles_indented_marker() {
+        // Some git versions / locales / colorisations stretch the
+        // leading whitespace; the parser trims_start before matching
+        // so any indent is fine.
+        let stderr = "    ! [rejected]        refs/jjf/issues/x1y2z3a -> refs/jjf/issues/x1y2z3a (fetch first)\n";
+        let refs = parse_rejected_refs(stderr);
+        assert_eq!(refs, vec!["refs/jjf/issues/x1y2z3a".to_owned()]);
+    }
+
+    #[test]
+    fn classify_push_error_real_d3b_yields_push_rejected_with_refs() {
+        let err = classify_push_error("origin", REAL_D3B_STDERR.to_owned());
+        match err {
+            CliError::PushRejected {
+                remote,
+                stderr,
+                refs_rejected,
+            } => {
+                assert_eq!(remote, "origin");
+                assert_eq!(refs_rejected, vec!["refs/jjf/issues/bfcfe03".to_owned()]);
+                // Raw stderr stays available for debugging callers
+                // via `details.stderr_raw`.
+                assert!(stderr.contains("! [rejected]"));
+            }
+            other => panic!("expected PushRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_rejected_display_is_short_and_deterministic() {
+        // The Display impl backs the `message` field in the `--json`
+        // envelope. Spec: short, single-line, no raw git stderr, no
+        // version-dependent advisory tokens (`fetch first`, git's
+        // own `hint:` preamble). Scripts must use `kind`, not
+        // `message` — but if a human ever does read this line, it
+        // shouldn't change shape between git releases.
+        let err = CliError::PushRejected {
+            remote: "origin".to_owned(),
+            stderr: REAL_D3B_STDERR.to_owned(),
+            refs_rejected: vec!["refs/jjf/issues/bfcfe03".to_owned()],
+        };
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains('\n'),
+            "message should be single-line, got: {msg:?}"
+        );
+        assert!(
+            !msg.contains("fetch first"),
+            "message must not embed git's version-dependent `fetch first` token: {msg:?}"
+        );
+        assert!(
+            !msg.contains("hint:"),
+            "message must not embed git's `hint:` preamble: {msg:?}"
+        );
+        assert!(
+            !msg.contains("refs/jjf"),
+            "message must not embed the internal refspec: {msg:?}"
+        );
+        // Must name the remote so a human reading it knows which
+        // push got rejected.
+        assert!(msg.contains("origin"), "message should name remote: {msg:?}");
+    }
+
+    #[test]
+    fn push_rejected_details_carry_structured_hint_and_refs() {
+        // `details` is the contract surface. Asserts the shape the
+        // `cli-json.md` push_rejected row promises.
+        let err = CliError::PushRejected {
+            remote: "origin".to_owned(),
+            stderr: REAL_D3B_STDERR.to_owned(),
+            refs_rejected: vec!["refs/jjf/issues/bfcfe03".to_owned()],
+        };
+        let details = err.details();
+        assert_eq!(details["remote"], "origin");
+        assert_eq!(
+            details["hint"],
+            "run `jjf pull origin` first, then retry the push"
+        );
+        assert_eq!(
+            details["refs_rejected"],
+            serde_json::json!(["refs/jjf/issues/bfcfe03"])
+        );
+        assert!(
+            details["stderr_raw"]
+                .as_str()
+                .expect("stderr_raw is a string")
+                .contains("! [rejected]"),
+            "stderr_raw should preserve original git output"
+        );
+    }
+
+    #[test]
+    fn push_rejected_details_emit_null_when_no_refs_parsed() {
+        // Honest signalling: if the parser didn't recognise any
+        // rejected lines (e.g. git output drifted), surface `null`
+        // rather than an empty array — callers can distinguish
+        // "parser failed" from "definitively no refs".
+        let err = CliError::PushRejected {
+            remote: "origin".to_owned(),
+            stderr: "error: failed to push some refs (remote hung up)\n".to_owned(),
+            refs_rejected: vec![],
+        };
+        let details = err.details();
+        assert!(
+            details["refs_rejected"].is_null(),
+            "expected null, got: {}",
+            details["refs_rejected"]
         );
     }
 }

@@ -316,9 +316,13 @@ d3b() {
   echo "[d3b] kind=$kind"
 
   # Extract the hint/message text (whichever the envelope carries).
+  # Reading `details.hint` preferentially is correct — that's the
+  # contract surface for the operator advisory.
   local hint=""
+  local message=""
   if [[ "$kind" != "unknown" && "$kind" != "success" ]]; then
     hint="$(jq -r '.error.details.hint // .error.message // ""' "$sib/evidence/last-stderr" 2>/dev/null || echo "")"
+    message="$(jq -r '.error.message // ""' "$sib/evidence/last-stderr" 2>/dev/null || echo "")"
     echo "[d3b] hint/message: $hint"
   fi
 
@@ -326,6 +330,14 @@ d3b() {
   # and push_rejected). Any hit is a contract-drift candidate: the
   # message text isn't stable contract, so scripts depending on it
   # will break when the message gets edited.
+  #
+  # Note (2026-06-26, 88e4d6b): after the push_rejected reshape,
+  # "retry" and "run `jjf pull" appearing here is EXPECTED — they
+  # are the intentional `details.hint` text (the contract surface
+  # for the operator advisory), not stderr leakage. The hits
+  # this probe is really looking for are "fetch first" (raw
+  # libgit2 token, git-version-dependent) and "non-fast-forward"
+  # leaking out of `stderr_raw` into the contract surface.
   local matched=0
   for phrase in \
     "another writer landed first" \
@@ -345,6 +357,28 @@ d3b() {
       matched=1
     fi
   done
+
+  # Stronger check: the `message` field itself must NOT carry raw
+  # git stderr tokens. These are the version-dependent phrases that
+  # were leaking pre-88e4d6b. If any of these appear in `message`,
+  # the contract drift is re-emerging.
+  if [[ "$kind" == "push_rejected" ]]; then
+    local message_clean=1
+    for raw_token in \
+      "fetch first" \
+      "hint: Updates were rejected" \
+      "refs/jjf/issues/" \
+      "git push --help"
+    do
+      if [[ "$message" == *"$raw_token"* ]]; then
+        echo "[d3b] FINDING: push_rejected MESSAGE field carries raw git stderr token '$raw_token' — contract drift, scripts pushed to parse message"
+        message_clean=0
+      fi
+    done
+    if [[ "$message_clean" == "1" ]]; then
+      echo "[d3b] OK: push_rejected message field is free of raw git stderr tokens"
+    fi
+  fi
 
   if [[ "$kind" == "concurrent_write" || "$kind" == "push_rejected" ]]; then
     if [[ "$matched" == "0" ]]; then

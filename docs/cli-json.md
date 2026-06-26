@@ -576,7 +576,7 @@ from plain-text mode (see the top comment in `main.rs`: `0` success,
 | `jj_git_remote_error`        | 1    | `JjGitRemote`                 | —                        |
 | `push_network_failure`       | 1    | `PushNetworkFailure`          | `remote`                 |
 | `push_auth_failure`          | 1    | `PushAuthFailure`             | `remote`                 |
-| `push_rejected`              | 1    | `PushRejected`                | `remote`                 |
+| `push_rejected`              | 1    | `PushRejected`                | `remote`, `hint`, `refs_rejected`, `stderr_raw` |
 | `jj_git_push_error`          | 1    | `JjGitPush`                   | —                        |
 | `pull_network_failure`       | 1    | `PullNetworkFailure`          | `remote`                 |
 | `pull_auth_failure`          | 1    | `PullAuthFailure`             | `remote`                 |
@@ -764,6 +764,53 @@ $ jjf --json comment a3f9c01 -F -    # sibling write raced and retry also raced
 
 $ jjf --json new -t winner --slug taken    # slug-claim race upgraded to slug_collision
 {"ok":false,"error":{"kind":"slug_collision","message":"slug \"taken\" already in use by issue a3f9c01","details":{"slug":"taken","conflicts_with":"a3f9c01"}}}
+```
+
+### Note on `push_rejected`
+
+Emitted by `jjf push <remote>` when the remote rejected the
+update (non-fast-forward — another writer landed first; or a
+remote-side hook rejection). Runtime failure (exit 1).
+
+`message` is a short, deterministic, single-line phrase (no
+raw git stderr, no version-dependent advisory tokens like
+`fetch first` or git's own multi-line `hint:` preamble). As
+with every other kind: scripts must use `kind`, not `message`.
+
+The structured surface is `details`:
+
+- `details.remote` — the remote name the operator passed.
+- `details.hint` — operator-facing one-line advisory,
+  rendered verbatim by the text renderer. Currently
+  `"run \`jjf pull <remote>\` first, then retry the push"`.
+  Mirrors `concurrent_write`'s `details.hint` shape so a
+  caller handling both error paths can read the same key.
+- `details.refs_rejected` — array of destination refs git
+  rejected (parsed from `! [rejected]   <src> -> <dst>` lines
+  in stderr). Example: `["refs/jjf/issues/bfcfe03"]`. Useful
+  for callers that want to surface "which issue conflicted?"
+  without scraping the raw stderr.
+  Surfaces as `null` (not an empty array) when the parser
+  recognised no rejected lines in stderr — better to be
+  honest about uncertainty than to ship a sometimes-wrong
+  list. Callers should treat `null` as "unknown, fall back
+  to stderr_raw or just tell the user to pull."
+- `details.stderr_raw` — the original git stderr blob, kept
+  available for debugging callers without putting it on the
+  `message` contract surface. Includes the multi-line `hint:`
+  preamble and any other version-dependent text git emits.
+
+Added in `qa-2026-06-25-push-rejected-raw-git` (issue
+`88e4d6b`) after a QA red-team round found `message` embedded
+raw git stderr — including the internal
+`refs/jjf/issues/*` refspec and git's version-dependent
+advisory phrases — creating pressure to parse `message`
+because `details` was too sparse to identify the conflicting
+refs.
+
+```sh
+$ jjf --json push origin
+{"ok":false,"error":{"kind":"push_rejected","message":"push to origin rejected (non-fast-forward); the remote moved since you last pulled","details":{"remote":"origin","hint":"run `jjf pull origin` first, then retry the push","refs_rejected":["refs/jjf/issues/bfcfe03"],"stderr_raw":"To file:///.../bare.git\n ! [rejected]        refs/jjf/issues/bfcfe03 -> refs/jjf/issues/bfcfe03 (fetch first)\n..."}}}
 ```
 
 ## Per-verb examples
@@ -1187,8 +1234,12 @@ Error path — non-fast-forward (operator should pull first):
 
 ```sh
 $ jjf push --json origin
-{"ok":false,"error":{"kind":"push_rejected","message":"push to origin rejected: …\nhint: run `jjf pull origin` first, then retry the push","details":{"remote":"origin"}}}
+{"ok":false,"error":{"kind":"push_rejected","message":"push to origin rejected (non-fast-forward); the remote moved since you last pulled","details":{"remote":"origin","hint":"run `jjf pull origin` first, then retry the push","refs_rejected":["refs/jjf/issues/bfcfe03"],"stderr_raw":"To file:///.../bare.git\n ! [rejected]        refs/jjf/issues/bfcfe03 -> refs/jjf/issues/bfcfe03 (fetch first)\n..."}}}
 ```
+
+See the [Note on `push_rejected`](#note-on-push_rejected) for the
+contract on `details.hint`, `details.refs_rejected`, and
+`details.stderr_raw`.
 
 ### `pull`
 
