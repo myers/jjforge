@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "id": "df74809",
+  "title": "qa-proptest-harness: stand up proptest against storage mutate/read surface",
+  "slug": "qa-proptest-harness",
+  "body": "# Goal\n\nStand up a `proptest` harness against `jjf-storage`'s public mutate/read\nsurface so future QA rounds can find counter-examples the harm-class\nattack tree wouldn't.\n\n# Approach (sketch)\n\n- Generate `(Issue, [Op])` tuples — Issue varying status / labels /\n  deps; Op varying verbs and arguments.\n- Assert invariants:\n  - **Round-trip**: write → read → write → read produces equal records.\n  - **Idempotence** of read-only verbs.\n  - **Status machine**: every transition either succeeds and lands a\n    valid status or rejects with a typed error; no panics.\n- Estimated setup cost: 4–6 hours. Why this round skipped it: the\n  harm-class attack tree caught the highest-leverage interaction\n  bugs first.\n\n# References\n\n- Round spec: `docs/superpowers/specs/2026-06-25-qa-redteam-sweep-design.md`\n- Round plan: `docs/superpowers/plans/2026-06-25-qa-redteam-sweep.md`\n- Surface map (in the spec) names the touchpoints worth covering first.\n",
+  "status": "open",
+  "block_reason": null,
+  "type": "feature",
+  "labels": [
+    "epic:agent-ergonomics",
+    "qa-redteam-2026-06-25"
+  ],
+  "dependencies": [],
+  "assignee": null,
+  "created_at": "2026-06-26T12:57:09Z",
+  "updated_at": "2026-06-26T12:57:09Z"
+}
