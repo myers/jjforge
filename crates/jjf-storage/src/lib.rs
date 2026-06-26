@@ -2337,17 +2337,19 @@ impl Storage {
     ///   present, return `Error::IssueNotFound { id: target }`. Both
     ///   checks happen before any mutating IO so a rejection leaves
     ///   the bookmark untouched.
-    /// - For `kind == DepKind::Blocks`, a forward DFS from `target`
-    ///   over existing `blocks` edges; if `id` is reachable, the new
-    ///   edge would close a cycle. Reject with
+    /// - For `kind` in `{Blocks, ParentChild}`, a forward DFS from
+    ///   `target` over the combined blocking graph — every existing
+    ///   `Blocks` *or* `ParentChild` edge. If `id` is reachable, the
+    ///   new edge would close a cycle in the graph
+    ///   `compute_blocked_set` walks at read time. Reject with
     ///   `Error::DependencyCycle` carrying the path
-    ///   `[target, ..., id]`. The check covers `blocks` only — the
-    ///   one edge kind `jjf ready` walks — so an undetected `blocks`
-    ///   cycle would silently hide every node in it from the ready
-    ///   set. `parent-child` cycles are a follow-up (also harmful
-    ///   for `jjf dep tree` recursion, but `dep tree` already has a
-    ///   visited-set guard; the storage write-path check there is a
-    ///   future bug-fix ticket).
+    ///   `[target, ..., id]`. Both kinds participate because the
+    ///   ready-set computation propagates blocked-ness along both:
+    ///   `A blocks B` plus `B parent-of A` makes both A and B
+    ///   permanently blocked, even though neither single-kind walk
+    ///   sees a cycle. The combined-graph check covers that
+    ///   (`121f48b`). `Related` and `DiscoveredFrom` edges do not
+    ///   participate in blocking and are not cycle-checked.
     pub fn add_dep_edge(
         &self,
         id: &IssueId,
@@ -2374,25 +2376,33 @@ impl Storage {
                 }
                 Err(e) => return MutateOutcome::Conflict(e),
             }
-            // Cycle preflight (v2.6, `43c7615`). `blocks` only — the
-            // one edge kind that participates in ready computation.
-            // Probed inside the closure so a CAS-loss retry re-walks
-            // the post-race graph: if another writer landed a cycle-
-            // closing edge between our attempts, we surface the
-            // cycle from the fresh state instead of compounding it.
+            // Cycle preflight (v2.6, `43c7615`; v2.x mixed-kind
+            // `121f48b`). Walks the combined blocking graph —
+            // `Blocks` plus `ParentChild` — because
+            // `compute_blocked_set` propagates blocked-ness along
+            // BOTH kinds: a `blocks` cycle and a mixed
+            // `blocks`+`parent-child` cycle both produce permanent
+            // lockouts at read time. Probed inside the closure so a
+            // CAS-loss retry re-walks the post-race graph: if
+            // another writer landed a cycle-closing edge between
+            // our attempts, we surface the cycle from the fresh
+            // state instead of compounding it.
             //
             // De-dup short-circuit: if the same `(target, kind)` edge
             // is already on the record, the operation is a no-op
             // (matches the post-MutateOutcome::Write branch below)
             // and the cycle walk would falsely report the existing
             // edge as a cycle. Skip the walk in that case.
-            if kind == DepKind::Blocks
+            //
+            // `Related` and `DiscoveredFrom` don't participate in
+            // blocking — they're skipped entirely.
+            if matches!(kind, DepKind::Blocks | DepKind::ParentChild)
                 && !rec
                     .dependencies
                     .iter()
-                    .any(|d| d.target == target && d.kind == DepKind::Blocks)
+                    .any(|d| d.target == target && d.kind == kind)
             {
-                match self.find_blocks_cycle(&rec.id, &target) {
+                match self.find_blocking_cycle(&rec.id, &target) {
                     Ok(Some(cycle)) => {
                         return MutateOutcome::Conflict(Error::DependencyCycle {
                             from: rec.id.clone(),
@@ -2425,10 +2435,13 @@ impl Storage {
         .map(|_| ())
     }
 
-    /// Walk the `blocks`-edge graph forward from `target`. If
-    /// `source` is reachable, returns the cycle path
-    /// `[target, ..., source]` — the nodes that would, together with
-    /// the new edge `source -> target`, form a back-edge.
+    /// Walk the combined blocking graph forward from `target`. The
+    /// "blocking graph" is the union of `Blocks` and `ParentChild`
+    /// edges — the two edge kinds whose presence makes an issue
+    /// blocked via `compute_blocked_set`. If `source` is reachable,
+    /// returns the cycle path `[target, ..., source]` — the nodes
+    /// that would, together with the new edge `source -> target`,
+    /// form a back-edge.
     ///
     /// DFS with a visited set. Every issue on the bookmark is a node;
     /// closed issues are NOT excluded (see `Error::DependencyCycle`
@@ -2438,8 +2451,12 @@ impl Storage {
     /// data, but they also can't host a back-edge so the cycle
     /// detection stays sound.
     ///
-    /// Reads via the snapshot cache. v2.6 (`43c7615`).
-    fn find_blocks_cycle(
+    /// `Related` and `DiscoveredFrom` edges have no blocking effect
+    /// and are skipped during the walk.
+    ///
+    /// Reads via the snapshot cache. v2.6 generalized from
+    /// `find_blocks_cycle` in `121f48b` to cover mixed-kind cycles.
+    fn find_blocking_cycle(
         &self,
         source: &IssueId,
         target: &IssueId,
@@ -2455,18 +2472,21 @@ impl Storage {
             std::collections::HashSet::new();
         visited.insert(target.clone());
 
-        // Iterative DFS: pop a node, push every unvisited blocks-target.
-        // Track the active path so we can echo the cycle on hit.
-        // The stack-and-path split lets the path stay a clean chain.
+        // Iterative DFS: pop a node, push every unvisited
+        // blocking-target. Track the active path so we can echo the
+        // cycle on hit. The stack-and-path split lets the path stay
+        // a clean chain.
         while let Some(node) = stack.last().cloned() {
-            // Find next unvisited blocks-child of `node`. If none, pop
-            // the frame and shrink the path.
+            // Find next unvisited blocking-child of `node` (either
+            // `Blocks` or `ParentChild` kind). If none, pop the
+            // frame and shrink the path.
             let next_child = match snapshot.issues.get(&node) {
                 Some(issue) => issue
                     .dependencies
                     .iter()
                     .find(|e| {
-                        e.kind == DepKind::Blocks && !visited.contains(&e.target)
+                        matches!(e.kind, DepKind::Blocks | DepKind::ParentChild)
+                            && !visited.contains(&e.target)
                     })
                     .map(|e| e.target.clone()),
                 None => None, // dangling target: leaf node

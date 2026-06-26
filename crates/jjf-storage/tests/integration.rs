@@ -3992,12 +3992,18 @@ fn dep_rm_then_dep_add_does_not_trip_cycle() {
 }
 
 #[test]
-fn cycle_check_applies_only_to_blocks_kind() {
-    // `related` / `discovered-from` / `parent-child` edges have no
-    // ready-set effect; cycles among them aren't silent landmines.
-    // The check skips them. Confirm by setting up what WOULD be
-    // a `blocks` cycle and replaying it with each non-blocks kind.
-    let repo = make_scratch_repo("dep_cycle_non_blocks");
+fn cycle_check_skips_related_and_discovered_from() {
+    // `related` / `discovered-from` edges have no ready-set effect
+    // (`compute_blocked_set` doesn't walk them), so cycles among
+    // them aren't silent landmines. The check skips them. Confirm
+    // by setting up what WOULD be a `blocks` cycle and replaying
+    // it with each non-blocking kind.
+    //
+    // `parent-child` is NOT in this list — it does participate in
+    // blocking, and as of `121f48b` cycles involving it are
+    // rejected. See `mixed_kind_blocks_and_parent_child_cycle_rejected`
+    // and `parent_child_only_cycle_rejected`.
+    let repo = make_scratch_repo("dep_cycle_non_blocking");
     let storage = Storage::open(&repo).unwrap();
 
     let a = storage
@@ -4028,15 +4034,166 @@ fn cycle_check_applies_only_to_blocks_kind() {
     storage
         .add_dep_edge(&b, &a, DepKind::DiscoveredFrom)
         .expect("discovered-from must not be cycle-checked");
+}
 
-    // And parent-child. The ticket says we focus on blocks for now;
-    // parent-child cycle detection is a follow-up.
-    storage
-        .add_dep_edge(&a, &b, DepKind::ParentChild)
-        .expect("parent-child must not be cycle-checked (out of scope)");
-    storage
+#[test]
+fn mixed_kind_blocks_and_parent_child_cycle_rejected() {
+    // `121f48b`: A blocks B + B parent-of A creates a mixed-kind
+    // cycle in the combined blocking graph. Before the fix this
+    // was silently accepted, then both A and B fell out of
+    // `jjf ready` forever because `compute_blocked_set` flagged
+    // both: A blocked by B (active), B blocked because its parent
+    // A is blocked-and-active.
+    let repo = make_scratch_repo("dep_cycle_mixed_blocks_first");
+    let storage = Storage::open(&repo).unwrap();
+
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let b = storage
+        .create_issue(&IssueDraft {
+            title: "B".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    // A -> B as `blocks` — fine.
+    storage.add_dep_edge(&a, &b, DepKind::Blocks).unwrap();
+
+    // B -> A as `parent-child` — would close the mixed cycle.
+    let err = storage
         .add_dep_edge(&b, &a, DepKind::ParentChild)
-        .expect("parent-child must not be cycle-checked (out of scope)");
+        .unwrap_err();
+    match err {
+        StorageError::DependencyCycle {
+            from,
+            target,
+            cycle,
+        } => {
+            assert_eq!(from, b);
+            assert_eq!(target, a);
+            // Walk from A: A blocks B. Path: [A, B].
+            assert_eq!(cycle, vec![a.clone(), b.clone()]);
+        }
+        other => panic!("expected DependencyCycle, got {other:?}"),
+    }
+
+    // Rejected edge must not have landed.
+    let after_b = storage.read(&b).unwrap();
+    assert!(
+        after_b.dependencies.is_empty(),
+        "rejected dep-add must not land an edge: {:?}",
+        after_b.dependencies,
+    );
+}
+
+#[test]
+fn mixed_kind_parent_child_then_blocks_cycle_rejected() {
+    // Converse of the above: parent-child landed first, then a
+    // closing `blocks` edge would create the mixed cycle.
+    // A parent-of B, then B blocks A would close it.
+    let repo = make_scratch_repo("dep_cycle_mixed_parent_first");
+    let storage = Storage::open(&repo).unwrap();
+
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let b = storage
+        .create_issue(&IssueDraft {
+            title: "B".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    storage.add_dep_edge(&a, &b, DepKind::ParentChild).unwrap();
+
+    let err = storage.add_dep_edge(&b, &a, DepKind::Blocks).unwrap_err();
+    assert!(
+        matches!(err, StorageError::DependencyCycle { .. }),
+        "mixed-kind cycle (parent-child first, then blocks) must be rejected: got {err:?}",
+    );
+}
+
+#[test]
+fn parent_child_only_cycle_rejected() {
+    // Pure parent-child cycle: A parent-of B + B parent-of A. The
+    // ready-set propagates parent-child blockage too (X blocked if
+    // any parent is blocked-and-active); a pure parent-child cycle
+    // is silent only if some other path injects blocked-ness, but
+    // it's still a structurally invalid graph and would activate
+    // the moment any node picked up a `blocks` edge. Reject at
+    // write time so the graph stays acyclic.
+    let repo = make_scratch_repo("dep_cycle_parent_only");
+    let storage = Storage::open(&repo).unwrap();
+
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let b = storage
+        .create_issue(&IssueDraft {
+            title: "B".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    storage.add_dep_edge(&a, &b, DepKind::ParentChild).unwrap();
+    let err = storage
+        .add_dep_edge(&b, &a, DepKind::ParentChild)
+        .unwrap_err();
+    assert!(
+        matches!(err, StorageError::DependencyCycle { .. }),
+        "parent-child 2-cycle must be rejected: got {err:?}",
+    );
+}
+
+#[test]
+fn related_and_blocks_cycle_through_related_is_not_rejected() {
+    // The walk must NOT cross `related` edges. A blocks B, B
+    // related-to A: not a cycle in the blocking graph (related
+    // has no blocking effect). Accept it.
+    let repo = make_scratch_repo("dep_cycle_blocks_related_skip");
+    let storage = Storage::open(&repo).unwrap();
+
+    let a = storage
+        .create_issue(&IssueDraft {
+            title: "A".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let b = storage
+        .create_issue(&IssueDraft {
+            title: "B".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    storage.add_dep_edge(&a, &b, DepKind::Blocks).unwrap();
+    storage
+        .add_dep_edge(&b, &a, DepKind::Related)
+        .expect("related back-edge must not be flagged");
+    // And the reverse: blocks adjacent to an existing related edge
+    // shouldn't trip either if related is the only return path.
+    let c = storage
+        .create_issue(&IssueDraft {
+            title: "C".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.add_dep_edge(&c, &a, DepKind::Related).unwrap();
+    // A's blocking-graph children are just {B}; A -> C via related
+    // is not walked. So adding A -> C as blocks is fine; no cycle.
+    storage
+        .add_dep_edge(&a, &c, DepKind::Blocks)
+        .expect("blocks edge with only related back-path must land");
 }
 
 #[test]
