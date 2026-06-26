@@ -458,7 +458,7 @@ separate lines).
 | `id`           | string (7-hex)        | yes  | Must equal the filename stem.                                  |
 | `title`        | string                | yes  | Single-line. Must not be empty.                                |
 | `slug`         | string \| null        | yes  | v2.1 — kebab-case orientation handle. Default `null`. See §3.4. |
-| `body`         | string                | yes  | Opening description. May be empty.                             |
+| `body`         | string                | yes  | Opening description. May be empty. Max 65,536 bytes (matches GitHub's `mediumblob` issue-body limit; measured as raw UTF-8 byte length). |
 | `status`       | string enum           | yes  | `open` \| `blocked` \| `in-progress` \| `closed` \| `abandoned`. Default `open`. (v2.3 added `in-progress`; v2.5 added `blocked`; v2.7 added `abandoned`.) |
 | `block_reason` | string \| null        | yes  | v2.5 — free-text reason for the current `blocked` status. `null` when not blocked. Single-line. |
 | `type`         | string enum           | yes  | v2.1 — `bug` \| `feature` \| `epic` \| `research` \| `roadmap` \| `unspecified`. Default `unspecified`. |
@@ -563,7 +563,7 @@ last line of the file.
 | `id`         | string (7-hex)    | yes  | Comment ID, scoped per-issue. Locally unique. |
 | `author`     | string            | yes  | Git author identity (`name <email>`).       |
 | `created_at` | string (RFC 3339) | yes  | UTC.                                        |
-| `body`       | string            | yes  | Markdown. May contain newlines (JSON-escaped). |
+| `body`       | string            | yes  | Markdown. May contain newlines (JSON-escaped). Max 65,536 bytes (same cap as the issue-record `body`). |
 
 ### 4.2 Ordering
 

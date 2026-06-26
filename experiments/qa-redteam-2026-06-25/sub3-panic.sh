@@ -114,7 +114,16 @@ c3() {
     echo "[c3] FINDING: panic on 10MB body"
   fi
   local body_rc; body_rc="$(cat "$EVIDENCE/c3-bigbody-exit" 2>/dev/null || echo timeout)"
-  echo "[c3] info: 10MB body exit=$body_rc"
+  # Post-fix (issue 679444a, 2026-06-26): jjforge declared a
+  # 65,536-byte cap matching GitHub's documented limit. A 10MB body
+  # should reject at preflight (exit 2) with a `body_too_large`
+  # envelope. Anything else is a regression: exit 0 means the cap
+  # got removed; any other exit means the rejection path broke.
+  case "$body_rc" in
+    2) echo "[c3] NEGATIVE: 10MB body rejected at preflight (exit 2)" ;;
+    0) echo "[c3] FINDING: 10MB body accepted (no length cap)" ;;
+    *) echo "[c3] FINDING-CANDIDATE: 10MB body exit $body_rc — check stderr" ;;
+  esac
 
   # 1k labels on one issue.
   run_jjf new -t "c3 label-explosion"

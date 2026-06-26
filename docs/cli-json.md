@@ -585,6 +585,7 @@ from plain-text mode (see the top comment in `main.rs`: `0` success,
 | `comment_file_conflict`      | 1    | `CommentFileConflict`         | `issue_id`               |
 | `invalid_slug`               | 2    | `Storage::InvalidSlug` / `InvalidSlug` | `slug`, `reason`        |
 | `invalid_title`              | 2    | `Storage::InvalidTitle` / `InvalidTitle` | `title`, `reason`, `codepoint`* |
+| `body_too_large`             | 2    | `Storage::InvalidBody` / `InvalidBody` | `limit`, `got`         |
 | `slug_collision`             | 2    | `Storage::SlugCollision` / `SlugCollision` | `slug`, `conflicts_with` |
 | `slug_not_found`             | 2    | `Storage::SlugNotFound` / `SlugNotFound` | `handle`                 |
 | `invalid_input`              | 1    | `Storage::Invalid`            | —                        |
@@ -642,6 +643,40 @@ argv is a NUL-terminated C string array, so a shell-typed
 `jjf new -t $'a\x00b'` actually loses the bytes after the
 null in the shell's argv expansion before `jjf` sees them —
 the storage-side guard catches it for every other entry point.
+
+### Note on `body_too_large`
+
+Emitted by `jjf new -F`, `jjf update --body-file`, and `jjf
+comment -F` when the supplied body exceeds 65,536 bytes
+(raw UTF-8 byte length). Preflight failure (exit 2). The
+cap matches GitHub's documented issue-body limit (and
+Forgejo's, which mirrors it) so jjforge's surface is
+predictable to anyone who already knows the prior art.
+Added in issue `679444a` (QA red-team 2026-06-25 sub-pass 4
+C3), where a multi-megabyte body landed silently with no
+declared bound.
+
+`details.limit` is the configured cap (always 65,536 today)
+and `details.got` is the measured byte length of the
+offending body — both are JSON integers, not strings, so
+scripted callers can branch on them directly. The same cap
+applies to comment bodies (`jjf comment -F`) for the same
+reasons: comment bodies are free-form markdown stored as
+JSONL records on the per-issue `.comments.jsonl` blob, with
+the same on-disk shape and per-write resource model as the
+issue body.
+
+```sh
+$ head -c 70000 /dev/urandom | base64 > big.md
+$ jjf new --json -t "demo" -F big.md
+{"ok":false,"error":{"kind":"body_too_large","message":"...","details":{"limit":65536,"got":94668}}}
+```
+
+Measurement is `body.len()` — raw UTF-8 bytes. Not character
+count, not grapheme cluster count, not after-trim. A body
+that's 65,537 bytes is rejected even if it's fewer than
+65,536 Unicode scalars (multi-byte content gets the worst-
+case-ASCII budget, matching the GitHub semantic).
 
 ### Note on `self_dependency`
 

@@ -42,8 +42,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use jjf_storage::{
     ISSUES_BOOKMARK, ClaimResult, DepEdge, DepKind, DepTreeNode, Error as StorageError, IdError,
-    Issue, IssueDraft, IssueId, IssueType, Memory, ReadyFilter, SlugInvalidReason, Status, Storage,
-    TitleInvalidReason, UnreadableRef, UpdateFields,
+    BodyInvalidReason, Issue, IssueDraft, IssueId, IssueType, Memory, ReadyFilter,
+    SlugInvalidReason, Status, Storage, TitleInvalidReason, UnreadableRef, UpdateFields,
 };
 
 /// Top-level CLI shape. Subcommands live on the `Commands` enum; the
@@ -1095,6 +1095,15 @@ enum CliError {
         reason: TitleInvalidReason,
     },
 
+    /// `jjf new -F`, `jjf update --body-file`, or `jjf comment -F`
+    /// was handed a body that exceeded the documented cap
+    /// (`BODY_MAX_BYTES` = 65,536 bytes, matching GitHub's issue-
+    /// body limit). Preflight failure (exit 2). The CLI envelope
+    /// kind is `body_too_large`. Added in issue `679444a` (QA
+    /// red-team 2026-06-25 sub-pass 4 C3).
+    #[error("invalid body: {reason}")]
+    InvalidBody { reason: BodyInvalidReason },
+
     /// `jjf dep add <X> <X>` (or the inline `jjf new -d <self-id>`)
     /// was asked to land an edge from an issue to itself. Self-deps
     /// make the child permanently blocked by itself, so the
@@ -1258,6 +1267,7 @@ impl CliError {
             CliError::Storage(StorageError::CorruptSentinel { .. }) => 1,
             CliError::Storage(StorageError::InvalidSlug { .. }) => 2,
             CliError::Storage(StorageError::InvalidTitle { .. }) => 2,
+            CliError::Storage(StorageError::InvalidBody { .. }) => 2,
             CliError::Storage(StorageError::SlugCollision { .. }) => 2,
             CliError::Storage(StorageError::SlugNotFound { .. }) => 2,
             CliError::Storage(StorageError::AlreadyClaimed { .. }) => 2,
@@ -1278,6 +1288,7 @@ impl CliError {
             CliError::RemoteNotFound(_) => 2,
             CliError::InvalidSlug { .. } => 2,
             CliError::InvalidTitle { .. } => 2,
+            CliError::InvalidBody { .. } => 2,
             CliError::SelfDependency { .. } => 2,
             CliError::DependencyCycle { .. } => 2,
             CliError::SlugCollision { .. } => 2,
@@ -1333,6 +1344,7 @@ impl CliError {
             CliError::Storage(StorageError::Git(_)) => "git_error",
             CliError::Storage(StorageError::InvalidSlug { .. }) => "invalid_slug",
             CliError::Storage(StorageError::InvalidTitle { .. }) => "invalid_title",
+            CliError::Storage(StorageError::InvalidBody { .. }) => "body_too_large",
             CliError::Storage(StorageError::SlugCollision { .. }) => "slug_collision",
             CliError::Storage(StorageError::SlugNotFound { .. }) => "slug_not_found",
             CliError::Storage(StorageError::AlreadyClaimed { .. }) => "already_claimed",
@@ -1341,6 +1353,7 @@ impl CliError {
             CliError::Storage(StorageError::ConcurrentWrite { .. }) => "concurrent_write",
             CliError::InvalidSlug { .. } => "invalid_slug",
             CliError::InvalidTitle { .. } => "invalid_title",
+            CliError::InvalidBody { .. } => "body_too_large",
             CliError::SelfDependency { .. } => "self_dependency",
             CliError::DependencyCycle { .. } => "dependency_cycle",
             CliError::SlugCollision { .. } => "slug_collision",
@@ -1479,6 +1492,19 @@ impl CliError {
                 }
                 serde_json::Value::Object(obj)
             }
+            // Flat `limit` + `got` mirrors the operator-facing
+            // GitHub `mediumblob` cap shape. Both are integers, not
+            // strings (so scripted callers can branch on them
+            // directly without re-parsing). Today the only
+            // `BodyInvalidReason` is `TooLong`; future reasons
+            // would gain their own keys here.
+            CliError::Storage(StorageError::InvalidBody { reason })
+            | CliError::InvalidBody { reason } => match reason {
+                BodyInvalidReason::TooLong { limit, got } => json!({
+                    "limit": *limit,
+                    "got": *got,
+                }),
+            },
             CliError::Storage(StorageError::SlugCollision { slug, conflicts_with }) => {
                 json!({ "slug": slug, "conflicts_with": conflicts_with.as_str() })
             }
@@ -1784,6 +1810,14 @@ fn run_new(
             title: title.clone(),
             reason,
         });
+    }
+
+    // 2a'. Pre-validate the body cap at the CLI boundary. Issue
+    // `679444a` (QA red-team 2026-06-25 sub-pass 4 C3): pre-fix,
+    // a multi-MB body landed silently. We now match GitHub's
+    // 65,536-byte cap. Storage re-validates.
+    if let Err(reason) = jjf_storage::validate_body(&body) {
+        return Err(CliError::InvalidBody { reason });
     }
 
     // 2b. Pre-validate the slug at the CLI boundary so the user gets
@@ -2870,6 +2904,13 @@ fn run_update(
             });
         }
     }
+    // Pre-validate the body cap at the CLI boundary. Issue
+    // `679444a` (QA red-team 2026-06-25 sub-pass 4 C3).
+    if let Some(body) = &body {
+        if let Err(reason) = jjf_storage::validate_body(body) {
+            return Err(CliError::InvalidBody { reason });
+        }
+    }
     let fields = UpdateFields {
         title,
         slug: slug_field,
@@ -3014,6 +3055,12 @@ fn run_comment(
     let body = read_body(Some(file.as_path()))?;
     if body.is_empty() {
         return Err(CliError::EmptyCommentBody);
+    }
+    // Pre-validate the comment body cap at the CLI boundary. Same
+    // 65,536-byte limit as issue bodies (same shape, same on-disk
+    // risk). Issue `679444a`.
+    if let Err(reason) = jjf_storage::validate_body(&body) {
+        return Err(CliError::InvalidBody { reason });
     }
 
     // 2. Resolve + canonicalize cwd.

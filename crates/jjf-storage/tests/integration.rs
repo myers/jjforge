@@ -3668,6 +3668,194 @@ fn validate_title_accepts_unicode_and_punctuation() {
     }
 }
 
+// --- qa-redteam-2026-06-25 sub-pass 4 C3: body cap (issue 679444a) ----
+//
+// `validate_body` caps issue / comment bodies at
+// `BODY_MAX_BYTES` (65,536 bytes, matching GitHub's documented
+// issue-body limit). The boundary is byte-exact; the cap is raw
+// UTF-8 byte length, not character count.
+
+#[test]
+fn validate_body_accepts_exactly_max_bytes() {
+    // At-cap (65,536 ASCII bytes) is a NEGATIVE — must accept.
+    let body = "a".repeat(jjf_storage::BODY_MAX_BYTES);
+    assert!(
+        jjf_storage::validate_body(&body).is_ok(),
+        "validator rejected at-cap body"
+    );
+}
+
+#[test]
+fn validate_body_rejects_one_byte_over_cap() {
+    // Cap + 1 ASCII byte is a POSITIVE — must reject with the
+    // typed reason carrying both `limit` and `got`.
+    let body = "a".repeat(jjf_storage::BODY_MAX_BYTES + 1);
+    match jjf_storage::validate_body(&body) {
+        Err(jjf_storage::BodyInvalidReason::TooLong { limit, got }) => {
+            assert_eq!(limit, jjf_storage::BODY_MAX_BYTES);
+            assert_eq!(got, jjf_storage::BODY_MAX_BYTES + 1);
+        }
+        other => panic!("expected TooLong, got {other:?}"),
+    }
+}
+
+#[test]
+fn validate_body_measures_bytes_not_chars() {
+    // A multi-byte string at-the-byte-cap is fine even though it has
+    // fewer SCALARS. Construct a body where every char is 2 bytes
+    // ('é' is U+00E9, UTF-8: 0xC3 0xA9). 32_768 chars = 65,536 bytes.
+    let mut body = String::with_capacity(jjf_storage::BODY_MAX_BYTES);
+    while body.len() < jjf_storage::BODY_MAX_BYTES {
+        body.push('é');
+    }
+    assert_eq!(body.len(), jjf_storage::BODY_MAX_BYTES);
+    assert!(jjf_storage::validate_body(&body).is_ok());
+
+    // Pushing one more 2-byte char now flips us 2 bytes over.
+    body.push('é');
+    assert_eq!(body.len(), jjf_storage::BODY_MAX_BYTES + 2);
+    match jjf_storage::validate_body(&body) {
+        Err(jjf_storage::BodyInvalidReason::TooLong { limit, got }) => {
+            assert_eq!(limit, jjf_storage::BODY_MAX_BYTES);
+            assert_eq!(got, jjf_storage::BODY_MAX_BYTES + 2);
+        }
+        other => panic!("expected TooLong, got {other:?}"),
+    }
+}
+
+#[test]
+fn create_issue_rejects_oversize_seed_body() {
+    let repo = make_scratch_repo("create_body_oversize");
+    let storage = Storage::open(&repo).unwrap();
+    let body = "a".repeat(jjf_storage::BODY_MAX_BYTES + 1);
+    let err = storage
+        .create_issue(&IssueDraft {
+            title: "baseline".into(),
+            body,
+            ..Default::default()
+        })
+        .unwrap_err();
+    match err {
+        StorageError::InvalidBody {
+            reason: jjf_storage::BodyInvalidReason::TooLong { limit, got },
+        } => {
+            assert_eq!(limit, jjf_storage::BODY_MAX_BYTES);
+            assert_eq!(got, jjf_storage::BODY_MAX_BYTES + 1);
+        }
+        other => panic!("expected InvalidBody/TooLong, got {other:?}"),
+    }
+}
+
+#[test]
+fn create_issue_accepts_at_cap_seed_body() {
+    // Boundary NEGATIVE: a body of exactly `BODY_MAX_BYTES` lands.
+    let repo = make_scratch_repo("create_body_at_cap");
+    let storage = Storage::open(&repo).unwrap();
+    let body = "a".repeat(jjf_storage::BODY_MAX_BYTES);
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "baseline".into(),
+            body,
+            ..Default::default()
+        })
+        .expect("at-cap body must be accepted");
+    // Round-trip: the stored body keeps its length.
+    let rec = storage.read(&id).unwrap();
+    assert_eq!(rec.body.len(), jjf_storage::BODY_MAX_BYTES);
+}
+
+#[test]
+fn set_body_rejects_oversize_with_typed_reason() {
+    let repo = make_scratch_repo("set_body_oversize");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "baseline".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let history_before = storage.read_history(&id).unwrap().len();
+    let body = "x".repeat(jjf_storage::BODY_MAX_BYTES + 1);
+    let err = storage.set_body(&id, &body).unwrap_err();
+    match err {
+        StorageError::InvalidBody {
+            reason: jjf_storage::BodyInvalidReason::TooLong { limit, got },
+        } => {
+            assert_eq!(limit, jjf_storage::BODY_MAX_BYTES);
+            assert_eq!(got, jjf_storage::BODY_MAX_BYTES + 1);
+        }
+        other => panic!("expected InvalidBody/TooLong, got {other:?}"),
+    }
+    let history_after = storage.read_history(&id).unwrap().len();
+    assert_eq!(
+        history_before, history_after,
+        "rejected set_body must not land a commit"
+    );
+}
+
+#[test]
+fn update_with_oversize_body_is_rejected_before_commit() {
+    let repo = make_scratch_repo("update_body_oversize");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "baseline".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let history_before = storage.read_history(&id).unwrap().len();
+    let body = "y".repeat(jjf_storage::BODY_MAX_BYTES + 1);
+    let err = storage
+        .update(
+            &id,
+            UpdateFields {
+                body: Some(body),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    match err {
+        StorageError::InvalidBody {
+            reason: jjf_storage::BodyInvalidReason::TooLong { limit, got },
+        } => {
+            assert_eq!(limit, jjf_storage::BODY_MAX_BYTES);
+            assert_eq!(got, jjf_storage::BODY_MAX_BYTES + 1);
+        }
+        other => panic!("expected InvalidBody/TooLong, got {other:?}"),
+    }
+    let history_after = storage.read_history(&id).unwrap().len();
+    assert_eq!(
+        history_before, history_after,
+        "rejected update must not land a commit"
+    );
+}
+
+#[test]
+fn add_comment_rejects_oversize_body_with_typed_reason() {
+    // Comment bodies share the same cap as issue bodies — same
+    // shape, same on-disk surface (`<id>.comments.jsonl`), same
+    // per-write resource model. Issue `679444a`.
+    let repo = make_scratch_repo("comment_body_oversize");
+    let storage = Storage::open(&repo).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "baseline".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let body = "z".repeat(jjf_storage::BODY_MAX_BYTES + 1);
+    let err = storage.add_comment(&id, &body, "alice").unwrap_err();
+    match err {
+        StorageError::InvalidBody {
+            reason: jjf_storage::BodyInvalidReason::TooLong { limit, got },
+        } => {
+            assert_eq!(limit, jjf_storage::BODY_MAX_BYTES);
+            assert_eq!(got, jjf_storage::BODY_MAX_BYTES + 1);
+        }
+        other => panic!("expected InvalidBody/TooLong, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------
 // qa-dep-validation (d1a01f0): the write path rejects phantom dep
 // targets and self-deps at the storage boundary. Both checks fire

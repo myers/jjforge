@@ -245,6 +245,19 @@ pub enum Error {
         reason: TitleInvalidReason,
     },
 
+    /// A body (issue body or comment body) failed validation.
+    /// Today the only failure mode is "too long" — the candidate
+    /// body's raw UTF-8 byte length exceeded [`BODY_MAX_BYTES`]
+    /// (65,536 bytes, matching GitHub's documented issue-body
+    /// limit). Surfaced from `Storage::create_issue` (seed body),
+    /// `Storage::set_body`, `Storage::update` (body field), and
+    /// `Storage::add_comment` (comment body) whenever a candidate
+    /// body doesn't pass [`validate_body`]. The CLI envelope kind
+    /// is `body_too_large`. Issue `679444a` (QA red-team
+    /// 2026-06-25 sub-pass 4).
+    #[error("invalid body: {reason}")]
+    InvalidBody { reason: BodyInvalidReason },
+
     /// Two open issues can't share a slug. Surfaced from
     /// `Storage::create_issue` / `Storage::update` when an attempted
     /// slug write collides with any existing issue's slug.
@@ -881,6 +894,88 @@ pub fn validate_title(title: &str) -> std::result::Result<(), TitleInvalidReason
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// Maximum byte length of an issue body or a comment body.
+///
+/// Matches GitHub's documented issue-body limit (65,536 characters).
+/// GitHub's underlying MySQL column is a `mediumblob` (262,144 bytes
+/// of capacity), but the public surface caps at 65,536 characters —
+/// which for ASCII-only content is 65,536 bytes. We measure raw
+/// UTF-8 byte length here so the cap is unambiguous across multi-
+/// byte content (a body that's 65,537 bytes is rejected even if it's
+/// fewer than 65,536 Unicode scalars). Picking the GitHub/Forgejo
+/// number means every consumer of the prior art already knows what
+/// the limit is; integrations don't have to learn a jjforge-specific
+/// constant.
+///
+/// Applied at every entry point that mints a body: `create_issue`'s
+/// seed body, `set_body`, `update`'s body field, and `add_comment`.
+pub const BODY_MAX_BYTES: usize = 65_536;
+
+/// Why a body failed validation. The enum is left open-ended so
+/// future rules (e.g. control-character bans) can extend it without
+/// changing the [`validate_body`] signature. As of issue
+/// `679444a` the only variant is [`BodyInvalidReason::TooLong`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyInvalidReason {
+    /// Body exceeded [`BODY_MAX_BYTES`] in raw UTF-8 byte length.
+    /// `limit` is the configured cap (always `BODY_MAX_BYTES` today);
+    /// `got` is the actual measured length of the offending body.
+    /// Both are exposed in the CLI error envelope's `details` for
+    /// scripted callers.
+    TooLong { limit: usize, got: usize },
+}
+
+impl BodyInvalidReason {
+    /// Stable lowercase snake_case name. Used by the CLI to surface
+    /// the rejection reason in the JSON error envelope's
+    /// `details.reason` slot when richer typing is needed; today the
+    /// `body_too_large` kind has only one reason so the CLI flattens
+    /// `limit` and `got` directly into `details`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BodyInvalidReason::TooLong { .. } => "too_long",
+        }
+    }
+}
+
+impl std::fmt::Display for BodyInvalidReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BodyInvalidReason::TooLong { limit, got } => {
+                write!(f, "body exceeds {limit} bytes (got {got})")
+            }
+        }
+    }
+}
+
+/// Validate an issue body or a comment body against the
+/// [`BODY_MAX_BYTES`] cap. Returns `Ok(())` if the body fits;
+/// otherwise [`BodyInvalidReason::TooLong`] with the limit and the
+/// measured byte length.
+///
+/// Measurement uses `body.len()` — raw UTF-8 byte length. Not
+/// character count (would mean re-deciding what "character" means —
+/// scalar, grapheme, displayed-width?), not grapheme cluster count
+/// (the public cap is a byte-storage budget, not a typographic one),
+/// not after-trim (whitespace-only padding is still bytes on disk).
+///
+/// Exposed publicly so the CLI can pre-validate before calling
+/// `Storage::create_issue` / `Storage::set_body` / `Storage::update`
+/// / `Storage::add_comment` — letting the CLI surface a typed exit-2
+/// error before any IO kicks off. Storage re-validates at the
+/// boundary so programmatic callers (a future MCP server, a Python
+/// client) can't bypass the cap.
+pub fn validate_body(body: &str) -> std::result::Result<(), BodyInvalidReason> {
+    let got = body.len();
+    if got > BODY_MAX_BYTES {
+        return Err(BodyInvalidReason::TooLong {
+            limit: BODY_MAX_BYTES,
+            got,
+        });
     }
     Ok(())
 }
@@ -1591,6 +1686,14 @@ impl Storage {
             });
         }
 
+        // Seed body must fit the cap. Issue `679444a` (QA red-team
+        // 2026-06-25 sub-pass 4 C3): pre-fix, a multi-MB body landed
+        // silently with no documented bound. We now match GitHub's
+        // 65,536-byte cap.
+        if let Err(reason) = validate_body(&draft.body) {
+            return Err(Error::InvalidBody { reason });
+        }
+
         // Trailer-injection guards (`qa-trailer-injection`, issue
         // `a902492`): every free-form string the create-time multi-op
         // stanza interpolates into the trailer block must be single-
@@ -1817,6 +1920,11 @@ impl Storage {
 
     /// Replace the body.
     pub fn set_body(&self, id: &IssueId, body: &str) -> Result<()> {
+        // Bound the body at the documented cap before any IO.
+        // Issue `679444a` (QA red-team 2026-06-25 sub-pass 4 C3).
+        if let Err(reason) = validate_body(body) {
+            return Err(Error::InvalidBody { reason });
+        }
         let body = body.to_owned();
         self.mutate(id, &format!("jjf: issue {} - set-body", id), |rec| {
             rec.body = body.clone();
@@ -1917,6 +2025,13 @@ impl Storage {
                     slug: slug.clone(),
                     reason,
                 });
+            }
+        }
+        // Body cap. Issue `679444a` (QA red-team 2026-06-25
+        // sub-pass 4 C3): match GitHub's 65,536-byte limit.
+        if let Some(body) = &fields.body {
+            if let Err(reason) = validate_body(body) {
+                return Err(Error::InvalidBody { reason });
             }
         }
         let summary = format!("jjf: issue {} - update", id);
@@ -2681,6 +2796,13 @@ impl Storage {
     pub fn add_comment(&self, id: &IssueId, body: &str, author: &str) -> Result<IssueId> {
         if author.trim().is_empty() {
             return Err(Error::Invalid("comment author must not be empty".into()));
+        }
+        // Comment body cap. Same shape (free-form markdown), same
+        // on-disk surface (`<id>.comments.jsonl`), same risk
+        // (unbounded resource on a per-write basis). Apply the same
+        // 65,536-byte limit as issue bodies. Issue `679444a`.
+        if let Err(reason) = validate_body(body) {
+            return Err(Error::InvalidBody { reason });
         }
         let comment_id = IssueId::random();
         let policy = RetryPolicy::from_env();
