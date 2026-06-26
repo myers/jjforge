@@ -4,7 +4,7 @@
   "title": "dep add: mixed-kind cycle (blocks + parent-child) silently accepted, locks both issues out of ready",
   "slug": "qa-2026-06-25-mixed-dep-cycle",
   "body": "# Findings\n\n`jjf dep add` only checks for cycles among `blocks`-kind edges (guard added in `d32ec955`). Mixed-kind cycles — specifically `A blocks B` combined with `B parent-of A` — are silently accepted. After the cycle is established, the `is_blocked` computation in `list_ready` propagates as follows:\n\n1. A has a `blocks` dep on B → A is blocked (B is open and active).\n2. B has a `parent-child` dep on A → B is blocked (A is blocked and active).\n\nResult: both A and B are permanently absent from `jjf ready` with no error or warning. There is no escape except to manually delete one of the edges.\n\nReproduced with the QA harness (`sub2-wronganswer.sh`, attack B3-i):\n\n```\njjf dep add <A> <B> --kind blocks    # accepted, exit 0\njjf dep add <B> <A> --kind parent-child  # also accepted, exit 0 — cycle not detected\njjf ready --json                     # returns empty or omits both A and B\n```\n\nRelevant source: `crates/jjf-storage/src/lib.rs` — the cycle preflight at `add_dep_edge` (line ~2389) only fires when `kind == DepKind::Blocks`. The comment at line ~2347 acknowledges: \"parent-child cycles are a follow-up (also harmful).\"\n\n# Recommendation\n\nExtend the cycle preflight to also detect cross-kind cycles that would create a blocking loop. At minimum: before accepting a `parent-child` edge from child C to parent P, verify that no path from P to C exists in the combined `{blocks, parent-child}` blocking graph. Alternatively, at `list_ready` time, detect cycles in the combined graph and surface a warning rather than silently omitting both issues.\n\nA simpler near-term fix: add an additional check — if the new `parent-child` edge from C → P would place C in the `blocked` set (because C already blocks P via `blocks`), reject it as a cycle.\n\n# Confidence\n\nHigh — reproduced deterministically; the code path is clearly missing the cross-kind cycle guard. The existing comment in `lib.rs` (`\"parent-child cycles are a follow-up (also harmful)\"`) confirms this was known-deferred.\n\n# Open follow-ups\n\n- Decide scope: should the fix cover all cross-kind cycles, or only the mixed `blocks` + `parent-child` case? The `related` and `discovered-from` edge kinds don't participate in `is_blocked`, so they can't create silent lockouts.\n- File a follow-up if the fix covers `parent-child`-only cycles too (e.g., A parent-of B + B parent-of A).\n",
-  "status": "open",
+  "status": "closed",
   "block_reason": null,
   "type": "bug",
   "labels": [
@@ -14,5 +14,5 @@
   "dependencies": [],
   "assignee": null,
   "created_at": "2026-06-26T00:18:52Z",
-  "updated_at": "2026-06-26T22:03:40Z"
+  "updated_at": "2026-06-26T22:03:44Z"
 }
