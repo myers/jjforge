@@ -229,6 +229,134 @@ d3() {
   fi
 }
 
+# -----------------------------------------------------------------------------
+# D3b. ConcurrentWrite.hint text snapshot — fallback recipe
+# -----------------------------------------------------------------------------
+#
+# 2026-06-26 followup (c67f162): the original d3 used `cp -R` to clone
+# the scratch repo to a sibling. That left both clones sharing jj's
+# op-log so neither push diverged, and the race never surfaced —
+# leaving `ConcurrentWrite.hint` text un-snapshotted (the whole point
+# of D3).
+#
+# This variant uses the recipe the plan documented as a fallback:
+# `git clone "$bare" "$sib"; cd "$sib"; jj git init --git-repo=. --colocate`.
+# That gives sib a fresh jj op-log over the same git history, so the
+# two writers really do diverge against the bare remote.
+#
+# We capture whichever surfaces first (concurrent_write or
+# push_rejected) and probe the message text for substring-matchable
+# phrases.
+d3b() {
+  mk_scratch_repo d3b >/dev/null
+  run_jjf new -t "d3b concurrent target"
+  local id
+  id="$(grep -oE '[0-9a-f]{7}' "$EVIDENCE/last-stdout" | head -1)"
+
+  # Set up a shared bare remote
+  local bare="$QA_ROOT/.scratch/d3b-bare.git"
+  rm -rf "$bare"; git init --bare "$bare" >/dev/null 2>&1
+
+  local orig_scratch="$SCRATCH"
+  local orig_evidence="$EVIDENCE"
+
+  (cd "$orig_scratch" && "$JJF_BIN" remote add origin "file://$bare" >/dev/null 2>&1)
+  (cd "$orig_scratch" && "$JJF_BIN" push origin >/dev/null 2>&1)
+
+  # Sibling via fallback recipe: `git clone` then `jj git init
+  # --colocate` then `jjf pull` to materialize the `refs/jjf/*`
+  # state locally. The plan documented `--git-repo=. --colocate`
+  # but those flags are mutually exclusive in jj 0.40
+  # (`--colocate` alone is the right form when the working dir
+  # already has a `.git/`). And `git clone` only fetches
+  # `refs/heads/*` and `refs/tags/*` by default — `refs/jjf/*`
+  # requires an explicit fetch, which is what `jjf pull` does.
+  # The fresh jj op-log + fetched refs/jjf/* is what makes the
+  # divergence real (vs `cp -R` which cloned the op-log too and
+  # left neither side diverged).
+  local sib="$QA_ROOT/.scratch/d3b-sib"
+  rm -rf "$sib"
+  git clone "file://$bare" "$sib" >/dev/null 2>&1
+  (cd "$sib" && jj git init --colocate >/dev/null 2>&1)
+  (cd "$sib" && "$JJF_BIN" remote add origin "file://$bare" >/dev/null 2>&1)
+  (cd "$sib" && "$JJF_BIN" pull origin >/dev/null 2>&1)
+  mkdir -p "$sib/evidence"
+
+  # Writer A (orig): mutate + push — this advances the bare remote
+  SCRATCH="$orig_scratch" EVIDENCE="$orig_evidence" run_jjf update "$id" --title "first" || true
+  SCRATCH="$orig_scratch" EVIDENCE="$orig_evidence" run_jjf push origin || true
+
+  # Writer B (sib): mutate (diverged from orig — sib pulled before
+  # orig's "first" push), then push — should conflict against the
+  # bare's updated refs/jjf/issues/* heads
+  SCRATCH="$sib" EVIDENCE="$sib/evidence" run_jjf --json update "$id" --title "second" || true
+  SCRATCH="$sib" EVIDENCE="$sib/evidence" run_jjf --json push origin || true
+
+  local push_rc; push_rc="$(cat "$sib/evidence/last-exit")"
+  local push_stdout; push_stdout="$(cat "$sib/evidence/last-stdout")"
+  local push_stderr; push_stderr="$(cat "$sib/evidence/last-stderr")"
+
+  echo "[d3b] sib push exit=$push_rc"
+  echo "[d3b] sib push stdout: $push_stdout"
+  echo "[d3b] sib push stderr: $push_stderr"
+
+  # Snapshot the full stderr for archival — this is the canonical
+  # record of "what does jjf say when a push diverges" for round
+  # 2026-06-25.
+  cp "$sib/evidence/last-stderr" "$orig_evidence/d3b-hint-snapshot.txt"
+  cp "$sib/evidence/last-stdout" "$orig_evidence/d3b-stdout-snapshot.txt"
+
+  # Determine error kind
+  local kind="unknown"
+  if jq -e '.ok == false' "$sib/evidence/last-stderr" >/dev/null 2>&1; then
+    kind="$(jq -r '.error.kind' "$sib/evidence/last-stderr" 2>/dev/null || echo unknown)"
+  elif jq -e '.ok == true' "$sib/evidence/last-stdout" >/dev/null 2>&1; then
+    kind="success"
+  fi
+  echo "[d3b] kind=$kind"
+
+  # Extract the hint/message text (whichever the envelope carries).
+  local hint=""
+  if [[ "$kind" != "unknown" && "$kind" != "success" ]]; then
+    hint="$(jq -r '.error.details.hint // .error.message // ""' "$sib/evidence/last-stderr" 2>/dev/null || echo "")"
+    echo "[d3b] hint/message: $hint"
+  fi
+
+  # Substring-match probe across both phrase sets (concurrent_write
+  # and push_rejected). Any hit is a contract-drift candidate: the
+  # message text isn't stable contract, so scripts depending on it
+  # will break when the message gets edited.
+  local matched=0
+  for phrase in \
+    "another writer landed first" \
+    "concurrent write" \
+    "concurrent" \
+    "conflict" \
+    "stale" \
+    "retry" \
+    "pull first" \
+    "run \`jjf pull" \
+    "rejected" \
+    "non-fast-forward" \
+    "fetch first"
+  do
+    if [[ "$hint" == *"$phrase"* ]]; then
+      echo "[d3b] FINDING-CANDIDATE: $kind hint contains substring '$phrase' — scripts may hardcode this; file as sev:contract-drift if the message isn't stabilized or split into structured fields"
+      matched=1
+    fi
+  done
+
+  if [[ "$kind" == "concurrent_write" || "$kind" == "push_rejected" ]]; then
+    if [[ "$matched" == "0" ]]; then
+      echo "[d3b] NEGATIVE: $kind surfaced with structured envelope; hint text contains none of the watched substrings"
+    fi
+  elif [[ "$kind" == "success" ]]; then
+    echo "[d3b] FINDING: both pushes succeeded under the fallback recipe — divergence didn't trigger an error envelope (expected concurrent_write or push_rejected)"
+  else
+    echo "[d3b] INFO: unexpected kind=$kind — raw stderr archived at $orig_evidence/d3b-hint-snapshot.txt"
+  fi
+}
+
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   echo "=== D1: envelope/exit-code sweep ==="
   d1
@@ -238,4 +366,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   echo ""
   echo "=== D3: ConcurrentWrite hint snapshot ==="
   d3
+  echo ""
+  echo "=== D3b: ConcurrentWrite hint snapshot (fallback recipe) ==="
+  d3b
 fi

@@ -31,6 +31,32 @@ b1() {
 # -----------------------------------------------------------------------------
 # B2. Status-machine reachability matrix
 # -----------------------------------------------------------------------------
+#
+# 2026-06-26 followup (c67f162): the original matrix only asserted on exit
+# code and stderr-regex. A verb that succeeds (exit 0) but performs no
+# state change on a terminal issue (e.g. `unblock` on `open`, `open` on
+# `open`) would not have been flagged — but the wrong-answer class
+# explicitly includes silent no-ops. We now read `jjf show --json` after
+# every verb and compare the post-status to the spec's status-machine
+# expectation. Any mismatch is reported as a finding.
+#
+# Expected post-status per (source_status, verb) pair, derived from
+# `crates/jjf-storage/src/lib.rs` (the unconditional `set_status` path
+# for close/open/abandon; `block` / `unblock` rejecting on
+# closed/abandoned; `comment` / `update --title` / `label add` /
+# `dep add` being status-preserving):
+#
+#                        verb that succeeds → post-status
+#   source │ comment │ updT │ updSO │ block │ unblock │ close │ open │ abandon │ label │ dep
+#   ──────┼─────────┼──────┼───────┼───────┼─────────┼───────┼──────┼─────────┼───────┼────
+#   open   │ open    │ open │ open  │block. │ open    │closed │ open │ aband.  │ open  │ open
+#   closed │ closed  │ closed│ open │  REJ  │   REJ   │closed │ open │ aband.  │ closed│ closed
+#   aband. │ aband.  │ aband.│ open │  REJ  │   REJ   │closed │ open │ aband.  │ aband.│ aband.
+#   blocked│ blocked │ blocked│ open│block. │ open    │closed │ open │ aband.  │ blocked│ blocked
+#
+# REJ = expected typed rejection (storage.block/unblock return
+# Error::Invalid on closed/abandoned). For REJ cells we assert post-
+# status is UNCHANGED from source.
 b2() {
   # Source statuses we'll drive an issue to.
   local statuses=("open" "closed" "abandoned" "blocked")
@@ -47,6 +73,69 @@ b2() {
     "label_add_test"
     "dep_add_self"   # we'll create a sibling for this
   )
+
+  # expected_post_status <source_status> <verb> → echoes expected post-
+  # status. The post-status reflects: success-cases follow the
+  # status-machine; rejection-cases (REJ) leave the status unchanged.
+  expected_post_status() {
+    local s="$1"
+    local v="$2"
+    case "$v" in
+      comment_one_line|update_title|label_add_test|dep_add_self)
+        # Status-preserving verbs.
+        echo "$s"
+        ;;
+      update_status_open|open_issue)
+        # Unconditional re-open via set_status (or update --status open).
+        echo "open"
+        ;;
+      close_issue)
+        # Unconditional close via set_status.
+        echo "closed"
+        ;;
+      abandon_issue)
+        # Unconditional abandon via set_status.
+        echo "abandoned"
+        ;;
+      block_issue)
+        # Rejects on closed/abandoned; otherwise → blocked.
+        case "$s" in
+          closed|abandoned) echo "$s" ;;
+          *) echo "blocked" ;;
+        esac
+        ;;
+      unblock_issue)
+        # Rejects on closed/abandoned; otherwise → open.
+        case "$s" in
+          closed|abandoned) echo "$s" ;;
+          *) echo "open" ;;
+        esac
+        ;;
+    esac
+  }
+
+  # Cells where the verb is EXPECTED to reject (typed Error::Invalid).
+  # For those cells: exit 1 is correct; exit 0 is a finding (silent
+  # success that didn't enforce the transition rule).
+  is_expected_rejection() {
+    local s="$1"
+    local v="$2"
+    case "$v" in
+      block_issue|unblock_issue)
+        case "$s" in
+          closed|abandoned) return 0 ;;
+          *) return 1 ;;
+        esac
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  mk_scratch_repo b2 >/dev/null
+  # Create a sibling for dep_add_self exercises.
+  run_jjf new -t "b2 sibling for dep" --slug b2-sibling
+  local sib
+  sib="$(grep -oE '[0-9a-f]{7}' "$EVIDENCE/last-stdout" | head -1)"
 
   # Helper: drive a fresh issue to the requested source status.
   # Echoes the issue id to stdout so the caller can capture it.
@@ -83,12 +172,6 @@ b2() {
     esac
   }
 
-  mk_scratch_repo b2 >/dev/null
-  # Create a sibling for dep_add_self exercises.
-  run_jjf new -t "b2 sibling for dep" --slug b2-sibling
-  local sib
-  sib="$(grep -oE '[0-9a-f]{7}' "$EVIDENCE/last-stdout" | head -1)"
-
   for s in "${statuses[@]}"; do
     for v in "${verbs[@]}"; do
       local id
@@ -96,6 +179,7 @@ b2() {
       exercise_verb "$v" "$id" "$sib"
       local rc; rc="$(cat "$EVIDENCE/last-exit")"
       record_evidence "matrix-$s-$v"
+
       # Generic exit 1 with no typed JSON envelope is a candidate finding.
       if [[ "$rc" == "1" ]]; then
         # Probe stderr for a typed error indicator (kind=... or invalid_input).
@@ -104,6 +188,44 @@ b2() {
         fi
       elif [[ "$rc" != "0" && "$rc" != "2" ]]; then
         echo "[b2] FINDING: ($s, $v) unexpected exit $rc"
+      fi
+
+      # Post-status assertion (2026-06-26 followup). Read the issue's
+      # post-state and compare to the spec's expectation. Silent no-ops
+      # surface here: e.g. a verb returning exit 0 on a terminal issue
+      # but failing to apply the transition.
+      run_jjf show --json "$id"
+      local show_rc; show_rc="$(cat "$EVIDENCE/last-exit")"
+      if [[ "$show_rc" != "0" ]]; then
+        echo "[b2] FINDING: ($s, $v) show --json failed after verb (exit $show_rc)"
+        cp "$EVIDENCE/last-stdout" "$EVIDENCE/matrix-$s-$v-show-stdout"
+        cp "$EVIDENCE/last-stderr" "$EVIDENCE/matrix-$s-$v-show-stderr"
+        continue
+      fi
+      local got_status
+      got_status="$(jq -r '.status' "$EVIDENCE/last-stdout" 2>/dev/null || echo NONE)"
+      local want_status
+      want_status="$(expected_post_status "$s" "$v")"
+      cp "$EVIDENCE/last-stdout" "$EVIDENCE/matrix-$s-$v-show-stdout"
+
+      if is_expected_rejection "$s" "$v"; then
+        # Cell where verb is expected to reject.
+        if [[ "$rc" == "0" && "$got_status" != "$s" ]]; then
+          # Silent acceptance that DID flip the status — clear finding.
+          echo "[b2] FINDING: ($s, $v) wrong-answer: verb exit 0 AND status flipped $s → $got_status; spec mandates rejection on terminal/non-applicable source"
+        elif [[ "$rc" == "0" && "$got_status" == "$s" ]]; then
+          # Silent no-op: exit 0 but post-state unchanged. The
+          # verb claimed success without doing anything.
+          echo "[b2] FINDING: ($s, $v) silent-no-op: verb exit 0 but post-status unchanged ($got_status); spec mandates a typed rejection"
+        fi
+      else
+        # Cell where verb is expected to apply (or be status-preserving).
+        if [[ "$rc" == "0" && "$got_status" != "$want_status" ]]; then
+          echo "[b2] FINDING: ($s, $v) wrong-answer: post-status=$got_status, expected $want_status (verb exited 0 but didn't apply the transition)"
+        elif [[ "$rc" != "0" && "$got_status" != "$s" ]]; then
+          # Verb errored but state changed — corruption.
+          echo "[b2] FINDING: ($s, $v) wrong-answer: verb exit $rc but status mutated $s → $got_status (failed mutation should be atomic)"
+        fi
       fi
     done
   done
