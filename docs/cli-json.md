@@ -559,6 +559,7 @@ from plain-text mode (see the top comment in `main.rs`: `0` success,
 | `kind`                       | Exit | Source variant                | `details` keys           |
 |------------------------------|------|-------------------------------|--------------------------|
 | `not_a_jj_repo`              | 2    | `Storage::NotAJjRepo`         | `path`                   |
+| `corrupt_sentinel`           | 1    | `Storage::CorruptSentinel`    | `oid`, `object_type`     |
 | `missing_issues_bookmark`    | 2    | `MissingIssuesBookmark`       | `path`                   |
 | `issue_not_found`            | 1    | `Storage::IssueNotFound`      | `id`                     |
 | `bad_id`                     | 2    | `BadIssueId` / `BadDepId`     | `value`, `field`         |

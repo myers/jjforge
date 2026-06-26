@@ -560,6 +560,64 @@ fn ls_no_warning_on_healthy_repo() {
     );
 }
 
+/// Repoint `refs/jjf/meta/format-version` at a junk blob to simulate
+/// the QA red-team `c1` attack (issue `de59159`). Mirrors the helper
+/// pattern of `corrupt_issue_ref`, but for the sentinel ref.
+fn corrupt_sentinel_to_blob(repo: &Path) -> String {
+    let blob_oid = git_capture_with_stdin(
+        &["hash-object", "-w", "--stdin"],
+        b"not a commit\n",
+        repo,
+    );
+    let blob_oid = blob_oid.trim().to_owned();
+    let out = Command::new("git")
+        .args(["update-ref", "refs/jjf/meta/format-version", &blob_oid])
+        .current_dir(repo)
+        .output()
+        .expect("spawn git update-ref");
+    assert!(
+        out.status.success(),
+        "git update-ref refs/jjf/meta/format-version {} failed: stderr={}",
+        blob_oid,
+        String::from_utf8_lossy(&out.stderr),
+    );
+    blob_oid
+}
+
+#[test]
+fn ls_exits_1_with_corrupt_sentinel_envelope() {
+    // Ticket `de59159` (QA sub-pass 3, attack `c1`): when someone
+    // hand-wires the v3 format-version sentinel to a blob,
+    // `jjf ls` used to silently exit 0 with normal output because
+    // `detect_storage_mode` only checked presence of the ref. The
+    // fix surfaces the typed `corrupt_sentinel` envelope.
+    let repo = make_initialized_repo("ls_corrupt_sentinel");
+    let blob_oid = corrupt_sentinel_to_blob(&repo);
+
+    let out = run_jjf(&repo, &["--json", "ls"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "ls must exit 1 with a corrupt sentinel, got code={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let envelope_line = stderr
+        .lines()
+        .find(|l| l.contains("\"ok\""))
+        .unwrap_or_else(|| panic!("no JSON envelope on stderr: {stderr:?}"));
+    let env: serde_json::Value =
+        serde_json::from_str(envelope_line).expect("envelope must be valid JSON");
+    assert_eq!(env["ok"].as_bool(), Some(false));
+    assert_eq!(env["error"]["kind"].as_str(), Some("corrupt_sentinel"));
+    assert_eq!(
+        env["error"]["details"]["object_type"].as_str(),
+        Some("blob")
+    );
+    assert_eq!(env["error"]["details"]["oid"].as_str(), Some(blob_oid.as_str()));
+}
+
 #[test]
 fn ls_help_documents_status_and_label_flags() {
     // --help should mention both --status and --label. Keeps the public

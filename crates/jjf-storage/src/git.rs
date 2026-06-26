@@ -319,6 +319,41 @@ impl GitRepo {
         Ok(Some(oid))
     }
 
+    /// Resolve `ref_name` to `(oid, object_type)` if the ref exists.
+    /// Returns `None` if the ref is absent. `object_type` is git's
+    /// own classification — typically `"commit"` for a healthy v3
+    /// sentinel or per-issue ref, but `"blob"` / `"tree"` / `"tag"`
+    /// are possible if someone hand-wired the ref with
+    /// `git update-ref` (the corrupt-sentinel case detected at
+    /// `Storage::open` per ticket `de59159`).
+    ///
+    /// Implementation: `git rev-parse --verify --quiet <ref>` to get
+    /// the oid (same probe `resolve_ref` uses), then `git cat-file
+    /// -t <oid>` for the type. Two spawns vs. one but only on the
+    /// "ref is present" path — the common "absent" case stays at
+    /// one spawn through `resolve_ref`.
+    pub(crate) fn resolve_ref_with_type(
+        &self,
+        ref_name: &str,
+    ) -> Result<Option<(String, String)>, GitError> {
+        let Some(oid) = self.resolve_ref(ref_name)? else {
+            return Ok(None);
+        };
+        let out = self
+            .cmd(&["cat-file", "-t", &oid])
+            .output()
+            .map_err(GitError::Io)?;
+        if !out.status.success() {
+            return Err(GitError::Cli {
+                cmd: format!("git cat-file -t {}", oid),
+                status: out.status.code(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+        let kind = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        Ok(Some((oid, kind)))
+    }
+
     /// Read the bytes of `path` from `ref_name`'s tree. Returns
     /// `Ok(None)` if either the ref doesn't exist or the path is
     /// absent within the ref's tree (a brand-new issue case, or a

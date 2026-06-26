@@ -204,6 +204,23 @@ pub enum Error {
     #[error("not a jj repo: {0}")]
     NotAJjRepo(PathBuf),
 
+    /// The v3 sentinel ref `refs/jjf/meta/format-version` exists but
+    /// doesn't point at a commit (e.g. it was hand-wired with
+    /// `git update-ref` to a blob, tree, or tag oid). The docstring on
+    /// `detect_storage_mode` declares "Returns V3 iff the sentinel
+    /// ref resolves to a commit"; this variant is the typed surface
+    /// of that contract failing.
+    ///
+    /// Runtime failure (exit 1 via the CLI envelope), not preflight:
+    /// the operator typed a well-formed command and the on-disk repo
+    /// is in an inconsistent state. The `oid` and `kind` carry git's
+    /// own classification (`blob` / `tree` / `tag`) so the operator
+    /// can identify what was planted. Per ticket `de59159`.
+    #[error(
+        "format-version sentinel ref points at {kind} {oid}, expected commit"
+    )]
+    CorruptSentinel { oid: String, kind: String },
+
     /// A slug failed the v2.1 validation rules (charset, length,
     /// hyphen placement). Surfaced from `Storage::create_issue` /
     /// `Storage::update` whenever a non-`None` slug doesn't pass
@@ -1038,15 +1055,27 @@ pub(crate) enum StorageMode {
 /// [`StorageMode::V3`] iff the sentinel ref resolves to a commit;
 /// otherwise [`StorageMode::V2`].
 ///
-/// Failure modes: a real git failure (corrupt repo, missing object,
-/// IO error) bubbles up as [`Error::Git`]. A simply-absent ref is
-/// NOT a failure — it's the v2 case, so we return `V2`.
+/// Failure modes:
+/// - A real git failure (corrupt repo, missing object, IO error)
+///   bubbles up as [`Error::Git`].
+/// - A simply-absent ref is NOT a failure — it's the v2 case, so we
+///   return `V2`.
+/// - A present-but-wrong-type ref (sentinel hand-wired to a blob /
+///   tree / tag rather than a commit) surfaces as
+///   [`Error::CorruptSentinel`]. The sentinel's docstring claims
+///   "iff the sentinel ref resolves to a commit"; this branch
+///   enforces it instead of silently flipping to v3 mode on a
+///   nonsense ref. Per ticket `de59159` (the QA red-team `c1`
+///   attack).
 ///
 /// This is the v3 vs v2 discriminator on every `Storage::open` and
-/// `Storage::init`. Cheap: one `git rev-parse --verify --quiet` call.
+/// `Storage::init`. Healthy-path cost: one `git rev-parse --verify
+/// --quiet` for absent (v2) or that plus a `git cat-file -t` for
+/// present (v3) — both cheap, both single-spawn.
 fn detect_storage_mode(git: &git::GitRepo) -> Result<StorageMode> {
-    match git.resolve_ref(v3_write::refs::FORMAT_VERSION_REF) {
-        Ok(Some(_)) => Ok(StorageMode::V3),
+    match git.resolve_ref_with_type(v3_write::refs::FORMAT_VERSION_REF) {
+        Ok(Some((_, kind))) if kind == "commit" => Ok(StorageMode::V3),
+        Ok(Some((oid, kind))) => Err(Error::CorruptSentinel { oid, kind }),
         Ok(None) => Ok(StorageMode::V2),
         Err(e) => Err(Error::Git(e)),
     }

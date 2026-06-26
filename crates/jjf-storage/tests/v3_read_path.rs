@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use jjf_storage::{
-    DepEdge, DepKind, IssueDraft, IssueType, ReadyFilter, Status, Storage,
-    UpdateFields,
+    DepEdge, DepKind, Error as StorageError, IssueDraft, IssueType,
+    ReadyFilter, Status, Storage, UpdateFields,
 };
 
 // ---- fixture --------------------------------------------------------
@@ -637,6 +637,85 @@ fn v3_read_returns_cached_record_after_ref_tamper() {
         issue.title, "sneaky",
         "v3 cache should reflect the on-disk blob after a ref tamper"
     );
+}
+
+// ---- corrupt-sentinel detection -----------------------------------
+//
+// Ticket `de59159` (QA red-team sub-pass 3, attack `c1`): if someone
+// hand-wires `refs/jjf/meta/format-version` to a blob (or tree, or
+// tag) rather than a commit, `detect_storage_mode` used to return
+// `StorageMode::V3` because `resolve_ref` checks presence not type.
+// The docstring at `lib.rs:1037` explicitly promises "iff the
+// sentinel ref resolves to a commit"; the fix enforces it.
+//
+// Test contract: opening such a repo surfaces the typed
+// `Error::CorruptSentinel { oid, kind }` rather than silently
+// flipping mode (or worse, panicking later on a missing tree
+// readbehind).
+
+#[test]
+fn v3_open_rejects_blob_sentinel() {
+    let repo = make_v3_scratch_repo("v3_open_rejects_blob_sentinel");
+    // Repoint the sentinel ref at a blob oid.
+    let blob_oid = git_capture_with_stdin(
+        &["hash-object", "-w", "--stdin"],
+        b"not a commit\n",
+        &repo,
+    );
+    let blob_oid = blob_oid.trim();
+    sh(
+        "git",
+        &["update-ref", "refs/jjf/meta/format-version", blob_oid],
+        &repo,
+    );
+
+    let err = Storage::open(&repo).expect_err(
+        "blob sentinel must be rejected, not silently treated as v3",
+    );
+    match err {
+        StorageError::CorruptSentinel { oid, kind } => {
+            assert_eq!(oid, blob_oid, "carry the offending oid");
+            assert_eq!(
+                kind, "blob",
+                "carry git's own object-type classification"
+            );
+        }
+        other => panic!("expected CorruptSentinel, got {other:?}"),
+    }
+}
+
+#[test]
+fn v3_open_rejects_tree_sentinel() {
+    let repo = make_v3_scratch_repo("v3_open_rejects_tree_sentinel");
+    // Mint a standalone tree (with no commit wrapper) and point the
+    // sentinel at it.
+    let blob_oid = git_capture_with_stdin(
+        &["hash-object", "-w", "--stdin"],
+        b"3\n",
+        &repo,
+    );
+    let blob_oid = blob_oid.trim();
+    let tree_oid = git_capture_with_stdin(
+        &["mktree"],
+        format!("100644 blob {blob_oid}\tversion\n").as_bytes(),
+        &repo,
+    );
+    let tree_oid = tree_oid.trim();
+    sh(
+        "git",
+        &["update-ref", "refs/jjf/meta/format-version", tree_oid],
+        &repo,
+    );
+
+    let err = Storage::open(&repo)
+        .expect_err("tree sentinel must be rejected");
+    match err {
+        StorageError::CorruptSentinel { oid, kind } => {
+            assert_eq!(oid, tree_oid);
+            assert_eq!(kind, "tree");
+        }
+        other => panic!("expected CorruptSentinel, got {other:?}"),
+    }
 }
 
 fn git_capture(args: &[&str], cwd: &Path) -> String {

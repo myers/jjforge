@@ -1229,6 +1229,10 @@ impl CliError {
     fn exit_code(&self) -> u8 {
         match self {
             CliError::Storage(StorageError::NotAJjRepo(_)) => 2,
+            // Runtime failure: the operator typed a well-formed
+            // command; the on-disk repo is in an inconsistent state
+            // (sentinel ref hand-wired to a non-commit object).
+            CliError::Storage(StorageError::CorruptSentinel { .. }) => 1,
             CliError::Storage(StorageError::InvalidSlug { .. }) => 2,
             CliError::Storage(StorageError::InvalidTitle { .. }) => 2,
             CliError::Storage(StorageError::SlugCollision { .. }) => 2,
@@ -1293,6 +1297,7 @@ impl CliError {
     fn kind(&self) -> &'static str {
         match self {
             CliError::Storage(StorageError::NotAJjRepo(_)) => "not_a_jj_repo",
+            CliError::Storage(StorageError::CorruptSentinel { .. }) => "corrupt_sentinel",
             CliError::Storage(StorageError::IssueNotFound(_)) => "issue_not_found",
             CliError::Storage(StorageError::Invalid(_)) => "invalid_input",
             CliError::Storage(StorageError::Clock(_)) => "clock_error",
@@ -1365,6 +1370,9 @@ impl CliError {
         match self {
             CliError::Storage(StorageError::NotAJjRepo(path)) => {
                 json!({ "path": path.display().to_string() })
+            }
+            CliError::Storage(StorageError::CorruptSentinel { oid, kind }) => {
+                json!({ "oid": oid, "object_type": kind })
             }
             CliError::Storage(StorageError::IssueNotFound(id)) => {
                 json!({ "id": id.as_str() })
