@@ -34,7 +34,7 @@ The `.scratch/` directory is gitignored.
 | C2     | negative  |     | all 5 Unicode titles (ZWSP, ZWJ, RTL-override, combining-acute, Cyrillic-а) round-trip byte-faithfully; `ls` exits 0 |
 | C3     | negative  |     | 10MB title → ARG_MAX (OS harness limit, not jjf); 10MB body accepted (no cap, no panic); 1k labels + 1k comments: `ls`/`show` exit 0 within 30s |
 | C4     | negative  |     | extra-field accepted (serde default, good forward-compat); missing-status + status-int both return typed `json_error` envelope, exit 1, no panic |
-| D1     | negative  |     | all 6 error-class cases correct: issue_not_found×3 (exit 1), slug_not_found (exit 2), close-idempotent→ok:true, label-bad-id→slug_not_found (exit 2 per slug-resolution path) |
+| D1     | negative  |     | all 6 error-class cases correct: issue_not_found×3 (exit 1), slug_not_found (exit 2), close-on-closed→invalid_input (exit 1), label-bad-id→slug_not_found (exit 2 per slug-resolution path) |
 | D2     | negative  |     | `abandon --json` emits `{"ok":true,"id":"...","status":"abandoned"}` exactly per v2.7 spec |
 | D3     | finding   | `88e4d6b` | `push_rejected` message embeds raw git stderr (version-dependent hint text + internal refspec paths); `details` only carries `remote`; hint placement inconsistent vs `concurrent_write` |
 
