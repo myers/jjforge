@@ -124,6 +124,11 @@ pub use record::{
     Comment, DepEdge, DepKind, Issue, IssueDraft, IssueRecord, IssueType, Memory, Status,
 };
 
+// `MatchedField`, `SearchHit`, `make_snippet`, and
+// `DEFAULT_SNIPPET_CONTEXT` are declared inline below alongside
+// `Storage::search`. We re-state the export here for discoverability;
+// public types live at the crate root.
+
 // `ReadyFilter` is declared below alongside its helpers, but we
 // re-state the export here for discoverability. Public types live
 // at the crate root.
@@ -729,6 +734,181 @@ fn compute_blocked_set(all: &[Issue]) -> std::collections::HashSet<IssueId> {
 /// Type union helper. Empty wanted = match every type.
 fn types_match_any(issue_type: IssueType, wanted: &[IssueType]) -> bool {
     wanted.is_empty() || wanted.iter().any(|t| *t == issue_type)
+}
+
+/// Which field on an issue the search query first matched against.
+/// Mirrors the priority order [`Storage::search`] uses when an issue
+/// hits in more than one field: title beats body, body beats comments.
+/// The CLI's `--json` envelope serializes this as a lowercase string
+/// (`"title"` / `"body"` / `"comments"`); the plain-text row uses the
+/// same spelling so the column is stable across both shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MatchedField {
+    /// The issue's title carried the first hit.
+    Title,
+    /// The issue's body carried the first hit (and the title didn't).
+    Body,
+    /// One of the issue's comment bodies carried the first hit (and
+    /// neither title nor body did). Only reachable when the search
+    /// was invoked with `include_comments = true`.
+    Comments,
+}
+
+impl MatchedField {
+    /// Wire spelling used by the `jjf search` plain-text row and the
+    /// JSON envelope's `matched_field` key. Lowercase to match
+    /// [`Status::as_str`] / [`IssueType::as_str`]'s shape.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MatchedField::Title => "title",
+            MatchedField::Body => "body",
+            MatchedField::Comments => "comments",
+        }
+    }
+}
+
+/// One hit returned by [`Storage::search`].
+///
+/// `score` is the total occurrence count of the (case-insensitive)
+/// substring across every searched field on the issue — title, body,
+/// and (when `include_comments = true`) every comment body. Used by
+/// the CLI to rank multi-field hits above single-field hits without
+/// bringing in a real BM25/TF-IDF surface.
+///
+/// `matched_field` is the field where the FIRST hit was discovered,
+/// using the priority order `Title > Body > Comments`. When an issue
+/// hits in more than one field, the more specific surface wins; e.g.
+/// "foo" hitting both title and body reports `Title`. Single-field
+/// hits report whichever field carried the match.
+///
+/// `snippet` is the rendered preview around the first hit on the
+/// matched field. See [`Storage::search`] for the exact windowing
+/// rules. Newlines and tabs in the source field are normalized to
+/// single spaces so the CLI's tab-separated plain-text row stays one
+/// line; leading/trailing `…` (U+2026) marks truncation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SearchHit {
+    /// The matching issue (full read-side projection — same shape
+    /// [`Storage::read`] returns).
+    pub issue: Issue,
+    /// Where the first hit was found. See type-level docs.
+    pub matched_field: MatchedField,
+    /// Total occurrence count across every searched field.
+    pub score: usize,
+    /// Preview of the matched field around the first hit.
+    pub snippet: String,
+}
+
+/// Default half-width of the snippet window built by
+/// [`Storage::search`] — `±40` chars around the first hit. Matches
+/// the value the ticket calls out as the default.
+pub const DEFAULT_SNIPPET_CONTEXT: usize = 40;
+
+/// Count non-overlapping occurrences of `needle` (already lowercased
+/// by the caller) in `haystack`, case-insensitively. Used by
+/// [`Storage::search`] to compute per-field hit counts.
+///
+/// The implementation walks `haystack.to_lowercase()` byte by byte,
+/// stepping past each match by `needle.len()`. Non-overlapping
+/// counting matches the way a reader would tally "how many times does
+/// X show up here" — overlapping matches (e.g. "aa" in "aaaa")
+/// surface as 2, not 3.
+///
+/// Returns 0 on an empty needle (the caller in [`Storage::search`]
+/// rejects empty queries up front; this is the defensive guard).
+fn count_ci(haystack: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let h = haystack.to_lowercase();
+    let mut count = 0;
+    let mut start = 0;
+    while let Some(off) = h[start..].find(needle) {
+        count += 1;
+        start += off + needle.len();
+        if start > h.len() {
+            break;
+        }
+    }
+    count
+}
+
+/// Build the snippet preview around the FIRST case-insensitive hit of
+/// `needle` (already lowercased) in `haystack`. The window is
+/// `±context` chars on either side of the hit; bytes outside the
+/// window are dropped, with a leading `…` if the window doesn't start
+/// at the beginning and a trailing `…` if it doesn't end at the end.
+///
+/// Char-boundary safe: we walk char indices, not bytes, so a snippet
+/// landing in the middle of a multibyte UTF-8 sequence still slices
+/// at a valid boundary. The CLI tab-separated row stays one line —
+/// embedded newlines and tabs in the source field are replaced with
+/// single ASCII spaces before windowing (so column count is stable).
+///
+/// Returns the empty string if the needle isn't found (defensive —
+/// the caller in [`Storage::search`] already verified `count_ci > 0`
+/// before calling this).
+pub fn make_snippet(haystack: &str, needle: &str, context: usize) -> String {
+    if needle.is_empty() {
+        return String::new();
+    }
+    // Normalize newlines/tabs before searching. Matching against the
+    // lowercase-normalized form keeps offsets in step.
+    let cleaned: String = haystack
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+        .collect();
+    let lower = cleaned.to_lowercase();
+    let Some(byte_idx) = lower.find(needle) else {
+        return String::new();
+    };
+
+    // Translate the byte offset (into `lower`, which has the same
+    // structure as `cleaned` byte-for-byte for the ASCII range we
+    // care about for offsets) into a char index in `cleaned`. The
+    // ASCII assumption is safe here only when matches stay ASCII;
+    // for the multibyte case we fall through to a char-walk that
+    // works regardless.
+    let mut chars_iter = cleaned.char_indices();
+    let mut hit_char_idx = 0usize;
+    for (cidx, (bidx, _ch)) in (&mut chars_iter).enumerate() {
+        if bidx == byte_idx {
+            hit_char_idx = cidx;
+            break;
+        }
+        if bidx > byte_idx {
+            hit_char_idx = cidx.saturating_sub(1);
+            break;
+        }
+    }
+
+    // Compute the char-index window. Use char counts (not bytes) so
+    // multibyte content gets the documented context width.
+    let total_chars = cleaned.chars().count();
+    let start_char = hit_char_idx.saturating_sub(context);
+    let end_char = (hit_char_idx + needle.chars().count() + context).min(total_chars);
+
+    // Materialize the substring via char_indices to stay safe on
+    // multibyte boundaries.
+    let mut start_byte = cleaned.len();
+    let mut end_byte = cleaned.len();
+    for (cidx, (bidx, _)) in cleaned.char_indices().enumerate() {
+        if cidx == start_char {
+            start_byte = bidx;
+        }
+        if cidx == end_char {
+            end_byte = bidx;
+            break;
+        }
+    }
+    // If we never set end_byte (window runs to the end), keep the
+    // default (cleaned.len()).
+    let middle = &cleaned[start_byte..end_byte];
+
+    let prefix = if start_char > 0 { "…" } else { "" };
+    let suffix = if end_char < total_chars { "…" } else { "" };
+    format!("{prefix}{middle}{suffix}")
 }
 
 /// Why a slug failed validation. Each variant maps to one of the
@@ -3245,6 +3425,119 @@ impl Storage {
             ready.truncate(n);
         }
         Ok(ready)
+    }
+
+    /// Case-insensitive substring search across every issue's title,
+    /// body, and (when `include_comments` is set) comment bodies.
+    /// Returns one [`SearchHit`] per issue that matched, unsorted —
+    /// the caller is responsible for sort + limit + filter
+    /// composition. The order in the returned vec is the snapshot
+    /// HashMap's iteration order; callers shouldn't rely on it.
+    ///
+    /// Match semantics:
+    ///
+    /// - Substring, not regex. `q.to_lowercase().contains(...)` is the
+    ///   primitive.
+    /// - Empty query (`""`) returns an empty vec — match-everything is
+    ///   `jjf ls`'s job, not `search`'s. Skipping early also keeps the
+    ///   storage layer's contract honest (no surprise full-table scan
+    ///   on the empty input).
+    /// - Comments are searched only when `include_comments` is true.
+    ///   The snapshot cache already materializes every comment inline
+    ///   on the projected [`Issue`] (see [`cache::SnapshotCache`]), so
+    ///   `include_comments` is a per-issue iteration toggle, not a
+    ///   separate IO path.
+    ///
+    /// `MatchedField` priority: when an issue hits in more than one
+    /// field, the more specific surface wins — `Title > Body >
+    /// Comments`. This makes "is this title-relevant?" the dominant
+    /// signal in mixed-hit cases, which matches how a human triages a
+    /// search result.
+    ///
+    /// `score` is the total hit count across every searched field on
+    /// the issue (title + body + every comment body when included).
+    /// Multi-field hits dominate single-field hits naturally without
+    /// bringing in BM25/TF-IDF — see the ticket's "Out of scope"
+    /// section.
+    ///
+    /// `snippet` is a [`make_snippet`] preview of the matched field
+    /// around the first occurrence; `snippet_context` is the half-
+    /// width of the window. Pass [`DEFAULT_SNIPPET_CONTEXT`] when the
+    /// caller has no opinion. See [`make_snippet`] for the windowing
+    /// rules (char-boundary safe, newlines normalized, leading/
+    /// trailing ellipsis on truncation).
+    ///
+    /// Implementation reads the snapshot cache (one probe + maybe one
+    /// rebuild — same shape as [`Storage::list_ready`]) and runs the
+    /// substring scan in memory. No new IO beyond the snapshot.
+    pub fn search(
+        &self,
+        q: &str,
+        include_comments: bool,
+        snippet_context: usize,
+    ) -> Result<Vec<SearchHit>> {
+        // Empty query is match-nothing. Returning the snapshot's full
+        // contents would silently make `search ""` an alias for `ls
+        // --status all`, which is the wrong default.
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let needle = q.to_lowercase();
+        let snapshot = self.snapshot()?;
+        let mut out: Vec<SearchHit> = Vec::new();
+        for issue in snapshot.issues.values() {
+            // Per-field hit counts. Title and body always searched;
+            // comments only when the toggle is on.
+            let title_hits = count_ci(&issue.title, &needle);
+            let body_hits = count_ci(&issue.body, &needle);
+            let comments_hits: usize = if include_comments {
+                issue
+                    .comments
+                    .iter()
+                    .map(|c| count_ci(&c.body, &needle))
+                    .sum()
+            } else {
+                0
+            };
+            let score = title_hits + body_hits + comments_hits;
+            if score == 0 {
+                continue;
+            }
+            // Priority resolution: which field carries the snippet
+            // and the matched_field tag. Title > Body > Comments.
+            let (matched_field, snippet) = if title_hits > 0 {
+                (
+                    MatchedField::Title,
+                    make_snippet(&issue.title, &needle, snippet_context),
+                )
+            } else if body_hits > 0 {
+                (
+                    MatchedField::Body,
+                    make_snippet(&issue.body, &needle, snippet_context),
+                )
+            } else {
+                // include_comments must be true here (otherwise
+                // comments_hits == 0 and we'd have continued above).
+                // The first comment whose body matches carries the
+                // snippet; comments are stored chronologically per
+                // `Storage::read`'s contract, so "first match" is
+                // deterministic across runs.
+                let first = issue
+                    .comments
+                    .iter()
+                    .find(|c| count_ci(&c.body, &needle) > 0)
+                    .map(|c| make_snippet(&c.body, &needle, snippet_context))
+                    .unwrap_or_default();
+                (MatchedField::Comments, first)
+            };
+            out.push(SearchHit {
+                issue: issue.clone(),
+                matched_field,
+                score,
+                snippet,
+            });
+        }
+        Ok(out)
     }
 
     /// Enumerate the change_id shorts of every head of the `issues`

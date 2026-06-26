@@ -583,13 +583,21 @@ jjf ls --status closed
 
 # JSON for scripting
 jjf ls --json --label epic | jq '.[] | {id, title}'
+
+# Substring search across titles, bodies, and (optionally)
+# comment bodies (v2.9). Case-insensitive, NOT regex. Default
+# limit 20, default snippet window ±40 chars. matched_field
+# priority: title > body > comments.
+jjf search "concurrent_write"                      # titles + bodies
+jjf search "body cap" --include-comments           # plus comments
+jjf search "needle" --status open --label backend  # filters compose AND
+jjf search --json "needle" --limit 5 \
+    | jq -r '.results[] | "\(.id)\t\(.matched_field)\t\(.title)"'
 ```
 
 Filters jjforge doesn't yet ship that we want (file as
 agent-ergonomics tickets when needed):
 
-- Full-text search across bodies and comments. git-bug had a
-  query language; jjforge has none yet.
 - `--unblocked-by <id>`: "tell me what would become ready if X
   closes." Useful follow-up to `jjf ready` for planning.
 - `jjf dep ls <id>` — flat list of an issue's edges, by kind.

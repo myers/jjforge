@@ -1,5 +1,72 @@
 # `jjf --json` output contract
 
+## v2.8 → v2.9 changelog
+
+Backwards-compatible additions, landed in the `host-asterinas-search`
+ticket (`bc6b9d9`). Storage spec unchanged — this is a new query
+verb, not a new field or op.
+
+- **New verb `jjf search <query>`** — case-insensitive substring
+  search across issue titles, bodies, and (with
+  `--include-comments`) comment bodies. Returns one row per
+  matching issue with a snippet preview around the first hit.
+
+  Plain-text shape: one tab-separated row per match,
+  `<id>\t<title>\t<matched_field>\t<snippet>`. Newlines and tabs
+  inside the source field are normalized to single spaces in the
+  rendered snippet so the column count stays stable. Empty
+  result is silent (matches `ls`).
+
+  JSON shape — an envelope (NOT a bare array, distinct from `ls`):
+
+  ```json
+  {
+    "ok": true,
+    "results": [
+      {"id": "a3f9c01", "title": "...", "score": 3,
+       "snippet": "…window around first hit…",
+       "matched_field": "title"}
+    ]
+  }
+  ```
+
+  Empty result under `--json` is `{"ok":true,"results":[]}`.
+
+- **`matched_field` priority order.** When an issue hits in more
+  than one field, the more specific surface wins — `title >
+  body > comments`. So an issue whose title AND body both
+  contain the needle reports `matched_field: "title"`, and the
+  snippet previews the title (which is short, so the snippet is
+  often the full title). The `score` field still counts hits
+  across every searched field.
+
+- **Sort.** Score descending (most hits first), then
+  `created_at` ascending (stable tiebreak — matches
+  `list_ready`).
+
+- **Filters compose AND with the substring match.** `--status
+  <S>` (default `all`; differs from `ls`'s `open` default
+  because search is fundamentally "find anything containing X"),
+  `--label <L>` (repeatable, AND across labels), `--type <T>`
+  (repeatable, OR across types) — same semantics as the
+  corresponding `ls` flags.
+
+- **Tunable snippet window.** `--snippet-context <N>` sets the
+  half-width on either side of the first hit. Default 40.
+
+- **`--limit <N>`** caps the result list after the sort.
+  Default 20. Pass `--limit 0` for unlimited.
+
+- **Empty query (`jjf search ""`)** returns zero results — not
+  every issue. Match-everything is `jjf ls`'s job; refusing the
+  empty case keeps the storage layer's contract honest. Under
+  `--json` you still get `{"ok":true,"results":[]}`; plain text
+  is silent.
+
+- **Out of scope** (deferred per ticket `bc6b9d9`): regex,
+  fuzzy / edit-distance matching, BM25/TF-IDF relevance
+  ranking, memories search (use `jjf memories <substring>`).
+
 ## v2.7 → v2.8 changelog
 
 Backwards-compatible additions, landed in the `abandon-verb`
@@ -1073,6 +1140,87 @@ Error path — running outside a jj repo:
 
 ```sh
 $ jjf ready --json
+{"ok":false,"error":{"kind":"not_a_jj_repo","message":"not a jj repo: /tmp/foo","details":{"path":"/tmp/foo"}}}
+```
+
+### `search`
+
+Substring search across issue titles, bodies, and (optionally)
+comment bodies. Distinct from `ls`/`ready`'s bare-array shape:
+`search --json` returns an envelope (`{"ok":true,"results":[...]}`).
+
+```sh
+$ jjf search --json "segfault"
+{
+  "ok": true,
+  "results": [
+    {
+      "id": "a3f9c01",
+      "title": "panic on segfault",
+      "score": 2,
+      "snippet": "…ic on segfault when run with no args…",
+      "matched_field": "title"
+    }
+  ]
+}
+```
+
+`matched_field` is one of `"title"`, `"body"`, `"comments"`. When
+an issue hits in multiple fields, the most-specific one wins:
+title > body > comments. `score` is the total hit count across
+every searched field (title + body + every comment body, when
+included).
+
+Flags:
+
+- `--status <S>` — repeats `jjf ls`'s `--status` filter.
+  **Defaults to `all`** (not `open`, like `ls`) because search
+  is fundamentally a "find anything containing X" verb. Use
+  `--status open` to restrict to the actionable set.
+- `--label <L>` — repeatable, AND-semantics. Mirrors `jjf ls
+  --label`.
+- `--type <T>` — repeatable, OR-semantics. Mirrors `jjf ls
+  --type`.
+- `--include-comments` — also search comment bodies. Off by
+  default so the cheap "what mentions X" case stays unambiguous.
+- `--limit <N>` — cap the result list after the sort. Default
+  20. Pass `--limit 0` for unlimited.
+- `--snippet-context <N>` — half-width of the snippet window,
+  in characters, around the first hit. Default 40.
+
+Sort:
+
+1. **Score** descending (most hits first).
+2. **Tiebreaker**: `created_at` ascending.
+
+Plain-text rows:
+
+```sh
+$ jjf search "concurrent_write" --include-comments --limit 3
+277f559	qa-concurrent-write-ux: map jj internal error to typed concurrent_write	title	…
+88e4d6b	push_rejected --json message embeds raw git stderr	body	…
+eb42f50	storage-v3 #1: replace try_commit_dance with git-only write path	body	…
+```
+
+Empty query (`jjf search ""`) returns zero results — match-
+everything is `jjf ls`'s job. Under `--json` you get
+`{"ok":true,"results":[]}`; plain text is silent.
+
+Snippet rendering: the source field is normalized (newlines and
+tabs replaced with single spaces) before windowing, so the
+tab-separated plain-text row stays one line. A leading `…`
+indicates the window doesn't start at the field's start; a
+trailing `…` indicates it doesn't end at the end. Char-boundary
+safe — multibyte content is never sliced mid-codepoint.
+
+Out of scope for v1 (see ticket `bc6b9d9` for the rationale):
+regex, fuzzy / edit-distance matching, BM25/TF-IDF relevance
+ranking, memories search (use `jjf memories <substring>`).
+
+Error path — running outside a jj repo:
+
+```sh
+$ jjf search "x" --json
 {"ok":false,"error":{"kind":"not_a_jj_repo","message":"not a jj repo: /tmp/foo","details":{"path":"/tmp/foo"}}}
 ```
 

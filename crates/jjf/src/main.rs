@@ -41,9 +41,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use jjf_storage::{
-    ISSUES_BOOKMARK, ClaimResult, DepEdge, DepKind, DepTreeNode, Error as StorageError, IdError,
-    BodyInvalidReason, Issue, IssueDraft, IssueId, IssueType, Memory, ReadyFilter,
-    SlugInvalidReason, Status, Storage, TitleInvalidReason, UnreadableRef, UpdateFields,
+    DEFAULT_SNIPPET_CONTEXT, ISSUES_BOOKMARK, ClaimResult, DepEdge, DepKind, DepTreeNode,
+    Error as StorageError, IdError, BodyInvalidReason, Issue, IssueDraft, IssueId, IssueType,
+    Memory, ReadyFilter, SearchHit, SlugInvalidReason, Status, Storage, TitleInvalidReason,
+    UnreadableRef, UpdateFields,
 };
 
 /// Top-level CLI shape. Subcommands live on the `Commands` enum; the
@@ -710,6 +711,71 @@ enum Commands {
         /// Remote name (must already be configured via
         /// `jjf remote add <name> <url>`).
         remote: String,
+    },
+
+    /// Substring search across issue titles, bodies, and (optionally)
+    /// comment bodies. Returns one row per matching issue with a
+    /// snippet preview around the first hit.
+    ///
+    /// Match semantics: case-insensitive substring, NOT regex. The
+    /// match priority for `matched_field` is `title > body >
+    /// comments` — an issue that hits in multiple fields reports the
+    /// most-specific surface (title beats body, body beats comments).
+    ///
+    /// Plain-text output is one row per match,
+    /// `<id>\t<title>\t<matched_field>\t<snippet>`, sorted by `score`
+    /// descending (most hits first) then `created_at` ascending
+    /// (stable tiebreak). `--json` emits the
+    /// `{"ok":true,"results":[...]}` envelope; the empty case is
+    /// `{"ok":true,"results":[]}`. Plain text is silent on empty,
+    /// mirroring `ls`.
+    ///
+    /// The empty query (`""`) returns no results — match-everything
+    /// is `jjf ls`'s job. Filters (`--status`, `--label`, `--type`)
+    /// compose with AND semantics against the search hits.
+    Search {
+        /// Substring to search for. Case-insensitive. Empty query
+        /// returns no results (use `jjf ls` to list every issue).
+        query: String,
+
+        /// Filter the search hits by status. Mirrors `jjf ls
+        /// --status`. Default `all` — search is fundamentally a
+        /// "find anything containing X" verb, so we don't pre-restrict
+        /// to open issues the way `ls` does.
+        #[arg(long, value_enum, default_value_t = StatusFilter::All)]
+        status: StatusFilter,
+
+        /// Filter by label. Repeatable. Semantics: AND — an issue
+        /// must carry every listed label to match. Mirrors `jjf ls
+        /// --label`.
+        #[arg(short = 'l', long = "label")]
+        labels: Vec<String>,
+
+        /// Filter by issue type. Repeatable. Semantics: OR — an
+        /// issue matches if its type equals any of the listed
+        /// types. Mirrors `jjf ls --type`.
+        #[arg(long = "type", value_enum)]
+        types: Vec<TypeArg>,
+
+        /// Also search comment bodies. Off by default so the common
+        /// "what's mentioned in titles/bodies" query stays cheap
+        /// and unambiguous; the snapshot cache already materializes
+        /// every comment, so this is a per-issue iteration toggle
+        /// rather than an extra IO path.
+        #[arg(long = "include-comments")]
+        include_comments: bool,
+
+        /// Truncate the result to the first N entries after the
+        /// score sort. Default 20 (matches the ticket's contract).
+        /// Pass `0` for unlimited.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+
+        /// Half-width of the snippet window — `±N` characters around
+        /// the first hit on the matched field. Default 40 (per
+        /// `DEFAULT_SNIPPET_CONTEXT`).
+        #[arg(long = "snippet-context", default_value_t = DEFAULT_SNIPPET_CONTEXT)]
+        snippet_context: usize,
     },
 
     /// Pull the `issues` bookmark from a git remote, then merge any
@@ -1674,6 +1740,24 @@ fn run(cli: Cli) -> Result<(), CliError> {
         },
         Commands::Push { remote } => run_push(cli.json, remote),
         Commands::Pull { remote } => run_pull(cli.json, remote),
+        Commands::Search {
+            query,
+            status,
+            labels,
+            types,
+            include_comments,
+            limit,
+            snippet_context,
+        } => run_search(
+            cli.json,
+            query,
+            status,
+            labels,
+            types,
+            include_comments,
+            limit,
+            snippet_context,
+        ),
         Commands::Update {
             id,
             title,
@@ -3464,6 +3548,112 @@ fn run_ready(
     // same handling as `run_ls`. The ready set silently dropping an
     // id is a worse failure mode than `ls` doing it, because `ready`
     // is the agent's headline pick-next-work verb. Ticket `4928ae6`.
+    let unreadable = storage.unreadable_refs()?;
+    emit_unreadable_warning(&unreadable, json);
+
+    Ok(())
+}
+
+/// `jjf search <query> [--status S] [--label L...] [--type T...]
+/// [--include-comments] [--limit N] [--snippet-context N] [--json]`
+/// — substring search across issue titles, bodies, and (optionally)
+/// comment bodies.
+///
+/// Preflight mirrors `run_ls` / `run_ready` exactly — read verb, no
+/// self-host-write guard. Storage layer handles the match logic;
+/// this fn does filter composition, sort, limit, and render.
+///
+/// Sort: `score` descending (most hits first), then `created_at`
+/// ascending (deterministic tiebreak — same shape as `list_ready`).
+///
+/// Output shapes diverge from `ls`'s bare-array convention because
+/// the ticket spec calls for an envelope. The empty-result case
+/// under `--json` is `{"ok":true,"results":[]}`, not silence,
+/// matching the contract documented in `docs/cli-json.md`.
+fn run_search(
+    json: bool,
+    query: String,
+    status: StatusFilter,
+    labels: Vec<String>,
+    types: Vec<TypeArg>,
+    include_comments: bool,
+    limit: usize,
+    snippet_context: usize,
+) -> Result<(), CliError> {
+    // Preflight: cwd is a jj repo AND `issues` bookmark exists.
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    preflight::issues_bookmark(&cwd)?;
+
+    let storage = Storage::open(&cwd)?;
+    let wanted_types: Vec<IssueType> =
+        types.into_iter().map(IssueType::from).collect();
+
+    let mut hits: Vec<SearchHit> = storage.search(&query, include_comments, snippet_context)?;
+    // Compose status/label/type filters on top of the substring
+    // match. AND semantics across all filters, matching `ls`.
+    hits.retain(|h| {
+        status_matches(&h.issue, status)
+            && labels_match(&h.issue, &labels)
+            && types_match(&h.issue, &wanted_types)
+    });
+
+    // Score descending, then created_at ascending. Stable sort means
+    // equal-score entries fall back to the second key cleanly.
+    hits.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.issue.created_at.cmp(&b.issue.created_at))
+    });
+
+    // `--limit 0` means unlimited (matches the `default_value_t = 20`
+    // contract — a script that explicitly wants every match passes
+    // `--limit 0`, not `--limit usize::MAX`).
+    if limit > 0 && hits.len() > limit {
+        hits.truncate(limit);
+    }
+
+    if json {
+        // Envelope shape per the ticket spec:
+        // `{"ok":true,"results":[{id,title,score,snippet,matched_field}]}`.
+        // Distinct from `ls`'s bare-array convention; the ticket
+        // body pins this contract explicitly.
+        let results: Vec<serde_json::Value> = hits
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "id": h.issue.id.as_str(),
+                    "title": h.issue.title,
+                    "score": h.score,
+                    "snippet": h.snippet,
+                    "matched_field": h.matched_field.as_str(),
+                })
+            })
+            .collect();
+        let envelope = serde_json::json!({
+            "ok": true,
+            "results": results,
+        });
+        let s = serde_json::to_string_pretty(&envelope)
+            .map_err(|e| CliError::Storage(StorageError::Json(e)))?;
+        println!("{s}");
+    } else {
+        // Plain text: tab-separated rows. Silent on empty, mirroring
+        // `ls`. Columns: id, title, matched_field, snippet.
+        // The snippet itself has tabs/newlines normalized at the
+        // storage layer (see `make_snippet`) so the column count
+        // stays stable.
+        for h in &hits {
+            println!(
+                "{id}\t{title}\t{field}\t{snippet}",
+                id = h.issue.id,
+                title = h.issue.title,
+                field = h.matched_field.as_str(),
+                snippet = h.snippet,
+            );
+        }
+    }
+
     let unreadable = storage.unreadable_refs()?;
     emit_unreadable_warning(&unreadable, json);
 
