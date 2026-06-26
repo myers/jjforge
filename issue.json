@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "id": "679444a",
+  "title": "no documented body-length cap; multi-MB bodies accepted silently",
+  "slug": "qa-2026-06-25-body-cap-undocumented",
+  "body": "# Goal\n\nThe CLI silently accepts a multi-megabyte body for `jjf new` /\n`jjf update --body-file`. The spec (`docs/storage-format.md`\n§3 issue-record schema, `cli-json.md` error-kind table) is\nambiguous: it describes the on-disk `body` field as \"string,\nmay be empty\" with no upper bound, and lists no\nbody-size-related error kind in the error table. The QA\nround 2026-06-25 (sub-pass 3 C3) flagged this as\ncontract-drift: the contract should either declare a cap\n(with a typed `invalid_input`-shaped rejection) or\nexplicitly document the unbounded behavior.\n\n# Repro\n\n`experiments/qa-redteam-2026-06-25/sub3-panic.sh::c3`. The\nsub-pass writes ~13MB of base64 to a file and runs\n`jjf new -t 'c3 bigbody' -F <bigfile>`. Observed:\n\n```\nexit=0\nstdout: <new id>\nstderr: (empty)\n```\n\nEvidence: `experiments/qa-redteam-2026-06-25/.scratch/c3/evidence/c3-bigbody-*`.\n\n# Observed\n\n- Body is accepted byte-for-byte. The resulting issue\n  commit's `issue.json` carries the full payload. The\n  `Jjf-Body-Hash` trailer (storage-format §5.5\n  `set-body`) gets a sha-256 over the full body.\n- No latency cliff (well under 30s on a release build).\n- `show --json <id>` echoes the full body back. `ls`\n  / `ready` are unaffected (body isn't in the snapshot\n  cache).\n\n# Expected\n\nOne of:\n\n1. **Declare a cap.** Add a documented limit (e.g. 1 MiB)\n   to `docs/storage-format.md` §3 and surface a typed\n   `body_too_large` (exit 2, preflight) or\n   `invalid_input` (exit 1, runtime) error from\n   `Storage::set_body` / `Storage::update` when the\n   limit is exceeded. A typed envelope on stderr in the\n   shape `cli-json.md` already defines:\n\n   ```json\n   {\"ok\":false,\"error\":{\"kind\":\"body_too_large\",\"message\":\"body exceeds N bytes\",\"details\":{\"limit\":N,\"got\":13333337}}}\n   ```\n\n2. **Declare unbounded as the contract.** Add an\n   explicit \"no upper bound on `body` length\" line to\n   storage-format.md §3 (next to \"may be empty\") so\n   future clients can trust the silence as policy. If\n   this path is taken, also note any latency\n   implications for ls/ready/show with large bodies\n   (today: none meaningful, but worth recording).\n\nThe third path — leaving the spec silent — is the\nstatus quo and the contract-drift finding.\n\n# Severity rationale\n\n`sev:contract-drift`. Not a correctness bug — the body\nround-trips faithfully. But the contract is ambiguous\nin a way that bites the next person who hits it (an\nagent flood-filling a body, an integration mistakenly\npiping `head -c` output) and the resource model is\nunbounded by default. Scripts that hit this today get\nsilent success and a fat commit; spec consumers\ncan't reason about worst-case storage costs without a\ndeclared bound.\n\n# Cross-refs\n\n- Round closing on `5a755ec` (epic agent-ergonomics).\n- C3 evidence in\n  `experiments/qa-redteam-2026-06-25/.scratch/c3/evidence/c3-bigbody-*`.\n- `docs/cli-json.md` error-kind table is the place a\n  typed rejection variant would land.\n- `docs/storage-format.md` §3 (issue-record schema,\n  `body` field) is the place the cap-or-not statement\n  goes.\n",
+  "status": "open",
+  "block_reason": null,
+  "type": "bug",
+  "labels": [
+    "qa-redteam-2026-06-25",
+    "sev:contract-drift"
+  ],
+  "dependencies": [],
+  "assignee": null,
+  "created_at": "2026-06-26T13:27:16Z",
+  "updated_at": "2026-06-26T13:27:16Z"
+}
