@@ -22,10 +22,10 @@ The `.scratch/` directory is gitignored.
 
 | Attack | Verdict | Ticket | Notes |
 | ------ | ------- | ------ | ----- |
-| A1     | _pending_ |     |     |
-| A2     | _pending_ |     |     |
-| A3     | _pending_ |     |     |
-| A4     | _pending_ |     |     |
+| A1     | negative  |     | assignee+BOM+tab, comment author JSON metachar, memory BOM value all round-trip clean |
+| A2     | negative  |     | LWW converges after full push→reject→pull→merge→push cycle; tiebreaker deterministic by commit SHA |
+| A3     | negative  |     | set-title in injected trailer not applied; unknown op silently skipped per spec §5.2 |
+| A4     | negative  |     | ls+ready both exit 0, emit unreadable-ref warning, exclude corrupt ref from output |
 | B1     | _pending_ |     |     |
 | B2     | _pending_ |     |     |
 | B3     | _pending_ |     |     |
