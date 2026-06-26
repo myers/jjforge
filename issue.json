@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "id": "88e4d6b",
+  "title": "push_rejected --json message embeds raw git stderr with version-dependent hint text",
+  "slug": "qa-2026-06-25-push-rejected-raw-git",
+  "body": "# Repro\n\nScript: `experiments/qa-redteam-2026-06-25/sub4-contractdrift.sh`, function `d3`.\n\nMinimal command sequence (from a repo with a conflicting push):\n\n```bash\n# Writer A already pushed to bare remote; Writer B's push is rejected:\njjf --json push origin\n# → exit 1, stderr below\n```\n\n# Observed\n\n`push_rejected` envelope on stderr, `details` carries only `{remote: \"origin\"}`. The `message` field embeds the full raw git stderr including git's own version-dependent `hint:` lines, the internal `refs/jjf/issues/*` ref paths, and jjf's appended advisory:\n\n```json\n{\n  \"ok\": false,\n  \"error\": {\n    \"kind\": \"push_rejected\",\n    \"message\": \"push to origin rejected: `git push origin refs/jjf/issues/*:refs/jjf/issues/* ...` exited Some(1):\\n...\\nhint: Updates were rejected because the remote contains work...\\nhint: run `jjf pull origin` first, then retry the push\",\n    \"details\": {\"remote\": \"origin\"}\n  }\n}\n```\n\nThe `message` field contains multi-line text including git-version-dependent advisory phrases (e.g. `\"hint: Updates were rejected because the remote contains work that you do not have locally\"`), the raw refspec (`refs/jjf/issues/*`), and the path to the remote — all of which change across git versions or repo layouts.\n\n# Expected\n\nPer `docs/cli-json.md`: \"`kind` is a stable lowercase snake_case identifier... `message` is the human-readable string... Format is not stable; don't pattern-match on it. Use `kind`.\" The doc explicitly says scripts must use `kind`, not `message`. However, `details` only exposes `{remote: \"...\"}`; a script that needs to identify WHICH refs conflicted must parse `message`. The structured fields in `details` should be sufficient for programmatic use — either the conflicting refs should appear in `details`, or the current design should be confirmed as intentional (message-only for ref detail).\n\nSeparately, the jjf-appended advisory (`\"hint: run \\`jjf pull origin\\` first, then retry the push\"`) appears embedded in `message` rather than in `details.hint`. The cli-json.md example for `push_rejected` shows this text in `message`; the `concurrent_write` kind puts the same advisory in `details.hint`. Inconsistency: one structured, one in the message blob.\n\n# Severity rationale\n\n`sev:contract-drift` because the `message` field embeds git-version-dependent text that scripts (particularly CI harnesses and MCP adapters) may accidentally key on despite the doc warning. The structured `details` object is too sparse (only `remote`), creating pressure to parse `message`. The `concurrent_write` vs `push_rejected` inconsistency in hint placement (`details.hint` vs embedded in `message`) is an additional contract surface mismatch that could confuse clients implementing both paths.\n",
+  "status": "open",
+  "block_reason": null,
+  "type": "bug",
+  "labels": [
+    "qa-redteam-2026-06-25",
+    "sev:contract-drift"
+  ],
+  "dependencies": [],
+  "assignee": null,
+  "created_at": "2026-06-26T12:51:40Z",
+  "updated_at": "2026-06-26T12:51:40Z"
+}
