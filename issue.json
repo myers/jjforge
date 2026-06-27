@@ -4,7 +4,7 @@
   "title": "proptest-list-ids-cardinality: list_ids().len() == N after N creates",
   "slug": "proptest-list-ids-cardinality",
   "body": "# Goal\n\nProperty 5 from the `df74809` follow-up list. After N successful\n`create_issue` calls on a fresh repo, `Storage::list_ids().len() == N`.\nEach minted id is unique.\n\n# Why now\n\nSmall, self-contained, lower-leverage than the dep-graph properties — but\ncatches an entire bug class (id-collision, silent-deletion-on-create,\nlist-index drift) for almost no implementation cost. Lands the cheapest\nremaining piece of harness coverage.\n\n# Approach\n\n- `create_issue` N times against a fresh repo (N ∈ 1..=8). Collect minted ids.\n- Assert `storage.list_ids().len() == N`.\n- Assert minted ids are pairwise distinct.\n- Assert each minted id appears in `list_ids()`.\n\n# References\n\n- Parent: `df74809` (qa-proptest-harness), commit `28e5ed71`.\n- 7-char id-collision birthday probability: 1 in 2^28; at N=8 collisions are vanishingly rare. Property is about cardinality, not collision-probability.\n\n# Acceptance\n\n- New property `list_ids_cardinality_matches_creates` ships green at 16 cases.\n",
-  "status": "open",
+  "status": "closed",
   "block_reason": null,
   "type": "feature",
   "priority": null,
@@ -15,5 +15,5 @@
   "dependencies": [],
   "assignee": null,
   "created_at": "2026-06-27T23:05:01Z",
-  "updated_at": "2026-06-27T23:32:51Z"
+  "updated_at": "2026-06-27T23:32:54Z"
 }
