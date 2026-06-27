@@ -1,0 +1,17 @@
+{
+  "version": 2,
+  "id": "b74b156",
+  "title": "ls/ready row: drop label-count column, add type column",
+  "slug": "ls-row-rework",
+  "body": "# Goal\n\nRework `jjf ls`'s default plain-text row to drop the\nnear-useless `<labels>L` column and add the type column.\nCompare current to target:\n\n```\n# current\ncc2fa96  open  1L  host-asterinas-migrate: …\nec5a0a8  open  2L  Epic: host-asterinas-workspace: …\n\n# target\ncc2fa96  open  feature  host-asterinas-migrate: …\nec5a0a8  open  epic     Epic: host-asterinas-workspace: …\n```\n\n# Why\n\nBeads' `bd list` (the inspiration) doesn't put labels in\nthe default row at all — only the long-form output lists\nthem, where it shows the actual values, not a count. A\ncount tells you almost nothing; the values would, but\nthey overflow the row on heavily-labeled issues. Type\nis the column scanners actually want — \"is this a bug?\nan epic?\" — and it's already a first-class field\n(`IssueType` per `crates/jjf-storage/src/record.rs:298`),\njust unused in the row today.\n\n# Source\n\n- `crates/jjf/src/main.rs:3252-3334` — `run_ls` and its\n  row formatter. The format string at line ~3316 is:\n  `\"{id}\\t{status}\\t{n}L\\t{title}\"`. Change to:\n  `\"{id}\\t{status}\\t{type}\\t{title}\"`.\n- `crates/jjf-storage/src/record.rs:298-326` — `IssueType`\n  enum and `as_str()` wire spelling. Use `as_str()` for\n  the column value verbatim.\n\n# Scope\n\n- Plain-text row only. `ls --json` shape unchanged.\n- `ls --slug` and the other filter flags unchanged.\n- `ready`'s row format mirrors `ls`'s today; keep them in\n  sync — `ready`'s row should also drop the label count\n  and add type.\n\n# Out of scope\n\n- Adding a `--long` mode (the row-format-as-flag pattern\n  beads uses with `--pretty` / `--long` / `--flat`). One\n  format is fine for v1; revisit if the row gets cramped\n  again.\n- Adding labels in any form. They're available via\n  `--json | jq` and via `jjf show`.\n\n# Acceptance\n\n- [ ] `jjf ls` default row is `<id>\\t<status>\\t<type>\\t<title>`.\n- [ ] `jjf ready` matches the same row format (mirror change).\n- [ ] `--json` envelope shape unchanged.\n- [ ] Existing tests that asserted on the `2L` label-count\n      column update to the new format. Don't loosen the\n      assertions; tighten them — assert the new column is\n      exactly the type's wire spelling.\n- [ ] `Unspecified` renders as `unspecified` (the type's\n      `as_str` value), matching how the JSON field already\n      reports it.\n\n# Cross-refs\n\n- The asymmetry was surfaced 2026-06-27 while comparing\n  to beads' `bd list` formatter at\n  `reference/beads/cmd/bd/list_format.go:42-72`.\n",
+  "status": "open",
+  "block_reason": null,
+  "type": "feature",
+  "labels": [
+    "agent-ergonomics"
+  ],
+  "dependencies": [],
+  "assignee": null,
+  "created_at": "2026-06-27T15:58:55Z",
+  "updated_at": "2026-06-27T15:58:55Z"
+}
