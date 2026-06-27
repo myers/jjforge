@@ -4,7 +4,7 @@
   "title": "jjf show: dependencies labeled 'blocks:' read inverted to the human",
   "slug": "show-deps-blocked-by",
   "body": "# Goal\n\nFix the wrong-answer in `jjf show <id>`'s `dependencies:` block.\nThe renderer at `crates/jjf/src/main.rs:2396-2412` labels each\nedge by the wire-spelling of `DepKind::as_str` (which mirrors\nthe storage trailer payload and the CLI `--kind` flag). That\nspelling is correct *for the storage layer* — `--kind blocks`\nmeans \"this edge has kind blocks\" — but in the `jjf show <A>`\noutput, the targets listed under `blocks: B` are the issues\nthat **block A**, not the issues A blocks. The label reads\ninverted to a human.\n\n# Repro\n\nFrom the fj issue (claude@github.com):\n\n```\njjf show da3b8c0\n# prints:\n# dependencies:\n#   blocks: fd5df85\n#\n# But: fd5df85 closing was what made da3b8c0 appear in `jjf ready`.\n# So da3b8c0 is blocked BY fd5df85, not the other way around.\n```\n\n`jjf ready` agrees with the semantic edge (correct direction);\nonly the `show` label is inverted.\n\n# Source\n\n- `crates/jjf/src/main.rs:2396-2412` — the renderer. Currently\n  prints `kind.as_str()` (the wire string) verbatim.\n- `crates/jjf-storage/src/record.rs:30-62` — `DepKind` enum.\n  The docstrings spell out the intended owner-perspective:\n  - `Blocks`: \"Hard prereq — owner blocked until target closes.\"\n  - `ParentChild`: \"Owner is child of target.\"\n  - `Related`: symmetric.\n  - `DiscoveredFrom`: \"I was found while working on X.\"\n- `crates/jjf-storage/src/lib.rs:2658-2670` — `add_dep_edge`'s\n  storage-level semantics confirm the direction: `add_dep_edge(id,\n  target, Blocks)` records that `id`'s ready-status depends on\n  `target` closing.\n\n# Fix shape\n\nAdd a perspective-correct human label on `DepKind` for the\ntext-mode `show` renderer ONLY. Wire spelling, JSON shape,\ntrailers, and CLI flags stay exactly as today.\n\nSuggested mapping for the show renderer:\n- `Blocks` → `blocked by`\n- `ParentChild` → `parent`\n- `Related` → `related`\n- `DiscoveredFrom` → `discovered from`\n\nThe `dep tree` text renderer (line ~2722) and the `dep add`/`dep\nrm` verbs continue using the wire spelling — those describe the\nedge, not the owner's relationship to it.\n\n# Scope\n\nBug fix only. No spec bump. Wire/JSON/trailer/CLI surface stays\nexactly as today.\n\n# Acceptance\n\n- [ ] `jjf show <id>` for an issue with a `Blocks` edge prints\n      `blocked by: <target>`, not `blocks: <target>`.\n- [ ] `jjf show <id> --json` shape unchanged.\n- [ ] `jjf dep add A B --kind blocks` flag value unchanged.\n- [ ] `jjf dep tree` rendering unchanged (it walks parent-child).\n- [ ] Test (find the existing show-text test in `crates/jjf/tests/`)\n      asserting the new labels.\n\n# Cross-refs\n\n- Source: github.com/myers/jjforge issue #2.\n",
-  "status": "open",
+  "status": "closed",
   "block_reason": null,
   "type": "bug",
   "labels": [
@@ -14,5 +14,5 @@
   "dependencies": [],
   "assignee": null,
   "created_at": "2026-06-27T13:58:21Z",
-  "updated_at": "2026-06-27T14:05:33Z"
+  "updated_at": "2026-06-27T14:05:39Z"
 }
