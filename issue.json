@@ -4,7 +4,7 @@
   "title": "proptest-multi-issue-generator: foundation for multi-stage prop generators",
   "slug": "proptest-multi-issue-generator",
   "body": "# Goal\n\nExtend the proptest harness at `crates/jjf-storage/tests/proptest_harness.rs`\nwith a multi-stage generator that creates N issues in a fresh repo, then\ndrafts further records that can reference real, extant issue ids. This is\nthe foundation for two follow-up properties (`proptest-list-ready-monotone`\nand `proptest-cycle-rejection`) that need to assert invariants across a\ndep-graph rather than a single issue.\n\n# Why now\n\nThe MVP harness in `28e5ed71` set `IssueDraft.dependencies = Vec::new()`\nbecause drafting deps requires already-extant target ids — a single-stage\nstrategy can't supply them. Every follow-up that exercises the dep surface\nneeds this primitive.\n\n# Approach\n\n- New strategy: `multi_issue_repo_strategy(n: Range<usize>) -> impl Strategy<Value = (Storage, Vec<IssueId>)>`. Generates N drafts (1..=N), creates them in order against a fresh scratch repo, returns the storage handle plus the list of minted ids.\n- Second-stage dep generator: given the id list, produce 0..=K random `(child_idx, parent_idx, kind)` triples to apply via `add_dep_edge`. Must avoid trivial self-edges and cycles (the cycle property tests the latter explicitly; for THIS generator, prune cycle-introducing edges so the base round-trip stays clean).\n- Reuse `fresh_scratch_repo`, `pin_clock`, `draft_strategy` as already wired.\n- Extend Property 1 (round-trip) to opt into this generator for a small N (e.g. 1..=4 issues) so dep edges round-trip too.\n\n# References\n\n- Parent: `df74809` (qa-proptest-harness), commit `28e5ed71`.\n- Existing harness: `crates/jjf-storage/tests/proptest_harness.rs`.\n- Dep verb implementation: `add_dep_edge` in `crates/jjf-storage/src/lib.rs`.\n\n# Acceptance\n\n- `multi_issue_repo_strategy` lands as a public-in-test helper.\n- One property using it ships green (extended Property 1 is the natural first home; standalone is also fine).\n- Wall-clock for `cargo test --release -p jjf-storage proptest_harness` stays under ~30s with default `cases: 16`.\n\n# Blocks\n\n- `proptest-list-ready-monotone` (Property 4).\n- `proptest-cycle-rejection`.\n",
-  "status": "open",
+  "status": "closed",
   "block_reason": null,
   "type": "feature",
   "priority": null,
@@ -15,5 +15,5 @@
   "dependencies": [],
   "assignee": null,
   "created_at": "2026-06-27T23:04:16Z",
-  "updated_at": "2026-06-27T23:13:40Z"
+  "updated_at": "2026-06-27T23:13:58Z"
 }
