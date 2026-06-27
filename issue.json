@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "id": "932cc40",
+  "title": "proptest-memory-surface: round-trip set/unset/read for jjf remember",
+  "slug": "proptest-memory-surface",
+  "body": "# Goal\n\nExtend the proptest harness to cover `Storage::set_memory` /\n`Storage::unset_memory` / `Storage::read_memory`. The persistent-memory\nsurface (`jjf remember` / `jjf forget` / `jjf recall`) has no property\ncoverage today.\n\n# Why now\n\nMemory is small, narrow, and already battle-tested via integration tests\n— but the same can be said of every surface that later surfaced a\nproptest-only bug. Round-trip property is cheap; the structural\nsimilarity to Property 1 means very little new harness scaffolding.\n\n# Approach\n\n- Generator: `(key: Slug, value: 0-256 bytes)` tuples from bounded pools.\n- Property 1 (memory round-trip): `set_memory(k, v)` then `read_memory(k)` returns `Some(v)`. After `unset_memory(k)`, `read_memory(k)` returns `None`.\n- Property 2 (memory idempotence): two consecutive `set_memory(k, v)` with the same `v` leave the read shape unchanged; two `unset_memory(k)` on a missing key both succeed.\n- Property 3 (memory non-interference): `set_memory(k1, v1)` does not affect `read_memory(k2)` for k1 ≠ k2.\n\n# References\n\n- Parent: `df74809` (qa-proptest-harness), commit `28e5ed71`.\n- Memory surface: `Storage::set_memory`/`unset_memory`/`read_memory` in `crates/jjf-storage/src/lib.rs`.\n\n# Acceptance\n\n- Three new properties land green at 16 cases.\n- Wall-clock for the harness file stays under ~35s.\n",
+  "status": "open",
+  "block_reason": null,
+  "type": "feature",
+  "priority": null,
+  "labels": [
+    "epic:agent-ergonomics",
+    "qa-proptest-followup"
+  ],
+  "dependencies": [],
+  "assignee": null,
+  "created_at": "2026-06-27T23:05:15Z",
+  "updated_at": "2026-06-27T23:05:15Z"
+}
