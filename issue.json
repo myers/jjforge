@@ -4,13 +4,13 @@
   "title": "actor-chain smoke 2",
   "slug": null,
   "body": "",
-  "status": "open",
+  "status": "in-progress",
   "block_reason": null,
   "type": "bug",
   "priority": null,
   "labels": [],
   "dependencies": [],
-  "assignee": null,
+  "assignee": "fallback-env",
   "created_at": "2026-06-27T21:03:26Z",
-  "updated_at": "2026-06-27T21:03:26Z"
+  "updated_at": "2026-06-27T21:03:27Z"
 }
