@@ -3469,16 +3469,18 @@ fn run_ls(
     } else {
         // Plain text: tab-separated, no header, silent on empty. The
         // 7-char id prefix is the documented human-display convention
-        // (CLAUDE.md). label-count is rendered with a trailing `L` so
-        // an eyeball can tell `3L` (three labels) apart from a numeric
-        // column that might mean comments or something else later.
+        // (CLAUDE.md).
+        //
+        // b74b156 row: <id>\t<status>\t<type>\t<title>. priority column
+        // lands in 326bbf7.
         for issue in &issues {
             let status_s = issue.status.as_str();
+            let type_s = issue.type_.as_str();
             println!(
-                "{id}\t{status}\t{n}L\t{title}",
+                "{id}\t{status}\t{type_}\t{title}",
                 id = issue.id,
                 status = status_s,
-                n = issue.labels.len(),
+                type_ = type_s,
                 title = issue.title,
             );
         }
@@ -3610,13 +3612,17 @@ fn run_ready(
     } else {
         // Plain text: tab-separated rows mirroring `ls`'s shape so a
         // single awk/cut pipeline handles both. Silent on empty.
+        //
+        // b74b156 row: <id>\t<status>\t<type>\t<title>. priority column
+        // lands in 326bbf7.
         for issue in &issues {
             let status_s = issue.status.as_str();
+            let type_s = issue.type_.as_str();
             println!(
-                "{id}\t{status}\t{n}L\t{title}",
+                "{id}\t{status}\t{type_}\t{title}",
                 id = issue.id,
                 status = status_s,
-                n = issue.labels.len(),
+                type_ = type_s,
                 title = issue.title,
             );
         }

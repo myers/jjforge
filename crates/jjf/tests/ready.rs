@@ -112,7 +112,7 @@ fn close_issue(repo: &Path, id: &str) {
 }
 
 /// Parse the tab-separated `ready` plain-text output into rows.
-/// Shape mirrors `ls`: `<id>\t<status>\t<labelN>L\t<title>`.
+/// Shape mirrors `ls`: `<id>\t<status>\t<type>\t<title>` (b74b156).
 fn parse_ready_rows(stdout: &str) -> Vec<(String, String, String, String)> {
     stdout
         .lines()
@@ -298,6 +298,13 @@ fn ready_type_priority_sort_puts_bug_first() {
     let rows = parse_ready_rows(&stdout);
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].0, bug, "bug must sort first: {rows:?}");
+    // b74b156: third column is the type wire spelling, not labels.
+    assert_eq!(rows[0].2, "bug", "type column should be 'bug': {rows:?}");
+    let types: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+    assert!(
+        types.contains(&"epic") && types.contains(&"feature"),
+        "type column should carry the wire spelling for every row: {rows:?}",
+    );
 }
 
 #[test]

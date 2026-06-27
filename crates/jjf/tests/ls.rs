@@ -127,8 +127,8 @@ fn close_bug(repo: &Path, id: &str) {
 }
 
 /// Parse `jjf ls` plain-text output into one row per bug. Each row is
-/// `<id>\t<status>\t<labelN>L\t<title>`; we split on tabs and drop
-/// empty lines.
+/// `<id>\t<status>\t<type>\t<title>` (b74b156); we split on tabs and
+/// drop empty lines.
 fn parse_ls_rows(stdout: &str) -> Vec<(String, String, String, String)> {
     stdout
         .lines()
@@ -186,6 +186,9 @@ fn ls_default_status_open_returns_every_bug_when_all_open() {
     }
     for r in &rows {
         assert_eq!(r.1, "open", "status column wrong in row: {r:?}");
+        // b74b156: third column is the type wire spelling. These
+        // fixtures didn't set --type, so default is `unspecified`.
+        assert_eq!(r.2, "unspecified", "type column wrong in row: {r:?}");
     }
     let titles: Vec<&str> = rows.iter().map(|r| r.3.as_str()).collect();
     assert!(titles.contains(&"alpha bug"));
