@@ -580,6 +580,31 @@ enum Commands {
         id: String,
     },
 
+    /// Set (or clear) an issue's assignee. Thin shorthand for
+    /// `jjf update <id> --assignee <name>` and `jjf update <id>
+    /// --unset-assignee`. Modeled on beads' `bd assign <id> <name>`
+    /// (`reference/beads/cmd/bd/assign.go`).
+    ///
+    /// `jjf assign <id> <name>` sets the assignee; an empty `name`
+    /// (e.g. `jjf assign <id> ""`) clears it. Same preflight
+    /// (issues_bookmark probe, handle resolution) and the same
+    /// typed errors as `update --assignee`: `issue_not_found` /
+    /// `slug_not_found` on unknown handles, `invalid_input` from
+    /// storage when the name contains a newline.
+    ///
+    /// This is sugar only — it doesn't flip status. Use `jjf update
+    /// <id> --claim` (or its `--claim` shorthand on `ready`) when
+    /// you want assignee + `in-progress` in one atomic commit.
+    Assign {
+        /// Issue handle (7-char hex id OR a slug).
+        id: String,
+
+        /// New assignee name. Pass an empty string (`""`) to clear
+        /// the assignee. Newlines are rejected at the storage layer
+        /// (`invalid_input`, exit 1) — single-line names only.
+        name: String,
+    },
+
     /// Park an issue: set status to `blocked` and record a free-text
     /// reason, in ONE multi-op commit. v2.5 (`agent-await-gates-impl`).
     ///
@@ -1836,6 +1861,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
         Commands::Close { id } => run_set_status(cli.json, id, Status::Closed),
         Commands::Open { id } => run_set_status(cli.json, id, Status::Open),
         Commands::Abandon { id } => run_set_status(cli.json, id, Status::Abandoned),
+        Commands::Assign { id, name } => run_assign(cli.json, id, name),
         Commands::Block { id, reason } => run_block(cli.json, id, reason),
         Commands::Unblock { id } => run_unblock(cli.json, id),
         Commands::Comment { id, file, author } => run_comment(cli.json, id, file, author),
@@ -2667,6 +2693,55 @@ fn run_unblock(json: bool, id: String) -> Result<(), CliError> {
         println!("{out}");
     } else {
         println!("unblocked {issue_id}");
+    }
+    Ok(())
+}
+
+/// `jjf assign <id> <name>` — sugar for `jjf update <id>
+/// --assignee <name>` / `--unset-assignee`. Modeled on beads'
+/// `bd assign` (`reference/beads/cmd/bd/assign.go`); the entire
+/// heavy lift lives in [`Storage::set_assignee`].
+///
+/// Empty `name` (after trim) clears the assignee — same semantic
+/// as `--unset-assignee`. A whitespace-only string is treated as
+/// empty so the obvious shell-quoting mistake doesn't write a
+/// blank-but-non-null assignee.
+///
+/// Preflight order mirrors `run_set_status`: canonicalize cwd,
+/// `issues_bookmark` probe, resolve the handle, hand off to
+/// storage. Newlines in `name` come back from the storage layer
+/// as a typed `invalid_input` error (exit 1).
+fn run_assign(json: bool, id: String, name: String) -> Result<(), CliError> {
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    preflight::issues_bookmark(&cwd)?;
+
+    let storage = Storage::open(&cwd)?;
+    let issue_id = resolve_handle(&storage, &id)?;
+
+    let trimmed = name.trim();
+    let assignee_payload: Option<&str> = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    };
+    storage.set_assignee(&issue_id, assignee_payload)?;
+
+    if json {
+        let assignee_value = match assignee_payload {
+            Some(a) => serde_json::Value::String(a.to_owned()),
+            None => serde_json::Value::Null,
+        };
+        let out = serde_json::json!({
+            "ok": true,
+            "id": issue_id.as_str(),
+            "assignee": assignee_value,
+        });
+        println!("{out}");
+    } else if let Some(a) = assignee_payload {
+        println!("assigned {issue_id} to {a}");
+    } else {
+        println!("unassigned {issue_id}");
     }
     Ok(())
 }

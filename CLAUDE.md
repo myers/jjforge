@@ -174,6 +174,8 @@ jjf update <id> --status closed              # change status
 jjf update <id> --body-file body.md          # rewrite body in place
 jjf update <id> --assignee alice             # assign
 jjf update <id> --unset-assignee             # unassign
+jjf assign <id> alice                        # shorthand for --assignee
+jjf assign <id> ""                           # shorthand for --unset-assignee
 
 jjf close <id>                               # convenience for status closed
 jjf open <id>                                # convenience for status open

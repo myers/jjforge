@@ -1512,6 +1512,37 @@ $ jjf close --json deadbee
 {"ok":false,"error":{"kind":"issue_not_found","message":"issue not found in working copy: deadbee","details":{"id":"deadbee"}}}
 ```
 
+### `assign`
+
+Shorthand for `jjf update <id> --assignee <name>` / `--unset-assignee`.
+Two positional args; an empty `name` clears the assignee.
+
+```sh
+$ jjf assign --json a3f9c01 alice
+{"ok":true,"id":"a3f9c01","assignee":"alice"}
+
+$ jjf assign --json a3f9c01 ""
+{"ok":true,"id":"a3f9c01","assignee":null}
+```
+
+The `assignee` field is explicit (`null` on unset, the trimmed
+name on set) so machine readers don't need a presence-check.
+
+Error path — nonexistent id:
+
+```sh
+$ jjf assign --json deadbee alice
+{"ok":false,"error":{"kind":"issue_not_found","message":"issue not found in working copy: deadbee","details":{"id":"deadbee"}}}
+```
+
+Error path — newline in name (storage rejects to prevent
+trailer injection; see `qa-trailer-injection`):
+
+```sh
+$ jjf assign --json a3f9c01 $'alice\nevil'
+{"ok":false,"error":{"kind":"invalid_input","message":"assignee must not contain newlines"}}
+```
+
 ### `label add` / `label rm`
 
 ```sh
