@@ -177,6 +177,9 @@ jjf update <id> --unset-assignee             # unassign
 jjf assign <id> alice                        # shorthand for --assignee
 jjf assign <id> ""                           # shorthand for --unset-assignee
 
+JJF_ACTOR=haiku-slice-3 jjf update <id> --claim   # multi-agent fan-out
+jjf update <id> --claim --actor haiku-slice-3     # per-invocation override
+
 jjf close <id>                               # convenience for status closed
 jjf open <id>                                # convenience for status open
 
@@ -470,6 +473,16 @@ When the user asks you to "orchestrate" or "make progress" or
    fine ONLY when the subagents have disjoint write targets
    (different issue ids, different files in `experiments/<topic>/`).
    When in doubt, serial.
+
+   **Multi-agent attribution.** When dispatching N parallel
+   agents on disjoint issue ids, set `JJF_ACTOR=<distinct-name>`
+   in each agent's environment so `jjf update --claim` and
+   `jjf comment` attribute work to that agent specifically.
+   Without it, every agent claims under the same shared
+   `jj user.name` and the `assignee` column can't tell them
+   apart. The `--actor <name>` flag on `jjf update` is the
+   per-invocation override if you don't want to set env. Chain
+   precedence: `--actor` > `JJF_ACTOR` > `jj user.name`.
 
 6. **Commit between dispatches.** Each subagent's experiments,
    docs, or other artifacts get committed before the next is

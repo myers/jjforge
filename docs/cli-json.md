@@ -1,5 +1,54 @@
 # `jjf --json` output contract
 
+## v2.11 → v2.12 changelog
+
+Backwards-compatible additions, landed in the
+`actor-override-chain` ticket (`ae0866b`). The CLI gains an
+explicit identity-resolution chain for `--claim` and the
+comment author field so multi-agent fan-outs can attribute
+work distinctly per agent without rewriting `jj user.name`
+per process.
+
+- **New `--actor <name>` flag on `jjf update`.** Overrides
+  the identity used by `--claim` (the value that lands in
+  `assignee`). Empty string falls through to the next slot in
+  the chain rather than writing an empty assignee. Mutually
+  exclusive with `--unclaim`, `--assignee`, and
+  `--unset-assignee` (those don't take an implicit
+  identity).
+
+- **New `JJF_ACTOR` env var.** Honored by both `jjf update
+  --claim` (and `jjf ready --claim`) for the assignee field
+  and by `jjf comment` for the `author` field. Empty / whitespace
+  values fall through (so a stray `JJF_ACTOR=` in a parent
+  process doesn't override the next slot).
+
+- **Actor resolution chain.**
+
+  For `jjf update --claim` and `jjf ready --claim`:
+
+  ```text
+  --actor <name> flag > JJF_ACTOR env > jj config user.name > no_current_user
+  ```
+
+  For `jjf comment` (the `author` field):
+
+  ```text
+  --author flag > JJF_ACTOR env (synthesizes `$JJF_ACTOR <user.email>`) > jj config user.name + user.email > missing_author
+  ```
+
+  `--actor`/`--author` and `JJF_ACTOR` are skipped when empty
+  / whitespace-only.
+
+- **`no_current_user` hint updated.** The error message now
+  mentions both paths: "set jj user.name … OR export
+  `JJF_ACTOR=<name>`". Error kind and exit code (2) are
+  unchanged.
+
+- **No envelope shape changes.** `--claim`'s mutating envelope
+  is bit-identical to v2.3; the chain only affects which name
+  lands in `assignee`. Same for `comment`'s `author`.
+
 ## v2.10 → v2.11 changelog
 
 Backwards-compatible additions, landed in the `priority-field`

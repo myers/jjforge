@@ -500,6 +500,28 @@ enum Commands {
             ],
         )]
         unclaim: bool,
+
+        /// Override the actor used by `--claim` (the identity that
+        /// lands in the `assignee` field). Precedence:
+        /// `--actor <name>` > `JJF_ACTOR` env > `jj config get
+        /// user.name`. Empty string falls through to the next slot
+        /// rather than writing an empty assignee. Intended for
+        /// multi-agent orchestrators that fan out N processes from
+        /// one machine and need each to claim under a distinct
+        /// name; everyone else should just set `jj user.name`.
+        /// Mutually exclusive with `--unclaim`, `--assignee`, and
+        /// `--unset-assignee` (those don't take an implicit
+        /// identity). v2.12 (`actor-override-chain`, ticket
+        /// `ae0866b`).
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "unclaim",
+                "assignee",
+                "unset_assignee",
+            ],
+        )]
+        actor: Option<String>,
     },
 
     /// Append a comment to an existing issue on the `issues` bookmark.
@@ -1388,11 +1410,13 @@ enum CliError {
     MemoryNotFound { key: String },
 
     /// `jjf update --claim` (or `jjf ready --claim`) couldn't find
-    /// a `user.name` in jj's config. Preflight failure (exit 2) —
-    /// claims require an identity to assign to.
-    /// v2.3 (`agent-claim-atomic`).
+    /// a current user. Preflight failure (exit 2) — claims require
+    /// an identity to assign to. The chain is `--actor <name>` >
+    /// `JJF_ACTOR` env > `jj config user.name`; this error fires
+    /// when every slot is empty. v2.3 (`agent-claim-atomic`); chain
+    /// extended v2.12 (`actor-override-chain`).
     #[error(
-        "no current user available; set jj user.name (e.g. `jj config set --user user.name 'Your Name'`) to claim issues"
+        "no current user available; set jj user.name (e.g. `jj config set --user user.name 'Your Name'`) OR export `JJF_ACTOR=<name>` to claim issues"
     )]
     NoCurrentUser,
 
@@ -1926,6 +1950,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             unset_assignee,
             claim,
             unclaim,
+            actor,
         } => run_update(
             cli.json,
             id,
@@ -1941,6 +1966,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             unset_assignee,
             claim,
             unclaim,
+            actor,
         ),
     }
 }
@@ -3173,6 +3199,7 @@ fn run_update(
     unset_assignee: bool,
     claim: bool,
     unclaim: bool,
+    actor: Option<String>,
 ) -> Result<(), CliError> {
     // 1. Build the `UpdateFields` bundle from the flag matrix. The
     // body-file read is done UP FRONT (before the at-least-one check,
@@ -3282,7 +3309,7 @@ fn run_update(
     // `fields.is_empty()` is true and the only branch a user could
     // possibly want is the atomic claim verb.
     if claim {
-        let who = resolve_current_user()?;
+        let who = resolve_current_user(actor.as_deref())?;
         storage.claim(&issue_id, &who)?;
         if json {
             let out = serde_json::json!({
@@ -3439,14 +3466,33 @@ fn run_comment(
     Ok(())
 }
 
-/// Resolve the current jj user's `user.name` for `--claim`.
-/// Returns the trimmed value or [`CliError::NoCurrentUser`] when
-/// `jj config get user.name` is unset / empty. Differs from
-/// [`resolve_author`] in that it doesn't synthesize `Name <email>`
-/// — claims are short identity strings stored in `assignee`, not
-/// authorship strings stored in `comments.jsonl`. v2.3
-/// (`agent-claim-atomic`).
-fn resolve_current_user() -> Result<String, CliError> {
+/// Resolve the current user's name for `--claim`. Precedence chain
+/// (each slot, when present and non-empty after trimming, wins;
+/// otherwise we fall through to the next):
+///
+/// 1. `actor_override` — the `--actor <name>` CLI flag on
+///    `jjf update`. Empty / whitespace falls through (per the
+///    `actor-override-chain` ticket: `--actor ""` is "skip me," not
+///    "set empty assignee").
+/// 2. `JJF_ACTOR` env var. Same emptiness rule as the flag.
+/// 3. `jj config get user.name`.
+///
+/// Returns [`CliError::NoCurrentUser`] when the chain runs dry.
+/// Differs from [`resolve_author`] in that it doesn't synthesize
+/// `Name <email>` — claims are short identity strings stored in
+/// `assignee`, not authorship strings stored in `comments.jsonl`.
+/// v2.3 (`agent-claim-atomic`), chain extended v2.12
+/// (`actor-override-chain`, ticket `ae0866b`).
+fn resolve_current_user(actor_override: Option<&str>) -> Result<String, CliError> {
+    if let Some(name) = actor_override {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_owned());
+        }
+    }
+    if let Some(name) = jjf_actor_env() {
+        return Ok(name);
+    }
     let name = jj_config_get("user.name")?;
     match name {
         Some(n) => Ok(n),
@@ -3454,17 +3500,48 @@ fn resolve_current_user() -> Result<String, CliError> {
     }
 }
 
-/// Resolve the comment author. Returns the caller's `--author` override
-/// when present and non-empty; otherwise synthesizes `Name <email>`
-/// from `jj config get user.name` + `jj config get user.email`.
+/// Read `JJF_ACTOR` from the environment, returning the trimmed
+/// value when present and non-empty. Empty / whitespace-only values
+/// behave as "unset" so a stray `JJF_ACTOR=` in a parent process
+/// doesn't override the next-slot fallback. v2.12
+/// (`actor-override-chain`).
+fn jjf_actor_env() -> Option<String> {
+    match std::env::var("JJF_ACTOR") {
+        Ok(v) => {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+/// Resolve the comment author. Precedence chain (each slot, when
+/// present and non-empty after trimming, wins; otherwise we fall
+/// through to the next):
+///
+/// 1. `override_name` — the `--author` CLI flag on `jjf comment`,
+///    written verbatim (caller is responsible for formatting it
+///    `Name <email>` if they want that shape).
+/// 2. `JJF_ACTOR` env var, synthesized as `$JJF_ACTOR <user.email>`
+///    (or just `$JJF_ACTOR` if `user.email` is unset). v2.12
+///    (`actor-override-chain`).
+/// 3. `jj config user.name` + `user.email` synthesized as
+///    `Name <email>` (or just `name` if `user.email` is unset).
 ///
 /// Format matches jj's `author` commit-template field (`Name <email>`)
 /// so a comment author and the surrounding commit's `author` line stay
 /// canonically identical for history walks.
 ///
 /// Edge cases:
-/// - Override is empty / whitespace → `MissingAuthor`.
-/// - `user.name` is unset (or empty) → `MissingAuthor`.
+/// - Override is empty / whitespace → falls through to the next
+///   slot (matches the `--actor` chain semantics).
+/// - `JJF_ACTOR` is set but empty / whitespace → falls through.
+/// - `user.name` is unset (or empty) and the prior slots fell
+///   through → `MissingAuthor`.
 /// - `user.name` is set but `user.email` is unset → return just the
 ///   `name`. This matches the spirit of jj's own behavior (it'll let
 ///   you commit with just a name) but means the resulting author
@@ -3474,10 +3551,16 @@ fn resolve_current_user() -> Result<String, CliError> {
 fn resolve_author(override_name: Option<String>) -> Result<String, CliError> {
     if let Some(name) = override_name {
         let trimmed = name.trim();
-        if trimmed.is_empty() {
-            return Err(CliError::MissingAuthor);
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_owned());
         }
-        return Ok(trimmed.to_owned());
+    }
+    if let Some(actor) = jjf_actor_env() {
+        let email = jj_config_get("user.email")?;
+        return Ok(match email {
+            Some(email) => format!("{actor} <{email}>"),
+            None => actor,
+        });
     }
     let name = jj_config_get("user.name")?;
     let Some(name) = name else {
@@ -3749,7 +3832,11 @@ fn run_ready(
         let target = issues.first().cloned();
         match target {
             Some(issue) => {
-                let who = resolve_current_user()?;
+                // `ready --claim` has no per-invocation actor flag;
+                // the env-var slot in `resolve_current_user` is the
+                // way orchestrators differentiate fan-out agents
+                // here. v2.12 (`actor-override-chain`).
+                let who = resolve_current_user(None)?;
                 match storage.claim(&issue.id, &who)? {
                     ClaimResult::Claimed => {}
                     ClaimResult::AlreadyOurs => {
@@ -4958,5 +5045,34 @@ error: failed to push some refs\n";
             "expected null, got: {}",
             details["refs_rejected"]
         );
+    }
+
+    // --- actor-override-chain (v2.12, ticket `ae0866b`) --------------
+    //
+    // Only the pure trim/whitespace behaviour of `jjf_actor_env` is
+    // tested in-process: nextest runs tests in shared processes, so
+    // `std::env::set_var` from a unit test would leak across the
+    // workspace and silently corrupt unrelated tests' env. The
+    // full precedence-chain integration coverage (env-only set,
+    // flag-over-env, flag-empty-falls-through, env-empty-falls-
+    // through, all-empty → `NoCurrentUser`, comment author chain)
+    // lives in `crates/jjf/tests/actor.rs`, which scopes every
+    // env tweak to a child `Command::env(...)`.
+
+    /// `jjf_actor_env` reads `JJF_ACTOR` lazily; passing
+    /// whitespace-only or empty values has to fall through (the
+    /// chain semantics say "skip me," not "set empty"). This test
+    /// removes the var first so the parent env can't pollute it.
+    #[test]
+    fn jjf_actor_env_unset_returns_none() {
+        // SAFETY: nextest runs each test in a shared process; we
+        // only `remove_var` here (no set), and we restore nothing
+        // because the canonical state of `JJF_ACTOR` for the test
+        // process is "unset." If a parent set it, the orchestrator
+        // wanted it gone for this assertion to be meaningful.
+        unsafe {
+            std::env::remove_var("JJF_ACTOR");
+        }
+        assert_eq!(jjf_actor_env(), None);
     }
 }
