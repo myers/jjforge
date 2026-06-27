@@ -1,5 +1,78 @@
 # `jjf --json` output contract
 
+## v2.9 → v2.10 changelog
+
+Backwards-compatible additions, landed in the `host-asterinas-stale`
+ticket (`e726cde`). Storage spec unchanged — this is a new query
+verb on top of the existing `updated_at` field, not a new field or
+op.
+
+- **New verb `jjf stale [--days N]`** — surface issues whose
+  `updated_at` is older than `N` days. Orchestrator hygiene query
+  for "what work has gone quiet?". Default `--days 14`.
+
+  Plain-text shape: one tab-separated row per stale issue,
+  `<id>\t<age>\t<title>\t<status>`. Empty result is silent
+  (matches `ls` / `search`).
+
+  JSON shape — a **bare array** (NOT an envelope; mirrors `ls
+  --json`, which is the structural cousin):
+
+  ```json
+  [
+    {"id": "a3f9c01", "title": "...", "status": "open",
+     "updated_at": "2026-05-12T08:14:31Z",
+     "days_since_update": 30}
+  ]
+  ```
+
+  Empty result under `--json` is `[]`.
+
+- **Strict-`>` staleness.** An issue is stale when
+  `now - updated_at > days * 86400`. Equal at the threshold tick
+  is NOT stale — a boundary-aged issue was touched right at the
+  cutoff, which reads as "just barely fresh".
+
+- **Sort.** Ascending by `updated_at` (oldest first) — the
+  orchestrator's highest-priority rows surface first.
+
+- **Filters compose AND with the staleness threshold.** `--status
+  <S>` (default `open`; matches `ls`'s default, distinct from
+  `search`'s `all`), `--label <L>` (repeatable, AND across labels),
+  `--type <T>` (repeatable, OR across types) — same semantics as
+  the corresponding `ls` flags.
+
+- **`--limit <N>`** caps the result after the oldest-first sort.
+  Default 0 (unlimited); mirrors `search`'s `--limit 0` convention.
+  Typical orchestrator use: `--limit 10` to skim the top of the
+  stale list.
+
+- **Age rendering** (plain text only — `--json` always emits the
+  raw `days_since_update` integer for scripting):
+
+  - `< 30d` → `Nd` (whole days; e.g. `19d`)
+  - `>= 30d && < 90d` → `Nw` (whole weeks; e.g. `5w` from 35d)
+  - `>= 90d` → `Nmo` (whole months; one month == 30 days; e.g.
+    `4mo` from 120d)
+
+  Always a single token — never compound forms like `1w 5d` or
+  prefixed approximations like `~3w`. Boundaries chosen so the
+  common stale-set (2-4 weeks old) stays in `Nd` shape; `19d`
+  reads faster than `2w` at a glance.
+
+- **Caveat (carried from ticket's "Out of scope")**: today's
+  `Storage::add_comment` DOES bump `updated_at` — at odds with
+  the ticket's "comments don't bump `updated_at` today" claim.
+  `jjf stale` uses the field as-is; if you want stale-by-true-
+  inactivity rather than stale-by-last-mutation-or-comment, that
+  needs a separate decision (storage spec — see closing comment
+  on `e726cde`).
+
+- **Out of scope** (deferred per ticket `e726cde`):
+  auto-closing stale issues (`jjf stale` is read-only), Slack /
+  email notifications (out-of-band), stale-by-activity recasting
+  of `updated_at` semantics.
+
 ## v2.8 → v2.9 changelog
 
 Backwards-compatible additions, landed in the `host-asterinas-search`
@@ -1221,6 +1294,65 @@ Error path — running outside a jj repo:
 
 ```sh
 $ jjf search "x" --json
+{"ok":false,"error":{"kind":"not_a_jj_repo","message":"not a jj repo: /tmp/foo","details":{"path":"/tmp/foo"}}}
+```
+
+### `stale`
+
+```sh
+$ jjf stale --days 14
+8eed630	30d	got abandoned a while back	open
+a3f9c01	2mo	older one	open
+```
+
+```sh
+$ jjf stale --days 14 --json
+[
+  {
+    "id": "8eed630",
+    "title": "got abandoned a while back",
+    "status": "open",
+    "updated_at": "2026-05-12T08:14:31Z",
+    "days_since_update": 30
+  },
+  {
+    "id": "a3f9c01",
+    "title": "older one",
+    "status": "open",
+    "updated_at": "2026-04-12T08:14:31Z",
+    "days_since_update": 60
+  }
+]
+```
+
+Flag matrix:
+
+| Flag | Default | Notes |
+| --- | --- | --- |
+| `--days <N>` | `14` | Whole days; converted to seconds at boundary. |
+| `--status <S>` | `open` | Mirrors `ls`'s default. `all` includes closed/abandoned. |
+| `--label <L>` | — | Repeatable, AND across labels. |
+| `--type <T>` | — | Repeatable, OR across types. |
+| `--limit <N>` | `0` | `0` == unlimited; mirrors `search`. |
+| `--json` | off | Bare array (NOT envelope); mirrors `ls`. |
+
+Plain-text columns: `<id>\t<age>\t<title>\t<status>`. `<age>` is
+the human-friendly token `Nd` / `Nw` / `Nmo`; see the v2.9 → v2.10
+changelog for the exact thresholds. Empty result is silence
+under plain text, `[]` under `--json`. Sort is ascending by
+`updated_at` (oldest first).
+
+Compose filters with the threshold:
+
+```sh
+$ jjf stale --days 7 --label epic:host-asterinas --status open --json
+[ ... only stale issues with the `epic:host-asterinas` label, open status ... ]
+```
+
+Error path — running outside a jj repo:
+
+```sh
+$ jjf stale --json
 {"ok":false,"error":{"kind":"not_a_jj_repo","message":"not a jj repo: /tmp/foo","details":{"path":"/tmp/foo"}}}
 ```
 

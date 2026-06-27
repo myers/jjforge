@@ -129,6 +129,9 @@ pub use record::{
 // `Storage::search`. We re-state the export here for discoverability;
 // public types live at the crate root.
 
+// `StaleHit` is declared inline below alongside `Storage::stale`.
+// Same discoverability note as `SearchHit`.
+
 // `ReadyFilter` is declared below alongside its helpers, but we
 // re-state the export here for discoverability. Public types live
 // at the crate root.
@@ -804,6 +807,25 @@ pub struct SearchHit {
 /// [`Storage::search`] — `±40` chars around the first hit. Matches
 /// the value the ticket calls out as the default.
 pub const DEFAULT_SNIPPET_CONTEXT: usize = 40;
+
+/// One row returned by [`Storage::stale`].
+///
+/// `seconds_since_update` is the wall-clock delta between `now` (the
+/// pinned/system clock — see [`Storage::stale`]) and the issue's
+/// `updated_at` field. Carried alongside the [`Issue`] so the CLI's
+/// `--json` envelope can serialize `days_since_update` without a
+/// second clock read at the render layer (any re-derivation would
+/// race the pinned clock contract under `JJF_TEST_CLOCK_SECS`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleHit {
+    /// The matching issue (full read-side projection — same shape
+    /// [`Storage::read`] returns).
+    pub issue: Issue,
+    /// `now - updated_at` in whole seconds. Always positive when the
+    /// issue was returned (the staleness filter excludes any issue
+    /// whose `updated_at` is at-or-after `now - threshold_secs`).
+    pub seconds_since_update: u64,
+}
 
 /// Count non-overlapping occurrences of `needle` (already lowercased
 /// by the caller) in `haystack`, case-insensitively. Used by
@@ -3540,6 +3562,72 @@ impl Storage {
         Ok(out)
     }
 
+    /// Return every issue whose `updated_at` is strictly older than
+    /// `now - threshold_secs`. Sort ascending by `updated_at` (oldest
+    /// first) so the caller's render loop walks the highest-priority
+    /// rows first.
+    ///
+    /// Boundary semantics: strict `>` against the threshold. An issue
+    /// whose age in seconds is exactly `threshold_secs` is NOT stale.
+    /// Reasoning: with second-resolution `updated_at` stamps a
+    /// boundary-matching issue was touched right at the threshold tick
+    /// — that's "just barely fresh", not "just barely stale". This
+    /// matches a human reading of "issues older than N days".
+    ///
+    /// `now` reads through the same env-pinned clock path
+    /// [`now_rfc3339`] uses, so tests can hold the clock steady via
+    /// `JJF_TEST_CLOCK_SECS`. Production code never sets that env
+    /// var.
+    ///
+    /// The threshold is in seconds (not days) so the storage layer
+    /// stays time-unit-agnostic; the CLI converts at the
+    /// `--days N -> threshold_secs = N * 86400` boundary.
+    ///
+    /// `updated_at` is bumped only by mutating verbs today (per the
+    /// storage spec); commenting on an issue does NOT bump it. This
+    /// fn uses the field as-is and inherits that contract — see the
+    /// `host-asterinas-stale` ticket's "Out of scope" section. A
+    /// "stale by activity" surface (comments-count-as-touches) is a
+    /// separate decision tracked on the storage spec.
+    ///
+    /// Reads through the snapshot cache (one probe + maybe one
+    /// rebuild — same shape as [`Storage::search`] / [`Storage::list_ready`]).
+    /// No new IO.
+    pub fn stale(&self, threshold_secs: u64) -> Result<Vec<StaleHit>> {
+        let now_secs = current_epoch_secs()?;
+        let snapshot = self.snapshot()?;
+        let mut out: Vec<StaleHit> = Vec::new();
+        for issue in snapshot.issues.values() {
+            let updated_secs = match rfc3339_to_epoch_secs(&issue.updated_at) {
+                Some(s) => s,
+                // An unparseable stamp can't be reasoned about; skip
+                // rather than panic. In practice every record carries
+                // a stamp written by `now_rfc3339`, which always emits
+                // the strict `YYYY-MM-DDTHH:MM:SSZ` shape this parser
+                // accepts. Defensive against a future spec change.
+                None => continue,
+            };
+            // Guard against future-dated `updated_at` (clock skew on a
+            // peer that pushed). `saturating_sub` keeps the math safe;
+            // a future-dated issue surfaces as `seconds_since_update
+            // = 0`, which is never `> threshold_secs` for any
+            // positive threshold — so future-dated issues are never
+            // stale, which matches intuition.
+            let age = now_secs.saturating_sub(updated_secs);
+            if age > threshold_secs {
+                out.push(StaleHit {
+                    issue: issue.clone(),
+                    seconds_since_update: age,
+                });
+            }
+        }
+        // Oldest first. `updated_at` is RFC 3339 with second-resolution
+        // and a trailing `Z`, so lexicographic order == chronological
+        // order — same trick `run_ls` uses on `created_at`.
+        out.sort_by(|a, b| a.issue.updated_at.cmp(&b.issue.updated_at));
+        Ok(out)
+    }
+
     /// Enumerate the change_id shorts of every head of the `issues`
     /// bookmark. Normally returns exactly one entry; returns more than
     /// one only when the bookmark is in a divergent ("conflicted")
@@ -4564,6 +4652,68 @@ pub(crate) fn epoch_secs_to_rfc3339(secs: u64) -> String {
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         y, m, d, hour, minute, second
     )
+}
+
+/// Parse a strict-shape RFC 3339 stamp (`YYYY-MM-DDTHH:MM:SSZ`,
+/// UTC, second resolution — exactly what [`epoch_secs_to_rfc3339`]
+/// emits) back to seconds-since-epoch. Returns `None` if the input
+/// doesn't match the expected shape or any field is out of range.
+///
+/// Used by [`Storage::stale`] to compute `now - updated_at`. We do
+/// not bring in `chrono` / `time` for this; the on-disk stamps are
+/// strict and emitted by us, so the parse stays small.
+fn rfc3339_to_epoch_secs(s: &str) -> Option<u64> {
+    // `YYYY-MM-DDTHH:MM:SSZ` is 20 bytes. Defensive length check.
+    let b = s.as_bytes();
+    if b.len() != 20 {
+        return None;
+    }
+    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T'
+        || b[13] != b':' || b[16] != b':' || b[19] != b'Z'
+    {
+        return None;
+    }
+    let parse_u = |start: usize, end: usize| -> Option<u32> {
+        s.get(start..end).and_then(|t| t.parse::<u32>().ok())
+    };
+    let year = parse_u(0, 4)? as i32;
+    let month = parse_u(5, 7)?;
+    let day = parse_u(8, 10)?;
+    let hour = parse_u(11, 13)?;
+    let minute = parse_u(14, 16)?;
+    let second = parse_u(17, 19)?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour >= 24
+        || minute >= 60
+        || second >= 60
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    if days < 0 {
+        // Pre-1970 stamps don't fit `u64` epoch-seconds; reject.
+        return None;
+    }
+    let secs = (days as u64) * 86_400
+        + (hour as u64) * 3600
+        + (minute as u64) * 60
+        + (second as u64);
+    Some(secs)
+}
+
+/// Howard Hinnant's `days_from_civil` (public domain). The inverse
+/// of [`civil_from_days`]: returns days since 1970-01-01 for the
+/// given UTC civil date. Negative when the input predates the epoch.
+fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { (y as i64) - 1 } else { y as i64 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64; // [0, 399]
+    let m = m as u64;
+    let d = d as u64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146_096]
+    era * 146_097 + (doe as i64) - 719_468
 }
 
 /// Howard Hinnant's `civil_from_days` (public domain). `z` is days

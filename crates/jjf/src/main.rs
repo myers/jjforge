@@ -43,7 +43,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use jjf_storage::{
     DEFAULT_SNIPPET_CONTEXT, ISSUES_BOOKMARK, ClaimResult, DepEdge, DepKind, DepTreeNode,
     Error as StorageError, IdError, BodyInvalidReason, Issue, IssueDraft, IssueId, IssueType,
-    Memory, ReadyFilter, SearchHit, SlugInvalidReason, Status, Storage, TitleInvalidReason,
+    Memory, ReadyFilter, SearchHit, SlugInvalidReason, StaleHit, Status, Storage,
+    TitleInvalidReason,
     UnreadableRef, UpdateFields,
 };
 
@@ -776,6 +777,68 @@ enum Commands {
         /// `DEFAULT_SNIPPET_CONTEXT`).
         #[arg(long = "snippet-context", default_value_t = DEFAULT_SNIPPET_CONTEXT)]
         snippet_context: usize,
+    },
+
+    /// Surface issues not touched in the last N days — orchestrator
+    /// hygiene query. Walks the snapshot, compares each issue's
+    /// `updated_at` against the configured threshold, returns oldest
+    /// first.
+    ///
+    /// Default `--days 14`; pass `--days N` to widen or narrow the
+    /// window. Default `--status open` because the orchestrator
+    /// question is "what actionable work has gone quiet?" — pass
+    /// `--status all` (or any specific status) to widen.
+    ///
+    /// Plain-text output is one row per stale issue,
+    /// `<id>\t<age>\t<title>\t<status>`, sorted ascending by
+    /// `updated_at` (oldest first). `<age>` is a human shape (`Nd`,
+    /// `Nw`, `Nmo`) keyed off whole-day deltas — see the per-verb
+    /// section of `docs/cli-json.md` for the exact rendering rule.
+    /// `--json` emits a bare array of `{id, title, status,
+    /// updated_at, days_since_update}` records (no envelope —
+    /// structural cousin of `jjf ls --json`, which the ticket
+    /// explicitly mirrors). Empty result is `[]` under `--json`,
+    /// silence under plain text.
+    ///
+    /// Filters (`--status`, `--label`, `--type`) compose with AND
+    /// semantics against the stale set.
+    ///
+    /// Caveat carried from the ticket's "Out of scope": comments do
+    /// NOT bump `updated_at` today (only mutating verbs do). A
+    /// commented-on but otherwise-untouched issue still shows as
+    /// stale. That's deliberate and tracked separately in the
+    /// storage spec.
+    Stale {
+        /// Staleness window in whole days. An issue is stale when
+        /// `now - updated_at > days * 86400` (strict `>`; an issue
+        /// touched exactly at the threshold tick is NOT stale).
+        /// Default 14 per the ticket spec.
+        #[arg(long, default_value_t = 14)]
+        days: u64,
+
+        /// Filter by status. Mirrors `jjf ls --status`. Default
+        /// `open` — the orchestrator question is "what actionable
+        /// work has gone quiet?".
+        #[arg(long, value_enum, default_value_t = StatusFilter::Open)]
+        status: StatusFilter,
+
+        /// Filter by label. Repeatable. Semantics: AND — an issue
+        /// must carry every listed label to match.
+        #[arg(short = 'l', long = "label")]
+        labels: Vec<String>,
+
+        /// Filter by issue type. Repeatable. Semantics: OR — an
+        /// issue matches if its type equals any of the listed
+        /// types.
+        #[arg(long = "type", value_enum)]
+        types: Vec<TypeArg>,
+
+        /// Truncate the result after the oldest-first sort. Default
+        /// 0 (unlimited); mirrors `search`'s convention of
+        /// `--limit 0` == no cap. Typical orchestrator use is
+        /// `--limit 10` to skim the top of the stale list.
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
     },
 
     /// Pull the `issues` bookmark from a git remote, then merge any
@@ -1758,6 +1821,13 @@ fn run(cli: Cli) -> Result<(), CliError> {
             limit,
             snippet_context,
         ),
+        Commands::Stale {
+            days,
+            status,
+            labels,
+            types,
+            limit,
+        } => run_stale(cli.json, days, status, labels, types, limit),
         Commands::Update {
             id,
             title,
@@ -3658,6 +3728,135 @@ fn run_search(
     emit_unreadable_warning(&unreadable, json);
 
     Ok(())
+}
+
+/// `jjf stale [--days N] [--status S] [--label L...] [--type T...]
+/// [--limit N] [--json]` — surface issues whose `updated_at` is older
+/// than `N` days. The orchestrator's "what work has gone quiet?"
+/// hygiene query.
+///
+/// Preflight mirrors `run_ls` / `run_search` exactly — read verb, no
+/// self-host-write guard. Storage layer computes the staleness set
+/// (strict `>` semantics — see [`Storage::stale`]); this fn handles
+/// the unit conversion (`days * 86_400`), filter composition, limit,
+/// and render.
+///
+/// Output shapes mirror `ls`'s bare-array convention because the
+/// ticket spec explicitly pins that shape (distinct from `search`,
+/// which carries an `{ok:true,results:[...]}` envelope). Empty
+/// result under `--json` is `[]`; plain text is silent.
+fn run_stale(
+    json: bool,
+    days: u64,
+    status: StatusFilter,
+    labels: Vec<String>,
+    types: Vec<TypeArg>,
+    limit: usize,
+) -> Result<(), CliError> {
+    // Preflight: cwd is a jj repo AND `issues` bookmark exists. Same
+    // order as `run_ls` / `run_search`.
+    let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
+    preflight::issues_bookmark(&cwd)?;
+
+    let storage = Storage::open(&cwd)?;
+    let wanted_types: Vec<IssueType> =
+        types.into_iter().map(IssueType::from).collect();
+
+    // Unit conversion at the CLI boundary. Storage layer takes
+    // seconds so the storage-level tests can pin to small intervals
+    // (e.g. `--days 0` becomes `> 0 seconds`, hits anything older
+    // than the pinned clock).
+    let threshold_secs = days.saturating_mul(86_400);
+
+    let mut hits: Vec<StaleHit> = storage.stale(threshold_secs)?;
+    // Compose status/label/type filters on top of the staleness set.
+    // AND semantics across all filters, matching `ls` / `search`.
+    hits.retain(|h| {
+        status_matches(&h.issue, status)
+            && labels_match(&h.issue, &labels)
+            && types_match(&h.issue, &wanted_types)
+    });
+
+    // Storage layer already sorts oldest-first; the retain pass
+    // preserves order. `--limit 0` means unlimited — mirrors
+    // `search`'s convention, declared in the clap doc-comment.
+    if limit > 0 && hits.len() > limit {
+        hits.truncate(limit);
+    }
+
+    if json {
+        // Bare array of `{id, title, status, updated_at,
+        // days_since_update}` — same structural shape `ls --json`
+        // uses (also a bare array). The ticket's "JSON" example
+        // pins this shape directly.
+        let results: Vec<serde_json::Value> = hits
+            .iter()
+            .map(|h| {
+                let days_since = h.seconds_since_update / 86_400;
+                serde_json::json!({
+                    "id": h.issue.id.as_str(),
+                    "title": h.issue.title,
+                    "status": h.issue.status.as_str(),
+                    "updated_at": h.issue.updated_at,
+                    "days_since_update": days_since,
+                })
+            })
+            .collect();
+        let s = serde_json::to_string_pretty(&results)
+            .map_err(|e| CliError::Storage(StorageError::Json(e)))?;
+        println!("{s}");
+    } else {
+        // Plain text: tab-separated rows. Columns: id, age (human
+        // shape — `Nd`/`Nw`/`Nmo`), title, status. Silent on empty,
+        // mirroring `ls` / `search`.
+        for h in &hits {
+            let age = render_age(h.seconds_since_update);
+            println!(
+                "{id}\t{age}\t{title}\t{status}",
+                id = h.issue.id,
+                age = age,
+                title = h.issue.title,
+                status = h.issue.status.as_str(),
+            );
+        }
+    }
+
+    let unreadable = storage.unreadable_refs()?;
+    emit_unreadable_warning(&unreadable, json);
+
+    Ok(())
+}
+
+/// Render a stale-age in seconds as a short human-friendly string.
+///
+/// Boundaries (round down at each):
+///
+/// - `< 30d` → `Nd` (whole days)
+/// - `>= 30d && < 90d` → `Nw` (whole weeks; one week == 7 days)
+/// - `>= 90d` → `Nmo` (whole months; one month == 30 days, the
+///   approximate-by-convention figure — calendar months aren't a
+///   stable unit at this resolution and the orchestrator just wants
+///   a back-of-envelope number)
+///
+/// Boundaries chosen so the common stale-set lives in `Nd` shape
+/// (most "this work has gone quiet" tickets are 2-4 weeks old and
+/// `19d` reads faster than `2w` at a glance). Weeks and months kick
+/// in only when the age has compressed enough that the precision is
+/// noise.
+///
+/// Output is always a single token (no spaces); the renderer never
+/// emits compound forms like `1w 5d` or `~3w`. Documented in
+/// `docs/cli-json.md`'s per-verb `stale` section.
+fn render_age(secs: u64) -> String {
+    let days = secs / 86_400;
+    if days < 30 {
+        format!("{days}d")
+    } else if days < 90 {
+        format!("{}w", days / 7)
+    } else {
+        format!("{}mo", days / 30)
+    }
 }
 
 /// `--status` predicate. `All` matches everything (including

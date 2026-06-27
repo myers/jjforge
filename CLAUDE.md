@@ -593,6 +593,12 @@ jjf search "body cap" --include-comments           # plus comments
 jjf search "needle" --status open --label backend  # filters compose AND
 jjf search --json "needle" --limit 5 \
     | jq -r '.results[] | "\(.id)\t\(.matched_field)\t\(.title)"'
+
+# Issues not touched in the last N days (v2.10). Default
+# --days 14; default --status open. Sorted oldest first.
+# Plain-text age column: Nd (<30d) / Nw (30-90d) / Nmo (>=90d).
+jjf stale --days 14                                # default; open issues only
+jjf stale --days 1 --label epic:host-asterinas --json  # compose with filters
 ```
 
 Filters jjforge doesn't yet ship that we want (file as
