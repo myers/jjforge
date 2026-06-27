@@ -112,8 +112,10 @@ fn close_issue(repo: &Path, id: &str) {
 }
 
 /// Parse the tab-separated `ready` plain-text output into rows.
-/// Shape mirrors `ls`: `<id>\t<status>\t<type>\t<title>` (b74b156).
-fn parse_ready_rows(stdout: &str) -> Vec<(String, String, String, String)> {
+/// Shape mirrors `ls`:
+/// `<id>\t<status>\t<priority>\t<type>\t<title>` (326bbf7, v2.8).
+/// The tuple shape is `(id, status, priority, type, title)`.
+fn parse_ready_rows(stdout: &str) -> Vec<(String, String, String, String, String)> {
     stdout
         .lines()
         .filter(|l| !l.is_empty())
@@ -121,8 +123,8 @@ fn parse_ready_rows(stdout: &str) -> Vec<(String, String, String, String)> {
             let parts: Vec<&str> = l.split('\t').collect();
             assert_eq!(
                 parts.len(),
-                4,
-                "expected 4 tab-separated columns, got {}: {l:?}",
+                5,
+                "expected 5 tab-separated columns, got {}: {l:?}",
                 parts.len()
             );
             (
@@ -130,6 +132,7 @@ fn parse_ready_rows(stdout: &str) -> Vec<(String, String, String, String)> {
                 parts[1].to_owned(),
                 parts[2].to_owned(),
                 parts[3].to_owned(),
+                parts[4].to_owned(),
             )
         })
         .collect()
@@ -298,9 +301,10 @@ fn ready_type_priority_sort_puts_bug_first() {
     let rows = parse_ready_rows(&stdout);
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].0, bug, "bug must sort first: {rows:?}");
-    // b74b156: third column is the type wire spelling, not labels.
-    assert_eq!(rows[0].2, "bug", "type column should be 'bug': {rows:?}");
-    let types: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+    // 326bbf7 (v2.8): fourth column is the type wire spelling (the
+    // third column is now the priority bucket).
+    assert_eq!(rows[0].3, "bug", "type column should be 'bug': {rows:?}");
+    let types: Vec<&str> = rows.iter().map(|r| r.3.as_str()).collect();
     assert!(
         types.contains(&"epic") && types.contains(&"feature"),
         "type column should carry the wire spelling for every row: {rows:?}",

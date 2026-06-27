@@ -525,6 +525,7 @@ fn read_then_serialize_byte_equals_on_disk_record() {
         block_reason: Option<&'a str>,
         #[serde(rename = "type")]
         type_: &'a str,
+        priority: Option<u8>,
         labels: &'a [String],
         dependencies: &'a [DepEdge],
         assignee: Option<&'a str>,
@@ -541,6 +542,7 @@ fn read_then_serialize_byte_equals_on_disk_record() {
         status: bug.status.as_str(),
         block_reason: bug.block_reason.as_deref(),
         type_: bug.type_.as_str(),
+        priority: bug.priority,
         labels: &bug.labels,
         dependencies: &bug.dependencies,
         assignee: bug.assignee.as_deref(),

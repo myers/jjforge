@@ -1,6 +1,6 @@
-# jjforge on-disk storage format — v2.7
+# jjforge on-disk storage format — v2.8
 
-Status: v2.7, current. This is the contract every other crate
+Status: v2.8, current. This is the contract every other crate
 implements against. Verdicts pinned by:
 
 - `dcd4b57` — Shape A (dedicated bookmark for issue data).
@@ -8,6 +8,39 @@ implements against. Verdicts pinned by:
   audit surface.
 - `2130de1` — shell out to the `jj` CLI; do not link `jj-lib`.
 - `72638a0` — the `mvp-storage` epic.
+
+## v2.7 → v2.8 changelog
+
+Backwards-compatible field additions, landed in the
+`priority-field` ticket (`326bbf7`). v2.7 readers tolerate v2.8
+records (the trailer parser ignores unknown ops per §5.2; the
+record parser tolerates extra fields because serde-derive does);
+v2.8 readers tolerate v2.7 records via serde-default on the new
+field. No bookmark rename, no path change, no migration commit.
+
+- **New record field `priority`** (integer 0–4 or null, default
+  `null`) — placed between `type` and `labels` in the on-disk
+  record. Lower number = higher priority (P0 = ship-stopping,
+  P4 = whenever). `null` means unspecified — the default for any
+  record whose creator didn't choose. The value space `0..=4` is
+  enforced at the write boundary (the parser rejects any other
+  integer with a typed `invalid_priority` error).
+- **New op `set-priority`** — payload field `Jjf-Priority`.
+  Integer string in `0..=4`, or empty value to clear back to
+  `null`. The empty form parses identically to absent — both
+  deserialize to `priority: None`.
+- **Create-time emission (§5.7)** — non-null `priority` values
+  emit a `set-priority` stanza in the multi-op create commit.
+  Emission order matches record field order: slug, body, type,
+  priority, labels, dependencies, assignee.
+- **`Storage::list_ready` primary sort key changes.** v2.8
+  inserts `priority` (nulls-last) as the primary key; the
+  existing type-priority weight (bug > feature > research >
+  epic > unspecified) drops to secondary, with `created_at`
+  ascending as the tertiary tiebreak. `Some(0)` < `Some(4)` <
+  `None` so an explicit P4 still sorts above an unspecified
+  issue. `jjf ls`'s sort is unchanged (still `created_at`
+  descending) — only the ready-set sort moves.
 
 ## v2.6 → v2.7 changelog
 
@@ -462,6 +495,7 @@ separate lines).
 | `status`       | string enum           | yes  | `open` \| `blocked` \| `in-progress` \| `closed` \| `abandoned`. Default `open`. (v2.3 added `in-progress`; v2.5 added `blocked`; v2.7 added `abandoned`.) |
 | `block_reason` | string \| null        | yes  | v2.5 — free-text reason for the current `blocked` status. `null` when not blocked. Single-line. |
 | `type`         | string enum           | yes  | v2.1 — `bug` \| `feature` \| `epic` \| `research` \| `roadmap` \| `unspecified`. Default `unspecified`. |
+| `priority`     | integer (0–4) \| null | yes  | v2.8 — lower = higher priority (P0 ship-stopping, P4 whenever). Default `null` (unspecified). Out-of-range integers rejected at the write boundary. |
 | `labels`       | array of string       | yes  | Sorted alphabetically. Empty array if none.                    |
 | `dependencies` | array of DepEdge (v2.4) | yes | Typed dependency edges. Sorted by `(target, kind)`. Empty array if none. v2.4 — was `array of string` in pre-v2.4 records; the reader accepts both shapes. |
 | `assignee`     | string \| null        | yes  | Free-text identifier. `null` if unassigned.                    |
@@ -668,6 +702,7 @@ trap that §5.6's filter-on-both-files workaround papers over.
 | `dep-rm`     | `Jjf-Dep`, `Jjf-Dep-Kind` (v2.4)                          | v2.4 — kind required for op-space causal merge keyed by `(target, kind)`. |
 | `set-assignee` | `Jjf-Assignee` (string or empty for unassign)           |                                                      |
 | `set-type`   | `Jjf-Type` (one of `bug` / `feature` / `epic` / `research` / `roadmap` / `unspecified`) | v2.1.                              |
+| `set-priority` | `Jjf-Priority` (integer string `0`–`4`, or empty to clear) | v2.8. Out-of-range integers are a parse error. |
 | `set-slug`   | `Jjf-Slug` (validated kebab-case per §3.4; empty clears) | v2.1.                                                |
 | `comment-add` | `Jjf-Comment-Id` (the new comment's 7-hex id)            | The comment body lives in `<id>.comments.jsonl`.     |
 | `merge`      | (no extra payload fields)                                 | Used by the merge driver in `e2e473b`.               |
@@ -812,11 +847,11 @@ on every non-trivial create.
 
 The writer emits them in this order, after the `Jjf-Op: create`
 stanza: `set-slug` (if non-null), `set-body`, `set-type` (if
-non-default), `label-add` (one per label, sorted), `dep-add` (one
-per dependency, sorted), `set-assignee` (if present). Order
-follows the record's field-declaration order (§3.1) so the
-op-replay view's structural fold matches the file-read view
-exactly.
+non-default), `set-priority` (if non-null; v2.8), `label-add`
+(one per label, sorted), `dep-add` (one per dependency, sorted),
+`set-assignee` (if present). Order follows the record's
+field-declaration order (§3.1) so the op-replay view's structural
+fold matches the file-read view exactly.
 
 ### 5.9 Atomic claim / unclaim (v2.3)
 

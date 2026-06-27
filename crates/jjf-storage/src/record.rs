@@ -343,6 +343,58 @@ impl IssueType {
     }
 }
 
+/// Why a priority value failed validation (spec v2.8).
+///
+/// Today the only failure mode is "out of range" — the integer
+/// landed outside the documented `0..=4` window. The enum is left
+/// open-ended so future rules (e.g. a per-status floor) can extend
+/// it without changing the validator signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriorityInvalidReason {
+    /// Priority integer was outside the documented `0..=4` window.
+    /// `got` carries the rejected value verbatim so a CLI envelope
+    /// can echo it back to the operator.
+    OutOfRange { got: u8 },
+}
+
+impl PriorityInvalidReason {
+    /// Stable lowercase snake_case name. Used by the CLI to surface
+    /// the rejection reason in the JSON error envelope's
+    /// `details.reason` slot.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PriorityInvalidReason::OutOfRange { .. } => "out_of_range",
+        }
+    }
+}
+
+impl std::fmt::Display for PriorityInvalidReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PriorityInvalidReason::OutOfRange { got } => {
+                write!(f, "priority must be in 0..=4 (got {got})")
+            }
+        }
+    }
+}
+
+/// Validate a priority value per spec v2.8: `None` always passes
+/// (unspecified is allowed); `Some(n)` requires `n <= 4`. Returns
+/// `Ok(())` on pass; otherwise the typed rejection variant.
+///
+/// Exposed publicly so the CLI can pre-validate before calling
+/// `Storage::create_issue` / `Storage::update` / `Storage::set_priority`
+/// and surface a typed `invalid_priority` exit-2 error before any
+/// IO kicks off.
+pub fn validate_priority(p: Option<u8>) -> std::result::Result<(), PriorityInvalidReason> {
+    if let Some(n) = p {
+        if n > 4 {
+            return Err(PriorityInvalidReason::OutOfRange { got: n });
+        }
+    }
+    Ok(())
+}
+
 /// The full v2 record. Field declaration order == on-disk emission
 /// order. Don't reorder.
 ///
@@ -385,6 +437,20 @@ pub struct IssueRecord {
     /// appears in the record (no `#[serde(skip)]`).
     #[serde(default, rename = "type")]
     pub type_: IssueType,
+    /// Priority bucket (v2.8 `priority-field`). Integer `0..=4`
+    /// with `None` (serialized as `null`) meaning unspecified.
+    /// Lower = higher priority (P0 ship-stopping, P4 whenever).
+    /// Per spec §3.1 the field always appears in the record (no
+    /// `#[serde(skip)]`); serde-default on read so pre-v2.8
+    /// records (which lack the field) deserialize cleanly as
+    /// `priority: None`. The value-space invariant (`0..=4`) is
+    /// enforced at the write boundary by
+    /// [`validate_priority`]; the read path trusts the on-disk
+    /// integer (a hand-edited out-of-range value would surface
+    /// here unchanged, the same way an unknown `IssueType`
+    /// variant does).
+    #[serde(default)]
+    pub priority: Option<u8>,
     pub labels: Vec<String>,
     /// Typed dependency edges (spec v2.4). Each edge carries a target
     /// id and a [`DepKind`]. Backward-compat: a v1 record (no kind
@@ -423,6 +489,12 @@ pub struct IssueDraft {
     /// at write time; collisions across OPEN issues surface as
     /// [`crate::Error::SlugCollision`].
     pub slug: Option<String>,
+    /// Priority bucket (v2.8). `None` writes a record with
+    /// `priority: null`; `Some(n)` (n in 0..=4) emits a
+    /// `Jjf-Op: set-priority` stanza in the create-time multi-op
+    /// commit. Out-of-range integers are rejected at the boundary
+    /// by `validate_priority` before write.
+    pub priority: Option<u8>,
 }
 
 /// One line of `issues/<id>.comments.jsonl`. Serialized one per line,
@@ -483,6 +555,11 @@ pub struct Issue {
     pub block_reason: Option<String>,
     #[serde(rename = "type")]
     pub type_: IssueType,
+    /// Priority bucket (v2.8). Mirrors [`IssueRecord::priority`];
+    /// serialized between `type` and `labels` to match the on-disk
+    /// record's emission order. `None` renders as `null`.
+    #[serde(default)]
+    pub priority: Option<u8>,
     pub labels: Vec<String>,
     /// Typed dependency edges. Same shape as
     /// [`IssueRecord::dependencies`] but emitted directly on

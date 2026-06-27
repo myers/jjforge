@@ -105,6 +105,17 @@ pub enum Op {
         issue_id: IssueId,
         slug: Option<String>,
     },
+    /// Set the priority bucket (spec v2.8). `None` clears the field
+    /// back to `null`; `Some(n)` with n in `0..=4` sets it. The
+    /// trailer carries the integer string `"0"`..`"4"` or `""` for
+    /// "no priority". Out-of-range integers are rejected at the
+    /// write boundary by `validate_priority`; the parser tolerates
+    /// unknown variants the same way other op-payload validators do
+    /// (an out-of-range trailer is dropped as an unknown op-shape).
+    SetPriority {
+        issue_id: IssueId,
+        priority: Option<u8>,
+    },
     /// Set the free-text reason for [`crate::record::Status::Blocked`]
     /// (spec v2.5). `None` clears it. The trailer carries the chosen
     /// value verbatim or `""` for "no reason"; the empty form is
@@ -139,6 +150,7 @@ impl Op {
             Op::SetAssignee { .. } => "set-assignee",
             Op::SetType { .. } => "set-type",
             Op::SetSlug { .. } => "set-slug",
+            Op::SetPriority { .. } => "set-priority",
             Op::SetBlockReason { .. } => "set-block-reason",
             Op::CommentAdd { .. } => "comment-add",
             Op::Merge { .. } => "merge",
@@ -159,6 +171,7 @@ impl Op {
             | Op::SetAssignee { issue_id, .. }
             | Op::SetType { issue_id, .. }
             | Op::SetSlug { issue_id, .. }
+            | Op::SetPriority { issue_id, .. }
             | Op::SetBlockReason { issue_id, .. }
             | Op::CommentAdd { issue_id, .. }
             | Op::Merge { issue_id } => issue_id,
@@ -269,6 +282,18 @@ impl Op {
                 );
                 s.push_str("Jjf-Slug: ");
                 s.push_str(v);
+                s.push('\n');
+            }
+            Op::SetPriority { priority, .. } => {
+                // v2.8 (`priority-field`): integer string for set,
+                // empty for clear. Mirrors `set-slug` / `set-assignee`'s
+                // empty-string-means-None convention. The write-boundary
+                // validator (`validate_priority`) keeps `Some(n)` in
+                // `0..=4`, so the formatted digit is always single-byte;
+                // no newline-guard needed.
+                let v: String = priority.map(|n| n.to_string()).unwrap_or_default();
+                s.push_str("Jjf-Priority: ");
+                s.push_str(&v);
                 s.push('\n');
             }
             Op::SetBlockReason { reason, .. } => {

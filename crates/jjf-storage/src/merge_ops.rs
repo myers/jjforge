@@ -292,6 +292,7 @@ pub(crate) fn reduce_to_merged(
             status: *status,
             block_reason: None,
             type_: IssueType::Unspecified,
+            priority: None,
             labels: Vec::new(),
             dependencies: Vec::new(),
             assignee: None,
@@ -351,6 +352,12 @@ pub(crate) fn reduce_to_merged(
             }
             Op::SetSlug { slug, .. } => {
                 record.slug = slug.clone();
+            }
+            Op::SetPriority { priority, .. } => {
+                // v2.8: scalar LWW — same shape as type/slug. Existing
+                // `(jjf_at, commit, trailer_index)` total order picks
+                // the winning op; we just overwrite.
+                record.priority = *priority;
             }
             Op::SetBlockReason { reason, .. } => {
                 // v2.5: scalar LWW — same shape as title/slug. The
@@ -1168,6 +1175,7 @@ mod tests {
                 status: Status::Open,
                 block_reason: None,
                 type_: IssueType::Unspecified,
+                priority: None,
                 labels: Vec::new(),
                 dependencies: Vec::new(),
                 assignee: None,
@@ -1199,6 +1207,7 @@ mod tests {
                 status: Status::Open,
                 block_reason: None,
                 type_: IssueType::Unspecified,
+                priority: None,
                 labels: Vec::new(),
                 dependencies: Vec::new(),
                 assignee: None,
@@ -1246,6 +1255,7 @@ mod tests {
                 status: Status::Open,
                 block_reason: None,
                 type_: IssueType::Unspecified,
+                priority: None,
                 labels: Vec::new(),
                 dependencies: Vec::new(),
                 assignee: None,
@@ -1298,6 +1308,7 @@ mod tests {
                 status: Status::Open,
                 block_reason: None,
                 type_: IssueType::Unspecified,
+                priority: None,
                 labels: Vec::new(),
                 dependencies: Vec::new(),
                 assignee: None,
@@ -1344,6 +1355,7 @@ mod tests {
                 status: Status::Open,
                 block_reason: None,
                 type_: IssueType::Unspecified,
+                priority: None,
                 labels: Vec::new(),
                 dependencies: Vec::new(),
                 assignee: None,

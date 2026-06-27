@@ -202,6 +202,7 @@ prop_compose! {
             assignee: None,
             type_,
             slug,
+            priority: None,
         }
     }
 }

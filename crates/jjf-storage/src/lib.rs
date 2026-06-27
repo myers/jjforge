@@ -121,7 +121,8 @@ pub fn pull_v3_bare(repo_root: &Path, remote: &str) -> Result<PullReportV3> {
     sync_v3::pull_v3(&git, remote)
 }
 pub use record::{
-    Comment, DepEdge, DepKind, Issue, IssueDraft, IssueRecord, IssueType, Memory, Status,
+    Comment, DepEdge, DepKind, Issue, IssueDraft, IssueRecord, IssueType, Memory,
+    PriorityInvalidReason, Status, validate_priority,
 };
 
 // `MatchedField`, `SearchHit`, `make_snippet`, and
@@ -159,6 +160,11 @@ pub struct UpdateFields {
     pub slug: Option<Option<String>>,
     pub status: Option<Status>,
     pub type_: Option<Option<IssueType>>,
+    /// v2.8 (`priority-field`). `None` leaves the field alone;
+    /// `Some(Some(n))` sets it to `n` (0..=4); `Some(None)` clears
+    /// it back to `null`. Same three-way pattern as `assignee` /
+    /// `slug`.
+    pub priority: Option<Option<u8>>,
     pub body: Option<String>,
     pub assignee: Option<Option<String>>,
 }
@@ -171,6 +177,7 @@ impl UpdateFields {
             && self.slug.is_none()
             && self.status.is_none()
             && self.type_.is_none()
+            && self.priority.is_none()
             && self.body.is_none()
             && self.assignee.is_none()
     }
@@ -265,6 +272,16 @@ pub enum Error {
     /// 2026-06-25 sub-pass 4).
     #[error("invalid body: {reason}")]
     InvalidBody { reason: BodyInvalidReason },
+
+    /// A priority value failed validation (v2.8). Today the only
+    /// failure mode is "out of range" — the candidate integer fell
+    /// outside the `0..=4` window. Surfaced from
+    /// `Storage::create_issue`, `Storage::set_priority`, and
+    /// `Storage::update` whenever a candidate priority doesn't
+    /// pass [`validate_priority`]. The CLI envelope kind is
+    /// `invalid_priority`. Ticket `326bbf7`.
+    #[error("invalid priority: {reason}")]
+    InvalidPriority { reason: PriorityInvalidReason },
 
     /// Two open issues can't share a slug. Surfaced from
     /// `Storage::create_issue` / `Storage::update` when an attempted
@@ -616,6 +633,17 @@ pub struct ReadyFilter {
     /// v2.5 (`agent-await-gates-impl`). When `false` (default),
     /// `Storage::list_ready` excludes [`Status::Blocked`] issues.
     pub include_blocked: bool,
+}
+
+/// Sortable key for the priority field: maps `Option<u8>` to a tuple
+/// that sorts `Some(0)` < `Some(4)` < `None` ("nulls last"). v2.8
+/// (`priority-field`): used as `list_ready`'s primary sort key so an
+/// explicit P4 still sorts above an unspecified issue.
+fn priority_sort_key(p: Option<u8>) -> (u8, u8) {
+    match p {
+        Some(n) => (0, n),
+        None => (1, 0),
+    }
 }
 
 /// Priority weight for `Storage::list_ready`'s primary sort key.
@@ -1931,6 +1959,13 @@ impl Storage {
             }
         }
 
+        // Pre-validate the priority value (v2.8): integers must fall
+        // in `0..=4`. Cheap, purely-local — runs before the id reroll
+        // and slug-uniqueness probe so a bogus `-p 9` rejects fast.
+        if let Err(reason) = validate_priority(draft.priority) {
+            return Err(Error::InvalidPriority { reason });
+        }
+
         // Pre-validate the slug, if any, BEFORE the (cheap) id reroll
         // and the (expensive) uniqueness probe. The first check is
         // purely local; the second is a list-and-read across every
@@ -1979,6 +2014,7 @@ impl Storage {
             status: Status::Open,
             block_reason: None,
             type_,
+            priority: draft.priority,
             labels: sorted_dedup(&draft.labels),
             dependencies: sorted_dedup_edges(&draft.dependencies),
             assignee: draft.assignee.clone(),
@@ -2021,6 +2057,12 @@ impl Storage {
             ops.push(Op::SetType {
                 issue_id: id.clone(),
                 kind: record.type_,
+            });
+        }
+        if let Some(p) = record.priority {
+            ops.push(Op::SetPriority {
+                issue_id: id.clone(),
+                priority: Some(p),
             });
         }
         for label in &record.labels {
@@ -2139,6 +2181,24 @@ impl Storage {
         .map(|_| ())
     }
 
+    /// Replace the priority. `None` clears it back to `null`.
+    /// v2.8 (`priority-field`). Rejects values outside `0..=4`
+    /// with [`Error::InvalidPriority`]; the CLI envelope kind is
+    /// `invalid_priority`.
+    pub fn set_priority(&self, id: &IssueId, priority: Option<u8>) -> Result<()> {
+        if let Err(reason) = validate_priority(priority) {
+            return Err(Error::InvalidPriority { reason });
+        }
+        self.mutate(id, &format!("jjf: issue {} - set-priority", id), |rec| {
+            rec.priority = priority;
+            MutateOutcome::Write(vec![Op::SetPriority {
+                issue_id: rec.id.clone(),
+                priority,
+            }])
+        })
+        .map(|_| ())
+    }
+
     /// Replace the assignee. `None` clears it.
     ///
     /// Rejects assignee values containing `\n` or `\r` with
@@ -2236,6 +2296,14 @@ impl Storage {
                 return Err(Error::InvalidBody { reason });
             }
         }
+        // Priority range. v2.8 (`priority-field`). `Some(Some(n))`
+        // with n > 4 rejects; `Some(None)` is the clear-to-null
+        // path, no range check.
+        if let Some(Some(n)) = fields.priority {
+            if let Err(reason) = validate_priority(Some(n)) {
+                return Err(Error::InvalidPriority { reason });
+            }
+        }
         let summary = format!("jjf: issue {} - update", id);
         let id_owned = id.clone();
         self.mutate(id, &summary, |rec| {
@@ -2286,6 +2354,13 @@ impl Storage {
                 ops.push(Op::SetType {
                     issue_id: rec.id.clone(),
                     kind: new_type,
+                });
+            }
+            if let Some(priority_outer) = fields.priority {
+                rec.priority = priority_outer;
+                ops.push(Op::SetPriority {
+                    issue_id: rec.id.clone(),
+                    priority: priority_outer,
                 });
             }
             if let Some(body) = &fields.body {
@@ -3435,11 +3510,16 @@ impl Storage {
             .filter(|i| types_match_any(i.type_, &filter.types))
             .collect();
 
-        // Sort: type priority, then created_at ASC. Stable sort means
-        // equal-priority entries fall back to the second key cleanly.
+        // Sort: priority (nulls last) → type priority → created_at
+        // ASC. v2.8 (`priority-field`): the explicit `priority` field
+        // is the new primary key. `Some(0)` < `Some(4)` < `None`, so
+        // an explicit P4 still sorts above an unspecified issue.
+        // Stable sort means equal-priority entries fall back to the
+        // secondary keys cleanly.
         ready.sort_by(|a, b| {
-            ready_priority(a.type_)
-                .cmp(&ready_priority(b.type_))
+            priority_sort_key(a.priority)
+                .cmp(&priority_sort_key(b.priority))
+                .then_with(|| ready_priority(a.type_).cmp(&ready_priority(b.type_)))
                 .then_with(|| a.created_at.cmp(&b.created_at))
         });
 
@@ -4842,6 +4922,7 @@ mod tests {
             status: Status::Open,
             block_reason: None,
             type_: IssueType::Bug,
+            priority: Some(1),
             labels: vec!["bug".into(), "p1".into()],
             dependencies: vec![],
             assignee: Some("alice".into()),
@@ -4860,6 +4941,7 @@ mod tests {
         let body_idx = s.find("\"body\"").unwrap();
         let status_idx = s.find("\"status\"").unwrap();
         let type_idx = s.find("\"type\"").unwrap();
+        let priority_idx = s.find("\"priority\"").unwrap();
         let labels_idx = s.find("\"labels\"").unwrap();
         let deps_idx = s.find("\"dependencies\"").unwrap();
         let assignee_idx = s.find("\"assignee\"").unwrap();
@@ -4871,7 +4953,8 @@ mod tests {
         assert!(slug_idx < body_idx);
         assert!(body_idx < status_idx);
         assert!(status_idx < type_idx);
-        assert!(type_idx < labels_idx);
+        assert!(type_idx < priority_idx);
+        assert!(priority_idx < labels_idx);
         assert!(labels_idx < deps_idx);
         assert!(deps_idx < assignee_idx);
         assert!(assignee_idx < created_idx);
@@ -5107,6 +5190,7 @@ Jjf-Label: fixed
             status: Status::Open,
             block_reason: None,
             type_: IssueType::Feature,
+            priority: None,
             labels: vec![],
             dependencies: vec![
                 DepEdge {
@@ -5231,6 +5315,7 @@ Jjf-Label: fixed
             status,
             block_reason: None,
             type_: IssueType::Unspecified,
+            priority: None,
             labels: vec![],
             dependencies: deps,
             assignee: None,

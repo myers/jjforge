@@ -229,6 +229,23 @@ fn stanza_to_op(stanza: &[(&str, &str)], id: &IssueId) -> Option<Op> {
                 slug: if v.is_empty() { None } else { Some(v) },
             }
         }
+        "set-priority" => {
+            // v2.8: integer string `0`..`4` for set, empty for clear.
+            // Out-of-range or non-integer values fall through the
+            // unknown-op-shape branch — same forward-compat tolerance
+            // spec §5.2 mandates for unknown variants.
+            let v = get("Jjf-Priority").unwrap_or_default();
+            let priority = if v.is_empty() {
+                None
+            } else {
+                let n: u8 = v.parse().ok()?;
+                if n > 4 {
+                    return None;
+                }
+                Some(n)
+            };
+            Op::SetPriority { issue_id, priority }
+        }
         "set-block-reason" => {
             // v2.5: free-text reason for `Status::Blocked`. Same
             // empty-string-means-None convention as `set-assignee` /

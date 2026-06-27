@@ -43,9 +43,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use jjf_storage::{
     DEFAULT_SNIPPET_CONTEXT, ISSUES_BOOKMARK, ClaimResult, DepEdge, DepKind, DepTreeNode,
     Error as StorageError, IdError, BodyInvalidReason, Issue, IssueDraft, IssueId, IssueType,
-    Memory, ReadyFilter, SearchHit, SlugInvalidReason, StaleHit, Status, Storage,
-    TitleInvalidReason,
-    UnreadableRef, UpdateFields,
+    Memory, PriorityInvalidReason, ReadyFilter, SearchHit, SlugInvalidReason, StaleHit, Status,
+    Storage, TitleInvalidReason,
+    UnreadableRef, UpdateFields, validate_priority,
 };
 
 /// Top-level CLI shape. Subcommands live on the `Commands` enum; the
@@ -245,6 +245,13 @@ enum Commands {
         /// preflight failure (exit 2).
         #[arg(long)]
         slug: Option<String>,
+
+        /// Set the priority bucket (0–4; lower = higher priority).
+        /// v2.8 (`priority-field`). Optional; omit to leave the
+        /// field at `null` (unspecified). Clap rejects values
+        /// outside `0..=4` as a preflight failure (exit 2).
+        #[arg(short = 'p', long, value_parser = clap::value_parser!(u8).range(0..=4))]
+        priority: Option<u8>,
     },
 
     /// Print a single issue from the `issues` bookmark — title,
@@ -300,6 +307,13 @@ enum Commands {
         /// Issues with no slug never match.
         #[arg(long)]
         slug: Option<String>,
+
+        /// Filter by priority bucket. Repeatable. Semantics: OR —
+        /// an issue matches if its priority equals any of the
+        /// listed values. Issues with `null` priority never match
+        /// any explicit value. v2.8 (`priority-field`).
+        #[arg(short = 'p', long = "priority", value_parser = clap::value_parser!(u8).range(0..=4))]
+        priorities: Vec<u8>,
     },
 
     /// List the unblocked open issues — the agent-ready set.
@@ -365,6 +379,16 @@ enum Commands {
         /// (`agent-claim-atomic`).
         #[arg(long = "claim")]
         claim: bool,
+
+        /// Filter by priority bucket. Repeatable. Semantics: OR —
+        /// an issue matches if its priority equals any of the
+        /// listed values. Issues with `null` priority never match
+        /// any explicit value. v2.8 (`priority-field`). Composes
+        /// AND with `--label` / `--type`; the sort order (priority
+        /// first, then type, then created_at) is independent of
+        /// the filter.
+        #[arg(short = 'p', long = "priority", value_parser = clap::value_parser!(u8).range(0..=4))]
+        priorities: Vec<u8>,
     },
 
     /// Mutate one or more scalar fields of an issue in a single commit.
@@ -416,6 +440,17 @@ enum Commands {
         /// `--slug`.
         #[arg(long = "unset-slug")]
         unset_slug: bool,
+
+        /// Replace the priority bucket (0–4; lower = higher priority).
+        /// Mutually exclusive with `--unset-priority`. v2.8
+        /// (`priority-field`).
+        #[arg(short = 'p', long, value_parser = clap::value_parser!(u8).range(0..=4), conflicts_with = "unset_priority")]
+        priority: Option<u8>,
+
+        /// Clear the priority (writes `null`). Mutually exclusive
+        /// with `--priority`. v2.8 (`priority-field`).
+        #[arg(long = "unset-priority")]
+        unset_priority: bool,
 
         /// Replace the body. Source is a path, or `-` to read stdin.
         /// Mirrors the `cli-new` / `cli-comment` body-source convention;
@@ -1233,6 +1268,14 @@ enum CliError {
     #[error("invalid body: {reason}")]
     InvalidBody { reason: BodyInvalidReason },
 
+    /// `jjf new -p` or `jjf update --priority` was handed an
+    /// integer outside the documented `0..=4` window. Preflight
+    /// failure (exit 2). The CLI envelope kind is
+    /// `invalid_priority`. Added in `priority-field` (ticket
+    /// `326bbf7`).
+    #[error("invalid priority: {reason}")]
+    InvalidPriority { reason: PriorityInvalidReason },
+
     /// `jjf dep add <X> <X>` (or the inline `jjf new -d <self-id>`)
     /// was asked to land an edge from an issue to itself. Self-deps
     /// make the child permanently blocked by itself, so the
@@ -1397,6 +1440,7 @@ impl CliError {
             CliError::Storage(StorageError::InvalidSlug { .. }) => 2,
             CliError::Storage(StorageError::InvalidTitle { .. }) => 2,
             CliError::Storage(StorageError::InvalidBody { .. }) => 2,
+            CliError::Storage(StorageError::InvalidPriority { .. }) => 2,
             CliError::Storage(StorageError::SlugCollision { .. }) => 2,
             CliError::Storage(StorageError::SlugNotFound { .. }) => 2,
             CliError::Storage(StorageError::AlreadyClaimed { .. }) => 2,
@@ -1418,6 +1462,7 @@ impl CliError {
             CliError::InvalidSlug { .. } => 2,
             CliError::InvalidTitle { .. } => 2,
             CliError::InvalidBody { .. } => 2,
+            CliError::InvalidPriority { .. } => 2,
             CliError::SelfDependency { .. } => 2,
             CliError::DependencyCycle { .. } => 2,
             CliError::SlugCollision { .. } => 2,
@@ -1474,6 +1519,7 @@ impl CliError {
             CliError::Storage(StorageError::InvalidSlug { .. }) => "invalid_slug",
             CliError::Storage(StorageError::InvalidTitle { .. }) => "invalid_title",
             CliError::Storage(StorageError::InvalidBody { .. }) => "body_too_large",
+            CliError::Storage(StorageError::InvalidPriority { .. }) => "invalid_priority",
             CliError::Storage(StorageError::SlugCollision { .. }) => "slug_collision",
             CliError::Storage(StorageError::SlugNotFound { .. }) => "slug_not_found",
             CliError::Storage(StorageError::AlreadyClaimed { .. }) => "already_claimed",
@@ -1483,6 +1529,7 @@ impl CliError {
             CliError::InvalidSlug { .. } => "invalid_slug",
             CliError::InvalidTitle { .. } => "invalid_title",
             CliError::InvalidBody { .. } => "body_too_large",
+            CliError::InvalidPriority { .. } => "invalid_priority",
             CliError::SelfDependency { .. } => "self_dependency",
             CliError::DependencyCycle { .. } => "dependency_cycle",
             CliError::SlugCollision { .. } => "slug_collision",
@@ -1634,6 +1681,13 @@ impl CliError {
                     "got": *got,
                 }),
             },
+            CliError::Storage(StorageError::InvalidPriority { reason })
+            | CliError::InvalidPriority { reason } => match reason {
+                PriorityInvalidReason::OutOfRange { got } => json!({
+                    "reason": reason.as_str(),
+                    "got": *got,
+                }),
+            },
             CliError::Storage(StorageError::SlugCollision { slug, conflicts_with }) => {
                 json!({ "slug": slug, "conflicts_with": conflicts_with.as_str() })
             }
@@ -1743,7 +1797,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             assignee,
             r#type,
             slug,
-        } => run_new(cli.json, title, file, labels, deps, assignee, r#type, slug),
+            priority,
+        } => run_new(cli.json, title, file, labels, deps, assignee, r#type, slug, priority),
         Commands::Show { id, include_memories } => {
             run_show(cli.json, id, include_memories)
         }
@@ -1758,7 +1813,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             labels,
             types,
             slug,
-        } => run_ls(cli.json, status, labels, types, slug),
+            priorities,
+        } => run_ls(cli.json, status, labels, types, slug, priorities),
         Commands::Ready {
             labels,
             types,
@@ -1766,6 +1822,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             include_claimed,
             include_blocked,
             claim,
+            priorities,
         } => run_ready(
             cli.json,
             labels,
@@ -1774,6 +1831,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             include_claimed,
             include_blocked,
             claim,
+            priorities,
         ),
         Commands::Close { id } => run_set_status(cli.json, id, Status::Closed),
         Commands::Open { id } => run_set_status(cli.json, id, Status::Open),
@@ -1835,6 +1893,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             r#type,
             slug,
             unset_slug,
+            priority,
+            unset_priority,
             body_file,
             assignee,
             unset_assignee,
@@ -1848,6 +1908,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             r#type,
             slug,
             unset_slug,
+            priority,
+            unset_priority,
             body_file,
             assignee,
             unset_assignee,
@@ -1937,6 +1999,7 @@ fn run_new(
     assignee: Option<String>,
     type_arg: Option<TypeArg>,
     slug: Option<String>,
+    priority: Option<u8>,
 ) -> Result<(), CliError> {
     // 1. Parse dep specs first — purely-local validation, no IO.
     // v2.4 (`agent-dep-types`): each spec is either a bare 7-hex id
@@ -1987,6 +2050,14 @@ fn run_new(
         }
     }
 
+    // 2c. Pre-validate the priority at the CLI boundary. Clap's
+    // range parser already rejects values outside 0..=4 with exit 2,
+    // but a second check keeps the storage-side contract honest
+    // even if a future caller wires the field through differently.
+    if let Err(reason) = validate_priority(priority) {
+        return Err(CliError::InvalidPriority { reason });
+    }
+
     // 3. Resolve the cwd as an absolute path. `Storage::open` requires
     // absolute; we canonicalize so symlinks in the path don't bite us.
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
@@ -2010,6 +2081,7 @@ fn run_new(
         assignee,
         type_: type_arg.map(IssueType::from),
         slug,
+        priority,
     };
     let id = storage.create_issue(&draft)?;
 
@@ -2384,6 +2456,15 @@ fn print_issue_plain(issue: &Issue) {
         issue.labels.join(", ")
     };
     println!("labels: {labels}");
+    // v2.8: priority renders as `P0`..`P4` when set, `(none)` when
+    // null — mirrors slug / assignee's Optional-presentation
+    // convention rather than the row-format dash (the show output
+    // is human-readable; the row format is the awk-friendly one).
+    let priority = match issue.priority {
+        Some(n) => format!("P{n}"),
+        None => "(none)".to_owned(),
+    };
+    println!("priority: {priority}");
     let assignee = issue.assignee.as_deref().unwrap_or("(none)");
     println!("assignee: {assignee}");
     // v2.4: the dependency section renders one line per kind so the
@@ -3010,6 +3091,8 @@ fn run_update(
     type_arg: Option<TypeArg>,
     slug: Option<String>,
     unset_slug: bool,
+    priority: Option<u8>,
+    unset_priority: bool,
     body_file: Option<PathBuf>,
     assignee: Option<String>,
     unset_assignee: bool,
@@ -3043,6 +3126,11 @@ fn run_update(
     } else {
         slug.map(Some)
     };
+    let priority_field: Option<Option<u8>> = if unset_priority {
+        Some(None)
+    } else {
+        priority.map(Some)
+    };
     // Pre-validate the title at the CLI boundary so the operator
     // sees the typed exit-2 error before any IO. Storage will
     // re-validate. `qa-title-validation` (issue `e4e483b`).
@@ -3073,11 +3161,21 @@ fn run_update(
             return Err(CliError::InvalidBody { reason });
         }
     }
+    // Pre-validate the priority value (v2.8). Clap's range check
+    // catches obviously-wrong CLI input; this is the storage-side
+    // contract echoed at the CLI boundary so the typed error
+    // surfaces before any IO.
+    if let Some(Some(p)) = priority_field {
+        if let Err(reason) = validate_priority(Some(p)) {
+            return Err(CliError::InvalidPriority { reason });
+        }
+    }
     let fields = UpdateFields {
         title,
         slug: slug_field,
         status: status.map(Status::from),
         type_: type_arg.map(|t| Some(IssueType::from(t))),
+        priority: priority_field,
         body,
         assignee: assignee_field,
     };
@@ -3181,6 +3279,9 @@ fn changed_field_names(fields: &UpdateFields) -> Vec<&'static str> {
     }
     if fields.type_.is_some() {
         out.push("type");
+    }
+    if fields.priority.is_some() {
+        out.push("priority");
     }
     if fields.body.is_some() {
         out.push("body");
@@ -3417,6 +3518,7 @@ fn run_ls(
     labels: Vec<String>,
     types: Vec<TypeArg>,
     slug: Option<String>,
+    priorities: Vec<u8>,
 ) -> Result<(), CliError> {
     // Preflight: cwd is a jj repo AND `issues` bookmark exists. Same
     // order as `run_show` — typed `run jjf init first` message rather
@@ -3446,6 +3548,9 @@ fn run_ls(
         if !slug_matches(&issue, slug.as_deref()) {
             continue;
         }
+        if !priorities_match(&issue, &priorities) {
+            continue;
+        }
         issues.push(issue);
     }
 
@@ -3471,15 +3576,19 @@ fn run_ls(
         // 7-char id prefix is the documented human-display convention
         // (CLAUDE.md).
         //
-        // b74b156 row: <id>\t<status>\t<type>\t<title>. priority column
-        // lands in 326bbf7.
+        // v2.8 row (326bbf7): <id>\t<status>\t<priority>\t<type>\t<title>.
+        // Priority renders as `P0`..`P4` when set, single dash `-`
+        // when null — keeps the column always populated so awk/cut
+        // parsing stays trivial.
         for issue in &issues {
             let status_s = issue.status.as_str();
             let type_s = issue.type_.as_str();
+            let priority_s = format_priority_column(issue.priority);
             println!(
-                "{id}\t{status}\t{type_}\t{title}",
+                "{id}\t{status}\t{priority}\t{type_}\t{title}",
                 id = issue.id,
                 status = status_s,
+                priority = priority_s,
                 type_ = type_s,
                 title = issue.title,
             );
@@ -3518,6 +3627,7 @@ fn run_ready(
     include_claimed: bool,
     include_blocked: bool,
     claim: bool,
+    priorities: Vec<u8>,
 ) -> Result<(), CliError> {
     // Preflight: --claim only composes with --limit 1. Reject any
     // other shape up front so callers don't quietly claim the first
@@ -3542,7 +3652,15 @@ fn run_ready(
         include_claimed,
         include_blocked,
     };
-    let issues = storage.list_ready(&filter)?;
+    let mut issues = storage.list_ready(&filter)?;
+    // Priority filter is composed at the CLI layer (storage's
+    // `list_ready` doesn't take it today — adding it to
+    // `ReadyFilter` is symmetric with `labels` / `types` but the
+    // ticket scopes the filter to the CLI surface for v2.8). Same
+    // OR semantics as `labels_match` / `types_match`.
+    if !priorities.is_empty() {
+        issues.retain(|i| priorities_match(i, &priorities));
+    }
 
     if claim {
         // Top result (if any) gets claimed atomically. Empty
@@ -3613,15 +3731,16 @@ fn run_ready(
         // Plain text: tab-separated rows mirroring `ls`'s shape so a
         // single awk/cut pipeline handles both. Silent on empty.
         //
-        // b74b156 row: <id>\t<status>\t<type>\t<title>. priority column
-        // lands in 326bbf7.
+        // v2.8 row (326bbf7): <id>\t<status>\t<priority>\t<type>\t<title>.
         for issue in &issues {
             let status_s = issue.status.as_str();
             let type_s = issue.type_.as_str();
+            let priority_s = format_priority_column(issue.priority);
             println!(
-                "{id}\t{status}\t{type_}\t{title}",
+                "{id}\t{status}\t{priority}\t{type_}\t{title}",
                 id = issue.id,
                 status = status_s,
+                priority = priority_s,
                 type_ = type_s,
                 title = issue.title,
             );
@@ -3898,6 +4017,32 @@ fn labels_match(issue: &Issue, wanted: &[String]) -> bool {
 /// out, distinct from `--label`'s AND.
 fn types_match(issue: &Issue, wanted: &[IssueType]) -> bool {
     wanted.is_empty() || wanted.iter().any(|t| *t == issue.type_)
+}
+
+/// `--priority` predicate. Empty filter matches every issue. A
+/// non-empty filter requires the issue's `priority` to equal at
+/// least one listed value (OR — mirrors `types_match`). Issues with
+/// `None` priority never match any explicit value. v2.8
+/// (`priority-field`).
+fn priorities_match(issue: &Issue, wanted: &[u8]) -> bool {
+    if wanted.is_empty() {
+        return true;
+    }
+    match issue.priority {
+        Some(n) => wanted.iter().any(|w| *w == n),
+        None => false,
+    }
+}
+
+/// Render the priority column for the tab-separated `ls` / `ready`
+/// row. `Some(n)` becomes `P{n}` (e.g. `P0`); `None` becomes a
+/// single dash so the column always carries a value (keeps
+/// awk / cut parsing trivial). v2.8 (`priority-field`).
+fn format_priority_column(p: Option<u8>) -> String {
+    match p {
+        Some(n) => format!("P{n}"),
+        None => "-".into(),
+    }
 }
 
 /// `--slug` predicate. `None` filter matches every issue. A non-`None`

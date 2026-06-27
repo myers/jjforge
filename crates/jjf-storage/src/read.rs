@@ -115,6 +115,7 @@ pub(crate) fn read(
         status: record.status,
         block_reason: record.block_reason,
         type_: record.type_,
+        priority: record.priority,
         // Defensive re-sort — writer guarantees sorted, but the merge
         // driver may emit unioned arrays.
         labels: {
@@ -217,6 +218,12 @@ struct OpView {
     /// type op was applied (the v2.1-default for any chain that
     /// predates the new field).
     type_: IssueType,
+    /// Latest priority seen in a `set-priority` op. `None` either
+    /// means no priority op was applied or the most recent op
+    /// cleared it (`Op::SetPriority { priority: None }`). v2.8
+    /// (`priority-field`). Cross-check matches this against the
+    /// file's `priority` field directly.
+    priority: Option<u8>,
     labels: Vec<String>,
     /// Typed dependency edges. v2.4 — same shape as
     /// [`IssueRecord::dependencies`]; the read path cross-check
@@ -314,6 +321,7 @@ fn apply_op(view: &mut Option<OpView>, op: Op) {
                 status,
                 block_reason: None,
                 type_: IssueType::Unspecified,
+                priority: None,
                 labels: Vec::new(),
                 dependencies: Vec::new(),
                 assignee: None,
@@ -351,6 +359,7 @@ fn apply_op(view: &mut Option<OpView>, op: Op) {
                 Op::SetAssignee { assignee, .. } => v.assignee = assignee,
                 Op::SetType { kind, .. } => v.type_ = kind,
                 Op::SetSlug { slug, .. } => v.slug = slug,
+                Op::SetPriority { priority, .. } => v.priority = priority,
                 Op::SetBlockReason { reason, .. } => v.block_reason = reason,
                 Op::CommentAdd { comment_id, .. } => v.comment_ids.push(comment_id),
                 Op::Merge { .. } => {
@@ -476,6 +485,16 @@ fn cross_check(record: &IssueRecord, comments: &[Comment], op_view: &OpView) {
         )
     );
 
+    assert_eq!(
+        record.priority, op_view.priority,
+        "{}",
+        mismatch(
+            "priority",
+            format!("{:?}", record.priority),
+            format!("{:?}", op_view.priority)
+        )
+    );
+
     // Body: only check when a `set-body` op recorded a hash. The
     // create-only path leaves the body unmolested in the file but
     // doesn't carry a hash op (spec §5.2 lists `set-body` but no
@@ -567,6 +586,7 @@ mod tests {
             status: Status::Open,
             block_reason: None,
             type_: IssueType::Unspecified,
+            priority: None,
             labels: Vec::new(),
             dependencies: Vec::new(),
             assignee: None,

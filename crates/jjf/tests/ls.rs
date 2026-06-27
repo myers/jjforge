@@ -127,9 +127,10 @@ fn close_bug(repo: &Path, id: &str) {
 }
 
 /// Parse `jjf ls` plain-text output into one row per bug. Each row is
-/// `<id>\t<status>\t<type>\t<title>` (b74b156); we split on tabs and
-/// drop empty lines.
-fn parse_ls_rows(stdout: &str) -> Vec<(String, String, String, String)> {
+/// `<id>\t<status>\t<priority>\t<type>\t<title>` (326bbf7, v2.8 row
+/// rework); we split on tabs and drop empty lines. The tuple shape
+/// is `(id, status, priority, type, title)`.
+fn parse_ls_rows(stdout: &str) -> Vec<(String, String, String, String, String)> {
     stdout
         .lines()
         .filter(|l| !l.is_empty())
@@ -137,8 +138,8 @@ fn parse_ls_rows(stdout: &str) -> Vec<(String, String, String, String)> {
             let parts: Vec<&str> = l.split('\t').collect();
             assert_eq!(
                 parts.len(),
-                4,
-                "expected 4 tab-separated columns, got {}: {l:?}",
+                5,
+                "expected 5 tab-separated columns, got {}: {l:?}",
                 parts.len()
             );
             (
@@ -146,6 +147,7 @@ fn parse_ls_rows(stdout: &str) -> Vec<(String, String, String, String)> {
                 parts[1].to_owned(),
                 parts[2].to_owned(),
                 parts[3].to_owned(),
+                parts[4].to_owned(),
             )
         })
         .collect()
@@ -186,11 +188,15 @@ fn ls_default_status_open_returns_every_bug_when_all_open() {
     }
     for r in &rows {
         assert_eq!(r.1, "open", "status column wrong in row: {r:?}");
-        // b74b156: third column is the type wire spelling. These
-        // fixtures didn't set --type, so default is `unspecified`.
-        assert_eq!(r.2, "unspecified", "type column wrong in row: {r:?}");
+        // 326bbf7 (v2.8): third column is the priority bucket. These
+        // fixtures didn't set -p, so the column carries `-`.
+        assert_eq!(r.2, "-", "priority column wrong in row: {r:?}");
+        // 326bbf7 (v2.8): fourth column is the type wire spelling.
+        // These fixtures didn't set --type, so default is
+        // `unspecified`.
+        assert_eq!(r.3, "unspecified", "type column wrong in row: {r:?}");
     }
-    let titles: Vec<&str> = rows.iter().map(|r| r.3.as_str()).collect();
+    let titles: Vec<&str> = rows.iter().map(|r| r.4.as_str()).collect();
     assert!(titles.contains(&"alpha bug"));
     assert!(titles.contains(&"beta bug"));
     assert!(titles.contains(&"gamma bug"));

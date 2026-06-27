@@ -1,5 +1,62 @@
 # `jjf --json` output contract
 
+## v2.10 → v2.11 changelog
+
+Backwards-compatible additions, landed in the `priority-field`
+ticket (`326bbf7`) as part of the v2.7 → v2.8 storage spec bump.
+The on-disk record gains a `priority` field; the CLI surface
+gains matching flags and a new error envelope.
+
+- **New `priority` field on the JSON envelope.** Every issue
+  emitted by `jjf show --json`, `jjf ls --json`, `jjf ready
+  --json`, `jjf search --json`, and `jjf stale --json` now
+  carries a `priority` field — integer 0–4 when set, `null`
+  when unspecified. Placed between `type` and `labels` to match
+  the on-disk record's emission order. Pre-v2.11 readers that
+  ignore unknown fields are unaffected.
+
+- **New flag `-p` / `--priority` on `jjf new`.** Takes an
+  integer in `0..=4`. Omit to leave the field at `null`. Clap's
+  range parser rejects values outside the window at exit 2.
+
+- **New flags `-p` / `--priority <N>` and `--unset-priority`
+  on `jjf update`.** Mutually exclusive. `--priority N` sets
+  the field; `--unset-priority` clears it back to `null`. Same
+  three-way pattern as `--assignee` / `--unset-assignee`.
+
+- **New flag `-p` / `--priority` on `jjf ls` and `jjf ready`.**
+  Repeatable filter; semantics: OR (an issue matches if its
+  priority equals any of the listed values). Issues with `null`
+  priority never match an explicit value. Composes AND with
+  `--label` / `--type`.
+
+- **Plain-text row format changed.** `jjf ls` and `jjf ready`
+  rows now carry the priority column between status and type:
+  `<id>\t<status>\t<priority>\t<type>\t<title>`. The priority
+  column renders `P0`..`P4` when set and a single dash `-`
+  when null, so awk / cut parsing always sees a value.
+
+- **`jjf ready` sort order changed.** Primary sort key is now
+  `priority` (nulls last). Secondary key is the existing
+  type-priority weight (bug > feature > research > epic >
+  unspecified). Tertiary tiebreak: `created_at` ascending. So
+  `Some(0)` < `Some(4)` < `None` — an explicit P4 still sorts
+  above an unspecified issue. `jjf ls`'s sort is unchanged
+  (still `created_at` descending).
+
+- **New `jjf show` plain-text line.** Between `assignee:` and
+  `dependencies:`: `priority: PN` (or `priority: (none)` when
+  `null`). JSON output gets the new field automatically via
+  serde (see above).
+
+- **New error envelope kind `invalid_priority`.** Exit 2.
+  `details` shape: `{"reason": "out_of_range", "got": <int>}`.
+  Surfaced by `jjf new`, `jjf update`, and any future direct
+  caller of the storage layer's `set_priority`. Wire-format
+  parse failures on a `Jjf-Priority:` trailer (out-of-range
+  or non-integer) fall through the unknown-op-shape tolerance
+  in spec §5.2 — they don't surface here.
+
 ## v2.9 → v2.10 changelog
 
 Backwards-compatible additions, landed in the `host-asterinas-stale`
