@@ -254,8 +254,8 @@ jjf: adding blocks-edge 3d1b6b7 -> 23ff23e would close a dependency cycle
 
 ## 7. Remember something for next session
 
-Persistent memories travel with the `issues` bookmark — they
-round-trip via `jjf push`/`pull` and are surfaced by
+Persistent memories travel with the rest of the `refs/jjf/*`
+namespace — they round-trip via `jjf push`/`pull` and are surfaced by
 `jjf show roadmap --include-memories`.  Save the things future-you
 would otherwise re-derive:
 

@@ -6,8 +6,8 @@ A jj-native, agent-first issue tracker. CLI: `jjf`.
 the full v1 verb set with `--json` on every command, push/pull
 over standard git transport, and an op-space merge driver so
 two clones can edit issues offline and converge without human
-intervention. 178 workspace tests green; spec pinned in
-`docs/storage-format.md`; output contract in `docs/cli-json.md`.
+intervention. Spec pinned in `docs/storage-format.md`; output
+contract in `docs/cli-json.md`.
 
 The project is self-hosted at
 [github.com/myers/jjforge](https://github.com/myers/jjforge)
@@ -49,10 +49,13 @@ type (`bug` / `feature` / `epic` / `research` / `roadmap` /
 dependencies, assignee, and an append-only comment thread.
 
 As of `199ed91` (v1 → v2 storage spec) the Rust types, wire
-trailers, bookmark, and on-disk paths all say "issue" too —
-the type-level rename catches the code up to the prose. The
-v2.1 update (`issue-type-and-slug-fields`) added the `type`
-and `slug` fields on top of v2 without breaking the wire shape.
+trailers, and on-disk paths all say "issue" too — the type-level
+rename catches the code up to the prose. The v2.1 update
+(`issue-type-and-slug-fields`) added the `type` and `slug`
+fields on top of v2 without breaking the wire shape. v3
+(`bd98097`, 2026-06-24) moved storage off a shared bookmark
+to a per-issue ref namespace under `refs/jjf/*`; see
+"Architecture" below.
 
 ## First-time setup
 
@@ -88,7 +91,7 @@ bootstrap jjforge on top of it:
 ```bash
 jj git init my-project
 cd my-project
-jjf init                              # creates the `issues` bookmark
+jjf init                              # plants the refs/jjf/* namespace
 ```
 
 Create, list, read:
@@ -137,30 +140,44 @@ so scripts can branch on `kind`.
 
 ## Architecture
 
-Issues live as commits on a dedicated `issues` bookmark in
-the underlying jj repo. Each issue is two files on that
-bookmark:
+Issues live in a `refs/jjf/*` ref namespace alongside the
+underlying jj+git repo. One ref per issue, one ref per memory,
+plus a sentinel:
 
-- `issues/<7hex-id>.json` — the current rendered state
-  (title, status, labels, dependencies, assignee, body).
-- `issues/<7hex-id>.comments.jsonl` — one JSON object per
-  line, append-only.
+- `refs/jjf/issues/<7hex-id>` — each issue's commit chain. The
+  tip's tree carries two files:
+  - `issue.json` — the current rendered state (title, status,
+    labels, dependencies, assignee, body).
+  - `comments.jsonl` — one JSON object per line, append-only.
+- `refs/jjf/memories/<key>` — each persistent memory's commit
+  chain, same shape.
+- `refs/jjf/meta/format-version` — a sentinel commit marking
+  the storage format. Presence tells readers the repo has
+  been `jjf init`-ed.
 
-Every mutation lands as a new commit on the `issues`
-bookmark. The commit description carries `Jjf-Op:` and
+Every mutation is a new commit on the relevant per-issue (or
+per-memory) ref, advanced via `git update-ref` with a CAS
+guard against the prior tip. Git HEAD never moves, so `jjf`
+verbs are safe to run alongside live source work in the same
+colocated repo. The commit description carries `Jjf-Op:` and
 `Jjf-At:` git-trailers documenting which op ran and when
-(nanosecond resolution). Both files and the trailers
-travel automatically with standard `git push` / `git fetch`
-of the bookmark.
+(nanosecond resolution). All of this travels with standard
+git transport — `jjf push <remote>` and `jjf pull <remote>`
+round-trip the whole `refs/jjf/*` namespace via the same
+ssh / https that carries `refs/heads/*`.
 
 On divergence (two clones modify the same issue offline),
 the merge driver walks both heads' op chains in op-space,
 resolves field-by-field with last-write-wins-by-`Jjf-At`,
 takes the set-union of labels / dependencies, unions the
 comment files chronologically, and lands a single merge
-commit with one `Jjf-Op: merge` trailer per resolved issue.
-There is no "body conflict" failure mode — the body is
-just another LWW field.
+commit per resolved issue. There is no "body conflict"
+failure mode — the body is just another LWW field.
+
+(Pre-v3 storage put everything on a shared `issues` bookmark
+in the working tree; v3 — `bd98097`, 2026-06-24 — moved to the
+per-issue ref model above so `jjf init` can run safely in any
+colocated repo without snapshotting the working copy.)
 
 For the full data shape: `docs/storage-format.md`.
 For the merge model: `docs/storage-format.md` §6.
@@ -168,19 +185,22 @@ For the output contract: `docs/cli-json.md`.
 
 ## Why jj-native
 
-- **Bookmarks are the unit of sync.** Push/pull a bookmark
-  and you've round-tripped a whole issue tracker. No
-  separate `refs/issues/*` namespace, no special transport.
-- **The op log makes audit free.** `jj op log` already
-  records every mutation; we just add structured trailers
-  to commit descriptions so the per-issue history is
-  reconstructable without protobuf.
+- **`refs/jjf/*` is the unit of sync.** `jjf push` /
+  `jjf pull` round-trip the whole namespace via standard
+  git transport — no special server, no protobuf, no LFS.
+  Server-side it's vanilla git; clone with `git clone`,
+  serve with Forgejo / Gitea / GitLab / GitHub all the same.
+- **The op log makes audit free.** Every mutation is a
+  commit; the chain on each per-issue ref IS the audit
+  trail, with structured `Jjf-Op:` trailers so the
+  per-issue history is reconstructable without protobuf.
 - **Conflicts as data.** jj's conflict model is rich and
   programmatic, so the merge driver can be deterministic
   rather than asking humans to resolve markers.
-- **Change IDs over commit IDs.** Issues survive history
-  rewrites because the bookmark moves over the same files,
-  not over the same commits.
+- **Change IDs over commit IDs.** jj's underlying change-id
+  model keeps the per-issue ref stable across history
+  rewrites in the host repo — issues survive a rebase of
+  unrelated git work.
 
 ## Planning lives in jjforge
 
