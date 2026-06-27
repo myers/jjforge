@@ -357,6 +357,33 @@ The `scripts/new-blog-post.py` helper stamps a post, an image
 directory, and a planning sibling in one call. Don't hand-edit
 the `date` frontmatter to be in the future.
 
+## Reference clones
+
+Read-only clones of upstream projects live under `./reference/`
+(gitignored — not part of jjforge). They're cloned in-tree so
+sessions can `grep` / `Read` them directly instead of round-
+tripping through `WebFetch`. Cheaper, more reliable, and the
+source-of-truth (the actual code or docs) is more authoritative
+than rendered web pages.
+
+Currently in there:
+
+- `./reference/beads/` — Steve Yegge's [beads](https://github.com/steveyegge/beads)
+  (`bd` CLI). The primary inspiration for `jjf ready` / `jjf
+  remember` / the `--json` everywhere convention. Read this
+  first when you need the canonical answer for "what does
+  `bd list` / `bd ready` / `bd dep add` do?" — it's faster
+  and more accurate than the rendered docs site.
+
+**Check `./reference/` before reaching for `WebFetch`** on
+upstream-project questions. A `find ./reference -maxdepth 2`
+shows what's available; treat it as a local doc cache.
+
+Reference clones are read-only — do NOT modify, commit, or
+push them. If you need a clone that isn't there yet, run
+`git clone <url> reference/<slug>` and use it; the parent
+`/reference/` gitignore covers it.
+
 ## Experiments
 
 Throwaway code and shell scripts live under `experiments/<topic>/`.
