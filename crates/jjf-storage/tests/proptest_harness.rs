@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use jjf_storage::{IssueDraft, IssueId, IssueType, Status, Storage};
+use jjf_storage::{DepEdge, DepKind, IssueDraft, IssueId, IssueType, Status, Storage};
 use proptest::collection::vec;
 use proptest::option;
 use proptest::prelude::*;
@@ -205,6 +205,174 @@ prop_compose! {
             priority: None,
         }
     }
+}
+
+// --- multi-issue plan generator ------------------------------------
+//
+// Foundation for properties that need a populated dep graph rather
+// than one isolated issue. Issue `c6aed85`
+// (proptest-multi-issue-generator, epic:agent-ergonomics). Unblocks
+// `proptest-list-ready-monotone` (`6ce795c`) and
+// `proptest-cycle-rejection` (`1078439`).
+//
+// Design: pure data plan + materialize function. Splitting the two
+// keeps the strategy side-effect-free so proptest's shrinker can do
+// its job — failures shrink the plan (drafts, edges) without
+// re-running every shrink-candidate against a fresh repo just to
+// shrink it again. The materialize call happens once per property
+// case, inside the test body.
+//
+// Cycle-freedom by construction: every generated edge has
+// `child_idx > parent_idx`. The edge points from `drafts[child_idx]`
+// (the owner) to `drafts[parent_idx]` (the target). Since indices
+// are strictly increasing along edges, the resulting graph is a DAG
+// — no edge can ever close a cycle. The cycle-rejection codepath
+// (`43c7615`) is therefore never tripped by this generator's
+// edge set. `proptest-cycle-rejection` (`1078439`) is the place
+// to exercise that path; here we keep the base round-trip clean.
+//
+// Slugs are forced to `None` for multi-issue drafts. With N up to
+// 4 and a 4-element SLUG_POOL, the `SlugCollision` rate from
+// `slug_strategy` is high enough that collisions would dominate
+// the create-loop's outcome distribution. Dropping slugs keeps
+// every create call in the success path; slug coverage stays on
+// Property 1.
+
+/// One self-contained `IssueDraft` with `slug = None`. See the
+/// module-level note above the multi-issue plan generator for why
+/// slugs are dropped in the N-issue path.
+fn draft_strategy_no_slug() -> impl Strategy<Value = IssueDraft> {
+    (
+        title_strategy(),
+        body_strategy(),
+        labels_strategy(),
+        type_strategy(),
+    )
+        .prop_map(|(title, body, labels, type_)| IssueDraft {
+            title,
+            body,
+            labels,
+            dependencies: Vec::new(),
+            assignee: None,
+            type_,
+            slug: None,
+            priority: None,
+        })
+}
+
+/// Pure plan for an N-issue repo with a dep graph. Generated as
+/// data, then materialized against a fresh scratch repo by
+/// [`build_multi_issue_repo`].
+///
+/// Edges carry index-into-`drafts` pairs because the real
+/// [`IssueId`]s aren't known until create-time. The materialize
+/// step resolves them.
+#[derive(Debug, Clone)]
+struct MultiIssuePlan {
+    drafts: Vec<IssueDraft>,
+    /// `(child_idx, parent_idx, kind)`. By construction
+    /// `child_idx > parent_idx`, so the resulting graph is a DAG and
+    /// no edge ever closes a cycle. The owner is `drafts[child_idx]`;
+    /// the target is `drafts[parent_idx]`.
+    edges: Vec<(usize, usize, DepKind)>,
+}
+
+/// Generate one [`MultiIssuePlan`]. `n_range` controls the issue
+/// count (e.g. `1..=4`); `max_edges` caps the per-plan edge count
+/// (e.g. `4`). Edge kinds are picked uniformly across the four
+/// `DepKind` variants — both blocking kinds (`Blocks`,
+/// `ParentChild`, which participate in cycle detection) and the
+/// non-blocking kinds (`Related`, `DiscoveredFrom`).
+fn multi_issue_plan_strategy(
+    n_range: std::ops::RangeInclusive<usize>,
+    max_edges: usize,
+) -> impl Strategy<Value = MultiIssuePlan> {
+    let drafts = vec(draft_strategy_no_slug(), n_range);
+    drafts.prop_flat_map(move |drafts| {
+        let n = drafts.len();
+        // Number of distinct (child, parent) index pairs in a strict
+        // upper triangle: n*(n-1)/2. With n in 1..=4 the max is 6,
+        // comfortably above max_edges=4. With n == 1 the graph has
+        // no valid edges (no pair satisfies child > parent), so the
+        // edge vec must be empty.
+        let edge_strategy = if n < 2 {
+            vec(edge_triple_strategy(n), 0..=0).boxed()
+        } else {
+            vec(edge_triple_strategy(n), 0..=max_edges).boxed()
+        };
+        edge_strategy.prop_map(move |raw_edges| {
+            // Dedupe (child, parent, kind) triples. Two ops with the
+            // same triple is fine at the storage layer (a no-op
+            // post-dedupe), but the test surface stays cleaner
+            // without trivial duplicates.
+            let mut edges = raw_edges.clone();
+            edges.sort();
+            edges.dedup();
+            MultiIssuePlan {
+                drafts: drafts.clone(),
+                edges,
+            }
+        })
+    })
+}
+
+/// One `(child_idx, parent_idx, kind)` edge triple. `n` is the
+/// number of issues in the plan; this strategy assumes `n >= 2`
+/// (the caller guards `n < 2` and skips edge generation entirely).
+fn edge_triple_strategy(
+    n: usize,
+) -> impl Strategy<Value = (usize, usize, DepKind)> {
+    // child_idx ranges over 1..n; for each, parent_idx ranges over
+    // 0..child_idx. Generating in two steps keeps the strict
+    // upper-triangle invariant.
+    (1..n)
+        .prop_flat_map(|child_idx| {
+            (Just(child_idx), 0..child_idx, dep_kind_strategy())
+        })
+}
+
+fn dep_kind_strategy() -> impl Strategy<Value = DepKind> {
+    prop_oneof![
+        Just(DepKind::Blocks),
+        Just(DepKind::ParentChild),
+        Just(DepKind::Related),
+        Just(DepKind::DiscoveredFrom),
+    ]
+}
+
+/// Materialize a plan against a fresh scratch repo. Creates every
+/// draft in order, then applies every edge via
+/// [`Storage::add_dep_edge`]. Returns the storage handle plus the
+/// minted [`IssueId`]s in plan order (so `drafts[i]` lives at
+/// `ids[i]`).
+///
+/// Both create and dep-add unwrap on failure. The plan generator
+/// is constructed so neither call should reject: drafts pass
+/// validation (titles non-empty post-trim, labels from a clean
+/// pool, slugs disabled so no `SlugCollision`), and edges are a
+/// strict-upper-triangle DAG so cycle preflight never fires.
+/// If unwrap panics, the plan generator has drifted from the
+/// storage layer's preconditions — that's a bug worth surfacing
+/// loudly, not papering over.
+fn build_multi_issue_repo(
+    plan: &MultiIssuePlan,
+    prefix: &str,
+) -> (Storage, Vec<IssueId>) {
+    let repo = fresh_scratch_repo(prefix);
+    let storage = Storage::open(&repo).unwrap();
+    let mut ids = Vec::with_capacity(plan.drafts.len());
+    for draft in &plan.drafts {
+        ids.push(storage.create_issue(draft).unwrap());
+    }
+    for (child_idx, parent_idx, kind) in &plan.edges {
+        // Strict upper triangle: child_idx > parent_idx, so the
+        // two indices are distinct and the SelfDependency
+        // precondition isn't tripped either.
+        storage
+            .add_dep_edge(&ids[*child_idx], &ids[*parent_idx], *kind)
+            .unwrap();
+    }
+    (storage, ids)
 }
 
 /// One "verb" the status-machine property can dispatch against a live
@@ -376,6 +544,67 @@ proptest! {
         prop_assert!(issue.dependencies.is_empty());
         // No comments on create.
         prop_assert!(issue.comments.is_empty());
+    }
+
+    /// **Property 1b: multi-issue round-trip with dep edges**.
+    ///
+    /// The N-issue extension of Property 1. Generate a
+    /// [`MultiIssuePlan`] (1-4 drafts, up to 4 dep edges), build it,
+    /// then read every issue back and assert:
+    ///
+    /// - Each draft's owner-visible scalar fields (title, body,
+    ///   labels, type, status=Open) round-trip equal.
+    /// - Each issue's dependency edge set matches the subset of
+    ///   `plan.edges` whose `child_idx` is this issue. The on-disk
+    ///   form is sorted+deduped by the writer.
+    ///
+    /// Issue `c6aed85` (proptest-multi-issue-generator). Foundation
+    /// for `proptest-list-ready-monotone` (`6ce795c`) and
+    /// `proptest-cycle-rejection` (`1078439`); this property
+    /// confirms the multi-issue primitive works end-to-end without
+    /// claiming any new invariants beyond Property 1's.
+    #[test]
+    fn round_trip_multi_issue_with_deps(
+        plan in multi_issue_plan_strategy(1..=4, 4),
+    ) {
+        pin_clock(1_800_000_004);
+        let (storage, ids) = build_multi_issue_repo(&plan, "rt-multi");
+
+        for (i, draft) in plan.drafts.iter().enumerate() {
+            let issue = storage.read(&ids[i]).unwrap();
+            prop_assert_eq!(&issue.title, &draft.title);
+            prop_assert_eq!(&issue.body, &draft.body);
+            prop_assert_eq!(
+                issue.type_,
+                draft.type_.unwrap_or(IssueType::Unspecified),
+            );
+            prop_assert_eq!(issue.status, Status::Open);
+            let mut expected_labels = draft.labels.clone();
+            expected_labels.sort();
+            expected_labels.dedup();
+            prop_assert_eq!(&issue.labels, &expected_labels);
+
+            // Expected edges for THIS issue: every plan triple whose
+            // child_idx == i. Sort+dedupe to match the writer's
+            // normalization (see Storage::add_dep_edge dedupe by
+            // (target, kind)).
+            let mut expected_edges: Vec<DepEdge> = plan
+                .edges
+                .iter()
+                .filter(|(child_idx, _, _)| *child_idx == i)
+                .map(|(_, parent_idx, kind)| DepEdge {
+                    target: ids[*parent_idx].clone(),
+                    kind: *kind,
+                })
+                .collect();
+            expected_edges.sort();
+            expected_edges.dedup();
+            prop_assert_eq!(
+                &issue.dependencies, &expected_edges,
+                "issue {} ({:?}) dependency edges mismatch",
+                i, ids[i],
+            );
+        }
     }
 
     /// **Property 2: status-machine no-panic + post-state matches
