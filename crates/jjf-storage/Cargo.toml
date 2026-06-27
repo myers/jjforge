@@ -10,3 +10,9 @@ description = "Write-path library for jjforge's on-disk storage format (v1) — 
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Property-based tests for the storage mutate/read surface.
+# Test-only — see `tests/proptest_harness.rs` for the harness.
+# Issue `df74809` (qa-proptest-harness).
+proptest = "1.11"
