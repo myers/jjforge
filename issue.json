@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "id": "1078439",
+  "title": "proptest-cycle-rejection: add_dep_edge never lands a cycle",
+  "slug": "proptest-cycle-rejection",
+  "body": "# Goal\n\nAssert that `Storage::add_dep_edge` never lands an edge that would close\na `Blocks`-or-`ParentChild` cycle — including mixed-kind cycles where the\nexisting edges are one kind and the new edge is another. Holds under\nin-flight retries (lost-update window).\n\nWould have caught the regression class behind `121f48b` (mixed-kind cycle\nsilently accepted) and `43c7615` (single-kind cycle accepted) cleanly,\nwithout depending on the harm-class attack tree to surface it.\n\n# Approach\n\n- Use `multi_issue_repo_strategy` (from `proptest-multi-issue-generator`) to spin up N issues.\n- Generate a sequence of `add_dep_edge` calls. After each one, walk the post-state dep graph and assert no `Blocks`/`ParentChild` cycle exists. Failed `add_dep_edge` calls (cycle-introducing) must return typed `Error::Invalid` and leave the graph untouched.\n- Stretch goal: a \"concurrent two-writer\" variant that lands two cycle-half edges in interleaved order to simulate the lost-update window. May require a small test harness on top of `add_dep_edge`; punt to a sub-follow-up if it's too heavy.\n\n# Why now\n\nThe cycle-detection codepath is exactly the kind of \"looks correct, but a subtle path lets one through\" that proptest catches better than hand-attack. Two real bugs (`121f48b`, `43c7615`) in this surface in the last sweep — durable defense matters.\n\n# Blocked by\n\n- `proptest-multi-issue-generator`.\n\n# References\n\n- Parent: `df74809` (qa-proptest-harness), commit `28e5ed71`.\n- Bugs this would have caught: `121f48b`, `43c7615`.\n- Existing cycle-rejection: `0f2fb9db`.\n\n# Acceptance\n\n- New property `add_dep_edge_never_closes_cycle` ships green at 16 cases.\n- Stress-runs clean at `PROPTEST_CASES=256`.\n- Failed cycle attempts: `Error::Invalid`, source graph atomic.\n",
+  "status": "open",
+  "block_reason": null,
+  "type": "feature",
+  "priority": null,
+  "labels": [
+    "epic:agent-ergonomics",
+    "qa-proptest-followup"
+  ],
+  "dependencies": [],
+  "assignee": null,
+  "created_at": "2026-06-27T23:04:50Z",
+  "updated_at": "2026-06-27T23:04:50Z"
+}
