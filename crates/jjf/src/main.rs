@@ -2407,7 +2407,15 @@ fn print_issue_plain(issue: &Issue) {
                 .map(|e| e.target.as_str().to_owned())
                 .collect();
             if !targets.is_empty() {
-                println!("  {}: {}", kind.as_str(), targets.join(", "));
+                // Owner-perspective label here (fix for
+                // `show-deps-blocked-by`, fj#2). The wire spelling
+                // at `DepKind::as_str` reads inverted to a human in
+                // this position: `blocks: B` under issue A reads as
+                // "A blocks B" but the storage semantics say "A is
+                // blocked until B closes". `as_show_label` flips it.
+                // Wire spelling stays in JSON, trailers, CLI flags,
+                // `dep tree`, and `dep add`/`dep rm` confirmations.
+                println!("  {}: {}", kind.as_show_label(), targets.join(", "));
             }
         }
     }

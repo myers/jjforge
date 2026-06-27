@@ -340,18 +340,28 @@ ticket (`b6d066b`).
   (preflight, exit 2).
 - **`jjf show` plain-text dependency section** changes from
   a single `dependencies: <id1>, <id2>` line to a typed
-  section:
+  section. As of `show-deps-blocked-by` (fj#2), each line
+  uses an **owner-perspective human label** instead of the
+  wire spelling — the displayed issue is the owner, and the
+  label describes its relationship to the listed targets:
 
   ```text
   dependencies:
-    blocks: abc1234, def5678
-    parent-child: ghi9012
+    blocked by: abc1234, def5678
+    parent: ghi9012
   ```
 
-  An empty dep set still renders `dependencies: (none)`.
-  `--json` output of `show` carries the new
-  `[{target, kind}, ...]` array shape under `dependencies`
-  (v2.4 spec §3).
+  The label mapping is `blocks` → `blocked by`,
+  `parent-child` → `parent`, `related` → `related`,
+  `discovered-from` → `discovered from`. The wire spelling
+  still appears in JSON output, `Jjf-Dep-Kind:` trailers,
+  the `--kind` flag values, `dep tree` rendering, and the
+  `dep add`/`dep rm` confirmation lines. An empty dep set
+  still renders `dependencies: (none)`. `--json` output of
+  `show` carries the `[{target, kind}, ...]` array shape
+  under `dependencies` (v2.4 spec §3) — kind values are
+  unchanged (`blocks`, `parent-child`, `related`,
+  `discovered-from`).
 
 - **`jjf ready` cascade.** With v2.4 edge kinds, an issue is
   blocked if any `blocks`-kind dep target is active, OR any

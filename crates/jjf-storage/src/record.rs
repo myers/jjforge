@@ -73,6 +73,51 @@ impl DepKind {
             _ => None,
         }
     }
+
+    /// Owner-perspective human label for the text-mode `jjf show`
+    /// renderer (fix for `show-deps-blocked-by`, fj#2). The wire
+    /// spelling at [`DepKind::as_str`] reads inverted when used to
+    /// label edges in `jjf show <A>`: `blocks: B` reads as "A blocks
+    /// B" but the storage semantics ("A is blocked until B closes")
+    /// say the opposite. This label flips the perspective so the
+    /// printed line scans correctly to a human.
+    ///
+    /// IMPORTANT: this is text-renderer-only. The wire spelling
+    /// ([`DepKind::as_str`]) is still the canonical form for
+    /// trailers, CLI `--kind` flags, JSON output, and `dep tree`.
+    pub fn as_show_label(self) -> &'static str {
+        match self {
+            DepKind::Blocks => "blocked by",
+            DepKind::ParentChild => "parent",
+            DepKind::Related => "related",
+            DepKind::DiscoveredFrom => "discovered from",
+        }
+    }
+}
+
+#[cfg(test)]
+mod dep_kind_tests {
+    use super::*;
+
+    #[test]
+    fn as_str_returns_wire_spelling() {
+        // Wire spelling is part of the on-disk contract — covered
+        // here so any accidental edit shows up in this crate's tests.
+        assert_eq!(DepKind::Blocks.as_str(), "blocks");
+        assert_eq!(DepKind::ParentChild.as_str(), "parent-child");
+        assert_eq!(DepKind::Related.as_str(), "related");
+        assert_eq!(DepKind::DiscoveredFrom.as_str(), "discovered-from");
+    }
+
+    #[test]
+    fn as_show_label_returns_owner_perspective_label() {
+        // The `jjf show <id>` text renderer uses these; the labels
+        // describe the owner's relationship to the target.
+        assert_eq!(DepKind::Blocks.as_show_label(), "blocked by");
+        assert_eq!(DepKind::ParentChild.as_show_label(), "parent");
+        assert_eq!(DepKind::Related.as_show_label(), "related");
+        assert_eq!(DepKind::DiscoveredFrom.as_show_label(), "discovered from");
+    }
 }
 
 /// One typed edge in an issue's `dependencies` field (spec v2.4 §3.x,

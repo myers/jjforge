@@ -135,8 +135,9 @@ fn dep_add_default_kind_blocks_show_reports_edge() {
         "show should report typed dependencies section, got: {stdout}"
     );
     assert!(
-        stdout.contains(&format!("blocks: {parent}")),
-        "show should list `blocks: {parent}`, got: {stdout}"
+        stdout.contains(&format!("blocked by: {parent}")),
+        "show should list `blocked by: {parent}` (owner-perspective \
+         label for the `blocks` kind, fix for fj#2), got: {stdout}"
     );
 }
 
@@ -155,13 +156,15 @@ fn dep_add_all_four_kinds_round_trip() {
         );
     }
 
-    // `show` lists all four kinds.
+    // `show` lists all four kinds with the owner-perspective labels
+    // (fix for fj#2). Wire spelling stays in JSON, trailers, and
+    // CLI `--kind` flags; the text renderer uses the human labels.
     let out = run_jjf(&repo, &["show", &child]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for kind in &["blocks", "parent-child", "related", "discovered-from"] {
+    for label in &["blocked by", "parent", "related", "discovered from"] {
         assert!(
-            stdout.contains(&format!("{kind}: {parent}")),
-            "show should list `{kind}: {parent}`, got: {stdout}"
+            stdout.contains(&format!("{label}: {parent}")),
+            "show should list `{label}: {parent}`, got: {stdout}"
         );
     }
 }
@@ -189,16 +192,22 @@ fn dep_rm_removes_only_named_kind() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // `show` no longer lists `blocks:` but still lists `parent-child:`.
+    // `show` no longer lists the blocks edge (under either the wire
+    // spelling or the owner-perspective label) but still lists the
+    // parent-child edge (rendered as `parent:` since fj#2).
     let out = run_jjf(&repo, &["show", &child]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        !stdout.contains(&format!("blocks: {parent}")),
+        !stdout.contains(&format!("blocked by: {parent}")),
         "blocks edge should be gone, got: {stdout}"
     );
     assert!(
-        stdout.contains(&format!("parent-child: {parent}")),
-        "parent-child edge should remain, got: {stdout}"
+        !stdout.contains(&format!("blocks: {parent}")),
+        "no wire-spelling `blocks:` label should appear in show, got: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("parent: {parent}")),
+        "parent-child edge should remain (rendered as `parent:`), got: {stdout}"
     );
 }
 
@@ -270,12 +279,13 @@ fn new_with_inline_dep_kind_syntax() {
 
     let out = run_jjf(&repo, &["show", &child]);
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // Owner-perspective label for parent-child is `parent:` (fj#2).
     assert!(
-        stdout.contains(&format!("parent-child: {parent}")),
-        "show should list parent-child edge, got: {stdout}"
+        stdout.contains(&format!("parent: {parent}")),
+        "show should list parent-child edge as `parent:`, got: {stdout}"
     );
     assert!(
-        !stdout.contains(&format!("blocks: {parent}")),
+        !stdout.contains(&format!("blocked by: {parent}")),
         "show should NOT list a blocks edge, got: {stdout}"
     );
 }
@@ -331,7 +341,7 @@ fn dep_add_phantom_target_exits_with_issue_not_found() {
     let show = run_jjf(&repo, &["show", &child]);
     let show_out = String::from_utf8_lossy(&show.stdout);
     assert!(
-        !show_out.contains("blocks: deadbee"),
+        !show_out.contains("blocked by: deadbee"),
         "rejected dep_add must not land an edge, got: {show_out}"
     );
 }
@@ -357,7 +367,7 @@ fn dep_add_self_target_exits_2_with_self_dependency() {
     let show = run_jjf(&repo, &["show", &child]);
     let show_out = String::from_utf8_lossy(&show.stdout);
     assert!(
-        !show_out.contains(&format!("blocks: {child}")),
+        !show_out.contains(&format!("blocked by: {child}")),
         "rejected self-dep must not land an edge, got: {show_out}"
     );
 }
@@ -561,7 +571,67 @@ fn dep_add_blocks_cycle_exits_2_with_dependency_cycle() {
     let show = run_jjf(&repo, &["show", &c]);
     let show_out = String::from_utf8_lossy(&show.stdout);
     assert!(
-        !show_out.contains(&format!("blocks: {a}")),
+        !show_out.contains(&format!("blocked by: {a}")),
         "rejected cycle-closing edge must not land: {show_out}"
     );
+}
+
+// ---- show-deps-blocked-by (f70d54f, fj#2) ---------------------------
+// `jjf show <A>` printed `blocks: B` for a `Blocks` edge whose storage
+// semantics are "A is blocked until B closes" — reads inverted to a
+// human. Fix: text renderer uses an owner-perspective label
+// (`blocked by:`); JSON / trailers / `--kind` flag stay wire-spelling.
+// ---------------------------------------------------------------------
+
+#[test]
+fn show_text_uses_blocked_by_label_for_blocks_edge() {
+    // Repro of fj#2: `child` has a `blocks` edge to `parent`; the
+    // storage semantics say "child is blocked until parent closes".
+    // The text-mode `show` label must read that way to a human.
+    let repo = make_initialized_repo("show_blocked_by_label");
+    let parent = create_issue(&repo, "parent");
+    let child = create_issue(&repo, "child");
+
+    let out = run_jjf(&repo, &["dep", "add", &child, &parent, "--kind", "blocks"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let out = run_jjf(&repo, &["show", &child]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!("blocked by: {parent}")),
+        "show should label the blocks edge as `blocked by:` (fj#2), \
+         got: {stdout}"
+    );
+    // The pre-fix wire-spelling label must NOT appear.
+    assert!(
+        !stdout.contains(&format!("blocks: {parent}")),
+        "show must not print the wire-spelling `blocks:` label (fj#2), \
+         got: {stdout}"
+    );
+}
+
+#[test]
+fn show_json_dependencies_kind_field_stays_wire_spelling() {
+    // The text-renderer fix for fj#2 must NOT change the JSON shape:
+    // `--json` output is the wire contract scripts and remotes
+    // depend on; the per-edge `kind` field stays kebab-case.
+    let repo = make_initialized_repo("show_json_dep_kind_wire");
+    let parent = create_issue(&repo, "parent");
+    let child = create_issue(&repo, "child");
+
+    let out = run_jjf(&repo, &["dep", "add", &child, &parent, "--kind", "blocks"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let out = run_jjf(&repo, &["--json", "show", &child]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid json");
+    let deps = v["dependencies"].as_array().expect("dependencies array");
+    assert_eq!(deps.len(), 1, "expected one edge, got: {stdout}");
+    assert_eq!(
+        deps[0]["kind"], "blocks",
+        "JSON shape must keep the wire spelling, got: {stdout}"
+    );
+    assert_eq!(deps[0]["target"], parent.as_str());
 }
