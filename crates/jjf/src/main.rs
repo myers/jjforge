@@ -326,6 +326,13 @@ enum Commands {
         /// any explicit value. v2.8 (`priority-field`).
         #[arg(short = 'p', long = "priority", value_parser = clap::value_parser!(u8).range(0..=4))]
         priorities: Vec<u8>,
+
+        /// Filter to issues carrying a `parent-child` dep edge to
+        /// `<handle>`. `<handle>` is an issue id (7-char hex) or
+        /// slug. AND-composed with `--label` / `--type` /
+        /// `--status` / `--slug`. Unknown handle exits 2.
+        #[arg(long)]
+        parent: Option<String>,
     },
 
     /// List the unblocked open issues — the agent-ready set.
@@ -1883,7 +1890,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             types,
             slug,
             priorities,
-        } => run_ls(cli.json, status, labels, types, slug, priorities),
+            parent,
+        } => run_ls(cli.json, status, labels, types, slug, priorities, parent),
         Commands::Ready {
             labels,
             types,
@@ -3713,6 +3721,7 @@ fn run_ls(
     types: Vec<TypeArg>,
     slug: Option<String>,
     priorities: Vec<u8>,
+    parent: Option<String>,
 ) -> Result<(), CliError> {
     // Preflight: cwd is a jj repo AND `issues` bookmark exists. Same
     // order as `run_show` — typed `run jjf init first` message rather
@@ -3726,6 +3735,11 @@ fn run_ls(
     let wanted_types: Vec<IssueType> =
         types.into_iter().map(IssueType::from).collect();
 
+    let parent_id: Option<IssueId> = match parent {
+        Some(handle) => Some(resolve_handle(&storage, &handle)?),
+        None => None,
+    };
+
     // Read every issue, filter. v1 is read-all; see the doc-comment.
     let mut issues: Vec<Issue> = Vec::with_capacity(ids.len());
     for id in &ids {
@@ -3737,6 +3751,9 @@ fn run_ls(
             continue;
         }
         if !types_match(&issue, &wanted_types) {
+            continue;
+        }
+        if !parent_matches(&issue, &parent_id) {
             continue;
         }
         if !slug_matches(&issue, slug.as_deref()) {
@@ -4223,6 +4240,21 @@ fn labels_match(issue: &Issue, wanted: &[String]) -> bool {
 /// out, distinct from `--label`'s AND.
 fn types_match(issue: &Issue, wanted: &[IssueType]) -> bool {
     wanted.is_empty() || wanted.iter().any(|t| *t == issue.type_)
+}
+
+/// `--parent` predicate. None matches every issue. Some(pid)
+/// requires the issue to carry a `DepKind::ParentChild` edge
+/// whose target equals `pid`. Mirrors `ReadyFilter::parent`'s
+/// semantics on the CLI side for verbs that don't go through
+/// the storage-layer filter (`ls`, `search`).
+fn parent_matches(issue: &Issue, wanted: &Option<IssueId>) -> bool {
+    match wanted {
+        None => true,
+        Some(pid) => issue
+            .dependencies
+            .iter()
+            .any(|d| d.target == *pid && d.kind == DepKind::ParentChild),
+    }
 }
 
 /// `--priority` predicate. Empty filter matches every issue. A

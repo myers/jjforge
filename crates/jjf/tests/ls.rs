@@ -153,6 +153,17 @@ fn parse_ls_rows(stdout: &str) -> Vec<(String, String, String, String, String)> 
         .collect()
 }
 
+/// Parse `jjf new --json` stdout to extract the issue id.
+fn parse_id_from_stdout(stdout: &[u8]) -> String {
+    let json_str = String::from_utf8_lossy(stdout);
+    let json_obj: serde_json::Value = serde_json::from_str(&json_str)
+        .unwrap_or_else(|e| panic!("stdout is not valid JSON: {e}\nstdout: {json_str}"));
+    json_obj["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no 'id' field in JSON: {json_obj}"))
+        .to_owned()
+}
+
 // --- tests ---------------------------------------------------------
 
 #[test]
@@ -625,6 +636,79 @@ fn ls_exits_1_with_corrupt_sentinel_envelope() {
         Some("blob")
     );
     assert_eq!(env["error"]["details"]["oid"].as_str(), Some(blob_oid.as_str()));
+}
+
+#[test]
+fn ls_parent_flag_filters_to_parent_child_children() {
+    let repo = make_initialized_repo("ls_parent_basic");
+    let epic_id = parse_id_from_stdout(
+        &run_jjf(&repo, &["new", "--json", "-t", "Epic", "--type", "epic", "--slug", "demo"]).stdout,
+    );
+    let child_id = parse_id_from_stdout(
+        &run_jjf(&repo, &["new", "--json", "-t", "child", "--parent", epic_id.as_str()]).stdout,
+    );
+    let _sibling = run_jjf(&repo, &["new", "--json", "-t", "sibling"]);
+
+    let out = run_jjf(&repo, &["ls", "--json", "--parent", "demo"]);
+    let arr: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["id"].as_str().unwrap(), child_id.as_str());
+}
+
+#[test]
+fn ls_parent_unknown_handle_exits_two() {
+    let repo = make_initialized_repo("ls_parent_unknown");
+    let out = run_jjf(&repo, &["ls", "--parent", "no-such-slug"]);
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn ls_parent_composes_with_type_and_status() {
+    let repo = make_initialized_repo("ls_parent_compose");
+    let epic_out = run_jjf(&repo, &["new", "--json", "-t", "E", "--type", "epic", "--slug", "epic-parent"]);
+    assert!(
+        epic_out.status.success(),
+        "failed to create epic: {}",
+        String::from_utf8_lossy(&epic_out.stderr)
+    );
+    let epic_id = parse_id_from_stdout(&epic_out.stdout);
+
+    let bug_out = run_jjf(&repo, &["new", "--json", "-t", "bug", "--type", "bug", "--parent", epic_id.as_str()]);
+    assert!(
+        bug_out.status.success(),
+        "failed to create bug: {}",
+        String::from_utf8_lossy(&bug_out.stderr)
+    );
+    let bug_id = parse_id_from_stdout(&bug_out.stdout);
+
+    let feat_out = run_jjf(&repo, &["new", "--json", "-t", "feat", "--type", "feature", "--parent", epic_id.as_str()]);
+    assert!(
+        feat_out.status.success(),
+        "failed to create feature: {}",
+        String::from_utf8_lossy(&feat_out.stderr)
+    );
+
+    // Close the bug; it should disappear from the default --status open listing.
+    run_jjf(&repo, &["close", bug_id.as_str()]);
+
+    let out = run_jjf(&repo, &["ls", "--json", "--parent", "epic-parent", "--type", "bug"]);
+    assert!(
+        out.status.success(),
+        "ls failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let arr: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(arr.len(), 0, "closed bug should be hidden by default --status open");
+
+    let out = run_jjf(&repo, &["ls", "--json", "--parent", "epic-parent", "--type", "bug", "--status", "all"]);
+    assert!(
+        out.status.success(),
+        "ls --status all failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let arr: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(arr.len(), 1);
 }
 
 #[test]
