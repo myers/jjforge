@@ -543,6 +543,26 @@ host repo, including jjforge's own source tree. Mutating verbs
 repo without drift; no env-var opt-in, no sibling working dir,
 no HEAD recovery dance.
 
+### Referring to issues: prefer slugs
+
+When you name an issue in user-facing text — dispatch announcements,
+task subjects, status updates, commit messages, comments — lead with
+the **slug**. The 7-char id is supporting detail. "Dispatching
+subagent on `proptest-multi-issue-generator`" reads cleaner than
+"Dispatching subagent on `c6aed85`"; the user can predict what's
+about to happen from the first form and can't from the second.
+
+Both at once is fine when context warrants it:
+`c6aed85 proptest-multi-issue-generator` in a status comment is
+helpful — the slug names the work, the id makes the cross-reference
+unambiguous if a future reader greps. But in a one-line update,
+just the slug.
+
+Slug-less issues exist (older tickets, anything created without
+`--slug`). For those, the id is the only handle — use it. When
+filing new tickets, set `--slug <kebab-case>` so the next
+orchestrator can refer to your work without reaching for the id.
+
 ### Dispatch prompt template
 
 When dispatching a subagent on an issue, include:

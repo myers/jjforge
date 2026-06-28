@@ -1,0 +1,9 @@
+{
+  "name": "jjforge",
+  "description": "Skills for working with jjforge issues from a Claude Code agent. Includes the subagent-working-a-jjforge-issue skill (closing-comment recipe + boundaries for subagent work on a single issue).",
+  "version": "0.1.0",
+  "author": {
+    "name": "Myers Carpenter",
+    "email": "myers@maski.org"
+  }
+}
