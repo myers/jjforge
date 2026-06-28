@@ -10,7 +10,6 @@
   "priority": null,
   "labels": [
     "bug",
-    "epic:mvp-storage",
     "epic:storage-v3-out-of-tree"
   ],
   "dependencies": [
