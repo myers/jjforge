@@ -9,8 +9,7 @@
   "type": "epic",
   "priority": null,
   "labels": [
-    "epic",
-    "epic:storage-v3-out-of-tree"
+    "epic"
   ],
   "dependencies": [
     {
@@ -24,5 +23,5 @@
   ],
   "assignee": null,
   "created_at": "2026-06-23T19:19:43Z",
-  "updated_at": "2026-06-28T18:39:55Z"
+  "updated_at": "2026-06-28T18:40:48Z"
 }
