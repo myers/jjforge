@@ -134,6 +134,17 @@ fn parse_search_rows(stdout: &str) -> Vec<(String, String, String, String)> {
         .collect()
 }
 
+/// Parse the `id` field from JSON-formatted stdout (e.g., from `jjf new --json`).
+fn parse_id_from_stdout(stdout: &[u8]) -> String {
+    let json_str = String::from_utf8_lossy(stdout);
+    let json_obj: serde_json::Value = serde_json::from_str(&json_str)
+        .unwrap_or_else(|e| panic!("stdout is not valid JSON: {e}\nstdout: {json_str}"));
+    json_obj["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no 'id' field in JSON: {json_obj}"))
+        .to_owned()
+}
+
 // --- tests ---------------------------------------------------------
 
 #[test]
@@ -305,4 +316,23 @@ fn search_outside_jj_repo_is_preflight_failure() {
     let out = run_jjf(&dir, &["search", "anything"]);
     assert!(!out.status.success(), "non-jj cwd must fail preflight");
     assert_eq!(out.status.code(), Some(2), "exit 2 = preflight");
+}
+
+#[test]
+fn search_parent_flag_intersects_with_query() {
+    let repo = make_initialized_repo("search_parent");
+    let epic_id = parse_id_from_stdout(
+        &run_jjf(&repo, &["new", "--json", "-t", "Epic", "--type", "epic", "--slug", "epic"]).stdout,
+    );
+    // Two children, both with "needle" in the title — only one is parented.
+    let parented_id = parse_id_from_stdout(
+        &run_jjf(&repo, &["new", "--json", "-t", "needle child", "--parent", &epic_id]).stdout,
+    );
+    let _orphan = run_jjf(&repo, &["new", "--json", "-t", "needle orphan"]);
+
+    let out = run_jjf(&repo, &["search", "--json", "--parent", &epic_id, "needle"]);
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let results = envelope["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["id"].as_str().unwrap(), parented_id.as_str());
 }

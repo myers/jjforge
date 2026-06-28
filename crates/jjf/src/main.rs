@@ -885,6 +885,13 @@ enum Commands {
         /// `DEFAULT_SNIPPET_CONTEXT`).
         #[arg(long = "snippet-context", default_value_t = DEFAULT_SNIPPET_CONTEXT)]
         snippet_context: usize,
+
+        /// Filter to issues carrying a `parent-child` dep edge to
+        /// `<handle>`. AND-composed with the search query and
+        /// existing `--label` / `--type` / `--status` filters.
+        /// Unknown handle exits 2.
+        #[arg(long)]
+        parent: Option<String>,
     },
 
     /// Surface issues not touched in the last N days — orchestrator
@@ -1949,6 +1956,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             include_comments,
             limit,
             snippet_context,
+            parent,
         } => run_search(
             cli.json,
             query,
@@ -1958,6 +1966,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             include_comments,
             limit,
             snippet_context,
+            parent,
         ),
         Commands::Stale {
             days,
@@ -4005,6 +4014,7 @@ fn run_search(
     include_comments: bool,
     limit: usize,
     snippet_context: usize,
+    parent: Option<String>,
 ) -> Result<(), CliError> {
     // Preflight: cwd is a jj repo AND `issues` bookmark exists.
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
@@ -4015,6 +4025,11 @@ fn run_search(
     let wanted_types: Vec<IssueType> =
         types.into_iter().map(IssueType::from).collect();
 
+    let parent_id: Option<IssueId> = match parent {
+        Some(handle) => Some(resolve_handle(&storage, &handle)?),
+        None => None,
+    };
+
     let mut hits: Vec<SearchHit> = storage.search(&query, include_comments, snippet_context)?;
     // Compose status/label/type filters on top of the substring
     // match. AND semantics across all filters, matching `ls`.
@@ -4022,6 +4037,7 @@ fn run_search(
         status_matches(&h.issue, status)
             && labels_match(&h.issue, &labels)
             && types_match(&h.issue, &wanted_types)
+            && parent_matches(&h.issue, &parent_id)
     });
 
     // Score descending, then created_at ascending. Stable sort means
