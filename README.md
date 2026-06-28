@@ -52,27 +52,6 @@ for what's open and what's next.
   resolution baked in. Don't reinvent what jj already does
   better than git.
 
-## What jjforge tracks
-
-The artifacts are **issues** (matching Gitea / GitHub / Beads
-terminology — same word everyone else uses; we don't call them
-"bugs" because most of what we track is roadmap and epic work,
-not defects). One issue per work item: roadmap, epic, story,
-research note, defect, whatever. Each issue has an id, title,
-an optional slug (kebab-case orientation handle), a coarse
-type (`bug` / `feature` / `epic` / `research` / `roadmap` /
-`unspecified`), status (open / closed), body, labels,
-dependencies, assignee, and an append-only comment thread.
-
-As of `199ed91` (v1 → v2 storage spec) the Rust types, wire
-trailers, and on-disk paths all say "issue" too — the type-level
-rename catches the code up to the prose. The v2.1 update
-(`issue-type-and-slug-fields`) added the `type` and `slug`
-fields on top of v2 without breaking the wire shape. v3
-(`bd98097`, 2026-06-24) moved storage off a shared bookmark
-to a per-issue ref namespace under `refs/jjf/*`; see
-"Architecture" below.
-
 ## First-time setup
 
 Stable Rust toolchain (1.75+; whatever rustup gives you).
