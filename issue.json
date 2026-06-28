@@ -7,6 +7,7 @@
   "status": "closed",
   "block_reason": null,
   "type": "bug",
+  "priority": null,
   "labels": [
     "epic:multi-project-readiness"
   ],
@@ -14,9 +15,13 @@
     {
       "target": "52ee82d",
       "kind": "blocks"
+    },
+    {
+      "target": "52ee82d",
+      "kind": "parent-child"
     }
   ],
   "assignee": null,
   "created_at": "2026-06-24T17:32:24Z",
-  "updated_at": "2026-06-24T19:00:11Z"
+  "updated_at": "2026-06-28T18:39:15Z"
 }
