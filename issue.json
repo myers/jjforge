@@ -9,7 +9,6 @@
   "type": "feature",
   "priority": null,
   "labels": [
-    "epic:mvp-storage",
     "epic:storage-v3-out-of-tree"
   ],
   "dependencies": [
