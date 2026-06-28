@@ -71,7 +71,7 @@ Capture the id of each new issue from the `--json` envelope so
 later commands can reference it:
 
 ```bash
-EPIC=$(cat <<'EOF' | jjf new --json -t "Epic: ship v1" --type epic --slug ship-v1 -l epic -F - | jq -r .id
+EPIC=$(cat <<'EOF' | jjf new --json -t "Epic: ship v1" --type epic --slug ship-v1 -F - | jq -r .id
 # Goal
 Get v1 out the door.
 
@@ -80,13 +80,13 @@ Two tickets: backend, then docs.
 EOF
 )
 
-BUG=$(cat <<'EOF' | jjf new --json -t "Backend handler crashes on empty input" --type bug -l epic:ship-v1 -F - | jq -r .id
+BUG=$(cat <<'EOF' | jjf new --json -t "Backend handler crashes on empty input" --type bug --parent ship-v1 -F - | jq -r .id
 The /submit handler panics when body is empty.
 EOF
 )
 
 # Note the `-d $BUG` — the README ticket is gated on the bug.
-FEAT=$(cat <<'EOF' | jjf new --json -t "Write the README" --type feature -l epic:ship-v1 -d $BUG -F - | jq -r .id
+FEAT=$(cat <<'EOF' | jjf new --json -t "Write the README" --type feature --parent ship-v1 -d $BUG -F - | jq -r .id
 Document the install/run flow once the crash is fixed.
 EOF
 )
