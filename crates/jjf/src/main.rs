@@ -3782,7 +3782,7 @@ fn run_ls(
         if !types_match(&issue, &wanted_types) {
             continue;
         }
-        if !parent_matches(&issue, &parent_id) {
+        if !parent_matches(&issue, parent_id.as_ref()) {
             continue;
         }
         if !slug_matches(&issue, slug.as_deref()) {
@@ -4071,7 +4071,7 @@ fn run_search(
         status_matches(&h.issue, status)
             && labels_match(&h.issue, &labels)
             && types_match(&h.issue, &wanted_types)
-            && parent_matches(&h.issue, &parent_id)
+            && parent_matches(&h.issue, parent_id.as_ref())
     });
 
     // Score descending, then created_at ascending. Stable sort means
@@ -4297,7 +4297,7 @@ fn types_match(issue: &Issue, wanted: &[IssueType]) -> bool {
 /// whose target equals `pid`. Mirrors `ReadyFilter::parent`'s
 /// semantics on the CLI side for verbs that don't go through
 /// the storage-layer filter (`ls`, `search`).
-fn parent_matches(issue: &Issue, wanted: &Option<IssueId>) -> bool {
+fn parent_matches(issue: &Issue, wanted: Option<&IssueId>) -> bool {
     match wanted {
         None => true,
         Some(pid) => issue
