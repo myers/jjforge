@@ -689,6 +689,81 @@ proptest! {
         }
     }
 
+    /// **Property 5: `list_ids` cardinality matches creates**.
+    ///
+    /// Issue `9f113b5` (proptest-list-ids-cardinality,
+    /// epic:agent-ergonomics). After N successful `create_issue` calls
+    /// on a fresh repo (N ∈ 1..=8):
+    ///
+    /// - `storage.list_ids().len() == N`.
+    /// - Minted ids are pairwise distinct.
+    /// - Every minted id appears in `list_ids()`.
+    ///
+    /// Catches id-collision, silent-deletion-on-create, and list-index
+    /// drift. 7-char hex ids have 2^28 possible values; at N=8 the
+    /// birthday-collision probability is vanishingly small, so a real
+    /// failure here points at storage logic, not RNG luck.
+    ///
+    /// Uses `draft_strategy_no_slug()` directly rather than the full
+    /// `multi_issue_plan_strategy` — cardinality doesn't need a dep
+    /// graph, and dropping the edge machinery keeps the property focused
+    /// on what it actually claims. Slugs are off for the same reason
+    /// the multi-issue path drops them: `SlugCollision` would dominate
+    /// the create-loop outcome at N=8 against a 4-slug pool.
+    ///
+    /// 16 cases default per the harness `ProptestConfig` above.
+    #[test]
+    fn list_ids_cardinality_matches_creates(
+        drafts in vec(draft_strategy_no_slug(), 1..=8),
+    ) {
+        pin_clock(1_800_000_005);
+        let repo = fresh_scratch_repo("listids");
+        let storage = Storage::open(&repo).unwrap();
+
+        let mut minted: Vec<IssueId> = Vec::with_capacity(drafts.len());
+        for draft in &drafts {
+            minted.push(storage.create_issue(draft).unwrap());
+        }
+
+        let listed = storage.list_ids().unwrap();
+
+        // Cardinality: list_ids reports exactly N entries.
+        prop_assert_eq!(
+            listed.len(),
+            drafts.len(),
+            "list_ids returned {} entries after {} creates",
+            listed.len(),
+            drafts.len(),
+        );
+
+        // Pairwise distinctness of minted ids. A duplicate here means
+        // create_issue handed out the same id twice — id-mint logic
+        // bug, not a list_ids bug.
+        let mut sorted_minted = minted.clone();
+        sorted_minted.sort();
+        let dedup_len = {
+            let mut v = sorted_minted.clone();
+            v.dedup();
+            v.len()
+        };
+        prop_assert_eq!(
+            dedup_len,
+            minted.len(),
+            "create_issue returned duplicate ids: {:?}",
+            minted,
+        );
+
+        // Every minted id appears in list_ids. Sort both sides and
+        // compare as multisets (equal cardinality already asserted).
+        let mut sorted_listed = listed.clone();
+        sorted_listed.sort();
+        prop_assert_eq!(
+            &sorted_minted, &sorted_listed,
+            "minted ids and list_ids disagree (minted={:?}, listed={:?})",
+            minted, listed,
+        );
+    }
+
     /// **Property 3: read-after-write idempotence**.
     ///
     /// After any sequence of successful mutations, two consecutive
