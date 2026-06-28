@@ -12,6 +12,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use jjf_storage::IssueId;
+
 const JJF_BIN: &str = env!("CARGO_BIN_EXE_jjf");
 
 /// Per-test scratch root. Gitignored via the workspace-level rule.
@@ -136,6 +138,19 @@ fn parse_ready_rows(stdout: &str) -> Vec<(String, String, String, String, String
             )
         })
         .collect()
+}
+
+/// Parse the stdout of a successful `jjf new --json` invocation
+/// (JSON mode: `{"ok":true,"id":"<id>"}`) into an `IssueId`.
+fn parse_id_from_stdout(stdout: &[u8]) -> IssueId {
+    let json_str = String::from_utf8_lossy(stdout);
+    let json_obj: serde_json::Value = serde_json::from_str(&json_str)
+        .unwrap_or_else(|e| panic!("stdout is not valid JSON: {e}\nstdout: {json_str}"));
+    let id_str = json_obj["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("JSON missing 'id' field: {json_obj}"));
+    IssueId::parse(id_str)
+        .unwrap_or_else(|e| panic!("stdout id {:?} is not a valid IssueId: {e}", id_str))
 }
 
 // --- tests ---------------------------------------------------------
@@ -469,5 +484,82 @@ fn ready_warns_on_corrupt_issue_ref() {
     assert!(
         !stdout.contains("corrupt ticket"),
         "corrupt ticket title must NOT appear, got: {stdout:?}"
+    );
+}
+
+#[test]
+fn ready_parent_flag_filters_to_parent_child_children() {
+    let repo = make_initialized_repo("ready_parent_basic");
+
+    let epic_id = parse_id_from_stdout(
+        &run_jjf_with_stdin(&repo, &["new", "--json", "-t", "Epic", "--type", "epic", "--slug", "demo-epic", "-F", "-"], b"")
+            .stdout,
+    );
+    let child_id = parse_id_from_stdout(
+        &run_jjf_with_stdin(&repo, &["new", "--json", "-t", "child", "--parent", epic_id.as_str(), "-F", "-"], b"").stdout,
+    );
+    let _sibling_id = parse_id_from_stdout(
+        &run_jjf_with_stdin(&repo, &["new", "--json", "-t", "sibling", "-F", "-"], b"").stdout,
+    );
+
+    // Bare `ready` returns all three.
+    let bare = run_jjf(&repo, &["ready", "--json"]);
+    let bare_arr: Vec<serde_json::Value> = serde_json::from_slice(&bare.stdout).unwrap();
+    assert_eq!(bare_arr.len(), 3);
+
+    // `--parent <epic-id>` returns only the child.
+    let filtered = run_jjf(&repo, &["ready", "--json", "--parent", epic_id.as_str()]);
+    let filtered_arr: Vec<serde_json::Value> = serde_json::from_slice(&filtered.stdout).unwrap();
+    assert_eq!(filtered_arr.len(), 1);
+    assert_eq!(filtered_arr[0]["id"].as_str().unwrap(), child_id.as_str());
+
+    // `--parent demo-epic` (by slug) works identically.
+    let by_slug = run_jjf(&repo, &["ready", "--json", "--parent", "demo-epic"]);
+    let by_slug_arr: Vec<serde_json::Value> = serde_json::from_slice(&by_slug.stdout).unwrap();
+    assert_eq!(by_slug_arr.len(), 1);
+    assert_eq!(by_slug_arr[0]["id"].as_str().unwrap(), child_id.as_str());
+}
+
+#[test]
+fn ready_parent_composes_with_type_and_limit() {
+    let repo = make_initialized_repo("ready_parent_compose");
+    let epic_id = parse_id_from_stdout(
+        &run_jjf_with_stdin(&repo, &["new", "--json", "-t", "E", "--type", "epic", "--slug", "epic", "-F", "-"], b"").stdout,
+    );
+    // Two children: one bug, one feature.
+    let _bug = run_jjf_with_stdin(
+        &repo,
+        &["new", "--json", "-t", "bug-child", "--type", "bug", "--parent", epic_id.as_str(), "-F", "-"],
+        b""
+    );
+    let _feat = run_jjf_with_stdin(
+        &repo,
+        &["new", "--json", "-t", "feat-child", "--type", "feature", "--parent", epic_id.as_str(), "-F", "-"],
+        b""
+    );
+
+    // `--parent epic --type bug` returns just the bug.
+    let out = run_jjf(&repo, &["ready", "--json", "--parent", "epic", "--type", "bug"]);
+    let arr: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["title"].as_str().unwrap(), "bug-child");
+
+    // `--parent epic --limit 1` returns the top-priority one (bug, per type-priority sort).
+    let out = run_jjf(&repo, &["ready", "--json", "--parent", "epic", "--limit", "1"]);
+    let arr: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["title"].as_str().unwrap(), "bug-child");
+}
+
+#[test]
+fn ready_parent_unknown_handle_exits_two() {
+    let repo = make_initialized_repo("ready_parent_unknown");
+    let out = run_jjf(&repo, &["ready", "--parent", "no-such-slug"]);
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("slug_not_found") || stderr.contains("no-such-slug"),
+        "stderr should mention the bad handle: {stderr}"
     );
 }

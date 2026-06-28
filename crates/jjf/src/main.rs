@@ -401,6 +401,13 @@ enum Commands {
         /// the filter.
         #[arg(short = 'p', long = "priority", value_parser = clap::value_parser!(u8).range(0..=4))]
         priorities: Vec<u8>,
+
+        /// Filter to issues carrying a `parent-child` dep edge to
+        /// `<handle>`. `<handle>` is an issue id (7-char hex) or
+        /// slug. AND-composed with `--label` / `--type`. Unknown
+        /// handle exits 2 (`slug_not_found`).
+        #[arg(long)]
+        parent: Option<String>,
     },
 
     /// Mutate one or more scalar fields of an issue in a single commit.
@@ -1885,6 +1892,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             include_blocked,
             claim,
             priorities,
+            parent,
         } => run_ready(
             cli.json,
             labels,
@@ -1894,6 +1902,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             include_blocked,
             claim,
             priorities,
+            parent,
         ),
         Commands::Close { id } => run_set_status(cli.json, id, Status::Closed),
         Commands::Open { id } => run_set_status(cli.json, id, Status::Open),
@@ -3813,6 +3822,7 @@ fn run_ready(
     include_blocked: bool,
     claim: bool,
     priorities: Vec<u8>,
+    parent: Option<String>,
 ) -> Result<(), CliError> {
     // Preflight: --claim only composes with --limit 1. Reject any
     // other shape up front so callers don't quietly claim the first
@@ -3830,13 +3840,19 @@ fn run_ready(
     preflight::issues_bookmark(&cwd)?;
 
     let storage = Storage::open(&cwd)?;
+
+    let parent_id: Option<IssueId> = match parent {
+        Some(handle) => Some(resolve_handle(&storage, &handle)?),
+        None => None,
+    };
+
     let filter = ReadyFilter {
         labels,
         types: types.into_iter().map(IssueType::from).collect(),
         limit,
         include_claimed,
         include_blocked,
-        parent: None,
+        parent: parent_id,
     };
     let mut issues = storage.list_ready(&filter)?;
     // Priority filter is composed at the CLI layer (storage's
