@@ -8,9 +8,7 @@
   "block_reason": null,
   "type": "feature",
   "priority": null,
-  "labels": [
-    "epic:mvp-sync"
-  ],
+  "labels": [],
   "dependencies": [
     {
       "target": "1c20aa3",
