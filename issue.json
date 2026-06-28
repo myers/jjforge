@@ -9,7 +9,6 @@
   "type": "feature",
   "priority": null,
   "labels": [
-    "epic:agent-ergonomics",
     "qa-proptest-followup"
   ],
   "dependencies": [
@@ -24,5 +23,5 @@
   ],
   "assignee": null,
   "created_at": "2026-06-27T23:04:50Z",
-  "updated_at": "2026-06-28T18:38:52Z"
+  "updated_at": "2026-06-28T18:38:53Z"
 }
