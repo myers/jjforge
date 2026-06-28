@@ -51,9 +51,6 @@ for what's open and what's next.
   that survive rewrites, operation log, automatic conflict
   resolution baked in. Don't reinvent what jj already does
   better than git.
-- **zfs-workspace markdown-in-repo convention** — disciplines
-  emerge from incidents, closure ties to a physical artifact,
-  "no parser depends on the format."
 
 ## What jjforge tracks
 
