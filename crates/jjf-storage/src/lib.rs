@@ -633,6 +633,11 @@ pub struct ReadyFilter {
     /// v2.5 (`agent-await-gates-impl`). When `false` (default),
     /// `Storage::list_ready` excludes [`Status::Blocked`] issues.
     pub include_blocked: bool,
+    /// When `Some(pid)`, `list_ready` only returns issues that
+    /// carry a `DepKind::ParentChild` edge whose `target == pid`.
+    /// Mirrors the CLI's `--parent <handle>` flag. AND-composed
+    /// with `labels` / `types`.
+    pub parent: Option<IssueId>,
 }
 
 /// Sortable key for the priority field: maps `Option<u8>` to a tuple
@@ -3508,6 +3513,15 @@ impl Storage {
             .filter(|i| !blocked.contains(&i.id))
             .filter(|i| labels_match_all(&i.labels, &filter.labels))
             .filter(|i| types_match_any(i.type_, &filter.types))
+            .filter(|i| {
+                if let Some(pid) = &filter.parent {
+                    i.dependencies
+                        .iter()
+                        .any(|d| d.target == *pid && d.kind == DepKind::ParentChild)
+                } else {
+                    true
+                }
+            })
             .collect();
 
         // Sort: priority (nulls last) → type priority → created_at

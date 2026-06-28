@@ -3836,6 +3836,7 @@ fn run_ready(
         limit,
         include_claimed,
         include_blocked,
+        parent: None,
     };
     let mut issues = storage.list_ready(&filter)?;
     // Priority filter is composed at the CLI layer (storage's

@@ -2155,6 +2155,50 @@ fn list_ready_on_empty_bookmark_returns_empty() {
     assert!(ready.is_empty(), "empty bookmark → empty ready: {ready:#?}");
 }
 
+#[test]
+fn list_ready_filters_by_parent_child_edge() {
+    let repo = make_scratch_repo("list_ready_parent");
+    let storage = Storage::open(&repo).unwrap();
+    let epic = storage
+        .create_issue(&IssueDraft {
+            title: "epic".into(),
+            type_: Some(IssueType::Epic),
+            ..Default::default()
+        })
+        .unwrap();
+    let child = storage
+        .create_issue(&IssueDraft {
+            title: "child of epic".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let _sibling = storage
+        .create_issue(&IssueDraft {
+            title: "sibling, no edge".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage
+        .add_dep_edge(&child, &epic, DepKind::ParentChild)
+        .unwrap();
+
+    // No filter: all three appear.
+    let all = storage.list_ready(&ReadyFilter::default()).unwrap();
+    assert_eq!(all.len(), 3);
+
+    // --parent <epic>: only `child` and `epic` itself appear?
+    // No — `--parent <epic>` is "issues with parent-child edge TO
+    // <epic>". The epic itself doesn't have an edge to itself, so
+    // it's excluded. Only `child`.
+    let filter = ReadyFilter {
+        parent: Some(epic.clone()),
+        ..Default::default()
+    };
+    let filtered = storage.list_ready(&filter).unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].id, child);
+}
+
 // ---------------------------------------------------------------------
 // Same-second comment-append regression (issue 004dd23).
 //
