@@ -2093,29 +2093,26 @@ fn run_new(
     slug: Option<String>,
     priority: Option<u8>,
 ) -> Result<(), CliError> {
-    // 1. Parse dep specs first — purely-local validation, no IO.
+    // 1. Parse `-d` dep specs first — purely-local validation, no IO.
     // v2.4 (`agent-dep-types`): each spec is either a bare 7-hex id
     // (interpreted as `blocks:<id>`) or `<kind>:<id>` for explicit
     // kinds. The `kind` token is one of
     // `blocks`/`parent-child`/`related`/`discovered-from`; unknown
     // kinds are a preflight failure (exit 2).
     //
-    // `--parent <id>` (fj#3) is the discoverable shorthand for the
-    // dominant child-of-epic case. We emit parent `DepAdd` ops first,
-    // but storage sorts `dependencies` on each write — read-back order
-    // is `(target, kind)`-sorted, not insertion-order.
+    // `--parent <id-or-slug>` (fj#3) is the discoverable shorthand for
+    // the dominant child-of-epic case. Its values are resolved AFTER
+    // storage opens (step 4), so slugs work the same way they do for
+    // `jjf ls --parent`, `jjf ready --parent`, etc. (b417864).
+    //
+    // We emit parent `DepAdd` ops first, but storage sorts
+    // `dependencies` on each write — read-back order is
+    // `(target, kind)`-sorted, not insertion-order.
     let mut all_deps: Vec<DepEdge> = Vec::with_capacity(parents.len() + deps.len());
-    for raw in parents {
-        let target = IssueId::parse(&raw).map_err(|error| CliError::BadDepId {
-            value: format!("--parent {raw}"),
-            error,
-        })?;
-        all_deps.push(DepEdge::new(target, DepKind::ParentChild));
-    }
     for raw in deps {
         all_deps.push(parse_dep_spec(raw)?);
     }
-    let deps = all_deps;
+    let parent_handles = parents;
 
     // 2. Read the body. `-F -` is stdin; `-F <path>` is the file's
     // bytes; omitted is empty. We deliberately preserve raw bytes — no
@@ -2176,8 +2173,22 @@ fn run_new(
     // so the read verbs share the same code.
     preflight::issues_bookmark(&cwd)?;
 
-    // 5. Hand the draft to storage.
+    // 5. Open storage. We need it before resolving `--parent` handles
+    // so slugs work (b417864), and obviously before the write itself.
     let storage = Storage::open(&cwd)?;
+
+    // 5a. Resolve every `--parent <handle>` value against the open
+    // storage so slugs work the same way they do for `jjf ls --parent`
+    // and friends (b417864). A 7-hex handle short-circuits inside
+    // `resolve_handle` with no bookmark walk; a non-hex handle with
+    // no matching slug surfaces as `slug_not_found` (exit 2).
+    for raw in parent_handles {
+        let target = resolve_handle(&storage, &raw)?;
+        all_deps.push(DepEdge::new(target, DepKind::ParentChild));
+    }
+    let deps = all_deps;
+
+    // 6. Hand the draft to storage.
     let draft = IssueDraft {
         title,
         body,

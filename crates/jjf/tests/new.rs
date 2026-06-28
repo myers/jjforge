@@ -448,8 +448,82 @@ fn new_with_bogus_parent_id_exits_two() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("--parent") || stderr.contains("parent"),
+        stderr.contains("--parent") || stderr.contains("parent") || stderr.contains("not-hex!"),
         "stderr should mention which flag failed, got: {stderr}"
+    );
+}
+
+#[test]
+fn new_with_parent_slug_resolves_to_id() {
+    // Forgejo b417864: `jjf new --parent <slug>` should resolve the slug
+    // to a 7-hex id the same way `jjf ls`/`ready`/`search` do, instead
+    // of rejecting with `bad_id`.
+    let repo = make_initialized_repo("new_parent_slug");
+
+    // Create an epic with a known slug.
+    let epic = run_jjf_with_stdin(
+        &repo,
+        &[
+            "new", "-t", "Epic: demo", "--type", "epic",
+            "--slug", "agent-ergonomics", "-F", "-",
+        ],
+        b"epic body",
+    );
+    assert!(
+        epic.status.success(),
+        "epic create failed: {}",
+        String::from_utf8_lossy(&epic.stderr)
+    );
+    let epic_id = parse_id_from_stdout(&epic.stdout);
+
+    // Now create a child using the slug — must succeed and land the
+    // parent-child edge to the resolved id.
+    let child = run_jjf_with_stdin(
+        &repo,
+        &["new", "-t", "child task", "--parent", "agent-ergonomics", "-F", "-"],
+        b"child body",
+    );
+    assert!(
+        child.status.success(),
+        "child via slug failed: code={:?} stderr={}",
+        child.status.code(),
+        String::from_utf8_lossy(&child.stderr),
+    );
+    let child_id = parse_id_from_stdout(&child.stdout);
+
+    let storage = Storage::open(&repo).expect("open storage");
+    let bug = storage.read(&child_id).expect("read child");
+    assert_eq!(
+        bug.dependencies,
+        vec![DepEdge::new(epic_id, DepKind::ParentChild)],
+        "`--parent <slug>` must resolve to a parent-child edge to the slug's id"
+    );
+}
+
+#[test]
+fn new_with_unknown_parent_slug_exits_two_slug_not_found() {
+    // Non-hex handle with no matching slug surfaces as `slug_not_found`
+    // (exit 2), matching the resolver semantics used by `ls`/`ready`.
+    let repo = make_initialized_repo("new_parent_slug_missing");
+    let out = run_jjf_with_stdin(
+        &repo,
+        &[
+            "new", "--json", "-t", "title", "-F", "-",
+            "--parent", "no-such-slug",
+        ],
+        b"",
+    );
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    // The `--json` error envelope goes to stderr (see `report_error`).
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("slug_not_found"),
+        "json envelope should report slug_not_found, got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no-such-slug"),
+        "json envelope should include the bad handle, got stderr: {stderr}"
     );
 }
 
