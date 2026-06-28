@@ -8,9 +8,7 @@
   "block_reason": null,
   "type": "bug",
   "priority": null,
-  "labels": [
-    "epic:multi-project-readiness"
-  ],
+  "labels": [],
   "dependencies": [
     {
       "target": "52ee82d",
