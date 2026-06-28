@@ -8,9 +8,7 @@
   "block_reason": null,
   "type": "research",
   "priority": null,
-  "labels": [
-    "epic:mvp-storage"
-  ],
+  "labels": [],
   "dependencies": [
     {
       "target": "f21b950",
@@ -19,5 +17,5 @@
   ],
   "assignee": null,
   "created_at": "2026-06-23T02:54:58Z",
-  "updated_at": "2026-06-28T18:40:59Z"
+  "updated_at": "2026-06-28T18:41:00Z"
 }
