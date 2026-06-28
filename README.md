@@ -208,11 +208,37 @@ Self-hosted on this very binary. The roadmap is the entry
 point in any new session:
 
 ```bash
-jjf show 9566f52
+jjf show roadmap
 ```
 
 See `CLAUDE.md` for the orchestration conventions if you're
 driving agent work against this repo.
+
+## Agent skills
+
+jjforge ships skills for agents driving it (Claude Code, Codex,
+Cursor, Gemini, Copilot CLI, and others that read the SKILL.md
+convention).
+
+Install with Vercel's `skills` CLI:
+
+```bash
+npx skills add myers/jjforge
+```
+
+The CLI auto-detects which agents you have installed and asks
+which to target. The two skills that ship today:
+
+- **`using-jjforge`** — how to read the roadmap, find unblocked
+  work, create / update / query issues. Auto-loads on `jjf`,
+  `jjforge`, `ready`, `remember`, or any `jjf <verb>` invocation.
+- **`subagent-working-a-jjforge-issue`** — the closing-comment
+  recipe and boundaries for a subagent dispatched to do focused
+  work on a single issue.
+
+Claude Code users can also install via the plugin marketplace
+shape — this repo's `.claude-plugin/plugin.json` makes the same
+`skills/` tree loadable as a plugin.
 
 ## Repo layout
 
@@ -221,6 +247,7 @@ crates/
   jjf-storage/     # the storage primitives (init/read/write/history/list/merge)
   jjf-merge/       # the legacy file-bytes merge driver (kept as library)
   jjf/             # the `jjf` binary (clap-derive CLI over the storage layer)
+skills/            # agent skills (SKILL.md per skill; Vercel + Claude Code compatible)
 docs/
   quickstart.md        # five-minute new-project walkthrough
   storage-format.md    # the on-disk spec
