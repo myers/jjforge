@@ -17,7 +17,9 @@ jjf ls
 
 For the full walk-through (push/pull across clones, dep edges,
 the agent-ergonomics verbs like `ready` and `remember`), see
-[docs/quickstart.md](docs/quickstart.md).
+[docs/quickstart.md](docs/quickstart.md). Every verb takes
+`--json` and emits the envelope shape documented in
+[docs/cli-json.md](docs/cli-json.md).
 
 ## What this is
 
@@ -51,87 +53,6 @@ for what's open and what's next.
   that survive rewrites, operation log, automatic conflict
   resolution baked in. Don't reinvent what jj already does
   better than git.
-
-## First-time setup
-
-Stable Rust toolchain (1.75+; whatever rustup gives you).
-
-Install once:
-
-```bash
-# jj — Jujutsu, the substrate jjf shells out to
-brew install jj   # or: cargo install --git https://github.com/jj-vcs/jj.git --locked --bin jj
-
-# nextest — preferred test runner; isolates test processes,
-# which matters for the integration tests that spawn real
-# `jj` subprocesses
-cargo install cargo-nextest --locked
-```
-
-Build and verify:
-
-```bash
-cargo build --release -p jjf
-cargo nextest run --workspace
-# fall back to `cargo test --workspace` if nextest isn't available
-```
-
-The binary lands at `target/release/jjf`.
-
-## Quick tour
-
-Initialize a jj repo (if you don't have one already), then
-bootstrap jjforge on top of it:
-
-```bash
-jj git init my-project
-cd my-project
-jjf init                              # plants the refs/jjf/* namespace
-```
-
-Create, list, read:
-
-```bash
-jjf new -t "the title" -F body.md -l epic            # body from file
-echo "the body" | jjf new -t "the title" -F -        # body from stdin
-jjf new --type feature --slug agent-ready -t "..."    # v2.1 — typed + slugged
-jjf ls                                                # open issues
-jjf ls --status all                                   # everything
-jjf ls --label epic                                   # filter by label
-jjf ls --type bug                                     # filter by type
-jjf ls --slug agent                                   # substring-match slug
-jjf show <id>                                         # one issue by id
-jjf show agent-ready                                  # one issue by slug
-jjf show <id> --json                                  # machine-readable
-```
-
-Every id-taking verb (`show`, `update`, `close`, `open`,
-`comment`, `label add|rm`) accepts a slug in place of the 7-hex
-id.
-
-Mutate:
-
-```bash
-jjf update <id> --title "new title" --status closed   # multi-field, one commit
-jjf close <id>                                        # convenience
-jjf open <id>
-jjf comment <id> -F note.md                           # append
-jjf label add <id> backend
-jjf label rm <id> backend
-```
-
-Sync across clones:
-
-```bash
-jjf remote add origin <url>                           # configure a remote
-jjf push origin                                       # publish
-jjf pull origin                                       # fetch + merge
-```
-
-Every verb takes `--json` and emits the envelope shape
-documented in `docs/cli-json.md`. Errors under `--json` come
-back as `{"ok": false, "error": {"kind": "...", "message": "...", "details": {...}}}`
-so scripts can branch on `kind`.
 
 ## Architecture
 
@@ -251,6 +172,22 @@ docs/
 experiments/       # throwaway scratch work; see CLAUDE.md
 blog/              # Zola site at jjforge.dev (or wherever we end up)
 ```
+
+## Building from source
+
+Stable Rust toolchain (1.75+); `jj` on your PATH (Quickstart
+covers this).
+
+```bash
+cargo build --release -p jjf
+cargo nextest run --workspace
+# fall back to `cargo test --workspace` if nextest isn't installed
+```
+
+The binary lands at `target/release/jjf`. `cargo nextest` is
+preferred — it isolates test processes, which matters for the
+integration tests that spawn real `jj` subprocesses (install:
+`cargo install cargo-nextest --locked`).
 
 ## License
 
