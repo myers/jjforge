@@ -8,9 +8,7 @@
   "block_reason": null,
   "type": "feature",
   "priority": null,
-  "labels": [
-    "epic:host-asterinas"
-  ],
+  "labels": [],
   "dependencies": [
     {
       "target": "ec5a0a8",
