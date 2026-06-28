@@ -330,7 +330,7 @@ fn search_parent_flag_intersects_with_query() {
     );
     let _orphan = run_jjf(&repo, &["new", "--json", "-t", "needle orphan"]);
 
-    let out = run_jjf(&repo, &["search", "--json", "--parent", &epic_id, "needle"]);
+    let out = run_jjf(&repo, &["search", "--json", "--parent", "epic", "needle"]);
     let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let results = envelope["results"].as_array().unwrap();
     assert_eq!(results.len(), 1);
