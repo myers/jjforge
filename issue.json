@@ -4,7 +4,7 @@
   "title": "parent-flag-bad-hex-silent: --parent <bad-7-hex> silently matches nothing instead of issue_not_found",
   "slug": "parent-flag-bad-hex-silent",
   "body": "# Goal\n\n`jjf ls --parent <handle>` / `jjf ready --parent <handle>` /\n`jjf search --parent <handle>` should surface `issue_not_found`\n(exit 1) when `<handle>` is a well-formed 7-char hex id that\ndoesn't match any issue. Today they silently match nothing\n(empty result, exit 0), which is a footgun for operators who\ntypo a parent id.\n\n# Repro\n\n```\n$ jjf ls --parent abcdef0\n# returns nothing, exit 0 — but no such issue exists\n```\n\n(Slug handles already exit 2 with `slug_not_found` correctly;\nthis bug is specific to the well-formed-hex-but-nonexistent path.)\n\n# Source\n\nFinal whole-branch review of the `--parent` feature (2026-06-28\ndrop-epic-label) flagged this as Minor #2. The root cause is\nthat `resolve_handle` (`crates/jjf/src/main.rs:~2227` calling\n`storage.resolve` at `crates/jjf-storage/src/lib.rs:~3336`)\nshort-circuits on `IssueId::parse(handle).is_ok()` without an\nexistence check. The other id-consuming verbs (`jjf show`,\n`jjf comment`, `jjf update`, ...) do a downstream `storage.read`\nthat surfaces `issue_not_found`, but the filter callers don't\nread — they just pass the id into a predicate, so the bad id\nsilently matches no issues.\n\nThis is a small deviation from the spec's \"Unknown handle exits\n2 (`slug_not_found`)\" — the spec was silent on the hex-but-\nnonexistent case.\n\n# Fix options\n\n- **A.** In `run_ls` / `run_ready` / `run_search`, after the\n  `resolve_handle` call, do a `storage.read(&parent_id)?` to\n  force an existence check. Bad id surfaces as `issue_not_found`\n  exit 1, same as `jjf show <bad-id>`.\n- **B.** Document the behavior in `docs/cli-json.md` under each\n  `--parent <H>` bullet (\"unknown id silently matches nothing;\n  only an unknown slug exits 2\"). Cheaper, leaves footgun.\n\nRecommend A. The cost is one extra `Storage::read` per --parent\ninvocation, which is negligible (one ref lookup).\n\n# Acceptance\n\n- [ ] `jjf ls --parent <bad-7-hex>` exits 1 with\n      `issue_not_found`.\n- [ ] Same for `jjf ready --parent <bad-7-hex>` and\n      `jjf search --parent <bad-7-hex>`.\n- [ ] `jjf ls --parent <unknown-slug>` still exits 2 with\n      `slug_not_found` (unchanged).\n- [ ] `jjf ls --parent <good-handle>` still works (unchanged).\n- [ ] New CLI tests pinning the exit-1 path for each verb.\n",
-  "status": "in-progress",
+  "status": "closed",
   "block_reason": null,
   "type": "bug",
   "priority": null,
@@ -17,5 +17,5 @@
   ],
   "assignee": "fix-parent-bad-hex",
   "created_at": "2026-06-28T19:36:36Z",
-  "updated_at": "2026-06-28T20:04:31Z"
+  "updated_at": "2026-06-28T20:04:35Z"
 }
