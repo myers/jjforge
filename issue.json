@@ -4,7 +4,7 @@
   "title": "proptest-list-ready-monotone: closing/opening preserves list_ready monotonicity",
   "slug": "proptest-list-ready-monotone",
   "body": "# Goal\n\nProperty 4 from the `df74809` follow-up list. Assert that closing an\nissue can only ADD members to the next `list_ready` result; opening one\ncan only REMOVE. Cycle membership is the dual: an issue locked in a dep\ncycle should NEVER appear in `list_ready`, regardless of dep-kind mix.\n\nThis is the property that would have falsified `121f48b` (mixed-kind\nblocks+parent-child cycle silently accepted, locking both issues out of\n`jjf ready`) directly.\n\n# Approach\n\n- Use `multi_issue_repo_strategy` (from `proptest-multi-issue-generator`) to spin up N issues with random dep edges.\n- Snapshot `list_ready()` before and after each mutation; assert the symmetric-difference direction matches the mutation's expected effect (closing → fresh members only added; opening → members only removed; status-preserving verbs → identical result).\n- For cycle-locking: when `add_dep_edge` lands successfully (post-rejection check), the issues involved must remain reachable from `list_ready` IF the kind set still permits readiness, and must NOT appear if a new cycle would close. (After `0f2fb9db` lands cycle-rejection at write time, the cycle path is mostly defensive; still worth asserting.)\n\n# Why now\n\n`list_ready` is the headline agent primitive. A regression here means agents see a wrong \"next task\" — high-leverage bug class.\n\n# Blocked by\n\n- `proptest-multi-issue-generator` (needs multi-stage generator).\n\n# References\n\n- Parent: `df74809` (qa-proptest-harness), commit `28e5ed71`.\n- Bug this would have caught: `121f48b` (mixed-kind cycle).\n- Cycle-rejection fix: commit `0f2fb9db`.\n\n# Acceptance\n\n- New property `list_ready_monotone_under_status_flips` ships green at 16 cases.\n- Stress-runs clean at `PROPTEST_CASES=256`.\n",
-  "status": "open",
+  "status": "closed",
   "block_reason": null,
   "type": "feature",
   "priority": null,
@@ -20,5 +20,5 @@
   ],
   "assignee": null,
   "created_at": "2026-06-27T23:04:33Z",
-  "updated_at": "2026-06-28T14:31:39Z"
+  "updated_at": "2026-06-28T14:31:44Z"
 }
