@@ -3756,7 +3756,16 @@ fn run_ls(
         types.into_iter().map(IssueType::from).collect();
 
     let parent_id: Option<IssueId> = match parent {
-        Some(handle) => Some(resolve_handle(&storage, &handle)?),
+        Some(handle) => {
+            let resolved = resolve_handle(&storage, &handle)?;
+            // Force an existence check: `resolve_handle` short-circuits
+            // on any well-formed 7-char hex id without confirming it
+            // matches an issue, so a typoed hex would silently filter
+            // to nothing. A read surfaces `issue_not_found` (exit 1),
+            // matching the contract of `jjf show <bad-hex>`.
+            storage.read(&resolved)?;
+            Some(resolved)
+        }
         None => None,
     };
 
@@ -3879,7 +3888,14 @@ fn run_ready(
     let storage = Storage::open(&cwd)?;
 
     let parent_id: Option<IssueId> = match parent {
-        Some(handle) => Some(resolve_handle(&storage, &handle)?),
+        Some(handle) => {
+            let resolved = resolve_handle(&storage, &handle)?;
+            // Force an existence check: a well-formed-but-nonexistent
+            // 7-char hex id would otherwise filter to nothing silently.
+            // See `run_ls` for the same pattern.
+            storage.read(&resolved)?;
+            Some(resolved)
+        }
         None => None,
     };
 
@@ -4037,7 +4053,14 @@ fn run_search(
         types.into_iter().map(IssueType::from).collect();
 
     let parent_id: Option<IssueId> = match parent {
-        Some(handle) => Some(resolve_handle(&storage, &handle)?),
+        Some(handle) => {
+            let resolved = resolve_handle(&storage, &handle)?;
+            // Force an existence check: a well-formed-but-nonexistent
+            // 7-char hex id would otherwise filter to nothing silently.
+            // See `run_ls` for the same pattern.
+            storage.read(&resolved)?;
+            Some(resolved)
+        }
         None => None,
     };
 

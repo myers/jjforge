@@ -664,6 +664,30 @@ fn ls_parent_unknown_handle_exits_two() {
 }
 
 #[test]
+fn ls_parent_bad_hex_exits_one_issue_not_found() {
+    // A well-formed 7-char hex id that doesn't match any issue must
+    // surface as `issue_not_found` (exit 1), the same shape as
+    // `jjf show <bad-hex>`. Today it silently matches nothing (exit 0).
+    let repo = make_initialized_repo("ls_parent_bad_hex");
+    let out = run_jjf(&repo, &["--json", "ls", "--parent", "deadbee"]);
+    assert!(
+        !out.status.success(),
+        "expected failure, got success with stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let v: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("stderr must be valid JSON envelope");
+    assert_eq!(v["ok"], serde_json::Value::Bool(false));
+    assert_eq!(
+        v["error"]["kind"].as_str(),
+        Some("issue_not_found"),
+        "kind wrong: {stderr}"
+    );
+}
+
+#[test]
 fn ls_parent_composes_with_type_and_status() {
     let repo = make_initialized_repo("ls_parent_compose");
     let epic_out = run_jjf(&repo, &["new", "--json", "-t", "E", "--type", "epic", "--slug", "epic-parent"]);
