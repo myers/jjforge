@@ -1,9 +1,8 @@
 # jjforge quick start
 
 Five minutes from empty directory to a working planner. Every
-command below was run end-to-end against a throwaway repo on
-2026-06-24; the transcript is reproduced verbatim under
-"Verified output."
+command below is reproducible end-to-end; the transcript is in
+[Verified output](#verified-output).
 
 ## Prerequisites
 
@@ -19,18 +18,14 @@ command below was run end-to-end against a throwaway repo on
 ## 1. Create the repo
 
 `jjf` writes to a `refs/jjf/*` namespace on an existing jj repo;
-it does not create a repo for you. On jj 0.40+, `jj git init`
-produces a colocated jj+git repo by default — you get `.git/`
-and `.jj/` side-by-side, and `git push`/`pull` and `jjf push`
-share the same remote:
+it does not create a repo for you. `jj git init` produces a
+colocated jj+git repo — you get `.git/` and `.jj/` side-by-side,
+and `git push` / `pull` and `jjf push` share the same remote:
 
 ```bash
 mkdir my-project && cd my-project
 jj git init
 ```
-
-(Older jj's `--colocate` flag still works; it's just the default
-now.)
 
 ## 2. Initialize jjforge
 
@@ -260,7 +255,7 @@ namespace — they round-trip via `jjf push`/`pull` and are surfaced by
 would otherwise re-derive:
 
 ```bash
-jjf remember "Backend's /submit handler can't take empty bodies (fixed 2026-06-24)."
+jjf remember "Backend's /submit handler can't take empty bodies."
 jjf memories
 ```
 
@@ -321,9 +316,9 @@ pushes / pulls round-trip cleanly.
 
 ## Verified output
 
-The transcript below was captured on 2026-06-25 running the
-exact commands above against an empty directory.  IDs will
-differ in your run; everything else should match.
+The transcript below was captured running the exact commands
+above against an empty directory.  IDs will differ in your run;
+everything else should match.
 
 ```
 $ jj git init
@@ -356,8 +351,9 @@ $ jjf ready       # bug closed → README unblocked
 ## Where to go next
 
 - **Full CLI surface:** `jjf --help` and per-verb `jjf <verb> --help`.
-- **JSON output shapes:** `docs/cli-json.md`.
-- **Storage format on disk:** `docs/storage-format.md`.
+- **Architecture:** [architecture.md](architecture.md).
+- **JSON output shapes:** [cli-json.md](cli-json.md).
 - **Working a single ticket from a subagent:** the
-  `subagent-working-a-jjforge-issue` skill, auto-loaded when the
-  dispatch mentions "issue", "ticket", "jjforge", or "jjf".
+  [subagent-working-a-jjforge-issue](../skills/subagent-working-a-jjforge-issue/SKILL.md)
+  skill, auto-loaded when the dispatch mentions "issue", "ticket",
+  "jjforge", or "jjf".

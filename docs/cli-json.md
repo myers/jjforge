@@ -1,560 +1,10 @@
 # `jjf --json` output contract
 
-## v2.11 → v2.12 changelog
-
-Backwards-compatible additions, landed in the
-`actor-override-chain` ticket (`ae0866b`). The CLI gains an
-explicit identity-resolution chain for `--claim` and the
-comment author field so multi-agent fan-outs can attribute
-work distinctly per agent without rewriting `jj user.name`
-per process.
-
-- **New `--actor <name>` flag on `jjf update`.** Overrides
-  the identity used by `--claim` (the value that lands in
-  `assignee`). Empty string falls through to the next slot in
-  the chain rather than writing an empty assignee. Mutually
-  exclusive with `--unclaim`, `--assignee`, and
-  `--unset-assignee` (those don't take an implicit
-  identity).
-
-- **New `JJF_ACTOR` env var.** Honored by both `jjf update
-  --claim` (and `jjf ready --claim`) for the assignee field
-  and by `jjf comment` for the `author` field. Empty / whitespace
-  values fall through (so a stray `JJF_ACTOR=` in a parent
-  process doesn't override the next slot).
-
-- **Actor resolution chain.**
-
-  For `jjf update --claim` and `jjf ready --claim`:
-
-  ```text
-  --actor <name> flag > JJF_ACTOR env > jj config user.name > no_current_user
-  ```
-
-  For `jjf comment` (the `author` field):
-
-  ```text
-  --author flag > JJF_ACTOR env (synthesizes `$JJF_ACTOR <user.email>`) > jj config user.name + user.email > missing_author
-  ```
-
-  `--actor`/`--author` and `JJF_ACTOR` are skipped when empty
-  / whitespace-only.
-
-- **`no_current_user` hint updated.** The error message now
-  mentions both paths: "set jj user.name … OR export
-  `JJF_ACTOR=<name>`". Error kind and exit code (2) are
-  unchanged.
-
-- **No envelope shape changes.** `--claim`'s mutating envelope
-  is bit-identical to v2.3; the chain only affects which name
-  lands in `assignee`. Same for `comment`'s `author`.
-
-## v2.10 → v2.11 changelog
-
-Backwards-compatible additions, landed in the `priority-field`
-ticket (`326bbf7`) as part of the v2.7 → v2.8 storage spec bump.
-The on-disk record gains a `priority` field; the CLI surface
-gains matching flags and a new error envelope.
-
-- **New `priority` field on the JSON envelope.** Every issue
-  emitted by `jjf show --json`, `jjf ls --json`, `jjf ready
-  --json`, `jjf search --json`, and `jjf stale --json` now
-  carries a `priority` field — integer 0–4 when set, `null`
-  when unspecified. Placed between `type` and `labels` to match
-  the on-disk record's emission order. Pre-v2.11 readers that
-  ignore unknown fields are unaffected.
-
-- **New flag `-p` / `--priority` on `jjf new`.** Takes an
-  integer in `0..=4`. Omit to leave the field at `null`. Clap's
-  range parser rejects values outside the window at exit 2.
-
-- **New flags `-p` / `--priority <N>` and `--unset-priority`
-  on `jjf update`.** Mutually exclusive. `--priority N` sets
-  the field; `--unset-priority` clears it back to `null`. Same
-  three-way pattern as `--assignee` / `--unset-assignee`.
-
-- **New flag `-p` / `--priority` on `jjf ls` and `jjf ready`.**
-  Repeatable filter; semantics: OR (an issue matches if its
-  priority equals any of the listed values). Issues with `null`
-  priority never match an explicit value. Composes AND with
-  `--label` / `--type`.
-
-- **Plain-text row format changed.** `jjf ls` and `jjf ready`
-  rows now carry the priority column between status and type:
-  `<id>\t<status>\t<priority>\t<type>\t<title>`. The priority
-  column renders `P0`..`P4` when set and a single dash `-`
-  when null, so awk / cut parsing always sees a value.
-
-- **`jjf ready` sort order changed.** Primary sort key is now
-  `priority` (nulls last). Secondary key is the existing
-  type-priority weight (bug > feature > research > epic >
-  unspecified). Tertiary tiebreak: `created_at` ascending. So
-  `Some(0)` < `Some(4)` < `None` — an explicit P4 still sorts
-  above an unspecified issue. `jjf ls`'s sort is unchanged
-  (still `created_at` descending).
-
-- **New `jjf show` plain-text line.** Between `assignee:` and
-  `dependencies:`: `priority: PN` (or `priority: (none)` when
-  `null`). JSON output gets the new field automatically via
-  serde (see above).
-
-- **New error envelope kind `invalid_priority`.** Exit 2.
-  `details` shape: `{"reason": "out_of_range", "got": <int>}`.
-  Surfaced by `jjf new`, `jjf update`, and any future direct
-  caller of the storage layer's `set_priority`. Wire-format
-  parse failures on a `Jjf-Priority:` trailer (out-of-range
-  or non-integer) fall through the unknown-op-shape tolerance
-  in spec §5.2 — they don't surface here.
-
-## v2.9 → v2.10 changelog
-
-Backwards-compatible additions, landed in the `host-asterinas-stale`
-ticket (`e726cde`). Storage spec unchanged — this is a new query
-verb on top of the existing `updated_at` field, not a new field or
-op.
-
-- **New verb `jjf stale [--days N]`** — surface issues whose
-  `updated_at` is older than `N` days. Orchestrator hygiene query
-  for "what work has gone quiet?". Default `--days 14`.
-
-  Plain-text shape: one tab-separated row per stale issue,
-  `<id>\t<age>\t<title>\t<status>`. Empty result is silent
-  (matches `ls` / `search`).
-
-  JSON shape — a **bare array** (NOT an envelope; mirrors `ls
-  --json`, which is the structural cousin):
-
-  ```json
-  [
-    {"id": "a3f9c01", "title": "...", "status": "open",
-     "updated_at": "2026-05-12T08:14:31Z",
-     "days_since_update": 30}
-  ]
-  ```
-
-  Empty result under `--json` is `[]`.
-
-- **Strict-`>` staleness.** An issue is stale when
-  `now - updated_at > days * 86400`. Equal at the threshold tick
-  is NOT stale — a boundary-aged issue was touched right at the
-  cutoff, which reads as "just barely fresh".
-
-- **Sort.** Ascending by `updated_at` (oldest first) — the
-  orchestrator's highest-priority rows surface first.
-
-- **Filters compose AND with the staleness threshold.** `--status
-  <S>` (default `open`; matches `ls`'s default, distinct from
-  `search`'s `all`), `--label <L>` (repeatable, AND across labels),
-  `--type <T>` (repeatable, OR across types) — same semantics as
-  the corresponding `ls` flags.
-
-- **`--limit <N>`** caps the result after the oldest-first sort.
-  Default 0 (unlimited); mirrors `search`'s `--limit 0` convention.
-  Typical orchestrator use: `--limit 10` to skim the top of the
-  stale list.
-
-- **Age rendering** (plain text only — `--json` always emits the
-  raw `days_since_update` integer for scripting):
-
-  - `< 30d` → `Nd` (whole days; e.g. `19d`)
-  - `>= 30d && < 90d` → `Nw` (whole weeks; e.g. `5w` from 35d)
-  - `>= 90d` → `Nmo` (whole months; one month == 30 days; e.g.
-    `4mo` from 120d)
-
-  Always a single token — never compound forms like `1w 5d` or
-  prefixed approximations like `~3w`. Boundaries chosen so the
-  common stale-set (2-4 weeks old) stays in `Nd` shape; `19d`
-  reads faster than `2w` at a glance.
-
-- **Caveat (carried from ticket's "Out of scope")**: today's
-  `Storage::add_comment` DOES bump `updated_at` — at odds with
-  the ticket's "comments don't bump `updated_at` today" claim.
-  `jjf stale` uses the field as-is; if you want stale-by-true-
-  inactivity rather than stale-by-last-mutation-or-comment, that
-  needs a separate decision (storage spec — see closing comment
-  on `e726cde`).
-
-- **Out of scope** (deferred per ticket `e726cde`):
-  auto-closing stale issues (`jjf stale` is read-only), Slack /
-  email notifications (out-of-band), stale-by-activity recasting
-  of `updated_at` semantics.
-
-## v2.8 → v2.9 changelog
-
-Backwards-compatible additions, landed in the `host-asterinas-search`
-ticket (`bc6b9d9`). Storage spec unchanged — this is a new query
-verb, not a new field or op.
-
-- **New verb `jjf search <query>`** — case-insensitive substring
-  search across issue titles, bodies, and (with
-  `--include-comments`) comment bodies. Returns one row per
-  matching issue with a snippet preview around the first hit.
-
-  Plain-text shape: one tab-separated row per match,
-  `<id>\t<title>\t<matched_field>\t<snippet>`. Newlines and tabs
-  inside the source field are normalized to single spaces in the
-  rendered snippet so the column count stays stable. Empty
-  result is silent (matches `ls`).
-
-  JSON shape — an envelope (NOT a bare array, distinct from `ls`):
-
-  ```json
-  {
-    "ok": true,
-    "results": [
-      {"id": "a3f9c01", "title": "...", "score": 3,
-       "snippet": "…window around first hit…",
-       "matched_field": "title"}
-    ]
-  }
-  ```
-
-  Empty result under `--json` is `{"ok":true,"results":[]}`.
-
-- **`matched_field` priority order.** When an issue hits in more
-  than one field, the more specific surface wins — `title >
-  body > comments`. So an issue whose title AND body both
-  contain the needle reports `matched_field: "title"`, and the
-  snippet previews the title (which is short, so the snippet is
-  often the full title). The `score` field still counts hits
-  across every searched field.
-
-- **Sort.** Score descending (most hits first), then
-  `created_at` ascending (stable tiebreak — matches
-  `list_ready`).
-
-- **Filters compose AND with the substring match.** `--status
-  <S>` (default `all`; differs from `ls`'s `open` default
-  because search is fundamentally "find anything containing X"),
-  `--label <L>` (repeatable, AND across labels), `--type <T>`
-  (repeatable, OR across types) — same semantics as the
-  corresponding `ls` flags.
-
-- **Tunable snippet window.** `--snippet-context <N>` sets the
-  half-width on either side of the first hit. Default 40.
-
-- **`--limit <N>`** caps the result list after the sort.
-  Default 20. Pass `--limit 0` for unlimited.
-
-- **Empty query (`jjf search ""`)** returns zero results — not
-  every issue. Match-everything is `jjf ls`'s job; refusing the
-  empty case keeps the storage layer's contract honest. Under
-  `--json` you still get `{"ok":true,"results":[]}`; plain text
-  is silent.
-
-- **Out of scope** (deferred per ticket `bc6b9d9`): regex,
-  fuzzy / edit-distance matching, BM25/TF-IDF relevance
-  ranking, memories search (use `jjf memories <substring>`).
-
-## v2.7 → v2.8 changelog
-
-Backwards-compatible additions, landed in the `abandon-verb`
-ticket (`c1ffea7`). See `docs/storage-format.md` v2.6 → v2.7
-for the storage-layer contract.
-
-- **New verb `jjf abandon <id>`** — soft-delete an issue.
-  Lands one `set-status` op with payload
-  `Jjf-Status: abandoned` on a new commit. Same envelope shape
-  and non-idempotency rules as `jjf close`:
-
-  ```json
-  {"ok": true, "id": "aa6600b", "status": "abandoned"}
-  ```
-
-  Plain-text output: `abandoned <id>` — one line, no
-  decoration. Re-abandoning is idempotent at the data level
-  (status stays `abandoned`) but each call lands a fresh
-  trailer so the audit log records intent (matching `close`'s
-  contract).
-
-- **New status enum value `abandoned`** on every verb that emits
-  or accepts status. `Status::Abandoned` is wire-spelled
-  `abandoned`.
-
-  - `jjf show <id>` (and `--json`) reports `[abandoned]` /
-    `"status": "abandoned"` for abandoned issues — show still
-    works, so an operator can confirm what was abandoned.
-  - `jjf ls --status abandoned` lists only abandoned issues.
-  - `jjf ls --status all` includes them alongside everything
-    else.
-  - `jjf ls` (default `--status open`) HIDES them — abandoned
-    is meant as a soft delete; the listing should stay clean.
-  - `jjf update <id> --status abandoned` is the same write as
-    `jjf abandon <id>`; `--status open` on an abandoned issue
-    is the documented revival path (no `jjf unabandon` inverse
-    verb).
-
-- **`jjf ready` EXCLUDES abandoned issues UNCONDITIONALLY.** No
-  `--include-abandoned` flag (unlike `--include-blocked` /
-  `--include-claimed`). Abandoning means "never come up again."
-  Dep targets in the abandoned state behave like closed deps —
-  they don't block dependents.
-
-- **No new error kinds.** `claim` / `block` / `unblock` on an
-  abandoned issue surface the existing `invalid_input` kind
-  with a "reopen before …" / "nothing to …" hint, matching the
-  closed-issue rejection shape. `slug_collision` triggers on
-  attempts to reuse an abandoned issue's slug — the existing
-  v2.6 rule that slug uniqueness spans every status holds.
-
-## v2.6 → v2.7 changelog
-
-Backwards-compatible additions, landed in the
-`corrupt-ref-silent-drop` ticket (`4928ae6`).
-
-- **`jjf ls` and `jjf ready` now emit a ref-corruption warning
-  on stderr.** When the snapshot-cache rebuild encounters one
-  or more refs under `refs/jjf/issues/*` or `refs/jjf/memories/*`
-  that don't resolve to a commit carrying the expected blob
-  (e.g. a ref pointed at a blob by `git update-ref`, a commit
-  whose tree is empty, or a `serde_json` parse failure on the
-  record), the affected refs are dropped from the result set
-  but listed in a stderr warning. Exit status is still 0; the
-  warning is informational. Before this change the corrupt
-  ids vanished from `ls` / `ready` with no diagnostic
-  (indistinguishable from "issue genuinely doesn't exist").
-- **Plain-text stderr shape:**
-  ```text
-  jjf: warning: 2 ref(s) unreadable: refs/jjf/issues/eed62d7, refs/jjf/memories/foo (skipped from listing)
-  ```
-  Capped at 5 ref names inline; beyond that the tail elides
-  with `, ... and N more`. The warning is one line so it
-  composes cleanly with operator log capture.
-- **JSON stderr shape:** one single-line JSON envelope per
-  call, regardless of how many refs are unreadable:
-  ```json
-  {"warning":"unreadable_refs","count":2,"refs":["refs/jjf/issues/eed62d7","refs/jjf/memories/foo"]}
-  ```
-  The `refs` array always carries the full list (no inline
-  cap) under `--json` — machine consumers don't need elision.
-- **STDOUT shape unchanged.** `jjf ls --json` and `jjf ready
-  --json` still emit a bare array of `Issue` records on
-  stdout. Wrapping the success payload into a `{issues, warnings}`
-  envelope would have broken every existing `--json` caller
-  (`jq '.[] | .id'`, scripts using `--limit 1 | jq '.[0]'`,
-  etc.); riding the warning on stderr keeps stdout
-  back-compat-stable. Consumers that don't read stderr stay
-  oblivious; consumers that want the diagnostic parse one
-  extra JSON object per stream.
-- **Public storage API:** `Storage::unreadable_refs() ->
-  Result<Vec<UnreadableRef>>` returns the same per-ref
-  diagnostics. Each `UnreadableRef` carries `name` (full ref
-  name) and `reason` (one-line human-readable cause). The
-  CLI uses this; downstream tools (a future `jjf doctor`
-  verb) will too.
-
-## v2.5 → v2.6 changelog
-
-Backwards-compatible additions, landed in the
-`dep-cycle-undetected` ticket (`43c7615`).
-
-- **New error kind `dependency_cycle`** (preflight, exit 2):
-  `jjf dep add <source> <target>` would close a cycle in the
-  `blocks`-edge graph. Self-deps (`source == target`) still
-  surface as `self_dependency`; multi-step cycles surface as
-  the new kind. `details.source` is the proposed edge's source
-  id, `details.target` is the proposed target, and
-  `details.cycle` is the existing chain `[target, ..., source]`
-  that, combined with the new edge, would close. Echoed back
-  so an operator can pinpoint which existing edges to break.
-- **No new verbs.** Only `dep add` learned to reject cycles.
-  `dep rm` is unaffected (removing edges can't create them).
-  `jjf new -d` currently creates issues with their initial
-  dep set in a single commit — cycles there require two
-  pre-existing issues plus the new one, so the smallest
-  cycle reachable via `-d` is two-step and lands fine for
-  now (the new issue can't be the target of any pre-existing
-  edge before it's created). A follow-up may extend cycle
-  detection to the on-create path; out of scope for this
-  ticket.
-- **Scope: `blocks`-kind edges only.** `parent-child`,
-  `related`, and `discovered-from` edges are not cycle-
-  checked. `blocks` is the load-bearing case (`jjf ready`
-  walks `blocks`-deps), so a `blocks` cycle silently hides
-  every node in it from the ready set. The other kinds
-  don't affect ready computation; their cycles are a follow-
-  up if they ever become harmful.
-
-## v2.4 → v2.5 changelog
-
-Backwards-compatible additions, landed in the
-`agent-await-gates-impl` ticket (`8ddf3fb`). Strict subset of
-the beads-style gates feature (see
-`docs/agent-await-gates-design.md` §6 for the verdict).
-
-- **Two new verbs** `jjf block <id> [--reason <text>]` and
-  `jjf unblock <id>`. Both land one multi-op commit on the
-  `issues` bookmark:
-  - `block`: sets `status = blocked` AND records
-    `block_reason` as a scalar. Two trailers (`set-status` +
-    `set-block-reason`), one commit.
-  - `unblock`: sets `status = open` AND clears
-    `block_reason`. Inverse of `block`. Idempotent when
-    already open + unblocked.
-  Reasons MUST be single-line — newlines surface as exit 1
-  `invalid_input` from storage.
-- **`jjf ready` gains `--include-blocked`** (mirror of the
-  v2.3 `--include-claimed` flag). Without it, `blocked` issues
-  are excluded from the ready set (an idle agent shouldn't see
-  parked work). With it, blocked issues appear alongside open
-  ones for "what's parked" views.
-- **New status enum value `blocked`** on every verb that emits
-  or accepts status (`show`, `ls --status blocked`, `update
-  --status blocked`). `Status::Blocked` is wire-spelled
-  `blocked`.
-- **New record field `block_reason`** on the `Issue` JSON
-  payload (string-or-null, default null). Visible on `jjf show
-  --json` and on every `--json` verb that emits an Issue
-  (`ls`, `ready`). Plain-text `jjf show` renders a
-  `block-reason: <text>` line immediately under the status when
-  the issue is blocked; non-blocked statuses don't render the
-  line at all.
-- **`jjf block --json` mutating envelope**:
-
-  ```json
-  {"ok": true, "id": "aa6600b", "status": "blocked", "reason": "waiting on PR-42", "blocked": true}
-  ```
-
-  When `--reason` is omitted (or whitespace-only), `reason` is
-  `null`.
-
-- **`jjf unblock --json` mutating envelope**:
-
-  ```json
-  {"ok": true, "id": "aa6600b", "status": "open", "blocked": false}
-  ```
-
-- **No new error kinds.** A multi-line `--reason` surfaces the
-  existing `invalid_input` kind from storage (exit 1).
-  Blocking a closed issue surfaces the same kind. Claiming a
-  blocked issue (`jjf update <id> --claim`) surfaces
-  `invalid_input` with a "unblock before claiming" hint.
-
-## v2.3 → v2.4 changelog
-
-Backwards-compatible additions, landed in the `agent-dep-types`
-ticket (`b6d066b`).
-
-- **New subcommand family `jjf dep add|rm|tree`** — manage
-  typed dependency edges between issues. Four edge kinds:
-  `blocks`, `parent-child`, `related`, `discovered-from`.
-  See "Dep verbs" below for envelope shapes.
-- **`jjf new -d` accepts `<kind>:<id>` inline** in addition
-  to the v1 bare-id shape. The bare-id form keeps the v1
-  default (`blocks`); the typed form lets you say
-  `-d parent-child:abc1234`. Bad kind → `bad_dep_kind`
-  (preflight, exit 2).
-- **`jjf show` plain-text dependency section** changes from
-  a single `dependencies: <id1>, <id2>` line to a typed
-  section. As of `show-deps-blocked-by` (fj#2), each line
-  uses an **owner-perspective human label** instead of the
-  wire spelling — the displayed issue is the owner, and the
-  label describes its relationship to the listed targets:
-
-  ```text
-  dependencies:
-    blocked by: abc1234, def5678
-    parent: ghi9012
-  ```
-
-  The label mapping is `blocks` → `blocked by`,
-  `parent-child` → `parent`, `related` → `related`,
-  `discovered-from` → `discovered from`. The wire spelling
-  still appears in JSON output, `Jjf-Dep-Kind:` trailers,
-  the `--kind` flag values, `dep tree` rendering, and the
-  `dep add`/`dep rm` confirmation lines. An empty dep set
-  still renders `dependencies: (none)`. `--json` output of
-  `show` carries the `[{target, kind}, ...]` array shape
-  under `dependencies` (v2.4 spec §3) — kind values are
-  unchanged (`blocks`, `parent-child`, `related`,
-  `discovered-from`).
-
-- **`jjf ready` cascade.** With v2.4 edge kinds, an issue is
-  blocked if any `blocks`-kind dep target is active, OR any
-  `parent-child` target is itself blocked (fixpoint cascade).
-  `related` and `discovered-from` edges are ignored.
-  `jjf ready` continues to return JSON-array-of-Issue.
-- **New error kind `bad_dep_kind`** (preflight, exit 2):
-  `--dep <kind>:<id>` carried an unknown kind token.
-  `details.value` is the raw spec; `details.kind` is the bad
-  kind token; `details.field` is `"dep"`.
-
-## v2.2 → v2.3 changelog
-
-Backwards-compatible additions, landed in the
-`agent-claim-atomic` ticket (`c3cc807`).
-
-- **`jjf update` gains `--claim` / `--unclaim`** atomic
-  shorthand flags. `--claim` sets assignee = current jj
-  `user.name` AND status = `in-progress` in one multi-op
-  commit. `--unclaim` clears the assignee AND sets status =
-  `open` in one multi-op commit. Mutually exclusive with each
-  other AND with `--assignee` / `--unset-assignee` /
-  `--status`.
-- **`jjf ready` gains `--include-claimed` and `--claim`.**
-  Without `--include-claimed`, `in-progress` issues are
-  excluded from the ready set (an idle agent shouldn't see
-  another's claimed work). With `--include-claimed`, they
-  appear alongside open issues. `--claim` is the
-  "pick-and-claim-atomically" shorthand: `ready --claim
-  --limit 1` returns one top result AND atomically claims it
-  in a single CLI call. Requires `--limit 1`; other values
-  exit 2 with `claim_requires_limit_one`.
-- **New status enum value `in-progress`** on every verb that
-  emits or accepts status (`show`, `ls`, `ready`, `update
-  --status`). `jjf ls --status in-progress` and `jjf update
-  --status in-progress` are valid.
-- **Three new error kinds.**
-  - `already_claimed` — preflight, exit 2. `--claim` was
-    asked to claim an issue already InProgress with a
-    different assignee. `details.by` is the existing
-    assignee.
-  - `no_current_user` — preflight, exit 2. `--claim` had no
-    `jj user.name` configured.
-  - `claim_requires_limit_one` — preflight, exit 2. `ready
-    --claim` was used with `--limit` other than 1.
-- **`jjf update --claim` mutating envelope**:
-
-  ```json
-  {"ok": true, "id": "aa6600b", "assignee": "alice", "status": "in-progress", "claimed": true}
-  ```
-
-- **`jjf update --unclaim` mutating envelope**:
-
-  ```json
-  {"ok": true, "id": "aa6600b", "status": "open", "claimed": false}
-  ```
-
-- **`jjf ready --claim --limit 1` mutating envelope** (when
-  a claim landed):
-
-  ```json
-  {"ok": true, "id": "aa6600b", "assignee": "alice", "status": "in-progress", "claimed": true}
-  ```
-
-  When the ready set is empty:
-
-  ```json
-  {"ok": true, "id": null, "claimed": false}
-  ```
-
-## v2.1 → v2.2 changelog
-
-Backwards-compatible additions, landed in the `agent-remember`
-ticket (`81db913`).
-
-- **Four new verbs** for persistent memories: `remember`,
-  `memories`, `recall`, `forget`. Envelope shapes below in
-  the "Memory verbs" section.
-- **`jjf show` gains `--include-memories`** — plain-text
-  affordance only. `--json` output of `show` is unchanged
-  (memories are reachable via `jjf memories --json`).
-- **Three new error kinds** — `missing_memory_value`
-  (preflight, exit 2), `empty_memory_key` (preflight, exit 2,
-  with `details.value`), `memory_not_found` (runtime, exit 1,
-  with `details.key`).
-
-## Dep verbs (v2.4)
+This file is the contract for `--json` output across every `jjf`
+verb. Two envelope shapes (mutating vs read), one error envelope,
+one error-kind table, per-verb examples below.
+
+## Dep verbs
 
 ### `jjf dep add <child> <parent> [--kind <kind>]`
 
@@ -607,7 +57,7 @@ abc1234 [open] epic A
   cycle; recursion stops there and `children: []` for that
   node.
 
-## Memory verbs (v2.2)
+## Memory verbs
 
 ### `jjf remember [<value>] [--key <slug>] [-F <path|->]`
 
@@ -663,90 +113,6 @@ Mutating envelope:
 ```
 
 Missing key → exit 1 + `memory_not_found` error envelope.
-
-## v2 → v2.1 changelog
-
-Backwards-compatible additions, landed in
-`issue-type-and-slug-fields`:
-
-- **`Issue` payload gains `type` and `slug`** — `show --json`,
-  `ls --json`, and the per-issue arrays embed the new fields
-  verbatim. `type` is the lowercase wire spelling (`bug` |
-  `feature` | `epic` | `research` | `roadmap` | `unspecified`);
-  `slug` is a string or `null`.
-- **`jjf new --json` accepts `--type` and `--slug` flags**; the
-  envelope shape is unchanged (`{"ok":true,"id":"..."}`).
-- **`jjf update --json` accepts `--type`, `--slug`,
-  `--unset-slug`**. The `fields` array surfaces the populated
-  field names — values include `"slug"` and `"type"` alongside
-  the existing `"title"`/`"status"`/`"body"`/`"assignee"`.
-- **`jjf ls --json` accepts `--type` (repeatable, OR-semantics)
-  and `--slug` (substring match)** as filter flags.
-- **Every id-taking verb (`show`, `update`, `close`, `open`,
-  `comment`, `label add|rm`) accepts a slug in place of the
-  7-hex id.** Resolution happens at the CLI boundary; verbs
-  surface `slug_not_found` (exit 2) when the handle doesn't
-  match an id or a known slug.
-- **Three new error kinds** — `invalid_slug` (with
-  `details.slug` + `details.reason`), `slug_collision` (with
-  `details.slug` + `details.conflicts_with`), `slug_not_found`
-  (with `details.handle`).
-- **`jjf ready` verb landed** (`agent-ready` ticket) — bare
-  JSON-array payload of `Issue` records (same shape as
-  `ls --json`), filtered to the open + unblocked set and
-  sorted by type priority (bug > feature > research > epic >
-  unspecified; roadmap excluded). Accepts `--label` (AND),
-  `--type` (OR), `--limit`. The canonical agent-loop call is
-  `jjf ready --json --limit 1`.
-
-This document is the canonical reference for what `jjf <verb> --json`
-emits. The contract here is what scripts, the `mvp-sync` orchestrator,
-and the `agent-ergonomics` MCP server are entitled to rely on. Changes
-to the shapes below are breaking changes — they require a deprecation
-note here and a parallel test update.
-
-The CLI binary lives in `crates/jjf/src/main.rs`. The
-integration-test pins for each shape live in
-`crates/jjf/tests/<verb>.rs` under names containing
-`json_envelope_shape` or `json_error_envelope`.
-
-## v1 → v2 changelog
-
-The nomenclature rename in the storage spec (`docs/storage-format.md`
-"v1 → v2 changelog") carries through here. Breaking changes for any
-script that pattern-matches the wire shape:
-
-- **Error kinds renamed** (full table in the next section):
-  - `bug_not_found` → `issue_not_found`
-  - `missing_bugs_bookmark` → `missing_issues_bookmark`
-  - The `bad_id` kind's `details.field` value `"id"` is unchanged
-    (`bad_id` previously sourced from `BadBugId` / `BadDepId`; v2
-    sources from `BadIssueId` / `BadDepId`, same wire shape).
-- **Error `details` field renames** on the two legacy
-  merge-driver kinds (`unmergeable`, `comment_file_conflict`): the
-  `bug_id` key under `details` is now `issue_id`. Both kinds are
-  unreachable from `jjf pull` post-`bfc732b`; only external callers
-  of `jjf_merge::resolve` can surface them.
-- **`jjf pull` envelope:** the `resolved_bugs` field is now
-  `resolved_issues`. The `bookmark` field's value changes from
-  `"bugs"` to `"issues"`.
-- **`jjf push` envelope:** the `bookmark` field's value changes
-  from `"bugs"` to `"issues"`.
-- **`jjf init` envelope:** the `bookmark` field's value changes
-  from `"bugs"` to `"issues"`.
-- **Plain-text messages** (not contract, but observable):
-  `pushed bugs -> X` → `pushed issues -> X`, etc.
-
-The terminology rationale: jjforge tracks issues (the broad set —
-roadmap, epic, defect, research note), not just bugs (the defect
-subset). The user-facing prose has been "issue" since the cutover
-blog post; v2 catches the wire shape up.
-
-The `Issue` record's JSON shape (the bare payload `jjf show` /
-`jjf ls` emit) was already documented as the `Bug` rust type's
-serde projection in v1; the field names inside the record didn't
-change in v2 (the record itself never used `bug_id` — its `id`
-field has always been called `id`).
 
 ## Two envelope shapes
 
@@ -819,7 +185,7 @@ from plain-text mode (see the top comment in `main.rs`: `0` success,
 | `missing_issues_bookmark`    | 2    | `MissingIssuesBookmark`       | `path`                   |
 | `issue_not_found`            | 1    | `Storage::IssueNotFound`      | `id`                     |
 | `bad_id`                     | 2    | `BadIssueId` / `BadDepId`     | `value`, `field`         |
-| `bad_dep_kind`               | 2    | `BadDepKind` (v2.4)           | `value`, `kind`, `field` |
+| `bad_dep_kind`               | 2    | `BadDepKind`                  | `value`, `kind`, `field` |
 | `empty_body`                 | 2    | `EmptyCommentBody`            | —                        |
 | `empty_label`                | 2    | `EmptyLabel`                  | —                        |
 | `missing_author`             | 2    | `MissingAuthor`               | —                        |
@@ -894,7 +260,7 @@ $ jjf new --json -t $'a\tb'
 
 The `null_byte` reason is reachable only via programmatic
 callers of `Storage::create_issue` / `Storage::update` (e.g. a
-Python or MCP client constructing the call directly). POSIX
+Python client constructing the call directly). POSIX
 argv is a NUL-terminated C string array, so a shell-typed
 `jjf new -t $'a\x00b'` actually loses the bytes after the
 null in the shell's argv expansion before `jjf` sees them —
@@ -908,9 +274,6 @@ comment -F` when the supplied body exceeds 65,536 bytes
 cap matches GitHub's documented issue-body limit (and
 Forgejo's, which mirrors it) so jjforge's surface is
 predictable to anyone who already knows the prior art.
-Added in issue `679444a` (QA red-team 2026-06-25 sub-pass 4
-C3), where a multi-megabyte body landed silently with no
-declared bound.
 
 `details.limit` is the configured cap (always 65,536 today)
 and `details.got` is the measured byte length of the
@@ -978,8 +341,7 @@ cleanup primitive and never lands a dangling edge.
 
 ### Note on `dependency_cycle`
 
-Emitted by `jjf dep add <source> <target>` (v2.6,
-`dep-cycle-undetected`, issue `43c7615`) when adding the
+Emitted by `jjf dep add <source> <target>` when adding the
 proposed `blocks`-edge would close a cycle in the existing
 `blocks`-edge graph. Preflight failure (exit 2). Added after
 QA found that `jjf dep add` silently accepted edges that
@@ -1091,10 +453,8 @@ The structured surface is `details`:
   `message` contract surface. Includes the multi-line `hint:`
   preamble and any other version-dependent text git emits.
 
-Added in `qa-2026-06-25-push-rejected-raw-git` (issue
-`88e4d6b`) after a QA red-team round found `message` embedded
-raw git stderr — including the internal
-`refs/jjf/issues/*` refspec and git's version-dependent
+`message` is curated specifically to exclude internal
+`refs/jjf/issues/*` refspec details and git's version-dependent
 advisory phrases — creating pressure to parse `message`
 because `details` was too sparse to identify the conflicting
 refs.
@@ -1108,7 +468,7 @@ $ jjf --json push origin
 
 Every example below is one success path and the most representative
 error path for the verb. The integration tests under
-`crates/jjf/tests/<verb>.rs` pin these shapes; if you change one
+[`crates/jjf/tests/<verb>.rs`](../crates/jjf/tests/) pin these shapes; if you change one
 here, change the test too.
 
 ### `init`
@@ -1132,7 +492,7 @@ $ echo "body" | jjf new --json -t "fix the thing" -F -
 {"ok":true,"id":"a3f9c01"}
 ```
 
-Optional flags for v2.1 fields:
+Optional flags:
 
 ```sh
 $ jjf new --json -t "agent-ready" --type feature --slug agent-ready
@@ -1235,7 +595,7 @@ $ jjf ls --json
 Empty result is `[]`, not silence — scripts piping to `jq length`
 get a useful value either way.
 
-v2.1 filters:
+Type and slug filters:
 
 - `--type <kind>` — repeatable, OR-semantics across the listed
   types. An issue matches if its `type` field equals any listed
@@ -1287,14 +647,13 @@ Filters:
   surface, not work to do — regardless of this filter.
 - `--limit <N>` — truncate to the first N entries AFTER the
   priority sort. Omit for unlimited.
-- `--include-claimed` (v2.3) — also include `in-progress`
-  issues in the result. Off by default so idle agents don't
-  see another agent's claimed work as available.
-- `--claim` (v2.3) — atomic shorthand: pick the top result
-  AND claim it. Requires `--limit 1`; other values exit 2
-  with `claim_requires_limit_one`. Emits the mutating
-  envelope shown in the v2.3 changelog at the top of this
-  file.
+- `--include-claimed` — also include `in-progress` issues in
+  the result. Off by default so idle agents don't see another
+  agent's claimed work as available.
+- `--claim` — atomic shorthand: pick the top result AND claim
+  it. Requires `--limit 1`; other values exit 2 with
+  `claim_requires_limit_one`. Emits the mutating envelope:
+  `{"ok": true, "id": "...", "assignee": "...", "status": "in-progress", "claimed": true}`.
 
 Selection criteria — an issue is "ready" iff:
 
@@ -1402,9 +761,8 @@ indicates the window doesn't start at the field's start; a
 trailing `…` indicates it doesn't end at the end. Char-boundary
 safe — multibyte content is never sliced mid-codepoint.
 
-Out of scope for v1 (see ticket `bc6b9d9` for the rationale):
-regex, fuzzy / edit-distance matching, BM25/TF-IDF relevance
-ranking, memories search (use `jjf memories <substring>`).
+Out of scope: regex, fuzzy / edit-distance matching, BM25/TF-IDF
+relevance ranking, memories search (use `jjf memories <substring>`).
 
 Error path — running outside a jj repo:
 
@@ -1453,10 +811,9 @@ Flag matrix:
 | `--json` | off | Bare array (NOT envelope); mirrors `ls`. |
 
 Plain-text columns: `<id>\t<age>\t<title>\t<status>`. `<age>` is
-the human-friendly token `Nd` / `Nw` / `Nmo`; see the v2.9 → v2.10
-changelog for the exact thresholds. Empty result is silence
-under plain text, `[]` under `--json`. Sort is ascending by
-`updated_at` (oldest first).
+the human-friendly token `Nd` (<30d) / `Nw` (30-90d) / `Nmo`
+(≥90d). Empty result is silence under plain text, `[]` under
+`--json`. Sort is ascending by `updated_at` (oldest first).
 
 Compose filters with the threshold:
 
@@ -1481,7 +838,7 @@ $ jjf update --json a3f9c01 --title "renamed" --status closed
 
 The `fields` array lists the populated fields in field-declaration
 order — the same order the storage layer lands the corresponding
-trailers on the resulting commit. The full ordering (v2.1):
+trailers on the resulting commit. The full ordering:
 
 1. `title`
 2. `slug`
@@ -1503,7 +860,7 @@ $ jjf update --json a3f9c01 --unset-slug
 {"ok":true,"id":"a3f9c01","fields":["slug"]}
 ```
 
-v2.3 added `--claim` / `--unclaim` shorthand:
+`--claim` / `--unclaim` shorthand:
 
 ```sh
 $ jjf update --json a3f9c01 --claim
@@ -1764,13 +1121,13 @@ and `comment_file_conflict` (jj content-merge marker in a
 `.comments.jsonl` file). The `jjf pull` v1 path could surface
 both.
 
-**As of `bfc732b` (sync-conflict-fallback), `jjf pull` uses the
-op-space resolver in `crates/jjf-storage/src/merge_ops.rs`. That
-resolver has no failure mode that maps to either error kind:
-`set-body` is just another LWW scalar (`storage-format.md` §6.2),
-and `.comments.jsonl` is rebuilt as a union of pristine bytes
-from each head, never read with conflict markers.** The error
-kinds stay defined for shape stability — external callers of
+**`jjf pull` uses the op-space resolver in
+[`crates/jjf-storage/src/merge_ops.rs`](../crates/jjf-storage/src/merge_ops.rs).
+That resolver has no failure mode that maps to either error
+kind: `set-body` is just another LWW scalar, and
+`.comments.jsonl` is rebuilt as a union of pristine bytes from
+each head, never read with conflict markers.** The error kinds
+stay defined for shape stability — external callers of
 `jjf_merge::resolve` (the library that stays in the workspace as
 a non-operator-path tool) can still surface them, and the JSON
 envelope contract pins the enum — but `jjf pull` will not raise
@@ -1816,7 +1173,7 @@ parsing (preflight, IO, storage, runtime) honors the JSON envelope.
 
 ## Exit-code convention
 
-Cross-link to the top-of-file comment in `crates/jjf/src/main.rs`,
+Cross-link to the top-of-file comment in [`crates/jjf/src/main.rs`](../crates/jjf/src/main.rs),
 which is the canonical statement:
 
 - `0` — success.
