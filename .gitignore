@@ -24,3 +24,7 @@ blog/public/
 # Read-only reference clones (e.g. ./reference/beads). Not part
 # of jjforge; cloned in-tree for grep/cross-reference.
 /reference/
+
+# One-shot operational migration scripts that mutate planner
+# state. Kept locally for re-run / audit; never committed.
+experiments/drop-epic-labels/
