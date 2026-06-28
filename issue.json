@@ -7,12 +7,12 @@
   "status": "open",
   "block_reason": null,
   "type": "epic",
+  "priority": null,
   "labels": [
-    "epic",
-    "epic:multi-client"
+    "epic"
   ],
   "dependencies": [],
   "assignee": null,
   "created_at": "2026-06-22T14:49:56Z",
-  "updated_at": "2026-06-23T06:38:16Z"
+  "updated_at": "2026-06-28T18:41:21Z"
 }
