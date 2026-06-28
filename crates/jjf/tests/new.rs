@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use jjf_storage::{DepEdge, IssueId, Storage};
+use jjf_storage::{DepEdge, DepKind, IssueId, Storage};
 
 /// Path to the compiled `jjf` binary. Cargo sets this env var for every
 /// integration test in the same package as the `[[bin]]` target.
@@ -356,6 +356,101 @@ fn new_full_field_round_trip() {
     assert_eq!(bug.dependencies, vec![DepEdge::blocks(first_id)]);
     assert_eq!(bug.assignee.as_deref(), Some("alice"));
     assert!(bug.comments.is_empty());
+}
+
+#[test]
+fn new_with_parent_flag_creates_parent_child_edge() {
+    // Forgejo #3: `jjf new --dep <id>` hardcoded a `blocks` edge,
+    // making child-of-epic creation a 3-step dance. `--parent <id>`
+    // is the shorthand: one flag → one `parent-child` edge.
+    let repo = make_initialized_repo("new_parent_flag");
+
+    let epic = run_jjf_with_stdin(
+        &repo,
+        &["new", "-t", "Epic: demo", "--type", "epic", "-F", "-"],
+        b"epic body",
+    );
+    assert!(epic.status.success(), "epic create failed: {}", String::from_utf8_lossy(&epic.stderr));
+    let epic_id = parse_id_from_stdout(&epic.stdout);
+
+    let child = run_jjf_with_stdin(
+        &repo,
+        &["new", "-t", "child task", "--parent", epic_id.as_str(), "-F", "-"],
+        b"child body",
+    );
+    assert!(
+        child.status.success(),
+        "child create failed: code={:?} stderr={}",
+        child.status.code(),
+        String::from_utf8_lossy(&child.stderr),
+    );
+    let child_id = parse_id_from_stdout(&child.stdout);
+
+    let storage = Storage::open(&repo).expect("open storage");
+    let bug = storage.read(&child_id).expect("read child");
+    assert_eq!(
+        bug.dependencies,
+        vec![DepEdge::new(epic_id, DepKind::ParentChild)],
+        "`--parent <id>` must land a single parent-child edge"
+    );
+}
+
+#[test]
+fn new_with_parent_and_dep_compose() {
+    // `--parent` and `-d` compose into one dep list with mixed kinds.
+    let repo = make_initialized_repo("new_parent_plus_dep");
+
+    let epic = run_jjf_with_stdin(&repo, &["new", "-t", "Epic", "--type", "epic", "-F", "-"], b"");
+    let epic_id = parse_id_from_stdout(&epic.stdout);
+    let blocker = run_jjf_with_stdin(&repo, &["new", "-t", "blocker", "-F", "-"], b"");
+    let blocker_id = parse_id_from_stdout(&blocker.stdout);
+
+    let child = run_jjf_with_stdin(
+        &repo,
+        &[
+            "new", "-t", "child", "-F", "-",
+            "--parent", epic_id.as_str(),
+            "-d", blocker_id.as_str(),
+        ],
+        b"",
+    );
+    assert!(
+        child.status.success(),
+        "compose failed: {}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let child_id = parse_id_from_stdout(&child.stdout);
+
+    let storage = Storage::open(&repo).expect("open storage");
+    let bug = storage.read(&child_id).expect("read child");
+    // Storage sorts `dependencies` by (target, kind) — compare as a
+    // multiset rather than assuming insertion order.
+    let mut got = bug.dependencies.clone();
+    got.sort();
+    let mut want = vec![
+        DepEdge::new(epic_id, DepKind::ParentChild),
+        DepEdge::blocks(blocker_id),
+    ];
+    want.sort();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn new_with_bogus_parent_id_exits_two() {
+    // `--parent` reuses the same id validator as `-d`. Bad id is exit 2.
+    let repo = make_initialized_repo("new_bad_parent");
+    let out = run_jjf_with_stdin(
+        &repo,
+        &["new", "-t", "title", "-F", "-", "--parent", "not-hex!"],
+        b"",
+    );
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--parent") || stderr.contains("parent"),
+        "stderr should mention which flag failed, got: {stderr}"
+    );
 }
 
 #[test]

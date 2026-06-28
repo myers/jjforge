@@ -222,11 +222,23 @@ enum Commands {
         #[arg(short = 'l', long = "label")]
         labels: Vec<String>,
 
-        /// Declare a dependency on another issue id. Repeatable. Each
-        /// value must be a 7-char lowercase-hex issue id; a bad value
-        /// is a preflight failure (exit 2).
+        /// Declare a dependency on another issue id. Repeatable.
+        /// Accepts a bare 7-char lowercase-hex id (interpreted as
+        /// `blocks:<id>` for v1 muscle memory) OR a `<kind>:<id>`
+        /// spec where `<kind>` is one of
+        /// `blocks` / `parent-child` / `related` / `discovered-from`.
+        /// A bad id or unknown kind is a preflight failure (exit 2).
+        /// For the common "child of an epic" case, see `--parent`.
         #[arg(short = 'd', long = "dep")]
         deps: Vec<String>,
+
+        /// Declare a `parent-child` edge: this issue is a child of
+        /// `<id>`. Repeatable. Shorthand for `-d parent-child:<id>`;
+        /// composes with `-d` to mix kinds in one create. The common
+        /// "file a ticket under an epic" case:
+        /// `jjf new -t "..." --parent <epic-id>`.
+        #[arg(long = "parent")]
+        parents: Vec<String>,
 
         /// Set the assignee. Optional; omit to leave the field unset
         /// (creates a record with `assignee: null`).
@@ -1843,11 +1855,12 @@ fn run(cli: Cli) -> Result<(), CliError> {
             file,
             labels,
             deps,
+            parents,
             assignee,
             r#type,
             slug,
             priority,
-        } => run_new(cli.json, title, file, labels, deps, assignee, r#type, slug, priority),
+        } => run_new(cli.json, title, file, labels, deps, parents, assignee, r#type, slug, priority),
         Commands::Show { id, include_memories } => {
             run_show(cli.json, id, include_memories)
         }
@@ -2048,6 +2061,7 @@ fn run_new(
     file: Option<PathBuf>,
     labels: Vec<String>,
     deps: Vec<String>,
+    parents: Vec<String>,
     assignee: Option<String>,
     type_arg: Option<TypeArg>,
     slug: Option<String>,
@@ -2059,10 +2073,23 @@ fn run_new(
     // kinds. The `kind` token is one of
     // `blocks`/`parent-child`/`related`/`discovered-from`; unknown
     // kinds are a preflight failure (exit 2).
-    let deps: Vec<DepEdge> = deps
-        .into_iter()
-        .map(parse_dep_spec)
-        .collect::<Result<Vec<_>, _>>()?;
+    //
+    // `--parent <id>` (fj#3) is the discoverable shorthand for the
+    // dominant child-of-epic case. We emit parent `DepAdd` ops first,
+    // but storage sorts `dependencies` on each write — read-back order
+    // is `(target, kind)`-sorted, not insertion-order.
+    let mut all_deps: Vec<DepEdge> = Vec::with_capacity(parents.len() + deps.len());
+    for raw in parents {
+        let target = IssueId::parse(&raw).map_err(|error| CliError::BadDepId {
+            value: format!("--parent {raw}"),
+            error,
+        })?;
+        all_deps.push(DepEdge::new(target, DepKind::ParentChild));
+    }
+    for raw in deps {
+        all_deps.push(parse_dep_spec(raw)?);
+    }
+    let deps = all_deps;
 
     // 2. Read the body. `-F -` is stdin; `-F <path>` is the file's
     // bytes; omitted is empty. We deliberately preserve raw bytes — no
