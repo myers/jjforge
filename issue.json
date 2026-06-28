@@ -5,14 +5,23 @@
   "slug": "sync-reenable-merge-cross-check",
   "body": "# Goal\n\nRemove the `if !op_view.touched_by_merge` guard at\n`crates/jjf-storage/src/read.rs:85` so the `cross_check`\nbetween the file's serialized record and the op-replay\nprojection runs for merged op-views too.\n\nToday the cross-check is skipped after any merge because\nthe file-bytes merge driver (legacy, from `e2e473b`) could\nproduce a file that disagreed with op-replay's last-write.\nWith op-space resolution (`bfc732b`) the file IS a\ndeterministic projection of the op chain, so the\ndisagreement window should be closed.\n\nEnd state: cross-check runs unconditionally; any divergence\nit surfaces is either a real bug (fix), a known limitation\nof the resolver (document with a focused skip + test), or\na stale invariant in `cross_check` itself (update).\n\n# Why now\n\nThe guard documents itself as \"skip; revisit after\nop-space lands.\" Op-space landed. The cross-check is a\nfree debug-build safety net that catches resolver bugs\nthe moment they happen rather than letting them propagate\ninto the read path silently. Leaving it disabled is\nstrictly worse than re-enabling and triaging whatever it\nfinds.\n\n# Why blocked by `sync-resolve-divergence-tests`\n\nIf the cross-check surfaces real divergences, the\nresolver-test suite from `1c20aa3` gives us a place to\nwrite minimal repros without having to scaffold a full\nsync test repo. Land the tests first; this ticket builds\non that foundation.\n\n# Scope\n\n## Code change\n\n- Remove the `if !op_view.touched_by_merge` guard at\n  `read.rs:85`. `cross_check(&record, &comments,\n  &op_view)` runs unconditionally (still only in debug\n  builds, per its existing `debug_assert`-shaped\n  invariants).\n- Likely also remove the `touched_by_merge: bool` field\n  on `OpView` (`read.rs:202`) and its setters\n  (`read.rs:289`, `read.rs:329`) — once the guard is\n  gone, the flag has no consumer. Confirm with `cargo\n  check` and remove the dead code.\n\n## Test path\n\n- `cargo nextest run --workspace` is the primary signal.\n- Any test that exercises a merge AND triggers the\n  cross-check is the load-bearing one. Existing sync\n  integration tests should produce merged op-views.\n- If a real divergence surfaces:\n  - Write a focused unit test against `resolve_divergence`\n    that reproduces it (uses the `1c20aa3` test\n    scaffolding).\n  - Fix the resolver if the divergence is a real bug.\n  - If the divergence is the comment at `read.rs:78-84`\n    foresaw — file content reflects merge-driver winner\n    while op-replay reflects last-applied — either:\n    - Enrich the merge trailer with per-field\n      `Jjf-Resolved-*` payload so op-replay can be\n      authoritative across merges (the comment's\n      forward-looking plan), or\n    - Adjust `cross_check` to tolerate the specific\n      class of divergence with a documented reason.\n\n# Acceptance\n\n- [ ] `if !op_view.touched_by_merge` guard removed from\n  `read.rs`.\n- [ ] `touched_by_merge` field removed from `OpView` if\n  no remaining consumer.\n- [ ] `cargo nextest run --workspace` green.\n- [ ] If any divergence surfaced: a regression test\n  pinning the resolved behavior, plus a closing-comment\n  note describing what was found.\n- [ ] `read.rs` comment block at lines 78-84 updated to\n  reflect the new state (or removed entirely if the\n  forward-looking caveat no longer applies).\n\n# Out of scope\n\n- Adding new merge-policy features.\n- Reshaping `OpView` beyond removing the now-dead flag.\n- Performance work on the cross-check (it's debug-only).\n- Rewriting `cross_check` itself unless a divergence\n  forces it.\n\n# Pointers\n\n- Guard site: `crates/jjf-storage/src/read.rs:85`.\n- Flag declaration: `read.rs:202`.\n- Flag setters: `read.rs:289`, `read.rs:329`.\n- `cross_check` definition: `read.rs:343`.\n- The forward-looking comment: `read.rs:78-84`.\n- Resolver: `crates/jjf-storage/src/merge_ops.rs`.\n- Spec: `docs/storage-format.md` §6 (per-field merge policy).\n",
   "status": "closed",
+  "block_reason": null,
   "type": "feature",
+  "priority": null,
   "labels": [
     "epic:mvp-sync"
   ],
   "dependencies": [
-    "1c20aa3"
+    {
+      "target": "1c20aa3",
+      "kind": "blocks"
+    },
+    {
+      "target": "54caedd",
+      "kind": "parent-child"
+    }
   ],
   "assignee": null,
   "created_at": "2026-06-22T20:09:08Z",
-  "updated_at": "2026-06-22T20:43:56Z"
+  "updated_at": "2026-06-28T18:41:09Z"
 }
