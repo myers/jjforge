@@ -137,29 +137,25 @@ gated on the backend, and a few children each:
 # Two epics. -d EPIC_A on the frontend epic means
 # "frontend is blocked by backend until backend closes."
 EPIC_A=$(jjf new --json -t "Epic: backend rewrite" --type epic \
-    --slug backend -l epic -F /dev/null | jq -r .id)
+    --slug backend -F /dev/null | jq -r .id)
 EPIC_B=$(jjf new --json -t "Epic: frontend ship" --type epic \
-    --slug frontend -l epic -d $EPIC_A -F /dev/null | jq -r .id)
+    --slug frontend -d $EPIC_A -F /dev/null | jq -r .id)
 
-# Backend children — chained with `blocks` so they run in order.
+# Backend children — chained with `blocks` so they run in order,
+# and attached to the backend epic with `--parent`.
 DB=$(jjf new --json -t "Migrate auth tables" --type bug \
-    --slug migrate-auth -l epic:backend -F /dev/null | jq -r .id)
+    --slug migrate-auth --parent backend -F /dev/null | jq -r .id)
 API=$(jjf new --json -t "Rewrite /login handler" --type feature \
-    --slug rewrite-login -l epic:backend -d $DB -F /dev/null | jq -r .id)
+    --slug rewrite-login --parent backend -d $DB -F /dev/null | jq -r .id)
 TESTS=$(jjf new --json -t "Backend integration tests" --type feature \
-    --slug backend-tests -l epic:backend -d $API -F /dev/null | jq -r .id)
+    --slug backend-tests --parent backend -d $API -F /dev/null | jq -r .id)
 
-# Frontend children — parallel, no inter-child ordering.
+# Frontend children — parallel, no inter-child ordering,
+# and attached to the frontend epic with `--parent`.
 LOGIN=$(jjf new --json -t "Rewrite login page" --type feature \
-    --slug login-page -l epic:frontend -F /dev/null | jq -r .id)
+    --slug login-page --parent frontend -F /dev/null | jq -r .id)
 SETTINGS=$(jjf new --json -t "Settings page polish" --type feature \
-    --slug settings-page -l epic:frontend -F /dev/null | jq -r .id)
-
-# Attach every child to its epic with a `parent-child` edge.
-# This is what lets `jjf ready` cascade an epic's blocked state
-# down to its children.
-for c in $DB $API $TESTS; do jjf dep add --kind parent-child $c $EPIC_A; done
-for c in $LOGIN $SETTINGS; do jjf dep add --kind parent-child $c $EPIC_B; done
+    --slug settings-page --parent frontend -F /dev/null | jq -r .id)
 ```
 
 Two edge kinds, two roles:
@@ -211,11 +207,11 @@ waits on the backend epic (`blocks`), and the two frontend
 children inherit the frontend epic's blocked state through
 their `parent-child` edges.
 
-Scope `ready` to one epic with `--label`:
+Scope `ready` to one epic with `--parent`:
 
 ```bash
-jjf ready --label epic:backend   # 1 result: the migration
-jjf ready --label epic:frontend  # empty — everything cascaded blocked
+jjf ready --parent backend   # 1 result: the migration
+jjf ready --parent frontend  # empty — everything cascaded blocked
 ```
 
 Close the migration, watch the chain advance:
