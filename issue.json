@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "id": "03df0f3",
+  "title": "parent-matches-option-ref: use Option<&IssueId> for clippy idiom",
+  "slug": "parent-matches-option-ref",
+  "body": "# Goal\n\nCosmetic refactor of `parent_matches` in `crates/jjf/src/main.rs`\nto use the idiomatic `Option<&IssueId>` parameter shape instead\nof `&Option<IssueId>`. Forestalls clippy's `ref_option` lint and\nmatches the convention used by other helpers in the same file\n(e.g. `&[T]` slices instead of `&Vec<T>`).\n\n# Approach\n\n- Change `fn parent_matches(issue: &Issue, wanted: &Option<IssueId>) -> bool`\n  to `fn parent_matches(issue: &Issue, wanted: Option<&IssueId>) -> bool`.\n- Update the two call sites (`run_ls`, `run_search`) to pass\n  `parent_id.as_ref()` instead of `&parent_id`.\n- No behavior change. Tests should pass unchanged.\n\n# Source\n\nFinal whole-branch review of the `--parent` feature (2026-06-28\ndrop-epic-label) flagged this as a Minor item. Captured for\nfollow-up rather than blocking the original merge.\n\n# Acceptance\n\n- [ ] `parent_matches` signature takes `Option<&IssueId>`.\n- [ ] Both call sites updated.\n- [ ] `cargo nextest run --workspace` green.\n- [ ] `cargo clippy --workspace --all-targets` shows no new lints.\n",
+  "status": "open",
+  "block_reason": null,
+  "type": "feature",
+  "priority": null,
+  "labels": [],
+  "dependencies": [
+    {
+      "target": "5a755ec",
+      "kind": "parent-child"
+    }
+  ],
+  "assignee": null,
+  "created_at": "2026-06-28T19:36:08Z",
+  "updated_at": "2026-06-28T19:36:08Z"
+}
