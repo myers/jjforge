@@ -12,77 +12,11 @@
 //!   `slug_not_found`) carry the documented `details` shape.
 
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
 
 use jjf_storage::{IssueType, Status, Storage};
 
-const JJF_BIN: &str = env!("CARGO_BIN_EXE_jjf");
-
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join(".scratch")
-        .join(name);
-    if dir.exists() {
-        fs::remove_dir_all(&dir).unwrap();
-    }
-    fs::create_dir_all(&dir).unwrap();
-    fs::canonicalize(&dir).unwrap()
-}
-
-fn make_jj_repo(name: &str) -> PathBuf {
-    let dir = scratch(name);
-    let out = Command::new("jj")
-        .args(["git", "init"])
-        .current_dir(&dir)
-        .output()
-        .expect("spawn jj");
-    assert!(out.status.success());
-    dir
-}
-
-fn make_initialized_repo(name: &str) -> PathBuf {
-    let repo = make_jj_repo(name);
-    let out = Command::new(JJF_BIN)
-        .arg("init")
-        .current_dir(&repo)
-        .output()
-        .expect("spawn jjf init");
-    assert!(
-        out.status.success(),
-        "jjf init failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    repo
-}
-
-fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(JJF_BIN)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("spawn jjf")
-}
-
-fn run_jjf_with_stdin(cwd: &Path, args: &[&str], stdin_bytes: &[u8]) -> Output {
-    let mut child = Command::new(JJF_BIN)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn jjf");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(stdin_bytes)
-        .unwrap();
-    child.wait_with_output().unwrap()
-}
+mod common;
+use common::*;
 
 #[test]
 fn new_with_type_and_slug_round_trips_via_storage() {

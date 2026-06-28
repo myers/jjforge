@@ -21,7 +21,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const JJF_BIN: &str = env!("CARGO_BIN_EXE_jjf");
+mod common;
+use common::{run_jjf, JJF_BIN};
 
 /// Per-test scratch root. Gitignored via the workspace-level rule.
 fn scratch(name: &str) -> PathBuf {
@@ -34,14 +35,6 @@ fn scratch(name: &str) -> PathBuf {
     }
     fs::create_dir_all(&dir).unwrap();
     fs::canonicalize(&dir).unwrap()
-}
-
-fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(JJF_BIN)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("spawn jjf")
 }
 
 fn must_succeed(out: &Output, what: &str) {

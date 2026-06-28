@@ -22,24 +22,12 @@
 //! Same hermetic-scratch / no-`assert_cmd` discipline as the other
 //! test files in this crate.
 
-use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-const JJF_BIN: &str = env!("CARGO_BIN_EXE_jjf");
-
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join(".scratch")
-        .join(name);
-    if dir.exists() {
-        fs::remove_dir_all(&dir).unwrap();
-    }
-    fs::create_dir_all(&dir).unwrap();
-    fs::canonicalize(&dir).unwrap()
-}
+mod common;
+use common::{scratch, JJF_BIN};
 
 /// Build a jj repo with the given user.name + user.email pinned in
 /// repo-local config. Pass `user = None` to leave user.name unset

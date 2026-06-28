@@ -13,67 +13,15 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
 
-const JJF_BIN: &str = env!("CARGO_BIN_EXE_jjf");
+mod common;
+use common::*;
 
 /// The cap pinned by `jjf-storage::BODY_MAX_BYTES`. Re-declared
 /// here so the CLI test fixtures don't need an extra crate
 /// dependency — the value is part of the public CLI contract and
 /// must not drift independently.
 const BODY_MAX_BYTES: usize = 65_536;
-
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join(".scratch")
-        .join(name);
-    if dir.exists() {
-        fs::remove_dir_all(&dir).unwrap();
-    }
-    fs::create_dir_all(&dir).unwrap();
-    fs::canonicalize(&dir).unwrap()
-}
-
-fn make_jj_repo(name: &str) -> PathBuf {
-    let dir = scratch(name);
-    let out = Command::new("jj")
-        .args(["git", "init"])
-        .current_dir(&dir)
-        .output()
-        .expect("spawn jj");
-    assert!(out.status.success());
-    dir
-}
-
-fn make_initialized_repo(name: &str) -> PathBuf {
-    let repo = make_jj_repo(name);
-    let out = Command::new(JJF_BIN)
-        .arg("init")
-        .current_dir(&repo)
-        .output()
-        .expect("spawn jjf init");
-    assert!(
-        out.status.success(),
-        "jjf init failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    repo
-}
-
-fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(JJF_BIN)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("spawn jjf")
-}
-
-fn parse_envelope(stderr_bytes: &[u8]) -> serde_json::Value {
-    let s = String::from_utf8_lossy(stderr_bytes);
-    serde_json::from_str(s.trim())
-        .unwrap_or_else(|e| panic!("envelope must be json; got {s:?}: {e}"))
-}
 
 /// Write a file of exactly `n` ASCII bytes and return its path.
 fn write_body_file(dir: &Path, name: &str, n: usize) -> PathBuf {

@@ -20,47 +20,11 @@
 //! tests never reach — `remote add` doesn't talk to the URL, just
 //! records it, so the test is fully offline.
 
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::path::Path;
+use std::process::Command;
 
-const JJF_BIN: &str = env!("CARGO_BIN_EXE_jjf");
-
-/// Per-test scratch root. Gitignored via the workspace-level rule.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join(".scratch")
-        .join(name);
-    if dir.exists() {
-        fs::remove_dir_all(&dir).unwrap();
-    }
-    fs::create_dir_all(&dir).unwrap();
-    fs::canonicalize(&dir).unwrap()
-}
-
-fn make_jj_repo(name: &str) -> PathBuf {
-    let dir = scratch(name);
-    let out = Command::new("jj")
-        .args(["git", "init"])
-        .current_dir(&dir)
-        .output()
-        .expect("spawn jj");
-    assert!(
-        out.status.success(),
-        "jj git init failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    dir
-}
-
-fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(JJF_BIN)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("spawn jjf")
-    }
+mod common;
+use common::*;
 
 // --- tests ---------------------------------------------------------
 

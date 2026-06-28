@@ -7,96 +7,17 @@
 //! `assert_cmd` dep — `CARGO_BIN_EXE_jjf` + `std::process` is enough.
 
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::path::Path;
+use std::process::Command;
 
 use jjf_storage::{DepEdge, DepKind, IssueId, Storage};
 
-/// Path to the compiled `jjf` binary. Cargo sets this env var for every
-/// integration test in the same package as the `[[bin]]` target.
-const JJF_BIN: &str = env!("CARGO_BIN_EXE_jjf");
-
-/// Per-test scratch root. Excluded from git via the workspace-level
-/// `.gitignore` rule for `crates/**/tests/.scratch/`.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join(".scratch")
-        .join(name);
-    if dir.exists() {
-        fs::remove_dir_all(&dir).unwrap();
-    }
-    fs::create_dir_all(&dir).unwrap();
-    fs::canonicalize(&dir).unwrap()
-}
-
-/// Make a directory that's a fresh jj repo with no `issues` bookmark.
-fn make_jj_repo(name: &str) -> PathBuf {
-    let dir = scratch(name);
-    let out = Command::new("jj")
-        .args(["git", "init"])
-        .current_dir(&dir)
-        .output()
-        .expect("spawn jj");
-    assert!(
-        out.status.success(),
-        "jj git init failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    dir
-}
-
-/// Make a directory that's a fresh jj repo AND has `issues` bookmarked
-/// (so subsequent `jjf new` calls pass the preflight). The pattern most
-/// of these tests want.
-fn make_initialized_repo(name: &str) -> PathBuf {
-    let repo = make_jj_repo(name);
-    let out = Command::new(JJF_BIN)
-        .arg("init")
-        .current_dir(&repo)
-        .output()
-        .expect("spawn jjf init");
-    assert!(
-        out.status.success(),
-        "jjf init in {} failed: {}",
-        repo.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    repo
-}
-
-/// Run `jjf <args...>` in `cwd` with no stdin, capture exit/stdout/stderr.
-fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(JJF_BIN)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("spawn jjf")
-    }
-
-/// Run `jjf <args...>` in `cwd`, piping `stdin_bytes` into stdin.
-fn run_jjf_with_stdin(cwd: &Path, args: &[&str], stdin_bytes: &[u8]) -> Output {
-    let mut child = Command::new(JJF_BIN)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn jjf");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin handle")
-        .write_all(stdin_bytes)
-        .expect("write stdin");
-    child.wait_with_output().expect("wait for jjf")
-}
+mod common;
+use common::*;
 
 /// Parse the stdout of a successful `jjf new` invocation (plain-text
 /// mode: a single line containing the new bug's id) into a `IssueId`.
-fn parse_id_from_stdout(stdout: &[u8]) -> IssueId {
+fn parse_id_from_plain_stdout(stdout: &[u8]) -> IssueId {
     let line = String::from_utf8_lossy(stdout);
     let trimmed = line.trim();
     IssueId::parse(trimmed)
@@ -121,7 +42,7 @@ fn new_happy_path_reads_stdin_and_round_trips_via_storage() {
         out.status.code(),
         String::from_utf8_lossy(&out.stderr),
     );
-    let id = parse_id_from_stdout(&out.stdout);
+    let id = parse_id_from_plain_stdout(&out.stdout);
 
     // Read back via the storage crate directly — this proves the bug
     // landed on the bookmark and that every field round-trips.
@@ -310,7 +231,7 @@ fn new_full_field_round_trip() {
         "first jjf new failed: {}",
         String::from_utf8_lossy(&first.stderr)
     );
-    let first_id = parse_id_from_stdout(&first.stdout);
+    let first_id = parse_id_from_plain_stdout(&first.stdout);
 
     // Now: a bug with title, body via stdin, two labels, the first
     // bug as a dep, and an assignee. Every field should round-trip.
@@ -340,7 +261,7 @@ fn new_full_field_round_trip() {
         second.status.code(),
         String::from_utf8_lossy(&second.stderr),
     );
-    let second_id = parse_id_from_stdout(&second.stdout);
+    let second_id = parse_id_from_plain_stdout(&second.stdout);
     assert_ne!(
         second_id, first_id,
         "two distinct creates must yield distinct ids"
@@ -371,7 +292,7 @@ fn new_with_parent_flag_creates_parent_child_edge() {
         b"epic body",
     );
     assert!(epic.status.success(), "epic create failed: {}", String::from_utf8_lossy(&epic.stderr));
-    let epic_id = parse_id_from_stdout(&epic.stdout);
+    let epic_id = parse_id_from_plain_stdout(&epic.stdout);
 
     let child = run_jjf_with_stdin(
         &repo,
@@ -384,7 +305,7 @@ fn new_with_parent_flag_creates_parent_child_edge() {
         child.status.code(),
         String::from_utf8_lossy(&child.stderr),
     );
-    let child_id = parse_id_from_stdout(&child.stdout);
+    let child_id = parse_id_from_plain_stdout(&child.stdout);
 
     let storage = Storage::open(&repo).expect("open storage");
     let bug = storage.read(&child_id).expect("read child");
@@ -401,9 +322,9 @@ fn new_with_parent_and_dep_compose() {
     let repo = make_initialized_repo("new_parent_plus_dep");
 
     let epic = run_jjf_with_stdin(&repo, &["new", "-t", "Epic", "--type", "epic", "-F", "-"], b"");
-    let epic_id = parse_id_from_stdout(&epic.stdout);
+    let epic_id = parse_id_from_plain_stdout(&epic.stdout);
     let blocker = run_jjf_with_stdin(&repo, &["new", "-t", "blocker", "-F", "-"], b"");
-    let blocker_id = parse_id_from_stdout(&blocker.stdout);
+    let blocker_id = parse_id_from_plain_stdout(&blocker.stdout);
 
     let child = run_jjf_with_stdin(
         &repo,
@@ -419,7 +340,7 @@ fn new_with_parent_and_dep_compose() {
         "compose failed: {}",
         String::from_utf8_lossy(&child.stderr)
     );
-    let child_id = parse_id_from_stdout(&child.stdout);
+    let child_id = parse_id_from_plain_stdout(&child.stdout);
 
     let storage = Storage::open(&repo).expect("open storage");
     let bug = storage.read(&child_id).expect("read child");
@@ -474,7 +395,7 @@ fn new_with_parent_slug_resolves_to_id() {
         "epic create failed: {}",
         String::from_utf8_lossy(&epic.stderr)
     );
-    let epic_id = parse_id_from_stdout(&epic.stdout);
+    let epic_id = parse_id_from_plain_stdout(&epic.stdout);
 
     // Now create a child using the slug — must succeed and land the
     // parent-child edge to the resolved id.
@@ -489,7 +410,7 @@ fn new_with_parent_slug_resolves_to_id() {
         child.status.code(),
         String::from_utf8_lossy(&child.stderr),
     );
-    let child_id = parse_id_from_stdout(&child.stdout);
+    let child_id = parse_id_from_plain_stdout(&child.stdout);
 
     let storage = Storage::open(&repo).expect("open storage");
     let bug = storage.read(&child_id).expect("read child");
@@ -540,7 +461,7 @@ fn new_with_no_file_flag_creates_bug_with_empty_body() {
         out.status.code(),
         String::from_utf8_lossy(&out.stderr),
     );
-    let id = parse_id_from_stdout(&out.stdout);
+    let id = parse_id_from_plain_stdout(&out.stdout);
 
     let storage = Storage::open(&repo).expect("open storage");
     let bug = storage.read(&id).expect("read bug");
@@ -572,7 +493,7 @@ fn new_with_file_flag_reads_path_not_stdin() {
         "jjf new -F <path> failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let id = parse_id_from_stdout(&out.stdout);
+    let id = parse_id_from_plain_stdout(&out.stdout);
 
     let storage = Storage::open(&repo).expect("open storage");
     let bug = storage.read(&id).expect("read bug");

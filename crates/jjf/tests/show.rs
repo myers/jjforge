@@ -14,89 +14,11 @@
 //! `tests/new.rs` does for write-side assertions). Same hermetic
 //! scratch / no-`assert_cmd` discipline as the other test files.
 
-use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::path::Path;
+use std::process::Command;
 
-/// Path to the compiled `jjf` binary. Cargo sets this env var for every
-/// integration test in the same package as the `[[bin]]` target.
-const JJF_BIN: &str = env!("CARGO_BIN_EXE_jjf");
-
-/// Per-test scratch root. Excluded from git via the workspace-level
-/// `.gitignore` rule for `crates/**/tests/.scratch/`.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join(".scratch")
-        .join(name);
-    if dir.exists() {
-        fs::remove_dir_all(&dir).unwrap();
-    }
-    fs::create_dir_all(&dir).unwrap();
-    fs::canonicalize(&dir).unwrap()
-}
-
-/// Make a directory that's a fresh jj repo with no `issues` bookmark.
-fn make_jj_repo(name: &str) -> PathBuf {
-    let dir = scratch(name);
-    let out = Command::new("jj")
-        .args(["git", "init"])
-        .current_dir(&dir)
-        .output()
-        .expect("spawn jj");
-    assert!(
-        out.status.success(),
-        "jj git init failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    dir
-}
-
-/// Make a directory that's a fresh jj repo AND has `issues` bookmarked.
-fn make_initialized_repo(name: &str) -> PathBuf {
-    let repo = make_jj_repo(name);
-    let out = Command::new(JJF_BIN)
-        .arg("init")
-        .current_dir(&repo)
-        .output()
-        .expect("spawn jjf init");
-    assert!(
-        out.status.success(),
-        "jjf init in {} failed: {}",
-        repo.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    repo
-}
-
-/// Run `jjf <args...>` in `cwd` with no stdin, capture exit/stdout/stderr.
-fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(JJF_BIN)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("spawn jjf")
-}
-
-/// Run `jjf <args...>` in `cwd`, piping `stdin_bytes` into stdin.
-fn run_jjf_with_stdin(cwd: &Path, args: &[&str], stdin_bytes: &[u8]) -> Output {
-    let mut child = Command::new(JJF_BIN)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn jjf");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin handle")
-        .write_all(stdin_bytes)
-        .expect("write stdin");
-    child.wait_with_output().expect("wait for jjf")
-}
+mod common;
+use common::*;
 
 /// Create a bug with the given title/body via `jjf new` and return its
 /// freshly-minted id. Centralized so each `show` test reads one line

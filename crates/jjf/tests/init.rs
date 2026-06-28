@@ -12,54 +12,11 @@
 //! is enough for what we need, and matches the rest of the
 //! workspace's "narrow dep list" discipline.
 
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::path::Path;
+use std::process::Command;
 
-/// Path to the compiled `jjf` binary. Cargo sets this env var for
-/// every integration test in the same package as the `[[bin]]`
-/// target. It's not a runtime env var — it's interpolated at compile
-/// time via `env!`.
-const JJF_BIN: &str = env!("CARGO_BIN_EXE_jjf");
-
-/// Per-test scratch root under the crate. Excluded from git via the
-/// workspace-level `.gitignore` rule for `crates/**/tests/.scratch/`.
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join(".scratch")
-        .join(name);
-    if dir.exists() {
-        fs::remove_dir_all(&dir).unwrap();
-    }
-    fs::create_dir_all(&dir).unwrap();
-    fs::canonicalize(&dir).unwrap()
-}
-
-/// Make a directory that's a fresh jj repo with no `issues` bookmark.
-fn make_jj_repo(name: &str) -> PathBuf {
-    let dir = scratch(name);
-    let out = Command::new("jj")
-        .args(["git", "init"])
-        .current_dir(&dir)
-        .output()
-        .expect("spawn jj");
-    assert!(
-        out.status.success(),
-        "jj git init failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    dir
-}
-
-/// Run `jjf <args...>` in `cwd`, capture exit/stdout/stderr.
-fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(JJF_BIN)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("spawn jjf")
-}
+mod common;
+use common::*;
 
 /// Convenience: list the `issues` bookmark via jj, return true if it
 /// exists. We re-implement the storage crate's probe here rather than

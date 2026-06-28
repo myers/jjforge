@@ -20,67 +20,8 @@
 //! Style mirrors `tests/type_and_slug.rs` (the sibling slug-validation
 //! integration suite).
 
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-
-const JJF_BIN: &str = env!("CARGO_BIN_EXE_jjf");
-
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join(".scratch")
-        .join(name);
-    if dir.exists() {
-        fs::remove_dir_all(&dir).unwrap();
-    }
-    fs::create_dir_all(&dir).unwrap();
-    fs::canonicalize(&dir).unwrap()
-}
-
-fn make_jj_repo(name: &str) -> PathBuf {
-    let dir = scratch(name);
-    let out = Command::new("jj")
-        .args(["git", "init"])
-        .current_dir(&dir)
-        .output()
-        .expect("spawn jj");
-    assert!(out.status.success());
-    dir
-}
-
-fn make_initialized_repo(name: &str) -> PathBuf {
-    let repo = make_jj_repo(name);
-    let out = Command::new(JJF_BIN)
-        .arg("init")
-        .current_dir(&repo)
-        .output()
-        .expect("spawn jjf init");
-    assert!(
-        out.status.success(),
-        "jjf init failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    repo
-}
-
-fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(JJF_BIN)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("spawn jjf")
-}
-
-/// Parse stderr as the JSON error envelope. Panics with a helpful
-/// message if the bytes aren't valid JSON — useful when a test fails
-/// because the rejection didn't fire (and stderr is a human-readable
-/// error trace instead).
-fn parse_envelope(stderr_bytes: &[u8]) -> serde_json::Value {
-    let s = String::from_utf8_lossy(stderr_bytes);
-    serde_json::from_str(s.trim())
-        .unwrap_or_else(|e| panic!("envelope must be json; got {s:?}: {e}"))
-}
+mod common;
+use common::*;
 
 // --- `jjf new -t <bad>` rejections ---------------------------------------
 

@@ -5,23 +5,11 @@
 //! Mirrors the hermetic-scratch style of `init.rs` and the other test
 //! files in this crate.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const JJF_BIN: &str = env!("CARGO_BIN_EXE_jjf");
-
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join(".scratch")
-        .join(name);
-    if dir.exists() {
-        fs::remove_dir_all(&dir).unwrap();
-    }
-    fs::create_dir_all(&dir).unwrap();
-    fs::canonicalize(&dir).unwrap()
-}
+mod common;
+use common::{scratch, run_jjf, JJF_BIN};
 
 /// Make a directory that's an initialized jj+jjf repo (i.e. the
 /// `issues` bookmark exists).
@@ -44,14 +32,6 @@ fn make_initialized(name: &str) -> PathBuf {
         String::from_utf8_lossy(&init.stderr)
     );
     dir
-}
-
-fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(JJF_BIN)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("spawn jjf")
 }
 
 fn run_jjf_stdin(cwd: &Path, args: &[&str], stdin: &str) -> Output {

@@ -7,57 +7,12 @@
 //! Same hermetic-scratch / no-`assert_cmd` discipline as `search.rs`
 //! and `ls.rs`.
 
-use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-const JJF_BIN: &str = env!("CARGO_BIN_EXE_jjf");
-
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join(".scratch")
-        .join(name);
-    if dir.exists() {
-        fs::remove_dir_all(&dir).unwrap();
-    }
-    fs::create_dir_all(&dir).unwrap();
-    fs::canonicalize(&dir).unwrap()
-}
-
-fn make_jj_repo(name: &str) -> PathBuf {
-    let dir = scratch(name);
-    let out = Command::new("jj")
-        .args(["git", "init"])
-        .current_dir(&dir)
-        .output()
-        .expect("spawn jj");
-    assert!(
-        out.status.success(),
-        "jj git init failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    dir
-}
-
-fn make_initialized_repo(name: &str) -> PathBuf {
-    let repo = make_jj_repo(name);
-    // jjf init at "now" — the seed commit's timestamp isn't load-
-    // bearing for stale tests, so we don't pin the clock here.
-    let out = Command::new(JJF_BIN)
-        .arg("init")
-        .current_dir(&repo)
-        .output()
-        .expect("spawn jjf init");
-    assert!(
-        out.status.success(),
-        "jjf init in {} failed: {}",
-        repo.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    repo
-}
+mod common;
+use common::{make_initialized_repo, JJF_BIN};
 
 fn run_jjf_with_env(cwd: &Path, args: &[&str], clock_secs: u64) -> Output {
     Command::new(JJF_BIN)

@@ -13,59 +13,12 @@
 //! - Plain-text row renders `P0`..`P4` or `-` in column 3.
 //! - `set-priority` op trailer round-trips through the parser.
 
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::path::Path;
 
 use jjf_storage::{Op, IssueId};
 
-const JJF_BIN: &str = env!("CARGO_BIN_EXE_jjf");
-
-fn scratch(name: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join(".scratch")
-        .join(name);
-    if dir.exists() {
-        fs::remove_dir_all(&dir).unwrap();
-    }
-    fs::create_dir_all(&dir).unwrap();
-    fs::canonicalize(&dir).unwrap()
-}
-
-fn make_jj_repo(name: &str) -> PathBuf {
-    let dir = scratch(name);
-    let out = Command::new("jj")
-        .args(["git", "init"])
-        .current_dir(&dir)
-        .output()
-        .expect("spawn jj");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    dir
-}
-
-fn make_initialized_repo(name: &str) -> PathBuf {
-    let repo = make_jj_repo(name);
-    let out = Command::new(JJF_BIN)
-        .arg("init")
-        .current_dir(&repo)
-        .output()
-        .expect("spawn jjf init");
-    assert!(
-        out.status.success(),
-        "jjf init failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    repo
-}
-
-fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(JJF_BIN)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("spawn jjf")
-}
+mod common;
+use common::*;
 
 fn create_issue(repo: &Path, title: &str, extra_args: &[&str]) -> String {
     let mut args: Vec<&str> = vec!["new", "-t", title];
