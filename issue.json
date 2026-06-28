@@ -8,9 +8,7 @@
   "block_reason": null,
   "type": "feature",
   "priority": null,
-  "labels": [
-    "epic:storage-v3-out-of-tree"
-  ],
+  "labels": [],
   "dependencies": [
     {
       "target": "07c1dc9",
@@ -27,5 +25,5 @@
   ],
   "assignee": null,
   "created_at": "2026-06-23T23:37:34Z",
-  "updated_at": "2026-06-28T18:39:34Z"
+  "updated_at": "2026-06-28T18:39:35Z"
 }
