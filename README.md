@@ -1,5 +1,26 @@
 # jjforge
 
+> **Alpha** — written by a coding agent, has been only lightly used so far. YOU HAVE BEEN WARNED.
+
+## Quickstart
+
+You'll need a recent Rust toolchain and [jj](https://github.com/jj-vcs/jj)
+on your PATH (jjforge shells out to `jj`).
+
+```bash
+cargo install --git https://github.com/myers/jjforge.git jjf
+cd /your/jj/repo
+jjf init                              # plant refs/jjf/* namespace
+echo "the body" | jjf new -t "first issue" -F -
+jjf ls
+```
+
+For the full walk-through (push/pull across clones, dep edges,
+the agent-ergonomics verbs like `ready` and `remember`), see
+[docs/quickstart.md](docs/quickstart.md).
+
+## What this is
+
 A jj-native, agent-first issue tracker. CLI: `jjf`.
 
 **Status:** post-MVP. The Rust binary at `crates/jjf/` covers
@@ -9,10 +30,8 @@ two clones can edit issues offline and converge without human
 intervention. Spec pinned in `docs/storage-format.md`; output
 contract in `docs/cli-json.md`.
 
-The project is self-hosted at
-[github.com/myers/jjforge](https://github.com/myers/jjforge)
-on a Forgejo instance, and it tracks its own work — see the
-roadmap (`jjf show 9566f52`) for what's open and what's next.
+It tracks its own work — see the roadmap (`jjf show roadmap`)
+for what's open and what's next.
 
 ## Inspirations
 
