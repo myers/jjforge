@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "id": "b417864",
+  "title": "new-parent-slug-broken: jjf new --parent rejects slugs (must use 7-hex id)",
+  "slug": "new-parent-slug-broken",
+  "body": "# Goal\n\nFix `jjf new --parent <slug>` to accept slugs the same way every\nother `--parent`-taking verb does (`jjf ls`, `jjf ready`,\n`jjf search` all resolve slug or 7-hex via the v2.1 resolver).\n\n# Repro\n\n```\n$ jjf new -t \"test\" --type feature --slug demo --parent agent-ergonomics -F /dev/null\n{\"ok\":false,\"error\":{\"kind\":\"bad_id\",\"message\":\"invalid issue id for --dep \\\"--parent agent-ergonomics\\\": issue id must be 7 chars, got 16\",...}}\n```\n\nWorkaround: pass the 7-hex id (`--parent 5a755ec`) instead of\nthe slug.\n\n# Source\n\nThe bug is in `run_new` at `crates/jjf/src/main.rs:2107-2114`.\nThe `--parent` plumbing (added in fj#3, \"new-dep-kinds\") calls\n`IssueId::parse(&raw)` directly on the value, which only accepts\n7-char hex. The `resolve_handle(&storage, &handle)` resolver\nused by `run_ls` / `run_ready` / `run_search` (added in the\n2026-06-28 drop-epic-label work) isn't called here.\n\nSurfaced 2026-06-28 while filing follow-up tickets from the\nfinal whole-branch review of the drop-epic-label feature —\ntrying to use `--parent agent-ergonomics` failed.\n\nNote: the migration script\n(`experiments/drop-epic-labels/run.sh`) was unaffected because\nit called `jjf dep add --kind parent-child <child> <epic-id>`\nwith pre-resolved 7-hex ids from a JSON catalog, not slugs.\n\n# Fix\n\nIn `run_new`, replace the direct `IssueId::parse(&raw)` call\nwith `resolve_handle(&storage, &raw)?` — same call shape the\nother verbs use. Requires that `Storage` is opened before the\ndep-parsing block (the current order opens storage AFTER\nparsing), so the fix may include a reorder of the preflight\nsteps OR a deferred resolution.\n\n# Acceptance\n\n- [ ] `jjf new -t \"x\" --parent <slug> -F /dev/null` succeeds with\n      a `parent-child` edge to the resolved id.\n- [ ] `jjf new -t \"x\" --parent <7-hex-id> -F /dev/null` still\n      succeeds (the existing path).\n- [ ] `jjf new -t \"x\" --parent no-such-slug -F /dev/null` exits\n      2 with `slug_not_found`.\n- [ ] New CLI integration test in `crates/jjf/tests/new.rs`\n      pinning the slug-resolution path.\n",
+  "status": "open",
+  "block_reason": null,
+  "type": "bug",
+  "priority": null,
+  "labels": [],
+  "dependencies": [
+    {
+      "target": "5a755ec",
+      "kind": "parent-child"
+    }
+  ],
+  "assignee": null,
+  "created_at": "2026-06-28T19:35:54Z",
+  "updated_at": "2026-06-28T19:35:54Z"
+}
