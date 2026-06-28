@@ -58,7 +58,7 @@ an epic, `--type` and `--slug` recommended on every new ticket.
 
 ```bash
 cat <<'EOF' | jjf new --json -t "Real title" --type feature \
-    --slug add-new-feature -l epic:foo -F -
+    --slug add-new-feature --parent foo -F -
 # Goal
 
 What done looks like.
@@ -124,9 +124,9 @@ ride the planner via `jjf push` / `pull`.
 
 ```bash
 jjf ls --type bug                                  # all bugs
-jjf ls --label epic:foo --status open              # work under epic
+jjf ls --parent foo --status open                  # work under epic
 jjf ls --status all                                # everything
-jjf ls --json --label epic | jq '.[] | .id'        # script-friendly
+jjf ls --json --type epic | jq '.[] | .id'         # script-friendly
 jjf show <handle>                                  # one issue + comments
 jjf search "needle"                                # titles + bodies
 jjf search "needle" --include-comments             # plus comments
@@ -155,6 +155,7 @@ rules for parallel dispatch.
 |---|---|
 | Used a 7-char id in a dispatch message or commit when the issue has a slug | Use the slug; both at once is fine when grep-anchoring matters |
 | `jjf new --dep <epic>` when meaning "child of epic" | Use `--parent <epic>` — `-d` defaults to `blocks`, which prevents the new issue from ever appearing in `jjf ready` |
+| Used a label to attach a child to an epic | The label-based epic convention was retired. Use `--parent <epic>` on `jjf new`, or `jjf dep add --kind parent-child <child> <epic>` after the fact. Filter with `jjf ls --parent <epic>`. |
 | Looked for an editor to pop up | Bodies are `-F <path>` or `-F -`. There are no prompts |
 | Tried partial-id lookup like `jjf show a3f` | Pass the full 7-char id, or use the slug |
 | Closed an issue with `--status closed` instead of `jjf close` | Both work; `jjf close <id>` is shorter and reads better in scripts |

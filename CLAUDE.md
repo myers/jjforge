@@ -94,12 +94,13 @@ bottom of this file.
 
 - **`roadmap`** — the running plan (one ticket, never closes;
   body edited in place via `jjf update --body-file`).
-- **`epic`** — the top-level epic issues. Each carries the goal,
-  the sketched approach, the tickets we expect to file under it,
-  and its dependency graph.
-- **`epic:<slug>`** — every issue belonging to an epic (the epic
-  itself plus child tickets when they're filed). Use the
-  colon-prefixed form always.
+- Issues that belong to an epic attach via a `parent-child` dep
+  edge. Use `--parent <epic>` on `jjf new`, or `jjf dep add
+  --kind parent-child <child> <epic>` after the fact. Filter
+  with `jjf ls --parent <epic>` / `jjf ready --parent <epic>`.
+- Epics themselves are typed `epic` (`--type epic`). The
+  label-based epic convention is retired (replaced by the
+  parent-child edge above).
 
 ### Epics vs child issues
 
@@ -111,7 +112,7 @@ Keep the two layers separate. The epic body must NOT enumerate
 its children or absorb their findings: no "Child tickets:
 `abc1234` — …" lists, no "Post-X sweep" subsections naming the
 shipped tickets. The child inventory is discovered via
-`jjf ls --label epic:<slug> --status all`; the epic body is
+`jjf ls --parent <epic> --status all`; the epic body is
 stable across the life of the epic.
 
 When closing an epic, the body's status section gets a "Done
@@ -137,7 +138,7 @@ show 69d5e1b`, and the type drives `jjf ls --type bug` /
 `jjf ready`'s priority sort.
 
 ```bash
-cat <<'EOF' | jjf new --json -t "Real title goes here" -F - -l epic -l epic:mvp-cli
+cat <<'EOF' | jjf new --json -t "Real title goes here" --parent mvp-cli -F - -l epic
 # Goal
 
 What does done look like.
@@ -615,7 +616,7 @@ Useful invocations for navigating jjforge. See
 jjf show roadmap                  # by slug (also `--type roadmap`)
 
 # Epics — the six top-level milestones
-jjf ls --label epic
+jjf ls --type epic
 
 # All tickets of a given type (v2.1)
 jjf ls --type bug
@@ -631,20 +632,20 @@ jjf ls --slug agent
 jjf ready                         # everything that's unblocked
 jjf ready --limit 1               # just the next one
 jjf ready --json --limit 1        # machine-readable, one issue
-jjf ready --label backend         # filter by label intersection
+jjf ready --parent backend        # filter by parent epic
 jjf ready --type bug              # bugs only
 
 # Work under one epic — open tickets only
-jjf ls --label epic:mvp-storage --status open
+jjf ls --parent mvp-storage --status open
 
 # Everything ever attached to an epic — open and closed
-jjf ls --label epic:mvp-sync --status all
+jjf ls --parent mvp-sync --status all
 
 # Closed tickets
 jjf ls --status closed
 
 # JSON for scripting
-jjf ls --json --label epic | jq '.[] | {id, title}'
+jjf ls --json --type epic | jq '.[] | {id, title}'
 
 # Substring search across titles, bodies, and (optionally)
 # comment bodies (v2.9). Case-insensitive, NOT regex. Default
@@ -660,7 +661,7 @@ jjf search --json "needle" --limit 5 \
 # --days 14; default --status open. Sorted oldest first.
 # Plain-text age column: Nd (<30d) / Nw (30-90d) / Nmo (>=90d).
 jjf stale --days 14                                # default; open issues only
-jjf stale --days 1 --label epic:host-asterinas --json  # compose with filters
+jjf stale --days 1 --parent host-asterinas --status open --json  # compose with filters
 ```
 
 Filters jjforge doesn't yet ship that we want (file as

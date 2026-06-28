@@ -602,6 +602,9 @@ Type and slug filters:
   type.
 - `--slug <pattern>` — case-sensitive substring match against
   the `slug` field. Issues without a slug never match.
+- `--parent <H>` — Filter to issues with a `parent-child` dep
+  edge to `<H>`. `<H>` is an id or slug. Unknown → exit 2
+  (`slug_not_found`).
 
 ```sh
 $ jjf ls --json --type bug --type feature
@@ -645,6 +648,9 @@ Filters:
   `jjf ls --type`. Note that `Roadmap`-typed issues are
   excluded from the ready set entirely — they're the planning
   surface, not work to do — regardless of this filter.
+- `--parent <H>` — Filter to issues with a `parent-child` dep
+  edge to `<H>`. `<H>` is an id or slug. Unknown → exit 2
+  (`slug_not_found`).
 - `--limit <N>` — truncate to the first N entries AFTER the
   priority sort. Omit for unlimited.
 - `--include-claimed` — also include `in-progress` issues in
@@ -729,6 +735,9 @@ Flags:
   --label`.
 - `--type <T>` — repeatable, OR-semantics. Mirrors `jjf ls
   --type`.
+- `--parent <H>` — Filter to issues with a `parent-child` dep
+  edge to `<H>`. `<H>` is an id or slug. Unknown → exit 2
+  (`slug_not_found`).
 - `--include-comments` — also search comment bodies. Off by
   default so the cheap "what mentions X" case stays unambiguous.
 - `--limit <N>` — cap the result list after the sort. Default
@@ -818,8 +827,8 @@ the human-friendly token `Nd` (<30d) / `Nw` (30-90d) / `Nmo`
 Compose filters with the threshold:
 
 ```sh
-$ jjf stale --days 7 --label epic:host-asterinas --status open --json
-[ ... only stale issues with the `epic:host-asterinas` label, open status ... ]
+$ jjf stale --days 7 --parent host-asterinas --status open --json
+[ ... only stale issues in the `host-asterinas` epic, open status ... ]
 ```
 
 Error path — running outside a jj repo:
