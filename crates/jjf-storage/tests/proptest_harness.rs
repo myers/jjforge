@@ -635,6 +635,157 @@ fn apply_list_ready_mutation(
     }
 }
 
+// --- cycle-rejection generator + walker ---------------------------
+//
+// Issue `1078439` (proptest-cycle-rejection, epic:agent-ergonomics).
+// Drives Property 7: `Storage::add_dep_edge` must NEVER land an edge
+// that would close a `Blocks`-or-`ParentChild` cycle — including
+// mixed-kind cycles where the existing edges are one kind and the
+// new edge is another. Failed cycle attempts surface a typed
+// `Error::DependencyCycle` (single-kind: `43c7615`, mixed-kind:
+// `121f48b`); the source record's dep list is left untouched.
+//
+// Generator shape: `multi_issue_plan_strategy` already builds a
+// strict-upper-triangle DAG (every edge `child_idx > parent_idx`).
+// We tack ONE extra edge onto the plan whose orientation can be
+// either DAG-keeping or cycle-closing. The cycle-closing flavor is
+// a back-edge `(parent_idx, child_idx, kind)` against the existing
+// DAG — picking an existing forward edge `(a, b)` and issuing
+// `add_dep_edge(b, a, kind)` reliably attempts to close a cycle.
+// We also allow self-edges (target == source) to exercise the
+// `Error::SelfDependency` reject path on the same property.
+//
+// The extra-edge `kind` is sampled across all four `DepKind`
+// variants. `Blocks` and `ParentChild` participate in cycle
+// detection (and can be cycle-closing); `Related` and
+// `DiscoveredFrom` never block — adding them to either orientation
+// must always succeed and never trip the cycle path.
+
+/// One add-dep-edge attempt the cycle property fires AFTER the base
+/// DAG is in place. Modeled as data so the strategy itself stays
+/// pure (proptest shrinker friendly).
+#[derive(Debug, Clone)]
+enum ExtraEdge {
+    /// `add_dep_edge(owner_idx, target_idx, kind)`. The base DAG has
+    /// `owner_idx < target_idx` for an edge `owner -> target` in
+    /// the plan's `(child_idx, parent_idx, kind)` triples, so to
+    /// reverse a base edge into a back-edge attempt we issue
+    /// `add_dep_edge(parent_idx, child_idx, kind)`.
+    Add {
+        owner_idx: usize,
+        target_idx: usize,
+        kind: DepKind,
+    },
+    /// `add_dep_edge(idx, idx, kind)`. Must reject with
+    /// `Error::SelfDependency` and leave the record's dep list
+    /// untouched. Tests a different reject path on the same property
+    /// without complicating the cycle generator.
+    SelfDep { idx: usize, kind: DepKind },
+}
+
+/// Pick an extra-edge to issue against a built repo. `n_drafts` is
+/// the plan's draft count so we can clamp indices into-range. We
+/// generate raw `usize` indices and modulo them down inside the
+/// property body (cheaper than a `prop_flat_map` chain).
+fn extra_edge_strategy() -> impl Strategy<Value = ExtraEdge> {
+    prop_oneof![
+        9 => (0usize..16, 0usize..16, dep_kind_strategy())
+            .prop_map(|(owner_idx, target_idx, kind)| ExtraEdge::Add {
+                owner_idx, target_idx, kind,
+            }),
+        1 => (0usize..16, dep_kind_strategy())
+            .prop_map(|(idx, kind)| ExtraEdge::SelfDep { idx, kind }),
+    ]
+}
+
+/// Walk the combined blocking graph (`Blocks` + `ParentChild`
+/// edges) and report whether ANY node sits on a directed cycle.
+/// Simple iterative DFS with a per-root visited set: cheap given
+/// N <= 4 issues per case, and re-deriving from the post-state
+/// every time means no incremental-cache-invalidation worry.
+///
+/// Mirrors `Storage::find_blocking_cycle`'s definition of the
+/// "blocking graph" (only `Blocks` + `ParentChild` count;
+/// `Related` and `DiscoveredFrom` are skipped) without reaching
+/// into a private helper — the test is the independent oracle.
+fn blocking_graph_has_cycle(storage: &Storage) -> bool {
+    let ids = storage.list_ids().unwrap();
+    // Build adjacency map: id -> blocking targets.
+    let mut adj: std::collections::HashMap<IssueId, Vec<IssueId>> =
+        std::collections::HashMap::new();
+    for id in &ids {
+        let issue = storage.read(id).unwrap();
+        let targets: Vec<IssueId> = issue
+            .dependencies
+            .iter()
+            .filter(|e| matches!(e.kind, DepKind::Blocks | DepKind::ParentChild))
+            .map(|e| e.target.clone())
+            .collect();
+        adj.insert(id.clone(), targets);
+    }
+    // DFS from each node, using the classic three-color
+    // (WHITE/GRAY/BLACK) scheme to detect back-edges. GRAY = on
+    // the current recursion stack; hitting a GRAY node closes a
+    // cycle. BLACK = fully explored, no cycle through here.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Color { White, Gray, Black }
+    let mut color: std::collections::HashMap<IssueId, Color> =
+        ids.iter().map(|i| (i.clone(), Color::White)).collect();
+    for root in &ids {
+        if color[root] != Color::White {
+            continue;
+        }
+        // Iterative DFS frame: (node, next-child-index-to-visit).
+        let mut stack: Vec<(IssueId, usize)> = vec![(root.clone(), 0)];
+        color.insert(root.clone(), Color::Gray);
+        while let Some((node, idx)) = stack.last().cloned() {
+            let children = adj.get(&node).cloned().unwrap_or_default();
+            if idx >= children.len() {
+                color.insert(node.clone(), Color::Black);
+                stack.pop();
+                continue;
+            }
+            // Advance the cursor on the current frame before
+            // (maybe) recursing into the child.
+            let last = stack.len() - 1;
+            stack[last].1 = idx + 1;
+            let child = &children[idx];
+            // Dangling edges (target id missing from list_ids —
+            // see find_blocking_cycle's "treat missing as leaf"
+            // comment) can't host a back-edge, skip them.
+            let child_color = color.get(child).copied().unwrap_or(Color::Black);
+            match child_color {
+                Color::White => {
+                    color.insert(child.clone(), Color::Gray);
+                    stack.push((child.clone(), 0));
+                }
+                Color::Gray => {
+                    // Back-edge: child is on the current recursion
+                    // stack. Cycle.
+                    return true;
+                }
+                Color::Black => {}
+            }
+        }
+    }
+    false
+}
+
+/// Snapshot every issue's dependency list, keyed by issue id. Used
+/// to verify that a failed `add_dep_edge` call left the graph
+/// untouched (atomic-on-reject contract).
+fn snapshot_dep_graph(
+    storage: &Storage,
+) -> std::collections::HashMap<IssueId, Vec<DepEdge>> {
+    let ids = storage.list_ids().unwrap();
+    ids.into_iter()
+        .map(|id| {
+            let deps = storage.read(&id).unwrap().dependencies;
+            (id, deps)
+        })
+        .collect()
+}
+
 // --- properties ----------------------------------------------------
 
 proptest! {
@@ -1189,6 +1340,107 @@ proptest! {
                         pre_status, post_status, target, pre_ready, post_ready,
                     );
                 }
+            }
+        }
+    }
+
+    /// **Property 7: `add_dep_edge` never closes a cycle**.
+    ///
+    /// Issue `1078439` (proptest-cycle-rejection, epic:agent-ergonomics).
+    /// Build a DAG via [`MultiIssuePlan`] (strict-upper-triangle edges,
+    /// cycle-free by construction). Then fire ONE extra
+    /// `add_dep_edge` attempt sampled from [`extra_edge_strategy`]
+    /// (90% additive `Add`, 10% `SelfDep`). The property asserts the
+    /// full add-dep-edge contract on a freshly-derived post-state:
+    ///
+    /// - If the call succeeds: the combined blocking graph
+    ///   (`Blocks` + `ParentChild` edges) contains no directed cycle.
+    ///   A walker re-derived from scratch per case ([`blocking_graph_has_cycle`])
+    ///   is the independent oracle.
+    /// - If the call rejects: the error is a typed `Error::DependencyCycle`
+    ///   (cycle-closing attempt on a blocking-kind edge),
+    ///   `Error::SelfDependency` (target == source), or
+    ///   `Error::IssueNotFound` (shouldn't fire here — every index
+    ///   is modulo'd into ids; surface it loudly if it does). And the
+    ///   pre-call dep snapshot equals the post-call snapshot — atomic
+    ///   on reject.
+    ///
+    /// This is the property that would have caught `121f48b` (mixed-
+    /// kind cycle silently accepted) and `43c7615` (single-kind
+    /// cycle accepted) without depending on the harm-class attack
+    /// tree to surface them. The `Add` branch with `swap`-ish
+    /// indices (owner_idx > target_idx hitting an existing DAG
+    /// edge in reverse) reliably attempts a back-edge.
+    ///
+    /// **N.B.** The ticket body says "typed `Error::Invalid`" but
+    /// the actual storage contract is `Error::DependencyCycle` (the
+    /// typed variant `find_blocking_cycle` surfaces). The property
+    /// matches the real contract; the ticket-body line is a slight
+    /// misstatement of the rejection's typed variant.
+    #[test]
+    fn add_dep_edge_never_closes_cycle(
+        plan in multi_issue_plan_strategy(1..=4, 4),
+        extra in extra_edge_strategy(),
+    ) {
+        pin_clock(1_800_000_007);
+        let (storage, ids) = build_multi_issue_repo(&plan, "cycle-rej");
+        let n = ids.len();
+
+        // Pre-state must be acyclic (build_multi_issue_repo enforces
+        // it by construction; assert anyway so a generator regression
+        // surfaces here rather than as a confusing post-state cycle).
+        prop_assert!(
+            !blocking_graph_has_cycle(&storage),
+            "pre-state blocking graph has a cycle — generator drift",
+        );
+
+        let pre_snapshot = snapshot_dep_graph(&storage);
+
+        // Resolve plan indices into real ids; modulo into-range so we
+        // exercise every index slot with each generated case.
+        let result = match &extra {
+            ExtraEdge::Add { owner_idx, target_idx, kind } => {
+                let owner = &ids[owner_idx % n];
+                let target = &ids[target_idx % n];
+                storage.add_dep_edge(owner, target, *kind)
+            }
+            ExtraEdge::SelfDep { idx, kind } => {
+                let owner = &ids[idx % n];
+                storage.add_dep_edge(owner, owner, *kind)
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                // Success path: post-state must be acyclic.
+                prop_assert!(
+                    !blocking_graph_has_cycle(&storage),
+                    "add_dep_edge({:?}) succeeded but post-state blocking \
+                     graph has a cycle (plan={:?})",
+                    extra, plan,
+                );
+            }
+            Err(jjf_storage::Error::DependencyCycle { .. })
+            | Err(jjf_storage::Error::SelfDependency { .. }) => {
+                // Reject path: graph must be unchanged.
+                let post_snapshot = snapshot_dep_graph(&storage);
+                prop_assert_eq!(
+                    &pre_snapshot, &post_snapshot,
+                    "add_dep_edge({:?}) rejected but graph mutated \
+                     (pre != post)",
+                    extra,
+                );
+            }
+            Err(other) => {
+                // Any other typed variant is a bug in this property
+                // (we generated an index in-range against a fresh
+                // repo so IssueNotFound/CAS-loss shouldn't fire) OR
+                // a contract drift worth surfacing.
+                prop_assert!(
+                    false,
+                    "add_dep_edge({:?}) returned unexpected error: {:?}",
+                    extra, other,
+                );
             }
         }
     }
