@@ -4,7 +4,7 @@
   "title": "test-helpers-shared-module: dedupe parse_id_from_stdout across tests/",
   "slug": "test-helpers-shared-module",
   "body": "# Goal\n\nMove `parse_id_from_stdout` (and any other test helpers that\nappear in more than one place) into a shared module under\n`crates/jjf/tests/common/mod.rs`, eliminating the current\n3-way duplication.\n\n# Source\n\nFinal whole-branch review of the `--parent` feature (2026-06-28\ndrop-epic-label) flagged this as Minor #4. `parse_id_from_stdout`\nis defined three times:\n\n- `crates/jjf/tests/ls.rs:~154` (returns String)\n- `crates/jjf/tests/ready.rs:~145` (returns IssueId)\n- `crates/jjf/tests/search.rs:~135` (returns String)\n\nSame shape, three places. Tests are compiled per-file in Cargo's\nintegration-test layout, so a shared helper needs a\n`tests/common/mod.rs` (or similar) that each test file pulls in\nvia `mod common;`.\n\n# Approach\n\n- Audit `crates/jjf/tests/*.rs` for repeated helpers — there are\n  likely more candidates besides `parse_id_from_stdout`\n  (`make_initialized_repo`, `run_jjf`, `run_jjf_with_stdin`,\n  `bookmark_tip_commit`).\n- For each helper that appears in 2+ files, move to\n  `crates/jjf/tests/common/mod.rs`.\n- Pick ONE return shape for `parse_id_from_stdout` — likely\n  `IssueId` (richer; lets a future test assert on `.as_str()`\n  or pass directly to `Storage::read`).\n- Each test file gains `mod common;` and `use common::*;`.\n- `crates/jjf/tests/common/mod.rs` does NOT get its own\n  `[[test]]` (the file naming `common` is conventional but\n  Cargo treats anything under `tests/` as a test binary unless\n  it's in a subdirectory — verify with `cargo build --tests`).\n\n# Acceptance\n\n- [ ] Single definition of each previously-duplicated helper.\n- [ ] All ls/ready/search/etc. tests still pass.\n- [ ] No `cargo build --tests` warnings about the common module\n      being treated as its own integration test binary.\n- [ ] New test additions reach for the shared helpers, not new\n      copy-paste.\n",
-  "status": "open",
+  "status": "closed",
   "block_reason": null,
   "type": "feature",
   "priority": null,
@@ -17,5 +17,5 @@
   ],
   "assignee": null,
   "created_at": "2026-06-28T19:36:57Z",
-  "updated_at": "2026-06-28T20:29:25Z"
+  "updated_at": "2026-06-28T20:29:30Z"
 }
