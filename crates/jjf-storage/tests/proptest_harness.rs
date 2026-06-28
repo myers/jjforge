@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use jjf_storage::{DepEdge, DepKind, IssueDraft, IssueId, IssueType, Status, Storage};
+use jjf_storage::{DepEdge, DepKind, IssueDraft, IssueId, IssueType, Memory, Status, Storage};
 use proptest::collection::vec;
 use proptest::option;
 use proptest::prelude::*;
@@ -484,6 +484,59 @@ fn apply_verb(storage: &Storage, id: &IssueId, verb: &Verb) -> jjf_storage::Resu
     }
 }
 
+// --- memory generators ---------------------------------------------
+//
+// Issue `932cc40` (proptest-memory-surface, epic:agent-ergonomics).
+// `Storage::set_memory` / `unset_memory` / `read_memory` validate keys
+// through the same `validate_slug` rules as issue slugs: kebab-case
+// `[a-z0-9-]`, length 3-48, no leading/trailing/consecutive hyphens.
+// The value must be non-empty post-trim.
+//
+// Pool discipline mirrors `LABEL_POOL` / `SLUG_POOL`: a small fixed
+// pool of valid keys keeps collisions (and `set` overwrites) frequent
+// enough to exercise the overwrite codepath. Values are 1-256
+// non-control ASCII bytes with at least one non-whitespace char so
+// `set_memory` accepts them.
+
+/// Fixed pool of valid memory keys. All pass `validate_slug` (length
+/// 3-48, kebab-case, no leading/trailing/consecutive hyphens). Five
+/// keys keep collisions common enough to exercise the overwrite path
+/// and the non-interference property's k1 != k2 sampling.
+const MEMORY_KEY_POOL: &[&str] = &[
+    "alpha-key",
+    "beta-key",
+    "gamma-key",
+    "delta-key",
+    "epsilon-key",
+];
+
+fn memory_key_strategy() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just(MEMORY_KEY_POOL[0].to_string()),
+        Just(MEMORY_KEY_POOL[1].to_string()),
+        Just(MEMORY_KEY_POOL[2].to_string()),
+        Just(MEMORY_KEY_POOL[3].to_string()),
+        Just(MEMORY_KEY_POOL[4].to_string()),
+    ]
+}
+
+/// Memory value: 1-256 non-control ASCII bytes with a forced
+/// non-whitespace prefix so `set_memory`'s "non-empty after trim"
+/// check always passes. Same character class as `body_strategy` for
+/// consistency.
+fn memory_value_strategy() -> impl Strategy<Value = String> {
+    "[a-zA-Z0-9 .,;:!?+\\-]{0,255}".prop_map(|tail| {
+        // Force a leading non-whitespace char so the value trims
+        // non-empty. Without this, a generated empty string or
+        // whitespace-only string would surface as a spurious
+        // `Error::Invalid` instead of exercising the round-trip.
+        let mut s = String::with_capacity(tail.len() + 1);
+        s.push('x');
+        s.push_str(&tail);
+        s
+    })
+}
+
 // --- properties ----------------------------------------------------
 
 proptest! {
@@ -762,6 +815,139 @@ proptest! {
             "minted ids and list_ids disagree (minted={:?}, listed={:?})",
             minted, listed,
         );
+    }
+
+    /// **Memory Property 1: round-trip on `set_memory` / `unset_memory`**.
+    ///
+    /// Issue `932cc40` (proptest-memory-surface, epic:agent-ergonomics).
+    /// After `set_memory(k, v)`, `read_memory(k)` returns `Some(m)` with
+    /// `m.key == k` and `m.value == v`. After `unset_memory(k)`,
+    /// `read_memory(k)` returns `None`. Catches snapshot-cache
+    /// invalidation regressions on the memory surface (the same bug class
+    /// `cache_first_write` surfaced on the issues surface).
+    #[test]
+    fn memory_round_trip_set_then_unset(
+        key in memory_key_strategy(),
+        value in memory_value_strategy(),
+    ) {
+        pin_clock(1_800_000_010);
+        let repo = fresh_scratch_repo("mem-rt");
+        let storage = Storage::open(&repo).unwrap();
+
+        storage.set_memory(&key, &value).unwrap();
+        let after_set = storage.read_memory(&key).unwrap();
+        prop_assert!(
+            after_set.is_some(),
+            "read_memory({:?}) returned None after set", key,
+        );
+        let m: Memory = after_set.unwrap();
+        prop_assert_eq!(&m.key, &key);
+        prop_assert_eq!(&m.value, &value);
+
+        storage.unset_memory(&key).unwrap();
+        let after_unset = storage.read_memory(&key).unwrap();
+        prop_assert!(
+            after_unset.is_none(),
+            "read_memory({:?}) returned Some after unset: {:?}",
+            key, after_unset,
+        );
+    }
+
+    /// **Memory Property 2: idempotence**.
+    ///
+    /// Two consecutive `set_memory(k, v)` with the same value leave the
+    /// read shape unchanged: same key, same value (updated_at may
+    /// advance, which is fine — it's not part of the observable shape
+    /// callers depend on). The second `unset_memory(k)` on a key that
+    /// was already removed surfaces as `Error::Invalid` ("no memory
+    /// with key") rather than panic — both calls reach a defined
+    /// terminal state.
+    ///
+    /// Note: `unset_memory` on a missing key is NOT silently-ok per
+    /// the storage contract (see `crates/jjf-storage/src/lib.rs`
+    /// `unset_memory` doc — it returns `Error::Invalid` with a
+    /// `not found` message). The property asserts the typed-rejection
+    /// shape, not silent idempotence, for the second unset.
+    #[test]
+    fn memory_idempotent_set_and_unset(
+        key in memory_key_strategy(),
+        value in memory_value_strategy(),
+    ) {
+        pin_clock(1_800_000_011);
+        let repo = fresh_scratch_repo("mem-idem");
+        let storage = Storage::open(&repo).unwrap();
+
+        // Two consecutive sets with the same value.
+        storage.set_memory(&key, &value).unwrap();
+        let first = storage.read_memory(&key).unwrap().unwrap();
+        storage.set_memory(&key, &value).unwrap();
+        let second = storage.read_memory(&key).unwrap().unwrap();
+        prop_assert_eq!(&first.key, &second.key);
+        prop_assert_eq!(&first.value, &second.value);
+        // created_at is preserved across overwrites (the original
+        // record's created_at survives — see `set_memory` impl).
+        prop_assert_eq!(&first.created_at, &second.created_at);
+
+        // First unset succeeds; second unset on missing key
+        // surfaces a typed Invalid rather than panicking.
+        storage.unset_memory(&key).unwrap();
+        let post_unset = storage.read_memory(&key).unwrap();
+        prop_assert!(post_unset.is_none());
+        let second_unset = storage.unset_memory(&key);
+        match second_unset {
+            Err(jjf_storage::Error::Invalid(_)) => {}
+            other => prop_assert!(
+                false,
+                "second unset_memory({:?}) on missing key expected \
+                 Invalid, got {:?}",
+                key, other,
+            ),
+        }
+    }
+
+    /// **Memory Property 3: non-interference**.
+    ///
+    /// `set_memory(k1, v1)` does not affect `read_memory(k2)` for
+    /// k1 != k2. We seed (k2, v2) first, then set (k1, v1) where
+    /// k1 != k2, then re-read k2 and assert the value is unchanged.
+    /// Catches accidental cross-key writes (e.g. a path-construction
+    /// bug that collapses two keys onto the same on-disk slot).
+    ///
+    /// Two independent key generators with a `prop_assume!` to discard
+    /// k1 == k2 cases. With a 5-element pool the discard rate is 20% —
+    /// well under proptest's default rejection budget for 16 cases.
+    #[test]
+    fn memory_set_does_not_affect_other_keys(
+        k1 in memory_key_strategy(),
+        v1 in memory_value_strategy(),
+        k2 in memory_key_strategy(),
+        v2 in memory_value_strategy(),
+    ) {
+        prop_assume!(k1 != k2);
+        pin_clock(1_800_000_012);
+        let repo = fresh_scratch_repo("mem-noni");
+        let storage = Storage::open(&repo).unwrap();
+
+        storage.set_memory(&k2, &v2).unwrap();
+        let before = storage.read_memory(&k2).unwrap().unwrap();
+
+        storage.set_memory(&k1, &v1).unwrap();
+        let after = storage.read_memory(&k2).unwrap();
+        prop_assert!(
+            after.is_some(),
+            "set_memory({:?}, ...) clobbered unrelated key {:?}",
+            k1, k2,
+        );
+        let after = after.unwrap();
+        prop_assert_eq!(&after.key, &k2);
+        prop_assert_eq!(&after.value, &v2);
+        prop_assert_eq!(&before.value, &after.value);
+
+        // And the k1 write actually landed (sanity: the set wasn't
+        // a silent no-op that left both keys alone).
+        let k1_read = storage.read_memory(&k1).unwrap().unwrap();
+        prop_assert_eq!(&k1_read.key, &k1);
+        prop_assert_eq!(&k1_read.value, &v1);
     }
 
     /// **Property 3: read-after-write idempotence**.
