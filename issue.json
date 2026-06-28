@@ -5,13 +5,14 @@
   "slug": "mvp-sync",
   "body": "Goal: two clones can both edit bugs while offline, `jjf push` /\n`jjf pull` round-trip the `issues` bookmark via standard git\ntransport, and `jjf sync` resolves any conflicts automatically\nwithout human intervention.\n\n# Approach\n\nThe big surprise from research (`8d3e045`, archived): jj's automatic\ncontent merge isn't enough for bug data. The moment two clones touch\nnearby lines in the same bug file (title vs status, status vs a new\ncomment), jj's content merge produces conflicts. The natural\nsingle-line-per-key JSON layout puts fields one line apart, well\ninside the merger's \"too close\" threshold.\n\nThe original fix was a **file-bytes merge driver** that parsed jj's\nconflict markers and ran a per-field policy. Later (in\n`sync-conflict-fallback`) this was superseded by an **op-space\nresolver** in `crates/jjf-storage/src/merge_ops.rs` — the file is a\ndeterministic projection of the op chain, divergence resolves in\nop-space, conflicts cannot surface.\n\nPer-field policy (final, see `docs/storage-format.md` §6):\n\n- **Scalars** (status, title, assignee, body): last-write-wins by\n  `Jjf-At:` trailer timestamp.\n- **Sets** (labels, dependencies): causal — each add/remove\n  tracked per key; final state is `present` iff the last write for\n  that key was an add.\n- **Comments**: union by `comment_id`; comments are append-only.\n\n`jjf push` / `pull` are wrappers over `jj git push --bookmark issues` /\n`jj git fetch`, plus the op-space resolver hook on fetch divergence.\n\n# Depends on\n\n- `mvp-storage` (defines the on-disk file format the merge driver works against).\n\n# Blocks\n\n- `multi-client` (the daemon model assumes cross-machine sync works).\n\n# Status\n\n**Done** as of 2026-06-22. Push/pull/merge loop works end-to-end with\nop-space resolution. Child tickets (open and closed) via\n`jjf ls --label epic:mvp-sync --status all`.\n",
   "status": "closed",
+  "block_reason": null,
   "type": "epic",
+  "priority": null,
   "labels": [
-    "epic",
-    "epic:mvp-sync"
+    "epic"
   ],
   "dependencies": [],
   "assignee": null,
   "created_at": "2026-06-22T14:48:18Z",
-  "updated_at": "2026-06-22T20:51:17Z"
+  "updated_at": "2026-06-28T18:41:21Z"
 }
