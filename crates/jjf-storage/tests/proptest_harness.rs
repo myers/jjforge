@@ -54,7 +54,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use jjf_storage::{DepEdge, DepKind, IssueDraft, IssueId, IssueType, Memory, Status, Storage};
+use jjf_storage::{
+    DepEdge, DepKind, IssueDraft, IssueId, IssueType, Memory, ReadyFilter, Status, Storage,
+};
 use proptest::collection::vec;
 use proptest::option;
 use proptest::prelude::*;
@@ -537,6 +539,102 @@ fn memory_value_strategy() -> impl Strategy<Value = String> {
     })
 }
 
+// --- list_ready mutation generator ---------------------------------
+//
+// Issue `6ce795c` (proptest-list-ready-monotone, epic:agent-ergonomics).
+// Drives Property 6: closing an issue can only ADD members to the
+// next `list_ready` (the things it was blocking become unblocked);
+// opening one can only REMOVE; status-preserving verbs (add_label,
+// add_comment) leave the set identical.
+//
+// We model mutations as `(index_into_ids, kind)` so the strategy
+// itself is data and the materialize step picks the actual id from
+// the plan-built repo. Kinds picked uniformly across the five
+// status-changing variants plus two status-preserving controls. The
+// strategy holds no live storage handles — proptest's shrinker can
+// shrink mutation sequences without re-binding to a repo.
+
+/// One mutation applied to the multi-issue repo during the
+/// `list_ready` monotonicity sweep.
+#[derive(Debug, Clone)]
+enum ListReadyMutation {
+    /// `set_status(_, Closed)`. Lands from every source unconditionally
+    /// (see `Storage::set_status` — unguarded flip).
+    Close,
+    /// `set_status(_, Abandoned)`. Same shape; treated as inactive
+    /// alongside Closed for `compute_blocked_set`.
+    Abandon,
+    /// `set_status(_, Open)`. Re-opens from any source. The "open"
+    /// half of the monotonicity property — flipping inactive→active
+    /// may re-block dependents.
+    Reopen,
+    /// `set_status(_, Blocked)`. Stays active for dep purposes but
+    /// drops out of the default `ReadyFilter` (which excludes Blocked).
+    /// Tests the "self-only flip" branch of the property.
+    Block,
+    /// `set_status(_, InProgress)`. Same shape as Block — active,
+    /// excluded from default `ReadyFilter` (via `include_claimed`).
+    InProgress,
+    /// `add_label(_, "qa")`. Status-preserving and label-filter is
+    /// `ReadyFilter::default().labels == []`, so the ready set must
+    /// be identical post-mutation.
+    AddLabel,
+    /// `add_comment(_, "x", "bot")`. Status-preserving, doesn't
+    /// touch any field `list_ready` looks at.
+    AddComment,
+}
+
+fn list_ready_mutation_kind_strategy() -> impl Strategy<Value = ListReadyMutation> {
+    prop_oneof![
+        Just(ListReadyMutation::Close),
+        Just(ListReadyMutation::Abandon),
+        Just(ListReadyMutation::Reopen),
+        Just(ListReadyMutation::Block),
+        Just(ListReadyMutation::InProgress),
+        Just(ListReadyMutation::AddLabel),
+        Just(ListReadyMutation::AddComment),
+    ]
+}
+
+/// `(target_idx, kind)` where `target_idx` indexes into the plan's
+/// `ids` vec. The strategy doesn't know N at generation time; we
+/// generate a usize in `0..16` and the property body modulos it down
+/// to the actual issue count (cheaper than a `prop_flat_map` chain
+/// and N is small).
+fn list_ready_mutation_strategy() -> impl Strategy<Value = (usize, ListReadyMutation)> {
+    (0usize..16, list_ready_mutation_kind_strategy())
+}
+
+/// True when the status counts as "active" per
+/// [`compute_blocked_set`]'s `is_active` helper — Open, Blocked, or
+/// InProgress. Closed and Abandoned are inactive (they release
+/// dependents). Mirrored from the storage layer so the property
+/// doesn't have to reach into private helpers.
+fn status_is_active(s: Status) -> bool {
+    matches!(s, Status::Open | Status::Blocked | Status::InProgress)
+}
+
+/// Apply one list_ready mutation. Returns `Ok(())` on success and
+/// propagates storage errors — the property body treats any Err as
+/// "no-op for monotonicity" since failed mutations are atomic.
+fn apply_list_ready_mutation(
+    storage: &Storage,
+    id: &IssueId,
+    m: &ListReadyMutation,
+) -> jjf_storage::Result<()> {
+    match m {
+        ListReadyMutation::Close => storage.set_status(id, Status::Closed),
+        ListReadyMutation::Abandon => storage.set_status(id, Status::Abandoned),
+        ListReadyMutation::Reopen => storage.set_status(id, Status::Open),
+        ListReadyMutation::Block => storage.set_status(id, Status::Blocked),
+        ListReadyMutation::InProgress => storage.set_status(id, Status::InProgress),
+        ListReadyMutation::AddLabel => storage.add_label(id, "qa"),
+        ListReadyMutation::AddComment => {
+            storage.add_comment(id, "comment-body", "bot").map(|_| ())
+        }
+    }
+}
+
 // --- properties ----------------------------------------------------
 
 proptest! {
@@ -948,6 +1046,151 @@ proptest! {
         let k1_read = storage.read_memory(&k1).unwrap().unwrap();
         prop_assert_eq!(&k1_read.key, &k1);
         prop_assert_eq!(&k1_read.value, &v1);
+    }
+
+    /// **Property 6: `list_ready` monotone under status flips**.
+    ///
+    /// Issue `6ce795c` (proptest-list-ready-monotone,
+    /// epic:agent-ergonomics). Snapshot `list_ready(&default())` before
+    /// and after each mutation against a `MultiIssuePlan` repo (1-4
+    /// issues, up to 4 dep edges). Per-mutation assertion depends on
+    /// how the target's status changed (observed by reading the issue
+    /// pre- and post-mutation):
+    ///
+    /// - `active -> inactive` (Open/Blocked/InProgress to Closed/Abandoned):
+    ///   every other issue's ready-membership can only ADD (deps that
+    ///   were blocking are released). The target itself MUST NOT appear
+    ///   in `new_ready` (it's inactive).
+    /// - `inactive -> active` (Closed/Abandoned to Open/Blocked/InProgress):
+    ///   every other issue's ready-membership can only REMOVE (deps may
+    ///   re-block). The target itself may newly appear.
+    /// - `active -> active`, `inactive -> inactive`, or no status change
+    ///   (status-preserving verbs like add_label / add_comment):
+    ///   `compute_blocked_set` is unchanged for every other issue, so
+    ///   the symmetric difference of the ready sets must be a subset
+    ///   of `{target_id}` — only the target's own ready membership can
+    ///   flip (Open <-> Blocked drops it out of the default
+    ///   `ReadyFilter`).
+    ///
+    /// This is the property that would have falsified `121f48b`
+    /// (mixed-kind blocks+parent-child cycle silently accepted,
+    /// locking both issues out of `jjf ready`) directly: a cycle-
+    /// locked id would stay missing from `list_ready` across a close
+    /// that should have released it.
+    ///
+    /// Uses `Storage::list_ready` directly (the storage-layer API,
+    /// surfaced via the `ReadyFilter` bundle the CLI also uses).
+    /// `ReadyFilter::default()` is the `jjf ready` no-flags shape.
+    ///
+    /// **Failed mutations are atomic**: if `apply_list_ready_mutation`
+    /// returns `Err`, the post-read status will equal pre-read status
+    /// and the property falls into the no-change branch automatically.
+    #[test]
+    fn list_ready_monotone_under_status_flips(
+        plan in multi_issue_plan_strategy(1..=4, 4),
+        muts in vec(list_ready_mutation_strategy(), 1..=6),
+    ) {
+        pin_clock(1_800_000_006);
+        let (storage, ids) = build_multi_issue_repo(&plan, "ready-mono");
+        let filter = ReadyFilter::default();
+
+        for (raw_idx, kind) in &muts {
+            let idx = raw_idx % ids.len();
+            let target = &ids[idx];
+
+            let pre_status = storage.read(target).unwrap().status;
+            let pre_ready: std::collections::HashSet<IssueId> = storage
+                .list_ready(&filter)
+                .unwrap()
+                .into_iter()
+                .map(|i| i.id)
+                .collect();
+
+            // Apply; ignore Err — failed mutations are atomic
+            // (post-read status will equal pre-read, so we land in
+            // the no-change branch).
+            let _ = apply_list_ready_mutation(&storage, target, kind);
+
+            let post_status = storage.read(target).unwrap().status;
+            let post_ready: std::collections::HashSet<IssueId> = storage
+                .list_ready(&filter)
+                .unwrap()
+                .into_iter()
+                .map(|i| i.id)
+                .collect();
+
+            let pre_active = status_is_active(pre_status);
+            let post_active = status_is_active(post_status);
+
+            match (pre_active, post_active) {
+                (true, false) => {
+                    // active -> inactive: dependents may unblock.
+                    // For every issue OTHER than the target,
+                    // pre-membership implies post-membership (only
+                    // additions allowed). The target itself must
+                    // have left the ready set.
+                    for id in &pre_ready {
+                        if id == target {
+                            continue;
+                        }
+                        prop_assert!(
+                            post_ready.contains(id),
+                            "active->inactive ({:?} -> {:?}) on target {:?} \
+                             removed unrelated id {:?} from list_ready \
+                             (pre={:?}, post={:?})",
+                            pre_status, post_status, target, id,
+                            pre_ready, post_ready,
+                        );
+                    }
+                    prop_assert!(
+                        !post_ready.contains(target),
+                        "active->inactive ({:?} -> {:?}) left target {:?} \
+                         in list_ready post (post={:?})",
+                        pre_status, post_status, target, post_ready,
+                    );
+                }
+                (false, true) => {
+                    // inactive -> active: dependents may re-block.
+                    // For every issue OTHER than the target,
+                    // post-membership implies pre-membership (only
+                    // removals allowed for others; target itself may
+                    // newly appear).
+                    for id in &post_ready {
+                        if id == target {
+                            continue;
+                        }
+                        prop_assert!(
+                            pre_ready.contains(id),
+                            "inactive->active ({:?} -> {:?}) on target {:?} \
+                             added unrelated id {:?} to list_ready \
+                             (pre={:?}, post={:?})",
+                            pre_status, post_status, target, id,
+                            pre_ready, post_ready,
+                        );
+                    }
+                }
+                _ => {
+                    // active->active, inactive->inactive, or no
+                    // status change. compute_blocked_set is invariant
+                    // for every issue other than the target; only the
+                    // target's own ready-membership can flip (e.g.
+                    // Open <-> Blocked changes its default-filter
+                    // visibility). Symmetric difference must be a
+                    // subset of {target}.
+                    let pre_minus_target: std::collections::HashSet<_> =
+                        pre_ready.iter().filter(|i| *i != target).cloned().collect();
+                    let post_minus_target: std::collections::HashSet<_> =
+                        post_ready.iter().filter(|i| *i != target).cloned().collect();
+                    prop_assert_eq!(
+                        &pre_minus_target, &post_minus_target,
+                        "no-status-change branch ({:?} -> {:?}) on target \
+                         {:?} mutated unrelated ready membership \
+                         (pre={:?}, post={:?})",
+                        pre_status, post_status, target, pre_ready, post_ready,
+                    );
+                }
+            }
+        }
     }
 
     /// **Property 3: read-after-write idempotence**.
