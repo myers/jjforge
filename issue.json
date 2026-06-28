@@ -9,7 +9,6 @@
   "type": "feature",
   "priority": null,
   "labels": [
-    "epic:agent-ergonomics",
     "qa-redteam-2026-06-25"
   ],
   "dependencies": [
