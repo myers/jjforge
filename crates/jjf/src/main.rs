@@ -1080,8 +1080,8 @@ enum LabelAction {
 #[derive(Debug, Subcommand)]
 enum MetadataAction {
     /// Set a metadata key to a value. Overwrites any existing value
-    /// for the key (last-write-wins). A fresh `set-metadata` op lands
-    /// either way.
+    /// for the key (last-write-wins). Is a no-op if the key already
+    /// has this value (no commit lands).
     Set {
         /// Full 7-char hex issue id (or slug). Bad parse → exit 2;
         /// valid id that doesn't exist → exit 1.
@@ -1096,8 +1096,8 @@ enum MetadataAction {
         value: String,
     },
 
-    /// Remove a metadata key. No-op at the record level if the key
-    /// isn't present, but a fresh `unset-metadata` op lands either way.
+    /// Remove a metadata key. Is a no-op if the key is already absent
+    /// (no commit lands).
     Unset {
         /// Full 7-char hex issue id (or slug). Bad parse → exit 2;
         /// valid id that doesn't exist → exit 1.
