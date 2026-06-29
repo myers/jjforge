@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use jjf_storage::{
-    ClaimResult, DepEdge, DepKind, Error as StorageError, IssueDraft, IssueId, IssueType, Op,
-    ReadyFilter, SlugInvalidReason, Status, Storage, TitleInvalidReason, UpdateFields,
+    ClaimResult, DepEdge, DepKind, Error as StorageError, IssueDraft, IssueId, IssueType,
+    METADATA_VALUE_MAX_BYTES, Op, ReadyFilter, SlugInvalidReason, Status, Storage,
+    TitleInvalidReason, UpdateFields,
 };
 use serde::Serialize;
 
@@ -5609,4 +5610,103 @@ fn git_capture_with_stdin(args: &[&str], stdin_bytes: &[u8], cwd: &Path) -> Stri
         String::from_utf8_lossy(&out.stderr),
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+// ------------------------------------------------------------------
+// Metadata-validator integration tests (PR #4 fix issues #1 #3 #4 #8)
+// ------------------------------------------------------------------
+
+/// Helper: open a storage on a fresh throwaway repo. Returns both the
+/// Storage handle and the repo path (needed by `commit_count_for_issue`).
+fn test_storage_named(name: &str) -> (Storage, std::path::PathBuf) {
+    let repo = make_scratch_repo(name);
+    let storage = Storage::open(&repo).unwrap();
+    (storage, repo)
+}
+
+/// Helper: create a minimal test issue and return its id.
+fn create_test_issue(storage: &Storage, title: &str) -> IssueId {
+    storage
+        .create_issue(&IssueDraft {
+            title: title.into(),
+            ..Default::default()
+        })
+        .unwrap()
+}
+
+/// Count the number of commits on the per-issue ref
+/// `refs/jjf/issues/<id>` in the git backing store.
+fn commit_count_for_issue(repo: &std::path::Path, id: &IssueId) -> usize {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("rev-list")
+        .arg("--count")
+        .arg(format!("refs/jjf/issues/{}", id))
+        .output()
+        .expect("git rev-list failed");
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    s.parse().unwrap_or(0)
+}
+
+#[test]
+fn set_metadata_rejects_empty_key_at_storage_layer() {
+    let (storage, _repo) = test_storage_named("meta_reject_empty_key");
+    let id = create_test_issue(&storage, "test");
+    let result = storage.set_metadata(&id, "", "value");
+    assert!(matches!(result, Err(StorageError::Invalid(_))));
+}
+
+#[test]
+fn set_metadata_rejects_whitespace_key_at_storage_layer() {
+    let (storage, _repo) = test_storage_named("meta_reject_ws_key");
+    let id = create_test_issue(&storage, "test");
+    let result = storage.set_metadata(&id, "foo bar", "value");
+    assert!(matches!(result, Err(StorageError::Invalid(_))));
+    let result = storage.set_metadata(&id, "\tfoo", "value");
+    assert!(matches!(result, Err(StorageError::Invalid(_))));
+}
+
+#[test]
+fn set_metadata_rejects_equals_in_key_at_storage_layer() {
+    let (storage, _repo) = test_storage_named("meta_reject_eq_key");
+    let id = create_test_issue(&storage, "test");
+    let result = storage.set_metadata(&id, "foo=bar", "value");
+    assert!(matches!(result, Err(StorageError::Invalid(_))));
+}
+
+#[test]
+fn set_metadata_rejects_oversize_value_at_storage_layer() {
+    let (storage, _repo) = test_storage_named("meta_reject_oversize_val");
+    let id = create_test_issue(&storage, "test");
+    let huge = "a".repeat(METADATA_VALUE_MAX_BYTES + 1);
+    let result = storage.set_metadata(&id, "key", &huge);
+    assert!(matches!(result, Err(StorageError::Invalid(_))));
+}
+
+#[test]
+fn set_metadata_idempotent_same_value_no_extra_commit() {
+    let (storage, repo) = test_storage_named("meta_idempotent_set");
+    let id = create_test_issue(&storage, "test");
+    storage.set_metadata(&id, "k", "v").unwrap();
+    let commits_before = commit_count_for_issue(&repo, &id);
+    storage.set_metadata(&id, "k", "v").unwrap();
+    let commits_after = commit_count_for_issue(&repo, &id);
+    assert_eq!(
+        commits_before, commits_after,
+        "second identical set_metadata should not land a commit"
+    );
+}
+
+#[test]
+fn unset_metadata_idempotent_absent_key_no_extra_commit() {
+    let (storage, repo) = test_storage_named("meta_idempotent_unset");
+    let id = create_test_issue(&storage, "test");
+    let commits_before = commit_count_for_issue(&repo, &id);
+    storage.unset_metadata(&id, "never-set").unwrap();
+    let commits_after = commit_count_for_issue(&repo, &id);
+    assert_eq!(
+        commits_before, commits_after,
+        "unset of absent key should not land a commit"
+    );
 }

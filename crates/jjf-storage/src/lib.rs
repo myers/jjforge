@@ -1250,6 +1250,84 @@ pub fn validate_no_newlines(s: &str) -> std::result::Result<(), ()> {
     Ok(())
 }
 
+/// Maximum bytes for a metadata value. Capped at 256 KiB — large
+/// enough for any realistic metadata payload (routing keys, hashes,
+/// short notes) but small enough that an oversize value can't be used
+/// as a body-cap bypass vector. Storage-layer enforcement; the CLI
+/// pre-validates so a typed exit-2 error fires before any IO.
+pub const METADATA_VALUE_MAX_BYTES: usize = 256 * 1024;
+
+/// Why `validate_metadata_key` rejected its input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataKeyInvalidReason {
+    Empty,
+    ContainsWhitespace,
+    ContainsEquals,
+    ContainsControl,
+}
+
+/// Why `validate_metadata_value` rejected its input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataValueInvalidReason {
+    ContainsNewline,
+    TooLong { limit: usize, got: usize },
+}
+
+/// Validate a metadata key. Keys must be non-empty, contain no
+/// whitespace (including tab — `split_trailer` strips leading/
+/// trailing whitespace, which would make `"\tfoo"` round-trip as
+/// `"foo"` and trip the `cross_check` invariant), contain no `=`
+/// (which would break `--meta key=value` filter round-trip), and
+/// contain no control characters (newlines/CR are a subset).
+pub fn validate_metadata_key(
+    key: &str,
+) -> std::result::Result<(), MetadataKeyInvalidReason> {
+    if key.is_empty() {
+        return Err(MetadataKeyInvalidReason::Empty);
+    }
+    if key.contains('=') {
+        return Err(MetadataKeyInvalidReason::ContainsEquals);
+    }
+    // Control chars (is_control() && !is_whitespace(), plus LF/CR) are the
+    // trailer-injection vector; report as ContainsControl. Horizontal
+    // whitespace (space, tab — is_whitespace() but not newline/CR) is the
+    // "looks like padding / breaks split_trailer" violation; report as
+    // ContainsWhitespace. Note: `\n` and `\t` are BOTH is_control() and
+    // is_whitespace() in Rust; we want `\n` → ContainsControl and
+    // `\t` → ContainsWhitespace, so we special-case newlines first.
+    if key.chars().any(|c| c.is_control() && !c.is_whitespace())
+        || key.contains('\n')
+        || key.contains('\r')
+    {
+        return Err(MetadataKeyInvalidReason::ContainsControl);
+    }
+    if key.chars().any(|c| c.is_whitespace()) {
+        return Err(MetadataKeyInvalidReason::ContainsWhitespace);
+    }
+    Ok(())
+}
+
+/// Validate a metadata value. Values may be empty, may contain `=`
+/// (the parser splits on the FIRST `=` so equals in the value are
+/// safe), but must contain no newlines (trailer-injection vector,
+/// same defense as `validate_no_newlines`) and must be at most
+/// `METADATA_VALUE_MAX_BYTES`.
+pub fn validate_metadata_value(
+    value: &str,
+) -> std::result::Result<(), MetadataValueInvalidReason> {
+    if value.contains('\n') || value.contains('\r') {
+        return Err(MetadataValueInvalidReason::ContainsNewline);
+    }
+    let got = value.len();
+    if got > METADATA_VALUE_MAX_BYTES {
+        return Err(MetadataValueInvalidReason::TooLong {
+            limit: METADATA_VALUE_MAX_BYTES,
+            got,
+        });
+    }
+    Ok(())
+}
+
 /// Minimum slug length (inclusive). Spec v2.1 §3.1.
 pub const SLUG_MIN_LEN: usize = 3;
 
@@ -2738,19 +2816,28 @@ impl Storage {
     /// Set a metadata key to a value. Last-write-wins per key; an
     /// existing key is overwritten. Mirrors [`Storage::add_label`].
     pub fn set_metadata(&self, id: &IssueId, key: &str, value: &str) -> Result<()> {
-        if validate_no_newlines(key).is_err() {
-            return Err(Error::Invalid(
-                "metadata key must not contain newlines".into(),
-            ));
+        if let Err(reason) = validate_metadata_key(key) {
+            return Err(Error::Invalid(format!(
+                "metadata key invalid: {:?}",
+                reason
+            )));
         }
-        if validate_no_newlines(value).is_err() {
-            return Err(Error::Invalid(
-                "metadata value must not contain newlines".into(),
-            ));
+        if let Err(reason) = validate_metadata_value(value) {
+            return Err(Error::Invalid(format!(
+                "metadata value invalid: {:?}",
+                reason
+            )));
         }
         let key = key.to_owned();
         let value = value.to_owned();
         self.mutate(id, &format!("jjf: issue {} - set-metadata", id), |rec| {
+            // Idempotence: short-circuit if the key already has this value.
+            // Mirrors the pattern used in `unblock` / `unclaim` (search
+            // `MutateOutcome::Skip` in this file for siblings). No commit
+            // lands; verb still returns Ok.
+            if rec.metadata.get(&key) == Some(&value) {
+                return MutateOutcome::Skip;
+            }
             rec.metadata.insert(key.clone(), value.clone());
             MutateOutcome::Write(vec![Op::SetMetadata {
                 issue_id: rec.id.clone(),
@@ -2764,13 +2851,18 @@ impl Storage {
     /// Remove a metadata key. No-op if not present (mirrors
     /// [`Storage::remove_label`]).
     pub fn unset_metadata(&self, id: &IssueId, key: &str) -> Result<()> {
-        if validate_no_newlines(key).is_err() {
-            return Err(Error::Invalid(
-                "metadata key must not contain newlines".into(),
-            ));
+        if let Err(reason) = validate_metadata_key(key) {
+            return Err(Error::Invalid(format!(
+                "metadata key invalid: {:?}",
+                reason
+            )));
         }
         let key = key.to_owned();
         self.mutate(id, &format!("jjf: issue {} - unset-metadata", id), |rec| {
+            // Idempotence: short-circuit if the key is already absent.
+            if !rec.metadata.contains_key(&key) {
+                return MutateOutcome::Skip;
+            }
             rec.metadata.remove(&key);
             MutateOutcome::Write(vec![Op::UnsetMetadata {
                 issue_id: rec.id.clone(),
@@ -5662,5 +5754,73 @@ Jjf-Label: fixed
         )];
         let blocked = compute_blocked_set(&all);
         assert!(!blocked.contains(&b));
+    }
+}
+
+#[cfg(test)]
+mod metadata_validator_tests {
+    use super::*;
+
+    #[test]
+    fn validate_metadata_key_rejects_empty() {
+        assert!(matches!(validate_metadata_key(""), Err(MetadataKeyInvalidReason::Empty)));
+    }
+
+    #[test]
+    fn validate_metadata_key_rejects_leading_space() {
+        assert!(matches!(validate_metadata_key(" foo"), Err(MetadataKeyInvalidReason::ContainsWhitespace)));
+    }
+
+    #[test]
+    fn validate_metadata_key_rejects_trailing_space() {
+        assert!(matches!(validate_metadata_key("foo "), Err(MetadataKeyInvalidReason::ContainsWhitespace)));
+    }
+
+    #[test]
+    fn validate_metadata_key_rejects_tab() {
+        assert!(matches!(validate_metadata_key("foo\tbar"), Err(MetadataKeyInvalidReason::ContainsWhitespace)));
+    }
+
+    #[test]
+    fn validate_metadata_key_rejects_equals() {
+        assert!(matches!(validate_metadata_key("foo=bar"), Err(MetadataKeyInvalidReason::ContainsEquals)));
+    }
+
+    #[test]
+    fn validate_metadata_key_rejects_control_char() {
+        assert!(matches!(validate_metadata_key("foo\x00"), Err(MetadataKeyInvalidReason::ContainsControl)));
+        assert!(matches!(validate_metadata_key("foo\n"), Err(MetadataKeyInvalidReason::ContainsControl)));
+    }
+
+    #[test]
+    fn validate_metadata_key_accepts_normal_key() {
+        assert!(validate_metadata_key("gc.routed_to").is_ok());
+        assert!(validate_metadata_key("dotted.with.path").is_ok());
+        assert!(validate_metadata_key("kebab-case").is_ok());
+        assert!(validate_metadata_key("with_under").is_ok());
+    }
+
+    #[test]
+    fn validate_metadata_value_rejects_newline() {
+        assert!(matches!(validate_metadata_value("a\nb"), Err(MetadataValueInvalidReason::ContainsNewline)));
+        assert!(matches!(validate_metadata_value("a\rb"), Err(MetadataValueInvalidReason::ContainsNewline)));
+    }
+
+    #[test]
+    fn validate_metadata_value_rejects_oversize() {
+        let huge = "a".repeat(METADATA_VALUE_MAX_BYTES + 1);
+        let result = validate_metadata_value(&huge);
+        assert!(matches!(result, Err(MetadataValueInvalidReason::TooLong { .. })));
+    }
+
+    #[test]
+    fn validate_metadata_value_accepts_at_cap() {
+        let at_cap = "a".repeat(METADATA_VALUE_MAX_BYTES);
+        assert!(validate_metadata_value(&at_cap).is_ok());
+    }
+
+    #[test]
+    fn validate_metadata_value_accepts_empty() {
+        assert!(validate_metadata_value("").is_ok());
     }
 }
