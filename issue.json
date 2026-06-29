@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "id": "41c2e4a",
+  "title": "storage-format-doc-revival: docs/storage-format.md is referenced from source but missing on disk",
+  "slug": "storage-format-doc-revival",
+  "body": "# Goal\n\n`docs/storage-format.md` is referenced from CLAUDE.md and from\n`crates/jjf-merge/src/parser.rs:249` (and elsewhere), but the\nfile does not exist on disk. Either revive it or remove the\nreferences.\n\n# Source\n\nSurfaced 2026-06-29 during PR #4 metadata-fixes Task 8 (doc\nupdates). The PR's metadata feature would have added §3 and §5\nentries — those are pending until this ticket resolves.\n\n# Approach options\n\n- A. Revive the doc with a current snapshot of the storage\n  format (v3 refs, v2 record schema, trailer kinds, op\n  variants). Substantial — needs a careful pass over `record.rs`,\n  `op.rs`, `trailer.rs`, `merge_ops.rs`.\n- B. Delete the references in source/docs. Cheaper but loses\n  the \"spec doc as source of truth\" contract.\n\n# Acceptance\n\nPick A or B and execute.\n",
+  "status": "open",
+  "block_reason": null,
+  "type": "bug",
+  "priority": null,
+  "labels": [],
+  "metadata": {},
+  "dependencies": [
+    {
+      "target": "cc2fa96",
+      "kind": "parent-child"
+    }
+  ],
+  "assignee": null,
+  "created_at": "2026-06-29T15:04:00Z",
+  "updated_at": "2026-06-29T15:04:00Z"
+}
