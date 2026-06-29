@@ -36,6 +36,88 @@ first.**
   image. Mirrors zfs-workspace's pattern except for the
   notify-flux hook (jjforge isn't a Flux deployment target).
 
+## Multiple host repos — auto-migration matters now
+
+As of 2026-06-29, jjforge is no longer a single-host tool. Live
+host repos using `refs/jjf/issues/*`:
+
+- **`~/p/jjforge`** (self-hosted, since 2026-06-22; `issues`
+  bookmark migrated to v3 refs in `bd98097`).
+- **`~/p/asterinas-workspace`** (trial migration started
+  2026-06-28; 18 issues seeded across `epic-01-qemu-first-light`
+  and `epic-01-host-net`; bulk run pending per
+  `docs/host-asterinas-dispatch.md` and `cc2fa96`).
+
+More are likely soon — every workspace that wants `jjf ready`
+is a candidate. This changes the math on storage migrations:
+
+### What's at stake
+
+Any breaking change to the storage format — schema bump, new
+required field, ref-namespace move, JSON-envelope tweak — now
+needs to land cleanly in **every** host repo a user has on
+disk, not just jjforge's own. The v2 → v3 storage move
+(`bd98097`) was tractable because there was exactly one live
+host repo (jjforge itself) and the migration ran on first
+`Storage::open`. We can't keep that pattern naively: an
+operator with five host repos shouldn't have to remember which
+ones need a migration pass before they next use them, and they
+shouldn't have to re-pull jjforge to find out a migration was
+even needed.
+
+### Migration-design rules (provisional)
+
+These are the operating instincts; they're not yet a
+formalized policy and the first real cross-repo migration will
+sharpen them.
+
+1. **Detect at `Storage::open` time.** Every host repo's first
+   open of a session checks the on-disk format version and
+   compares to the binary's expected version. If they differ,
+   migrate or refuse with a clear message — never silently
+   read a stale shape.
+2. **Migrations should be self-contained.** The migration code
+   for `vN → vN+1` lives in the `jjf` binary and runs from the
+   binary alone. No external script, no out-of-band data file.
+   Operators upgrade their `jjf` binary and migrations Just Run.
+3. **Never assume single-host.** Don't store global state in
+   `~/.config/jjf/` that a per-host migration might depend on.
+   Each host's `refs/jjf/*` IS the state; the binary is the
+   actor.
+4. **Version on every record, not just at the repo level.**
+   The v3 storage already does this — each issue record
+   carries its schema version. Cross-version reads can degrade
+   gracefully (warn-and-skip) rather than crash; cross-version
+   writes refuse until migrated.
+5. **`jjf migrate` as an explicit verb is on the table.** For
+   migrations that are expensive or destructive (anything
+   beyond a JSON re-shape), an explicit verb operators run
+   beats silent open-time migration. The trade-off: explicit
+   = visible cost + audit trail; silent = no operator
+   friction but invisible breakage if it fails partway.
+6. **Cross-repo broadcast is the operator's job.** jjforge
+   does not phone home or maintain a registry of host repos.
+   When a migration ships, the user knows their own host repos
+   and runs the upgrade. CLAUDE.md (this file) and
+   `docs/storage-format.md` are the source of truth for
+   "which version is current."
+
+### Open questions
+
+- Does `jjf migrate` need to be a verb today, or wait for the
+  first real breaking change? (Today: no breaking change is
+  imminent.)
+- How does an operator find every host repo on their disk?
+  (`find ~ -name '.jj' -type d` finds candidates; we don't
+  have a registry.)
+- Read-only access from an older `jjf` to a newer-format repo:
+  refuse with a clear message, or downgrade-degrade? (Lean:
+  refuse — agents misreading a newer shape is worse than a
+  noisy error.)
+
+The first cross-repo migration that lands after this section
+gets to update or refute these rules in place.
+
 ## How to use jjforge
 
 The project is dogfooding `jjf` as its own planner. Treat every
