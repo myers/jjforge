@@ -597,6 +597,7 @@ $ jjf ls --json
     "id": "a3f9c01",
     "title": "fix the thing",
     "status": "open",
+    "metadata": {},
     ...
   }
 ]
@@ -764,6 +765,10 @@ Flags:
 - `--include-metadata` — also search metadata keys and values.
   Off by default. Matches on the concatenated `"key=value"` form
   of each entry.
+- `--meta <key>=<value>` — repeatable, AND-semantics. An issue
+  matches only if its `metadata` map contains every listed
+  `key=value` pair exactly. Bare-key form (`--meta key`) is
+  rejected at preflight: exit 2, `metadata_filter_malformed`.
 - `--limit <N>` — cap the result list after the sort. Default
   20. Pass `--limit 0` for unlimited.
 - `--snippet-context <N>` — half-width of the snippet window,
