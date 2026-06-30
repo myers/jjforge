@@ -553,12 +553,12 @@ enum Commands {
 
         /// Override the actor used by `--claim` (the identity that
         /// lands in the `assignee` field). Precedence:
-        /// `--actor <name>` > `JJF_ACTOR` env > `jj config get
+        /// `--actor <name>` > `JJF_ACTOR` env > `git config
         /// user.name`. Empty string falls through to the next slot
         /// rather than writing an empty assignee. Intended for
         /// multi-agent orchestrators that fan out N processes from
         /// one machine and need each to claim under a distinct
-        /// name; everyone else should just set `jj user.name`.
+        /// name; everyone else should just set `git config user.name`.
         /// Mutually exclusive with `--unclaim`, `--assignee`, and
         /// `--unset-assignee` (those don't take an implicit
         /// identity). v2.12 (`actor-override-chain`, ticket
@@ -594,9 +594,9 @@ enum Commands {
 
         /// Override the comment author. Free-form string written
         /// verbatim into the comment record. When omitted, the author
-        /// is sourced from `jj config get user.name` + `user.email`
-        /// in the `Name <email>` format that matches jj's commit-author
-        /// template. If no jj `user.name` is configured and no
+        /// is sourced from `git config user.name` + `user.email`
+        /// in the `Name <email>` format that matches git's commit-author
+        /// template. If no git `user.name` is configured and no
         /// override is given, the verb exits 2 with a hint to set one.
         #[arg(long)]
         author: Option<String>,
@@ -1528,7 +1528,7 @@ enum CliError {
     /// `jjf update --claim` (or `jjf ready --claim`) couldn't find
     /// a current user. Preflight failure (exit 2) — claims require
     /// an identity to assign to. The chain is `--actor <name>` >
-    /// `JJF_ACTOR` env > `jj config user.name`; this error fires
+    /// `JJF_ACTOR` env > `git config user.name`; this error fires
     /// when every slot is empty. v2.3 (`agent-claim-atomic`); chain
     /// extended v2.12 (`actor-override-chain`).
     #[error(
