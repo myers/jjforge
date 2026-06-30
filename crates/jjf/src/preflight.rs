@@ -21,15 +21,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use jjf_storage::{Error as StorageError, ISSUES_BOOKMARK, Storage};
+use jjf_storage::Error as StorageError;
 
 use crate::CliError;
-
-/// The v1 bookmark name. If we see this AND no `issues` bookmark,
-/// the repo is pre-migration; calling `Storage::open` runs the
-/// inline v1→v2 rename. Kept duplicated here because the storage
-/// crate doesn't expose its `V1_BUGS_BOOKMARK` constant publicly.
-const V1_BUGS_BOOKMARK: &str = "bugs";
 
 /// Probe that `cwd` is inside a git repo. Shells out to `git rev-parse
 /// --git-dir` and translates a non-zero exit into `NotAJjRepo`;
@@ -55,67 +49,27 @@ pub(crate) fn jj_repo(cwd: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Probe that (a) `cwd` is inside a jj repo and (b) the repo is
-/// `jjf init`-ed — meaning either the v2 `issues` bookmark exists or
-/// the v3 `refs/jjf/meta/format-version` sentinel ref resolves.
+/// Probe that (a) `cwd` is inside a git repo and (b) the repo is
+/// `jjf init`-ed — meaning the v3 `refs/jjf/meta/format-version`
+/// sentinel ref resolves.
 ///
-/// Both checks shell out directly so we can surface distinct
-/// preflight-error variants rather than the storage layer's generic
-/// `Jj` runtime error.
+/// The v3 sentinel is the only supported init marker. v2 (`issues`
+/// bookmark) and v1 (`bugs` bookmark) shapes are no longer accepted;
+/// repos using those shapes must migrate via `jjf init`.
 ///
 /// Most read/write verbs (`jjf new`, `jjf show`, `jjf ls`, etc.) call
 /// this. The `jjf remote *` verbs use the simpler [`jj_repo`] probe
 /// because remote setup is meaningful before `jjf init`.
 pub(crate) fn issues_bookmark(cwd: &Path) -> Result<(), CliError> {
-    // Check 1: is this a jj repo at all? Same logic as `jj_repo` —
-    // reuse it so the two probes stay in sync.
+    // Check 1: is this a git repo at all?
     jj_repo(cwd)?;
 
-    // Check 2a: v3 sentinel? Cheapest probe — one `git rev-parse`.
-    // If present, the repo is v3-init'd and we're done.
+    // Check 2: v3 sentinel ref. Its presence means the repo is
+    // `jjf init`-ed. v2/v1 bookmark shapes are no longer supported.
     if git_ref_exists(cwd, "refs/jjf/meta/format-version")? {
         return Ok(());
     }
-
-    // Check 2b: does the v2 `issues` bookmark exist? `jj bookmark
-    // list` exits 0 either way; we key off stdout content.
-    let out = Command::new("jj")
-        .arg("--repository")
-        .arg(cwd)
-        .args(["bookmark", "list", "-T", "name ++ \"\\n\"", ISSUES_BOOKMARK])
-        .output()
-        .map_err(CliError::Probe)?;
-    if !out.status.success() {
-        return Err(CliError::Probe(std::io::Error::other(format!(
-            "jj bookmark list failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ))));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    if !stdout.lines().any(|l| l.trim() == ISSUES_BOOKMARK) {
-        // Neither v3 sentinel nor v2 bookmark. Before refusing, check
-        // if the v1 `bugs` bookmark is present — if so, this is a v1
-        // repo that hasn't been migrated yet; calling `Storage::open`
-        // triggers the inline v1→v2 rename in the storage layer.
-        // After the migration commits, `issues` exists and the verb
-        // proceeds normally on the next call.
-        let v1_out = Command::new("jj")
-            .arg("--repository")
-            .arg(cwd)
-            .args(["bookmark", "list", "-T", "name ++ \"\\n\"", V1_BUGS_BOOKMARK])
-            .output()
-            .map_err(CliError::Probe)?;
-        let v1_stdout = String::from_utf8_lossy(&v1_out.stdout);
-        if v1_out.status.success()
-            && v1_stdout.lines().any(|l| l.trim() == V1_BUGS_BOOKMARK)
-        {
-            let _ =
-                Storage::open(PathBuf::from(cwd)).map_err(CliError::Storage)?;
-            return Ok(());
-        }
-        return Err(CliError::MissingIssuesBookmark(cwd.to_owned()));
-    }
-    Ok(())
+    Err(CliError::MissingIssuesBookmark(cwd.to_owned()))
 }
 
 /// Cheap check: does a git ref resolve in `cwd`? Used by

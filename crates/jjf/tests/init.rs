@@ -221,6 +221,45 @@ fn global_json_flag_works_before_subcommand_too() {
 }
 
 #[test]
+fn verb_on_uninitialized_repo_rejects_without_jj() {
+    // A jj-colocated repo that has NOT had `jjf init` run — no
+    // refs/jjf/meta/format-version sentinel. After J3 the preflight
+    // must cleanly refuse via MissingIssuesBookmark rather than
+    // spawning `jj bookmark list`. Using make_jj_repo gives us the
+    // right substrate: git+jj colocated, no sentinel, so the v3 check
+    // returns false and the function returns MissingIssuesBookmark.
+    // The current (pre-J3) code falls through to `jj bookmark list`
+    // which returns 0 but no matching `issues` line, then tries v1
+    // fallback, then returns MissingIssuesBookmark — both shapes
+    // return exit non-zero, so the first assertion passes both before
+    // and after the rewrite. The meaningful change is that after J3
+    // we don't invoke jj at all for the v2/v1 fallback path.
+    let repo = make_jj_repo("verb_uninitialized");
+
+    // ls must fail — no sentinel, no init.
+    let out = run_jjf(&repo, &["ls"]);
+    assert!(
+        !out.status.success(),
+        "ls should refuse on an uninitialized repo; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // After `jjf init`, ls must succeed.
+    let init_out = run_jjf(&repo, &["init"]);
+    assert!(
+        init_out.status.success(),
+        "jjf init failed: stderr={}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+    let ls_out = run_jjf(&repo, &["ls"]);
+    assert!(
+        ls_out.status.success(),
+        "ls should succeed after jjf init; stderr={}",
+        String::from_utf8_lossy(&ls_out.stderr)
+    );
+}
+
+#[test]
 fn help_lists_every_epic_verb() {
     // Run from the crate's manifest dir; `--help` doesn't touch the
     // filesystem so the cwd doesn't matter, but using a stable path
