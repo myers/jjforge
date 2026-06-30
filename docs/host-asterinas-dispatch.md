@@ -2,7 +2,7 @@
 
 The contract between the orchestrator and each Haiku slice agent
 during the bulk migration of `~/p/asterinas-workspace/issues/`
-into jjforge. Builds on `docs/host-asterinas-audit.md` (the
+into git-issues. Builds on `docs/host-asterinas-audit.md` (the
 mapping table) by pinning down the rules the audit left to
 agent judgment.
 
@@ -14,14 +14,14 @@ the fly.
 ## Working directory and binary
 
 ```bash
-JJF=/Users/myers/p/jjforge/bin/jjf
-export JJF_ACTOR=haiku-slice-<slug>     # distinct per agent
+JJF=/Users/myers/p/jjforge/bin/iss
+export ISS_ACTOR=haiku-slice-<slug>     # distinct per agent
 cd /Users/myers/p/asterinas-workspace
 ```
 
-All `jjf` commands run from the asterinas-workspace dir so they
+All `iss` commands run from the asterinas-workspace dir so they
 write to its `refs/jjf/issues/*`. NEVER `cd` into `~/p/jjforge`
-for a `jjf` call — that contaminates the jjforge planner.
+for a `iss` call — that contaminates the git-issues planner.
 
 ## Slug policy
 
@@ -66,7 +66,7 @@ there's no `**Status:**` line"; fixed here.
 
 **Explicit `**Status:**` line:**
 
-| source root                                       | jjforge status | extra label              |
+| source root                                       | git-issues status | extra label              |
 |---------------------------------------------------|----------------|--------------------------|
 | `done`/`closed`/`fixed`/`resolved`/`shipped`/`landed` | `closed`       | —                        |
 | `not-started`/`filed`                             | `open`         | —                        |
@@ -121,7 +121,7 @@ Phase label per the dir-prefix rule above (always applied).
 ## Parent edge
 
 Every child in an `epic-*/` directory gets `--parent <epic-slug>`
-on `jjf new`. Resolve via slug — `jjf new --parent` now accepts
+on `iss new`. Resolve via slug — `iss new --parent` now accepts
 slugs as of `fbf66a82` (commit 2026-06-28).
 
 ## `Blocked by:` resolution (two-pass)
@@ -130,7 +130,7 @@ slugs as of `fbf66a82` (commit 2026-06-28).
 
 1. Create the epic first (no `--parent`). Capture id.
 2. Create each child with title/slug/type/status/labels/parent.
-3. Build the local-numeric → jjforge-id mapping table:
+3. Build the local-numeric → git-issues-id mapping table:
    - For `host-net-04a-…` → map `04a` to the id.
    - For files with just numeric prefixes (`02-…`) → map `02`.
 4. Apply `close` / `block` status changes that didn't fit on
@@ -221,7 +221,7 @@ Must contain:
 
 - **Counts.** Files processed / expected; issues created;
   `blocks` edges created; refs skipped (broken out by reason).
-- **Mapping table.** Local-numeric or filename → slug → jjforge
+- **Mapping table.** Local-numeric or filename → slug → git-issues
   id, one row per issue. The orchestrator's cross-epic
   resolution pass reads these tables.
 - **Per-file detail.** Source path → id, status, labels.
@@ -235,9 +235,9 @@ Must contain:
 
 - Do NOT push. The orchestrator owns transport.
 - Do NOT edit source markdown in `~/p/asterinas-workspace/issues/`.
-- Do NOT mutate jjforge's own source tree.
+- Do NOT mutate git-issues' own source tree.
 - Do NOT touch other epics outside the assigned slice.
-- Set `JJF_ACTOR=haiku-slice-<distinct-slug>` so attribution
+- Set `ISS_ACTOR=haiku-slice-<distinct-slug>` so attribution
   works across parallel agents.
 
 ## Slice-dispatch prompt template
@@ -245,7 +245,7 @@ Must contain:
 Copy-paste into the agent prompt:
 
 > You are migrating one slice of the asterinas-workspace
-> markdown tree into jjforge. Read
+> markdown tree into git-issues. Read
 > `~/p/jjforge/docs/host-asterinas-dispatch.md` first — every
 > rule you need is in that doc. Then read
 > `~/p/jjforge/docs/host-asterinas-audit.md` for the mapping
@@ -255,8 +255,8 @@ Copy-paste into the agent prompt:
 > `<count>`. Expected statuses: `<rough mix>`.
 >
 > **Working dir:** `/Users/myers/p/asterinas-workspace`. Binary:
-> `/Users/myers/p/jjforge/bin/jjf`. Actor:
-> `JJF_ACTOR=haiku-slice-<distinct-slug>`.
+> `/Users/myers/p/jjforge/bin/iss`. Actor:
+> `ISS_ACTOR=haiku-slice-<distinct-slug>`.
 >
 > Apply the dispatch recipe (slug policy, phase label, status
 > parse, labels, two-pass `Blocked by:`, body-cap split,

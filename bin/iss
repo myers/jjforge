@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# jjf — the jjforge CLI.
+# iss — the git-issues CLI.
 #
 # Delegates to the Rust binary built in this workspace. Picks
 # the most recently built of release/debug; builds release on
@@ -10,8 +10,8 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 workspace_root="$(cd "$here/.." && pwd)"
 
-release_bin="$workspace_root/target/release/jjf"
-debug_bin="$workspace_root/target/debug/jjf"
+release_bin="$workspace_root/target/release/iss"
+debug_bin="$workspace_root/target/debug/iss"
 
 # Pick the newer of the two when both exist, so a fresh `cargo
 # build` (debug, by default) doesn't get shadowed by a stale
@@ -32,6 +32,6 @@ if [[ -x "$debug_bin" ]]; then
     exec "$debug_bin" "$@"
 fi
 
-echo "jjf: no built binary at $release_bin or $debug_bin; building release..." >&2
-cargo build --release --manifest-path "$workspace_root/Cargo.toml" -p jjf >&2
+echo "iss: no built binary at $release_bin or $debug_bin; building release..." >&2
+cargo build --release --manifest-path "$workspace_root/Cargo.toml" -p iss >&2
 exec "$release_bin" "$@"

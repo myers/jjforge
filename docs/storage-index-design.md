@@ -8,8 +8,8 @@ ever become a real problem.
 
 ## 1. The scale problem, measured
 
-Every list-shaped read path (`jjf ls`, `jjf ready`, `jjf show <slug>`,
-`jjf memories`) calls `Storage::read` or `Storage::read_record_from_bookmark`
+Every list-shaped read path (`iss ls`, `iss ready`, `iss show <slug>`,
+`iss memories`) calls `Storage::read` or `Storage::read_record_from_bookmark`
 once per id. Each of those is a `jj file show` shell-out — and
 sometimes two (one for `<id>.json`, one for `<id>.comments.jsonl`).
 Per `experiments/jj-cli-overhead/README.md`, one `jj` invocation
@@ -29,7 +29,7 @@ Measured wall-clock at three sizes against a synthetic bookmark
 The headline number is `list_ready` at N=1000: **22.5 seconds**. At
 N=10000 the linear extrapolation is **~4 minutes per call**. That's
 not a future problem — `~/p/asterinas-workspace` has ~1000 issues
-today and the operator wants to migrate it to jjforge. We're at the
+today and the operator wants to migrate it to git-issues. We're at the
 cliff.
 
 The interesting cell is the **cache-hit column**: ~15 ms regardless
@@ -49,7 +49,7 @@ operator pays that once per write that moves the bookmark.
 
 Ship this. Cheapest possible thing that crushes the read path.
 
-**Location.** `.jj/jjforge-cache.json` (or `.bincode` / `.cbor` for
+**Location.** `.jj/git-issues-cache.json` (or `.bincode` / `.cbor` for
 faster parse — JSON parsing for 10k issues is ~10 ms and not the
 hot path, so we pick whichever is most operator-readable; JSON
 wins). `.jj/` is already gitignored, so the cache is invisible to
@@ -85,7 +85,7 @@ fn open_or_load_cache(repo) -> Cache {
     let head = repo.run(["log", "-r", "bookmarks(issues)",
                           "-T", "commit_id", "--limit", "1",
                           "--no-graph"]);
-    if let Some(cache) = read_cache_file(".jj/jjforge-cache.json") {
+    if let Some(cache) = read_cache_file(".jj/git-issues-cache.json") {
         if cache.head_commit == head {
             return cache;  // hit; ~15 ms total
         }
@@ -107,7 +107,7 @@ fast enough at N=10k:
    Then `jj new root()` to step `@` back off. **Drawback:** mutates
    `@` — risky to run while the operator may have a concurrent
    commit landing. The 4-CLI write dance does the same thing
-   though, so it's already in jjforge's vocabulary.
+   though, so it's already in git-issues' vocabulary.
 
 2. **`jj file show` per id** (the current N-spawn pattern). 22 s at
    N=1000, 225 s at N=10k. Reject — this is the thing we're trying
@@ -120,7 +120,7 @@ fast enough at N=10k:
 
 Pick option 1. The bookmark mutation footprint is fine: the read
 path holds the cache rebuild lock (in-memory `Mutex` or a `.jj/
-jjforge-cache.lock` advisory file), so two concurrent rebuilds
+git-issues-cache.lock` advisory file), so two concurrent rebuilds
 don't fight. A concurrent writer is the same situation we already
 have today — jj's bookmark-set's fast-forward semantics handle the
 race.
@@ -172,7 +172,7 @@ Rationale:
   proc-macro. Compare to redb (pure Rust, no FFI): cleaner, but for
   the wrong hot path.
 - Migrations: in the index world we don't ALTER. The index is pure
-  derived state. On schema bump we delete `.jj/jjforge-index.db`
+  derived state. On schema bump we delete `.jj/git-issues-index.db`
   and rebuild from the cache or from the bookmark. SQLite's
   `ALTER TABLE` story doesn't matter; redb's "disk format not yet
   1.0" doesn't matter either; both win on the migration question
@@ -237,7 +237,7 @@ CREATE TABLE meta (
 --         'schema_version': '1' }
 ```
 
-`jjf ready` becomes (roughly):
+`iss ready` becomes (roughly):
 
 ```sql
 SELECT i.* FROM issues i
@@ -275,7 +275,7 @@ If we ever ship the index, rebuild is the same shape as the cache:
 Post-write hooks are tempting (write the change directly to the
 index on every mutation, eliminate the probe) but introduce a
 correctness surface we don't want: the moment a write lands on the
-bookmark via another path (`jjf pull`, an interactive `jj` op
+bookmark via another path (`iss pull`, an interactive `jj` op
 against `issues/`, a future merge driver fixup), the index goes
 stale and we wouldn't notice. The probe-on-read story has no such
 failure mode — the index either matches the bookmark or gets
@@ -291,9 +291,9 @@ Per the measured numbers:
 - Cache rebuild (working-copy walk): 5 s at N=10k. Once per bookmark
   move.
 
-A typical interactive session: one rebuild on the first `jjf` call
-after a `jjf pull` or operator-side mutation, then cheap reads for
-the rest of the session. An agent loop hitting `jjf ready` 50 times
+A typical interactive session: one rebuild on the first `iss` call
+after a `iss pull` or operator-side mutation, then cheap reads for
+the rest of the session. An agent loop hitting `iss ready` 50 times
 between writes: 5 s rebuild + 50 × 15 ms ≈ 5.75 s total instead of
 50 × 22 s = 18 minutes.
 
@@ -309,7 +309,7 @@ schema to reach for.
 - Implementing the index. We don't file an implementation ticket
   for the index; the design above is enough to act on later if
   needed.
-- A `jjf bench` verb. Measurements live here, not in the CLI.
+- A `iss bench` verb. Measurements live here, not in the CLI.
 - Replacing the op chain as the source of truth. Cache and index
   are both pure derived state. Source of truth stays the
   `issues` bookmark.
@@ -317,14 +317,14 @@ schema to reach for.
 ## Pointers
 
 - `experiments/scale-index/` — the bench binary and README.
-- `crates/jjf-storage/src/lib.rs` — `Storage::list_ids`,
+- `crates/iss-storage/src/lib.rs` — `Storage::list_ids`,
   `Storage::list_ready`, `Storage::resolve`, `Storage::read`.
-- `crates/jjf-storage/src/read.rs` — `read::read` (the per-id read
+- `crates/iss-storage/src/read.rs` — `read::read` (the per-id read
   the loops call).
-- `crates/jjf-storage/src/history.rs` — `read_history_at` (the
+- `crates/iss-storage/src/history.rs` — `read_history_at` (the
   per-issue `jj log` walker; debug-build cross-check only, not
   load-bearing on the release-build read hot path).
-- `crates/jjf-storage/src/memory.rs` — `list_memories` /
+- `crates/iss-storage/src/memory.rs` — `list_memories` /
   `read_memory_from_bookmark` follow the same one-spawn-per-key
   pattern; the cache covers them too.
 - `experiments/jj-cli-overhead/README.md` — the underlying ~15 ms

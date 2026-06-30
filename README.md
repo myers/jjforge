@@ -1,18 +1,18 @@
-# jjforge
+# git-issues
 
 > **Alpha** — written by a coding agent, has been only lightly used so far. YOU HAVE BEEN WARNED.
 
 ## Quickstart
 
 You'll need a recent Rust toolchain and [jj](https://github.com/jj-vcs/jj)
-on your PATH (jjforge shells out to `jj`).
+on your PATH (git-issues shells out to `jj`).
 
 ```bash
-cargo install --git https://github.com/myers/jjforge.git jjf
+cargo install --git https://github.com/myers/jjforge.git iss
 cd /your/jj/repo
-jjf init                              # plant refs/jjf/* namespace
-echo "the body" | jjf new -t "first issue" -F -
-jjf ls
+iss init                              # plant refs/jjf/* namespace
+echo "the body" | iss new -t "first issue" -F -
+iss ls
 ```
 
 For the full walk-through (push/pull across clones, dep edges,
@@ -23,7 +23,7 @@ the agent-ergonomics verbs like `ready` and `remember`), see
 
 ## What this is
 
-A jj-native, agent-first issue tracker. CLI: `jjf`.
+A jj-native, agent-first issue tracker. CLI: `iss`.
 
 The Rust binary covers the full verb set with `--json` on every
 command, push/pull over standard git transport, and an op-space
@@ -32,7 +32,7 @@ without human intervention. Output contract in
 [docs/cli-json.md](docs/cli-json.md); architecture in
 [docs/architecture.md](docs/architecture.md).
 
-It tracks its own work — see the roadmap (`jjf show roadmap`)
+It tracks its own work — see the roadmap (`iss show roadmap`)
 for what's open and what's next.
 
 ## Inspirations
@@ -59,34 +59,34 @@ deterministic — no human-resolvable conflicts. See
 [docs/architecture.md](docs/architecture.md) for the full picture
 and the rationale for leaning on jj rather than git alone.
 
-## Planning lives in jjforge
+## Planning lives in git-issues
 
 Self-hosted on this very binary. The roadmap is the entry
 point in any new session:
 
 ```bash
-jjf show roadmap
+iss show roadmap
 ```
 
 ## Agent skills
 
-jjforge ships skills for agents driving it (Claude Code, Codex,
+git-issues ships skills for agents driving it (Claude Code, Codex,
 Cursor, Gemini, Copilot CLI, and others that read the SKILL.md
 convention).
 
 Install with Vercel's `skills` CLI:
 
 ```bash
-npx skills add myers/jjforge
+npx skills add myers/git-issues
 ```
 
 The CLI auto-detects which agents you have installed and asks
 which to target. The two skills that ship today:
 
-- **`using-jjforge`** — how to read the roadmap, find unblocked
-  work, create / update / query issues. Auto-loads on `jjf`,
-  `jjforge`, `ready`, `remember`, or any `jjf <verb>` invocation.
-- **`subagent-working-a-jjforge-issue`** — the closing-comment
+- **`using-git-issues`** — how to read the roadmap, find unblocked
+  work, create / update / query issues. Auto-loads on `iss`,
+  `git-issues`, `ready`, `remember`, or any `iss <verb>` invocation.
+- **`subagent-working-a-git-issues-issue`** — the closing-comment
   recipe and boundaries for a subagent dispatched to do focused
   work on a single issue.
 
@@ -96,11 +96,11 @@ shape — this repo's `.claude-plugin/plugin.json` makes the same
 
 ## Repo layout
 
-- [`crates/jjf-storage/`](crates/jjf-storage/) — storage
+- [`crates/iss-storage/`](crates/iss-storage/) — storage
   primitives (init / read / write / history / list / merge).
-- [`crates/jjf-merge/`](crates/jjf-merge/) — file-bytes merge
+- [`crates/iss-merge/`](crates/iss-merge/) — file-bytes merge
   driver, kept as a library.
-- [`crates/jjf/`](crates/jjf/) — the `jjf` binary (clap-derive
+- [`crates/iss/`](crates/iss/) — the `iss` binary (clap-derive
   CLI over the storage layer).
 - [`skills/`](skills/) — agent skills, one SKILL.md per skill
   (Vercel + Claude Code compatible).
@@ -116,12 +116,12 @@ Stable Rust toolchain (1.75+); `jj` on your PATH (Quickstart
 covers this).
 
 ```bash
-cargo build --release -p jjf
+cargo build --release -p iss
 cargo nextest run --workspace
 # fall back to `cargo test --workspace` if nextest isn't installed
 ```
 
-The binary lands at `target/release/jjf`. `cargo nextest` is
+The binary lands at `target/release/iss`. `cargo nextest` is
 preferred — it isolates test processes, which matters for the
 integration tests that spawn real `jj` subprocesses (install:
 `cargo install cargo-nextest --locked`).

@@ -1,6 +1,6 @@
-# jjforge architecture
+# git-issues architecture
 
-How issues are stored, how mutations land, and why jjforge leans
+How issues are stored, how mutations land, and why git-issues leans
 on jj rather than git alone.
 
 ## Storage layout
@@ -17,19 +17,24 @@ jj+git repo. One ref per issue, one ref per memory, plus a sentinel:
   same shape.
 - `refs/jjf/meta/format-version` — a sentinel commit marking the
   storage format. Presence tells readers the repo has been
-  `jjf init`-ed.
+  `iss init`-ed.
+
+> **Vestigial tokens:** `refs/jjf/*`, `Jjf-Op:`, `Jjf-At:`, and the
+> `jjf_at` field in JSON are named from before the project was renamed
+> from `jjforge`/`jjf` to `git-issues`/`iss`. They are wire-format
+> tokens frozen for backwards compatibility and must not be renamed.
 
 ## Write path
 
 Every mutation is a new commit on the relevant per-issue (or
 per-memory) ref, advanced via `git update-ref` with a CAS guard
-against the prior tip. Git HEAD never moves, so `jjf` verbs are
+against the prior tip. Git HEAD never moves, so `iss` verbs are
 safe to run alongside live source work in the same colocated repo.
 
 The commit description carries `Jjf-Op:` and `Jjf-At:` git-trailers
 documenting which op ran and when (nanosecond resolution). All of
-this travels with standard git transport — `jjf push <remote>` and
-`jjf pull <remote>` round-trip the whole `refs/jjf/*` namespace via
+this travels with standard git transport — `iss push <remote>` and
+`iss pull <remote>` round-trip the whole `refs/jjf/*` namespace via
 the same ssh / https that carries `refs/heads/*`.
 
 ## Merge model
@@ -43,7 +48,7 @@ and lands a single merge commit per resolved issue. There is no
 
 ## Why jj-native
 
-- **`refs/jjf/*` is the unit of sync.** `jjf push` / `jjf pull`
+- **`refs/jjf/*` is the unit of sync.** `iss push` / `iss pull`
   round-trip the whole namespace via standard git transport — no
   special server, no protobuf, no LFS. Server-side it's vanilla
   git; clone with `git clone`, serve with Forgejo / Gitea /
@@ -63,7 +68,7 @@ and lands a single merge commit per resolved issue. There is no
 
 - [docs/cli-json.md](cli-json.md) — output contract for `--json`.
 - [docs/quickstart.md](quickstart.md) — five-minute walkthrough.
-- [`crates/jjf-storage/src/lib.rs`](../crates/jjf-storage/src/lib.rs) —
+- [`crates/iss-storage/src/lib.rs`](../crates/iss-storage/src/lib.rs) —
   the storage layer (source-of-truth for the on-disk record shape).
-- [`crates/jjf-storage/src/merge_ops.rs`](../crates/jjf-storage/src/merge_ops.rs) —
+- [`crates/iss-storage/src/merge_ops.rs`](../crates/iss-storage/src/merge_ops.rs) —
   the op-space merge resolver.

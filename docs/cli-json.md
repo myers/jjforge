@@ -1,12 +1,12 @@
-# `jjf --json` output contract
+# `iss --json` output contract
 
-This file is the contract for `--json` output across every `jjf`
+This file is the contract for `--json` output across every `iss`
 verb. Two envelope shapes (mutating vs read), one error envelope,
 one error-kind table, per-verb examples below.
 
 ## Dep verbs
 
-### `jjf dep add <child> <parent> [--kind <kind>]`
+### `iss dep add <child> <parent> [--kind <kind>]`
 
 Mutating envelope:
 
@@ -20,13 +20,13 @@ Mutating envelope:
   omitted.
 - `action`: `"added"`.
 
-### `jjf dep rm <child> <parent> [--kind <kind>]`
+### `iss dep rm <child> <parent> [--kind <kind>]`
 
 Same envelope shape as `dep add`, but `action: "removed"`.
 Only edges with the matching `(target, kind)` are removed;
 other-kind edges to the same target stay.
 
-### `jjf dep tree <id>`
+### `iss dep tree <id>`
 
 Read verb. Plain-text output is an indented tree:
 
@@ -59,7 +59,7 @@ abc1234 [open] epic A
 
 ## Memory verbs
 
-### `jjf remember [<value>] [--key <slug>] [-F <path|->]`
+### `iss remember [<value>] [--key <slug>] [-F <path|->]`
 
 Mutating envelope:
 
@@ -72,7 +72,7 @@ Mutating envelope:
 - `action`: `"remembered"` for a fresh memory; `"updated"`
   for the upsert path.
 
-### `jjf memories [<search>]`
+### `iss memories [<search>]`
 
 Bare payload — array of `Memory` records (no envelope):
 
@@ -89,7 +89,7 @@ Empty result is `[]`, never silence (matches `ls --json` /
 The `<search>` substring filter is case-insensitive over the
 key + value combo (any match counts).
 
-### `jjf recall <key>`
+### `iss recall <key>`
 
 Envelope shape — `{key, value, found}`:
 
@@ -104,7 +104,7 @@ When the key doesn't exist, the verb exits 1 with the
 {"ok": false, "error": {"kind": "memory_not_found", "message": "...", "details": {"key": "no-such-thing"}}}
 ```
 
-### `jjf forget <key>`
+### `iss forget <key>`
 
 Mutating envelope:
 
@@ -116,7 +116,7 @@ Missing key → exit 1 + `memory_not_found` error envelope.
 
 ## Two envelope shapes
 
-`jjf` has two distinct output shapes under `--json`, intentionally.
+`iss` has two distinct output shapes under `--json`, intentionally.
 Reads and mutations look different on purpose; do not flatten them.
 
 ### Mutating verbs — `{"ok": true, ...}` envelope
@@ -165,7 +165,7 @@ single shape on **stderr**:
 - `kind` is a stable lowercase snake_case identifier. The table in
   the next section enumerates every kind the binary emits today.
 - `message` is the human-readable string (the same text the plain
-  `jjf: <message>` stderr would print). Format is not stable; don't
+  `iss: <message>` stderr would print). Format is not stable; don't
   pattern-match on it. Use `kind`.
 - `details` is variant-specific structured context. Either absent
   (no structured fields beyond kind+message) or an object whose
@@ -232,12 +232,12 @@ test in the relevant `tests/<verb>.rs` file that pins it.
 
 ### Note on `invalid_title`
 
-Emitted by `jjf new -t` and `jjf update --title` when the supplied
+Emitted by `iss new -t` and `iss update --title` when the supplied
 title contains a control character that would corrupt downstream
 surfaces, or is empty after trim. Preflight failure (exit 2).
 Added in `qa-title-validation` (issue `e4e483b`) after a QA
 red-team round found embedded `\0` was silently truncated before
-storage (data loss) and embedded `\n` corrupted `jjf ls` text
+storage (data loss) and embedded `\n` corrupted `iss ls` text
 rows (the tab-separated row format has no escape rule).
 
 `details.reason` is one of:
@@ -247,14 +247,14 @@ rows (the tab-separated row format has no escape rule).
 - `null_byte` — title contained `\0` (U+0000).
 - `control_char` — title contained any other control character
   per `char::is_control` (tabs included — `\t` breaks the
-  `jjf ls` row format too). `details.codepoint` carries the
+  `iss ls` row format too). `details.codepoint` carries the
   offending Unicode scalar as an unsigned integer.
 
 ```sh
-$ jjf new --json -t $'foo\nbar'
+$ iss new --json -t $'foo\nbar'
 {"ok":false,"error":{"kind":"invalid_title","message":"...","details":{"title":"foo\nbar","reason":"newline"}}}
 
-$ jjf new --json -t $'a\tb'
+$ iss new --json -t $'a\tb'
 {"ok":false,"error":{"kind":"invalid_title","message":"...","details":{"title":"a\tb","reason":"control_char","codepoint":9}}}
 ```
 
@@ -262,24 +262,24 @@ The `null_byte` reason is reachable only via programmatic
 callers of `Storage::create_issue` / `Storage::update` (e.g. a
 Python client constructing the call directly). POSIX
 argv is a NUL-terminated C string array, so a shell-typed
-`jjf new -t $'a\x00b'` actually loses the bytes after the
-null in the shell's argv expansion before `jjf` sees them —
+`iss new -t $'a\x00b'` actually loses the bytes after the
+null in the shell's argv expansion before `iss` sees them —
 the storage-side guard catches it for every other entry point.
 
 ### Note on `body_too_large`
 
-Emitted by `jjf new -F`, `jjf update --body-file`, and `jjf
+Emitted by `iss new -F`, `iss update --body-file`, and `iss
 comment -F` when the supplied body exceeds 65,536 bytes
 (raw UTF-8 byte length). Preflight failure (exit 2). The
 cap matches GitHub's documented issue-body limit (and
-Forgejo's, which mirrors it) so jjforge's surface is
+Forgejo's, which mirrors it) so git-issues' surface is
 predictable to anyone who already knows the prior art.
 
 `details.limit` is the configured cap (always 65,536 today)
 and `details.got` is the measured byte length of the
 offending body — both are JSON integers, not strings, so
 scripted callers can branch on them directly. The same cap
-applies to comment bodies (`jjf comment -F`) for the same
+applies to comment bodies (`iss comment -F`) for the same
 reasons: comment bodies are free-form markdown stored as
 JSONL records on the per-issue `.comments.jsonl` blob, with
 the same on-disk shape and per-write resource model as the
@@ -287,7 +287,7 @@ issue body.
 
 ```sh
 $ head -c 70000 /dev/urandom | base64 > big.md
-$ jjf new --json -t "demo" -F big.md
+$ iss new --json -t "demo" -F big.md
 {"ok":false,"error":{"kind":"body_too_large","message":"...","details":{"limit":65536,"got":94668}}}
 ```
 
@@ -299,13 +299,13 @@ case-ASCII budget, matching the GitHub semantic).
 
 ### Note on `self_dependency`
 
-Emitted by `jjf dep add <child> <target>` (and the inline
-`jjf new -d <self-id>` / `jjf new --dep <kind>:<self-id>`
+Emitted by `iss dep add <child> <target>` (and the inline
+`iss new -d <self-id>` / `iss new --dep <kind>:<self-id>`
 on-create forms) when `<child> == <target>`. Preflight failure
 (exit 2). Added in `qa-dep-validation` (issue `d1a01f0`) after
-a QA red-team round found that `jjf dep add A A` would silently
+a QA red-team round found that `iss dep add A A` would silently
 land a `blocks`-edge from A to itself — making A permanently
-blocked-by-itself and excluding it from `jjf ready` forever (a
+blocked-by-itself and excluding it from `iss ready` forever (a
 one-line DoS).
 
 The check applies to every dep kind: `blocks` is the
@@ -319,34 +319,34 @@ which equals the resolved target id by definition).
 The companion validation — phantom dep targets — reuses the
 existing `issue_not_found` kind (no new kind needed): the
 target failed to resolve on the bookmark, so it's surfaced the
-same way as `jjf show <bogus-id>`. That kind is exit 1
+same way as `iss show <bogus-id>`. That kind is exit 1
 (runtime: well-formed input, just doesn't exist), not exit 2
 like `self_dependency`. Scripts pattern-match on the kind;
 the exit code distinguishes preflight from runtime.
 
 ```sh
-$ jjf --json dep add a3f9c01 a3f9c01
+$ iss --json dep add a3f9c01 a3f9c01
 {"ok":false,"error":{"kind":"self_dependency","message":"issue a3f9c01 cannot depend on itself","details":{"id":"a3f9c01"}}}
 
-$ jjf --json dep add a3f9c01 deadbee   # phantom target
+$ iss --json dep add a3f9c01 deadbee   # phantom target
 {"ok":false,"error":{"kind":"issue_not_found","message":"issue not found in working copy: deadbee","details":{"id":"deadbee"}}}
 
-$ jjf --json new -t "child" -d deadbee -F -
+$ iss --json new -t "child" -d deadbee -F -
 {"ok":false,"error":{"kind":"issue_not_found","message":"issue not found in working copy: deadbee","details":{"id":"deadbee"}}}
 ```
 
-`jjf dep rm` is intentionally permissive against phantom
+`iss dep rm` is intentionally permissive against phantom
 targets — removing an edge that doesn't exist is a useful
 cleanup primitive and never lands a dangling edge.
 
 ### Note on `dependency_cycle`
 
-Emitted by `jjf dep add <source> <target>` when adding the
+Emitted by `iss dep add <source> <target>` when adding the
 proposed `blocks`-edge would close a cycle in the existing
 `blocks`-edge graph. Preflight failure (exit 2). Added after
-QA found that `jjf dep add` silently accepted edges that
+QA found that `iss dep add` silently accepted edges that
 closed multi-step cycles, hiding every node in the cycle
-from `jjf ready` with no diagnostic.
+from `iss ready` with no diagnostic.
 
 Self-deps (`source == target`) still surface as
 `self_dependency`, not `dependency_cycle` — the older check
@@ -354,29 +354,29 @@ runs first and is more specific.
 
 `details.source` and `details.target` are the proposed
 edge's endpoints (the values the operator passed to
-`jjf dep add`). `details.cycle` is the existing chain of ids
+`iss dep add`). `details.cycle` is the existing chain of ids
 `[target, ..., source]`: walking forward over `blocks`-deps
 from `target`, that's the path that ends at `source`. The
 proposed `source -> target` edge would extend it to
 `[source, target, ..., source]`, which is the back-edge.
 
 ```sh
-$ jjf --json dep add a3f9c01 c001cab
+$ iss --json dep add a3f9c01 c001cab
 {"ok":false,"error":{"kind":"dependency_cycle","message":"adding blocks-edge a3f9c01 -> c001cab would close a dependency cycle","details":{"source":"a3f9c01","target":"c001cab","cycle":["c001cab","b00b00b","a3f9c01"]}}}
 ```
 
 Scope: the check covers `--kind blocks` only. The other dep
 kinds (`parent-child`, `related`, `discovered-from`) don't
-affect `jjf ready` computation, so cycles among them aren't
+affect `iss ready` computation, so cycles among them aren't
 silent landmines. A future ticket may extend cycle detection
-to `parent-child` (which `jjf dep tree` recurses on, though
+to `parent-child` (which `iss dep tree` recurses on, though
 that walker already has its own visited-set guard).
 
 ### Note on `concurrent_write`
 
 Emitted by any mutating verb (`new`, `update`, `comment`, `close`,
 `open`, `block`, `unblock`, `label add|rm`, `dep add|rm`,
-`remember`, `forget`) when a sibling jjforge writer landed first
+`remember`, `forget`) when a sibling git-issues writer landed first
 and the 4-CLI write dance hit jj's "Concurrent checkout" failure.
 Runtime failure (exit 1): the command was well-formed, the loser
 just has to re-run.
@@ -406,22 +406,22 @@ rendered verbatim by the text renderer. The hint distinguishes
 the command yourself."
 
 Added in `qa-concurrent-write-ux` (issue `277f559`) after a QA
-red-team round found the loser of a concurrent `jjf new --slug
+red-team round found the loser of a concurrent `iss new --slug
 <s>` saw a 12-line jj-internal cascade including "Internal
 error: Failed to check out commit … Caused by: Concurrent
 checkout" — useless to an agent in an automated loop.
 
 ```sh
-$ jjf --json comment a3f9c01 -F -    # sibling write raced and retry also raced
+$ iss --json comment a3f9c01 -F -    # sibling write raced and retry also raced
 {"ok":false,"error":{"kind":"concurrent_write","message":"concurrent write conflict; another writer landed first; retried once and still raced. Retry your command.","details":{"hint":"another writer landed first; retried once and still raced. Retry your command."}}}
 
-$ jjf --json new -t winner --slug taken    # slug-claim race upgraded to slug_collision
+$ iss --json new -t winner --slug taken    # slug-claim race upgraded to slug_collision
 {"ok":false,"error":{"kind":"slug_collision","message":"slug \"taken\" already in use by issue a3f9c01","details":{"slug":"taken","conflicts_with":"a3f9c01"}}}
 ```
 
 ### Note on `push_rejected`
 
-Emitted by `jjf push <remote>` when the remote rejected the
+Emitted by `iss push <remote>` when the remote rejected the
 update (non-fast-forward — another writer landed first; or a
 remote-side hook rejection). Runtime failure (exit 1).
 
@@ -435,7 +435,7 @@ The structured surface is `details`:
 - `details.remote` — the remote name the operator passed.
 - `details.hint` — operator-facing one-line advisory,
   rendered verbatim by the text renderer. Currently
-  `"run \`jjf pull <remote>\` first, then retry the push"`.
+  `"run \`iss pull <remote>\` first, then retry the push"`.
   Mirrors `concurrent_write`'s `details.hint` shape so a
   caller handling both error paths can read the same key.
 - `details.refs_rejected` — array of destination refs git
@@ -460,42 +460,42 @@ because `details` was too sparse to identify the conflicting
 refs.
 
 ```sh
-$ jjf --json push origin
-{"ok":false,"error":{"kind":"push_rejected","message":"push to origin rejected (non-fast-forward); the remote moved since you last pulled","details":{"remote":"origin","hint":"run `jjf pull origin` first, then retry the push","refs_rejected":["refs/jjf/issues/bfcfe03"],"stderr_raw":"To file:///.../bare.git\n ! [rejected]        refs/jjf/issues/bfcfe03 -> refs/jjf/issues/bfcfe03 (fetch first)\n..."}}}
+$ iss --json push origin
+{"ok":false,"error":{"kind":"push_rejected","message":"push to origin rejected (non-fast-forward); the remote moved since you last pulled","details":{"remote":"origin","hint":"run `iss pull origin` first, then retry the push","refs_rejected":["refs/jjf/issues/bfcfe03"],"stderr_raw":"To file:///.../bare.git\n ! [rejected]        refs/jjf/issues/bfcfe03 -> refs/jjf/issues/bfcfe03 (fetch first)\n..."}}}
 ```
 
 ## Per-verb examples
 
 Every example below is one success path and the most representative
 error path for the verb. The integration tests under
-[`crates/jjf/tests/<verb>.rs`](../crates/jjf/tests/) pin these shapes; if you change one
+[`crates/iss/tests/<verb>.rs`](../crates/iss/tests/) pin these shapes; if you change one
 here, change the test too.
 
 ### `init`
 
 ```sh
-$ jjf init --json
+$ iss init --json
 {"ok":true,"bookmark":"issues"}
 ```
 
 Error path — running in a directory that isn't a jj repo:
 
 ```sh
-$ jjf init --json
+$ iss init --json
 {"ok":false,"error":{"kind":"not_a_jj_repo","message":"not a jj repo: /tmp/foo","details":{"path":"/tmp/foo"}}}
 ```
 
 ### `new`
 
 ```sh
-$ echo "body" | jjf new --json -t "fix the thing" -F -
+$ echo "body" | iss new --json -t "fix the thing" -F -
 {"ok":true,"id":"a3f9c01"}
 ```
 
 Optional flags:
 
 ```sh
-$ jjf new --json -t "agent-ready" --type feature --slug agent-ready
+$ iss new --json -t "agent-ready" --type feature --slug agent-ready
 {"ok":true,"id":"a3f9c01"}
 ```
 
@@ -506,7 +506,7 @@ Bare-key form (`--meta key`) is rejected by clap at parse time: exits
 key=value...` on stderr (no JSON envelope).
 
 ```sh
-$ jjf new --json -t "import task" --meta gc.owner=haiku-3 --meta gc.phase=import
+$ iss new --json -t "import task" --meta gc.owner=haiku-3 --meta gc.phase=import
 {"ok":true,"id":"a3f9c01"}
 ```
 
@@ -515,32 +515,32 @@ Error path — invalid slug (`bad_charset` is one of `bad_charset` /
 `consecutive_hyphens`):
 
 ```sh
-$ jjf new --json -t x --slug Bad_Slug
+$ iss new --json -t x --slug Bad_Slug
 {"ok":false,"error":{"kind":"invalid_slug","message":"...","details":{"slug":"Bad_Slug","reason":"bad_charset"}}}
 ```
 
 Error path — slug collision with an open issue:
 
 ```sh
-$ jjf new --json -t x --slug taken
+$ iss new --json -t x --slug taken
 {"ok":false,"error":{"kind":"slug_collision","message":"...","details":{"slug":"taken","conflicts_with":"a3f9c01"}}}
 ```
 
-Error path — invalid title (embedded newline corrupts `jjf ls`
+Error path — invalid title (embedded newline corrupts `iss ls`
 text rows; embedded null byte was silently truncated before
 `qa-title-validation`). `reason` is one of `empty` / `newline` /
 `null_byte` / `control_char`:
 
 ```sh
-$ jjf new --json -t $'foo\nbar'
+$ iss new --json -t $'foo\nbar'
 {"ok":false,"error":{"kind":"invalid_title","message":"...","details":{"title":"foo\nbar","reason":"newline"}}}
 ```
 
-Error path — `issues` bookmark missing (didn't run `jjf init` first):
+Error path — `issues` bookmark missing (didn't run `iss init` first):
 
 ```sh
-$ echo body | jjf new --json -t x -F -
-{"ok":false,"error":{"kind":"missing_issues_bookmark","message":"the `issues` bookmark does not exist in /repo; run `jjf init` first","details":{"path":"/repo"}}}
+$ echo body | iss new --json -t x -F -
+{"ok":false,"error":{"kind":"missing_issues_bookmark","message":"the `issues` bookmark does not exist in /repo; run `iss init` first","details":{"path":"/repo"}}}
 ```
 
 ### `show`
@@ -548,7 +548,7 @@ $ echo body | jjf new --json -t x -F -
 Success path emits the `Issue` record verbatim — no envelope:
 
 ```sh
-$ jjf show --json a3f9c01
+$ iss show --json a3f9c01
 {
   "id": "a3f9c01",
   "title": "fix the thing",
@@ -569,7 +569,7 @@ $ jjf show --json a3f9c01
 `show` also accepts a slug in place of the id:
 
 ```sh
-$ jjf show --json agent-ready
+$ iss show --json agent-ready
 { ... same payload ... }
 ```
 
@@ -577,14 +577,14 @@ A handle that's neither a parseable id nor a known slug surfaces
 the `slug_not_found` envelope:
 
 ```sh
-$ jjf show --json nope
+$ iss show --json nope
 {"ok":false,"error":{"kind":"slug_not_found","message":"no issue with handle \"nope\"","details":{"handle":"nope"}}}
 ```
 
 Error path — nonexistent id:
 
 ```sh
-$ jjf show --json deadbee
+$ iss show --json deadbee
 {"ok":false,"error":{"kind":"issue_not_found","message":"issue not found in working copy: deadbee","details":{"id":"deadbee"}}}
 ```
 
@@ -593,7 +593,7 @@ $ jjf show --json deadbee
 Success path is a bare JSON array (possibly empty):
 
 ```sh
-$ jjf ls --json
+$ iss ls --json
 [
   {
     "id": "a3f9c01",
@@ -626,20 +626,20 @@ Type, slug, and metadata filters:
   key=value...` on stderr (no JSON envelope).
 
 ```sh
-$ jjf ls --json --type bug --type feature
+$ iss ls --json --type bug --type feature
 [ ... open issues whose type is bug OR feature ... ]
 
-$ jjf ls --json --slug agent
+$ iss ls --json --slug agent
 [ ... open issues whose slug contains "agent" ... ]
 
-$ jjf ls --json --meta gc.owner=haiku-3 --meta gc.phase=import
+$ iss ls --json --meta gc.owner=haiku-3 --meta gc.phase=import
 [ ... open issues where metadata["gc.owner"]=="haiku-3" AND metadata["gc.phase"]=="import" ... ]
 ```
 
 Error path — running outside a jj repo:
 
 ```sh
-$ jjf ls --json
+$ iss ls --json
 {"ok":false,"error":{"kind":"not_a_jj_repo","message":"not a jj repo: /tmp/foo","details":{"path":"/tmp/foo"}}}
 ```
 
@@ -650,7 +650,7 @@ records — the same per-element shape as `ls --json` and `show
 --json`:
 
 ```sh
-$ jjf ready --json --limit 1
+$ iss ready --json --limit 1
 [
   {
     "id": "a3f9c01",
@@ -665,16 +665,16 @@ $ jjf ready --json --limit 1
 Filters:
 
 - `--label <NAME>` — repeatable, AND-semantics. Mirrors
-  `jjf ls --label`.
+  `iss ls --label`.
 - `--type <KIND>` — repeatable, OR-semantics. Mirrors
-  `jjf ls --type`. Note that `Roadmap`-typed issues are
+  `iss ls --type`. Note that `Roadmap`-typed issues are
   excluded from the ready set entirely — they're the planning
   surface, not work to do — regardless of this filter.
 - `--parent <H>` — Filter to issues with a `parent-child` dep
   edge to `<H>`. `<H>` is an id or slug. Unknown → exit 2
   (`slug_not_found`).
 - `--meta <key>=<value>` — repeatable, AND-semantics. Mirrors
-  `jjf ls --meta`. Bare-key form (`--meta key`) is rejected by
+  `iss ls --meta`. Bare-key form (`--meta key`) is rejected by
   clap at parse time: exits 2 with `error: invalid value 'key'
   for '--meta <KEY=VALUE>': expected key=value...` on stderr
   (no JSON envelope).
@@ -710,17 +710,17 @@ Empty result is `[]`, matching `ls`'s convention so scripts
 piping to `jq length` get a useful value.
 
 ```sh
-$ jjf ready --json --label backend
+$ iss ready --json --label backend
 [ ... open + unblocked + label=backend ... ]
 
-$ jjf ready --json --type bug --limit 1
+$ iss ready --json --type bug --limit 1
 [ ... the one highest-priority unblocked bug ... ]
 ```
 
 Error path — running outside a jj repo:
 
 ```sh
-$ jjf ready --json
+$ iss ready --json
 {"ok":false,"error":{"kind":"not_a_jj_repo","message":"not a jj repo: /tmp/foo","details":{"path":"/tmp/foo"}}}
 ```
 
@@ -731,7 +731,7 @@ comment bodies. Distinct from `ls`/`ready`'s bare-array shape:
 `search --json` returns an envelope (`{"ok":true,"results":[...]}`).
 
 ```sh
-$ jjf search --json "segfault"
+$ iss search --json "segfault"
 {
   "ok": true,
   "results": [
@@ -755,13 +755,13 @@ their respective include flags are active).
 
 Flags:
 
-- `--status <S>` — repeats `jjf ls`'s `--status` filter.
+- `--status <S>` — repeats `iss ls`'s `--status` filter.
   **Defaults to `all`** (not `open`, like `ls`) because search
   is fundamentally a "find anything containing X" verb. Use
   `--status open` to restrict to the actionable set.
-- `--label <L>` — repeatable, AND-semantics. Mirrors `jjf ls
+- `--label <L>` — repeatable, AND-semantics. Mirrors `iss ls
   --label`.
-- `--type <T>` — repeatable, OR-semantics. Mirrors `jjf ls
+- `--type <T>` — repeatable, OR-semantics. Mirrors `iss ls
   --type`.
 - `--parent <H>` — Filter to issues with a `parent-child` dep
   edge to `<H>`. `<H>` is an id or slug. Unknown → exit 2
@@ -789,14 +789,14 @@ Sort:
 Plain-text rows:
 
 ```sh
-$ jjf search "concurrent_write" --include-comments --limit 3
+$ iss search "concurrent_write" --include-comments --limit 3
 277f559	qa-concurrent-write-ux: map jj internal error to typed concurrent_write	title	…
 88e4d6b	push_rejected --json message embeds raw git stderr	body	…
 eb42f50	storage-v3 #1: replace try_commit_dance with git-only write path	body	…
 ```
 
-Empty query (`jjf search ""`) returns zero results — match-
-everything is `jjf ls`'s job. Under `--json` you get
+Empty query (`iss search ""`) returns zero results — match-
+everything is `iss ls`'s job. Under `--json` you get
 `{"ok":true,"results":[]}`; plain text is silent.
 
 Snippet rendering: the source field is normalized (newlines and
@@ -807,25 +807,25 @@ trailing `…` indicates it doesn't end at the end. Char-boundary
 safe — multibyte content is never sliced mid-codepoint.
 
 Out of scope: regex, fuzzy / edit-distance matching, BM25/TF-IDF
-relevance ranking, memories search (use `jjf memories <substring>`).
+relevance ranking, memories search (use `iss memories <substring>`).
 
 Error path — running outside a jj repo:
 
 ```sh
-$ jjf search "x" --json
+$ iss search "x" --json
 {"ok":false,"error":{"kind":"not_a_jj_repo","message":"not a jj repo: /tmp/foo","details":{"path":"/tmp/foo"}}}
 ```
 
 ### `stale`
 
 ```sh
-$ jjf stale --days 14
+$ iss stale --days 14
 8eed630	30d	got abandoned a while back	open
 a3f9c01	2mo	older one	open
 ```
 
 ```sh
-$ jjf stale --days 14 --json
+$ iss stale --days 14 --json
 [
   {
     "id": "8eed630",
@@ -864,21 +864,21 @@ the human-friendly token `Nd` (<30d) / `Nw` (30-90d) / `Nmo`
 Compose filters with the threshold:
 
 ```sh
-$ jjf stale --days 7 --parent host-asterinas --status open --json
+$ iss stale --days 7 --parent host-asterinas --status open --json
 [ ... only stale issues in the `host-asterinas` epic, open status ... ]
 ```
 
 Error path — running outside a jj repo:
 
 ```sh
-$ jjf stale --json
+$ iss stale --json
 {"ok":false,"error":{"kind":"not_a_jj_repo","message":"not a jj repo: /tmp/foo","details":{"path":"/tmp/foo"}}}
 ```
 
 ### `update`
 
 ```sh
-$ jjf update --json a3f9c01 --title "renamed" --status closed
+$ iss update --json a3f9c01 --title "renamed" --status closed
 {"ok":true,"id":"a3f9c01","fields":["title","status"]}
 ```
 
@@ -893,26 +893,26 @@ trailers on the resulting commit. The full ordering:
 5. `body`
 6. `assignee`
 
-`update` accepts a slug in place of the id (`jjf update
+`update` accepts a slug in place of the id (`iss update
 agent-ready --title ...` works the same as the 7-hex variant).
 `--slug new-handle` and `--unset-slug` are mutually exclusive
 (clap enforces).
 
 ```sh
-$ jjf update --json a3f9c01 --type bug --slug fix-the-thing
+$ iss update --json a3f9c01 --type bug --slug fix-the-thing
 {"ok":true,"id":"a3f9c01","fields":["slug","type"]}
 
-$ jjf update --json a3f9c01 --unset-slug
+$ iss update --json a3f9c01 --unset-slug
 {"ok":true,"id":"a3f9c01","fields":["slug"]}
 ```
 
 `--claim` / `--unclaim` shorthand:
 
 ```sh
-$ jjf update --json a3f9c01 --claim
+$ iss update --json a3f9c01 --claim
 {"ok":true,"id":"a3f9c01","assignee":"alice","status":"in-progress","claimed":true}
 
-$ jjf update --json a3f9c01 --unclaim
+$ iss update --json a3f9c01 --unclaim
 {"ok":true,"id":"a3f9c01","status":"open","claimed":false}
 ```
 
@@ -922,58 +922,58 @@ re-claim is a no-op (exit 0, no new commit). Different-user
 re-claim exits 2 with `already_claimed`:
 
 ```sh
-$ jjf update --json a3f9c01 --claim
+$ iss update --json a3f9c01 --claim
 {"ok":false,"error":{"kind":"already_claimed","message":"issue already claimed by \"alice\"","details":{"by":"alice"}}}
 ```
 
 Error path — nonexistent id:
 
 ```sh
-$ jjf update --json deadbee --title x
+$ iss update --json deadbee --title x
 {"ok":false,"error":{"kind":"issue_not_found","message":"issue not found in working copy: deadbee","details":{"id":"deadbee"}}}
 ```
 
 ### `comment`
 
 ```sh
-$ echo "looks good to me" | jjf comment --json a3f9c01 -F -
+$ echo "looks good to me" | iss comment --json a3f9c01 -F -
 {"ok":true,"id":"a3f9c01","comment_id":"b71f02a"}
 ```
 
 Error path — empty body:
 
 ```sh
-$ echo -n "" | jjf comment --json a3f9c01 -F -
+$ echo -n "" | iss comment --json a3f9c01 -F -
 {"ok":false,"error":{"kind":"empty_body","message":"comment body is empty; pipe non-empty content via -F - or pass -F <path>"}}
 ```
 
 ### `close` / `open`
 
 ```sh
-$ jjf close --json a3f9c01
+$ iss close --json a3f9c01
 {"ok":true,"id":"a3f9c01","status":"closed"}
 
-$ jjf open --json a3f9c01
+$ iss open --json a3f9c01
 {"ok":true,"id":"a3f9c01","status":"open"}
 ```
 
 Error path — nonexistent id:
 
 ```sh
-$ jjf close --json deadbee
+$ iss close --json deadbee
 {"ok":false,"error":{"kind":"issue_not_found","message":"issue not found in working copy: deadbee","details":{"id":"deadbee"}}}
 ```
 
 ### `assign`
 
-Shorthand for `jjf update <id> --assignee <name>` / `--unset-assignee`.
+Shorthand for `iss update <id> --assignee <name>` / `--unset-assignee`.
 Two positional args; an empty `name` clears the assignee.
 
 ```sh
-$ jjf assign --json a3f9c01 alice
+$ iss assign --json a3f9c01 alice
 {"ok":true,"id":"a3f9c01","assignee":"alice"}
 
-$ jjf assign --json a3f9c01 ""
+$ iss assign --json a3f9c01 ""
 {"ok":true,"id":"a3f9c01","assignee":null}
 ```
 
@@ -983,7 +983,7 @@ name on set) so machine readers don't need a presence-check.
 Error path — nonexistent id:
 
 ```sh
-$ jjf assign --json deadbee alice
+$ iss assign --json deadbee alice
 {"ok":false,"error":{"kind":"issue_not_found","message":"issue not found in working copy: deadbee","details":{"id":"deadbee"}}}
 ```
 
@@ -991,24 +991,24 @@ Error path — newline in name (storage rejects to prevent
 trailer injection; see `qa-trailer-injection`):
 
 ```sh
-$ jjf assign --json a3f9c01 $'alice\nevil'
+$ iss assign --json a3f9c01 $'alice\nevil'
 {"ok":false,"error":{"kind":"invalid_input","message":"assignee must not contain newlines"}}
 ```
 
 ### `label add` / `label rm`
 
 ```sh
-$ jjf label add --json a3f9c01 needs-review
+$ iss label add --json a3f9c01 needs-review
 {"ok":true,"id":"a3f9c01","label":"needs-review","action":"added"}
 
-$ jjf label rm --json a3f9c01 needs-review
+$ iss label rm --json a3f9c01 needs-review
 {"ok":true,"id":"a3f9c01","label":"needs-review","action":"removed"}
 ```
 
 Error path — empty label:
 
 ```sh
-$ jjf label add --json a3f9c01 ""
+$ iss label add --json a3f9c01 ""
 {"ok":false,"error":{"kind":"empty_label","message":"label must not be empty"}}
 ```
 
@@ -1019,10 +1019,10 @@ Mutating verbs — key/value metadata attached to an issue.
 removes it (no-op if the key doesn't exist).
 
 ```sh
-$ jjf metadata set --json a3f9c01 gc.owner haiku-3
+$ iss metadata set --json a3f9c01 gc.owner haiku-3
 {"ok":true,"id":"a3f9c01","key":"gc.owner","value":"haiku-3","action":"set"}
 
-$ jjf metadata unset --json a3f9c01 gc.owner
+$ iss metadata unset --json a3f9c01 gc.owner
 {"ok":true,"id":"a3f9c01","key":"gc.owner","action":"unset"}
 ```
 
@@ -1033,7 +1033,7 @@ $ jjf metadata unset --json a3f9c01 gc.owner
 Error path — invalid key (empty, or contains `=` or newline):
 
 ```sh
-$ jjf metadata set --json a3f9c01 "bad=key" val
+$ iss metadata set --json a3f9c01 "bad=key" val
 {"ok":false,"error":{"kind":"invalid_input","message":"invalid input: metadata key invalid: ContainsEquals"}}
 ```
 
@@ -1044,14 +1044,14 @@ Error path — invalid value (contains a newline, or exceeds
 256 KiB):
 
 ```sh
-$ jjf metadata set --json a3f9c01 gc.note $'line1\nline2'
+$ iss metadata set --json a3f9c01 gc.note $'line1\nline2'
 {"ok":false,"error":{"kind":"invalid_input","message":"invalid input: metadata value invalid: ContainsNewline"}}
 ```
 
 Error path — nonexistent id:
 
 ```sh
-$ jjf metadata set --json deadbee gc.owner haiku-3
+$ iss metadata set --json deadbee gc.owner haiku-3
 {"ok":false,"error":{"kind":"issue_not_found","message":"issue not found in working copy: deadbee","details":{"id":"deadbee"}}}
 ```
 
@@ -1063,14 +1063,14 @@ records it. URL validation is jj's responsibility — whatever jj
 rejects, we surface as `jj_git_remote_error` (exit 1).
 
 ```sh
-$ jjf remote add --json origin https://example.com/repo.git
+$ iss remote add --json origin https://example.com/repo.git
 {"ok":true,"name":"origin","url":"https://example.com/repo.git"}
 ```
 
 Error path — name already exists:
 
 ```sh
-$ jjf remote add --json origin https://example.com/other.git
+$ iss remote add --json origin https://example.com/other.git
 {"ok":false,"error":{"kind":"remote_already_exists","message":"git remote already exists: origin","details":{"name":"origin"}}}
 ```
 
@@ -1080,7 +1080,7 @@ Read verb — bare JSON array of `{name, url}` objects. Empty result
 is `[]`, not silence (same `jq length` rationale as `ls`).
 
 ```sh
-$ jjf remote ls --json
+$ iss remote ls --json
 [
   {
     "name": "origin",
@@ -1092,7 +1092,7 @@ $ jjf remote ls --json
 Error path — running outside a jj repo:
 
 ```sh
-$ jjf remote ls --json
+$ iss remote ls --json
 {"ok":false,"error":{"kind":"not_a_jj_repo","message":"not a jj repo: /tmp/foo","details":{"path":"/tmp/foo"}}}
 ```
 
@@ -1103,14 +1103,14 @@ jj also forgets bookmarks tracked from that remote (its own
 behavior); we surface its successful exit verbatim.
 
 ```sh
-$ jjf remote rm --json origin
+$ iss remote rm --json origin
 {"ok":true,"name":"origin"}
 ```
 
 Error path — name not found:
 
 ```sh
-$ jjf remote rm --json nope
+$ iss remote rm --json nope
 {"ok":false,"error":{"kind":"remote_not_found","message":"git remote not found: nope","details":{"name":"nope"}}}
 ```
 
@@ -1127,22 +1127,22 @@ push if the local bookmark doesn't exist. Unknown remote is exit 2
 was well-formed, the remote just said no).
 
 ```sh
-$ jjf push --json origin
+$ iss push --json origin
 {"ok":true,"remote":"origin","bookmark":"issues"}
 ```
 
 Error path — unknown remote:
 
 ```sh
-$ jjf push --json nope
+$ iss push --json nope
 {"ok":false,"error":{"kind":"remote_not_found","message":"git remote not found: nope","details":{"name":"nope"}}}
 ```
 
 Error path — non-fast-forward (operator should pull first):
 
 ```sh
-$ jjf push --json origin
-{"ok":false,"error":{"kind":"push_rejected","message":"push to origin rejected (non-fast-forward); the remote moved since you last pulled","details":{"remote":"origin","hint":"run `jjf pull origin` first, then retry the push","refs_rejected":["refs/jjf/issues/bfcfe03"],"stderr_raw":"To file:///.../bare.git\n ! [rejected]        refs/jjf/issues/bfcfe03 -> refs/jjf/issues/bfcfe03 (fetch first)\n..."}}}
+$ iss push --json origin
+{"ok":false,"error":{"kind":"push_rejected","message":"push to origin rejected (non-fast-forward); the remote moved since you last pulled","details":{"remote":"origin","hint":"run `iss pull origin` first, then retry the push","refs_rejected":["refs/jjf/issues/bfcfe03"],"stderr_raw":"To file:///.../bare.git\n ! [rejected]        refs/jjf/issues/bfcfe03 -> refs/jjf/issues/bfcfe03 (fetch first)\n..."}}}
 ```
 
 See the [Note on `push_rejected`](#note-on-push_rejected) for the
@@ -1167,7 +1167,7 @@ shapes, distinguished by `remote_present` (bool) and
 
 Every success envelope carries `merge_strategy: "op_space"` to pin
 which driver ran. The field exists for forward-compat — a future
-`jjf` may grow alternate strategies (e.g. a `file_bytes` escape
+`iss` may grow alternate strategies (e.g. a `file_bytes` escape
 hatch, see `bfc732b`); today the only value is `op_space`.
 
 Preflight is jj-repo-only (not the full `issues_bookmark` probe) —
@@ -1176,7 +1176,7 @@ a fresh clone has `issues@<remote>` but no local `issues` yet, and
 `jj bookmark track` step.
 
 ```sh
-$ jjf pull --json origin
+$ iss pull --json origin
 {"ok":true,"remote":"origin","bookmark":"issues","remote_present":true,"merge_strategy":"op_space","resolved_issues":0}
 ```
 
@@ -1184,34 +1184,34 @@ Empty-remote variant — first time anyone pulls from a remote whose
 issues bookmark hasn't been pushed yet:
 
 ```sh
-$ jjf pull --json origin
+$ iss pull --json origin
 {"ok":true,"remote":"origin","bookmark":"issues","remote_present":false,"merge_strategy":"op_space","resolved_issues":0}
 ```
 
 With merges:
 
 ```sh
-$ jjf pull --json origin
+$ iss pull --json origin
 {"ok":true,"remote":"origin","bookmark":"issues","remote_present":true,"merge_strategy":"op_space","resolved_issues":2}
 ```
 
 Error path — unknown remote:
 
 ```sh
-$ jjf pull --json nope
+$ iss pull --json nope
 {"ok":false,"error":{"kind":"remote_not_found","message":"git remote not found: nope","details":{"name":"nope"}}}
 ```
 
 #### Unreachable error kinds on the v2 operator path
 
-The legacy v1 file-bytes merge driver (`jjf-merge`) had two
+The legacy v1 file-bytes merge driver (`iss-merge`) had two
 human-surface failure modes — `unmergeable` (body-text collision)
 and `comment_file_conflict` (jj content-merge marker in a
-`.comments.jsonl` file). The `jjf pull` v1 path could surface
+`.comments.jsonl` file). The `iss pull` v1 path could surface
 both.
 
-**`jjf pull` uses the op-space resolver in
-[`crates/jjf-storage/src/merge_ops.rs`](../crates/jjf-storage/src/merge_ops.rs).
+**`iss pull` uses the op-space resolver in
+[`crates/iss-storage/src/merge_ops.rs`](../crates/iss-storage/src/merge_ops.rs).
 That resolver has no failure mode that maps to either error
 kind: `set-body` is just another LWW scalar, and
 `.comments.jsonl` is rebuilt as a union of pristine bytes from
@@ -1219,18 +1219,18 @@ each head, never read with conflict markers.** The error kinds
 stay defined for shape stability — external callers of
 `jjf_merge::resolve` (the library that stays in the workspace as
 a non-operator-path tool) can still surface them, and the JSON
-envelope contract pins the enum — but `jjf pull` will not raise
+envelope contract pins the enum — but `iss pull` will not raise
 them.
 
 The two error kinds' historic shape (kept for reference):
 
 ```sh
-$ jjf pull --json origin
+$ iss pull --json origin
 {"ok":false,"error":{"kind":"unmergeable","message":"…","details":{"issue_id":"aa6600b","detail":"…"}}}
 ```
 
 ```sh
-$ jjf pull --json origin
+$ iss pull --json origin
 {"ok":false,"error":{"kind":"comment_file_conflict","message":"…","details":{"issue_id":"aa6600b"}}}
 ```
 
@@ -1247,10 +1247,10 @@ stderr, exit 2), even when the user passed `--json`. A representative
 shape:
 
 ```sh
-$ jjf --not-a-real-flag
+$ iss --not-a-real-flag
 error: unexpected argument '--not-a-real-flag' found
 
-Usage: jjf [OPTIONS] <COMMAND>
+Usage: iss [OPTIONS] <COMMAND>
 
 For more information, try '--help'.
 ```
@@ -1262,7 +1262,7 @@ parsing (preflight, IO, storage, runtime) honors the JSON envelope.
 
 ## Exit-code convention
 
-Cross-link to the top-of-file comment in [`crates/jjf/src/main.rs`](../crates/jjf/src/main.rs),
+Cross-link to the top-of-file comment in [`crates/iss/src/main.rs`](../crates/iss/src/main.rs),
 which is the canonical statement:
 
 - `0` — success.

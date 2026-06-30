@@ -4,15 +4,15 @@ Status: design-only. Decision pinned in §6. Implementation
 ticket follow-up referenced from the closing comment on
 `08bc9eb`.
 
-This doc evaluates whether jjforge should ship beads-style
+This doc evaluates whether git-issues should ship beads-style
 external-signal gates — a way for an issue to park itself on
 an external condition (a PR landing, a timer expiring, a human
 responding) instead of staying "open" forever, where
-`jjf ready` would surface it as if it were workable today.
+`iss ready` would surface it as if it were workable today.
 
 The TL;DR is in §6: **skip it for v1**, with a single tactical
 addition (`Status::Blocked` + a slim `--reason` flag on
-`jjf block`) carried by a follow-up ticket. Full reasoning
+`iss block`) carried by a follow-up ticket. Full reasoning
 follows.
 
 ## 1. The use case, in two concrete scenarios
@@ -21,17 +21,17 @@ follows.
 
 A subagent just filed a follow-up ticket whose body says "give
 the codebase 24 h to settle before working this." The agent
-wants the new ticket to be invisible to `jjf ready` until
+wants the new ticket to be invisible to `iss ready` until
 2026-06-24T00:00Z, then surface as if it had just been filed.
 
 Today's options:
-- Leave the ticket open. `jjf ready` surfaces it immediately.
-  Whoever runs `jjf ready` next may pick it up before the
+- Leave the ticket open. `iss ready` surfaces it immediately.
+  Whoever runs `iss ready` next may pick it up before the
   cooldown elapses.
 - Close it. Re-file at the right time. Requires someone
   remembering. Loses the history.
 - Add a label `wait-until:2026-06-24`. Convention-only.
-  Nothing reads it; `jjf ready` ignores it.
+  Nothing reads it; `iss ready` ignores it.
 
 beads' answer: `bd defer <id> --until=2026-06-24T00:00Z`
 sets `defer_until` plus `status=deferred`. `bd ready` filters
@@ -44,10 +44,10 @@ A subagent finished a refactor and opened a PR. The next ticket
 in the chain depends on that PR landing. The agent wants:
 
 ```
-jjf await <next-ticket-id> --until fj:pr:chaos-inc/jjforge/42
+iss await <next-ticket-id> --until fj:pr:chaos-inc/git-issues/42
 ```
 
-…and the next ticket to be invisible to `jjf ready` until
+…and the next ticket to be invisible to `iss ready` until
 PR #42 hits status MERGED. Today: same three escape hatches as
 Scenario A, all unsatisfying. beads' answer: a `gate` issue
 type with `await_type=gh:pr`, `await_id=<owner>/<repo>/<num>`,
@@ -61,16 +61,16 @@ work:
 
 | Approach | Reads & surfaces? | Auto-clears? | Spec impact | Operator burden |
 | --- | --- | --- | --- | --- |
-| **A. `wait-on:<thing>` label convention** | `jjf ready` ignores it; `jjf ls --label wait-on:X` finds it | No — remove label by hand | None | Discipline only; nothing enforces |
-| **B. Close + re-file on signal** | Closed issues hidden from `jjf ready`; refile carries new id | No — external watcher must re-file | None | Loses history; new id breaks dep edges |
-| **C. `Status::Blocked` + comment** | Need to ADD `Blocked` variant; `jjf ready` filters it like Closed | No — operator `jjf open <id>`s | Yes — spec v2.5 status-enum bump | One verb to set; one to clear |
-| **D. Full beads gates (`Awaiting` + `await_type/await_id`)** | New status variant filtered from ready; `jjf check-gates` clears | Yes for `timer`, `gh:pr`, etc.; manual for `human` | Yes — spec v2.5 status + two new fields | Bring-your-own auth for GH/FJ; polling architecture decision |
+| **A. `wait-on:<thing>` label convention** | `iss ready` ignores it; `iss ls --label wait-on:X` finds it | No — remove label by hand | None | Discipline only; nothing enforces |
+| **B. Close + re-file on signal** | Closed issues hidden from `iss ready`; refile carries new id | No — external watcher must re-file | None | Loses history; new id breaks dep edges |
+| **C. `Status::Blocked` + comment** | Need to ADD `Blocked` variant; `iss ready` filters it like Closed | No — operator `iss open <id>`s | Yes — spec v2.5 status-enum bump | One verb to set; one to clear |
+| **D. Full beads gates (`Awaiting` + `await_type/await_id`)** | New status variant filtered from ready; `iss check-gates` clears | Yes for `timer`, `gh:pr`, etc.; manual for `human` | Yes — spec v2.5 status + two new fields | Bring-your-own auth for GH/FJ; polling architecture decision |
 
 Honest reads on each:
 
 **(A) `wait-on:<thing>` label.** Costs nothing. Works as
 documentation. Does NOT solve the surfacing problem — the
-ticket still appears in `jjf ready` until someone manually
+ticket still appears in `iss ready` until someone manually
 adds a `Status::Blocked`-equivalent. Useful as a tag IN
 ADDITION to one of the other approaches; not a complete
 answer on its own.
@@ -78,7 +78,7 @@ answer on its own.
 **(B) Close + re-file.** Trades durability for surfacing.
 Loses the issue id (breaks deps pointing at it), loses the
 comment thread continuity, requires the external signal to
-trigger a new `jjf new` call. Only viable for genuinely
+trigger a new `iss new` call. Only viable for genuinely
 disposable tickets (e.g. recurring chores). Not a serious
 contender for the use case.
 
@@ -86,10 +86,10 @@ contender for the use case.
 have. Today's `Status` enum is `Open | InProgress | Closed`.
 Adding `Blocked` is a single-variant bump and a v2.5 spec
 revision. The status flip can carry a free-text reason
-(comment, body edit, or `--reason` flag on `jjf block`). The
-ticket disappears from `jjf ready` (we filter on `Status::Open`
+(comment, body edit, or `--reason` flag on `iss block`). The
+ticket disappears from `iss ready` (we filter on `Status::Open`
 already; adding the filter for `Blocked` is a one-line patch).
-It does NOT auto-clear — an operator runs `jjf open <id>`
+It does NOT auto-clear — an operator runs `iss open <id>`
 when the external signal fires. For scenarios where a human
 or agent IS in the loop (the common case in this project), the
 clear is cheap: one verb call.
@@ -98,8 +98,8 @@ clear is cheap: one verb call.
 for it with: spec-bump cost (status + two new fields,
 `await_type`, `await_id`, possibly `timeout` and `waiters`),
 runtime auth dependency on the gate provider (GitHub / Forgejo
-API), polling architecture decision (pull from `jjf ready`, a
-separate `jjf check-gates` verb, or a daemon), and the hostname
+API), polling architecture decision (pull from `iss ready`, a
+separate `iss check-gates` verb, or a daemon), and the hostname
 namespace question (`gh:pr` vs `fj:pr` vs
 `pr:<host>:<owner>/<repo>/<num>`).
 
@@ -107,19 +107,19 @@ namespace question (`gh:pr` vs `fj:pr` vs
 
 Three models, in increasing order of cost:
 
-- **Pull, in-band.** `jjf ready` itself polls the gate provider
+- **Pull, in-band.** `iss ready` itself polls the gate provider
   for any open gate it encounters. Pros: one verb, no daemon.
-  Cons: `jjf ready` becomes slow and network-dependent; a
+  Cons: `iss ready` becomes slow and network-dependent; a
   flaky GH/FJ API makes the headline agent verb flaky; auth
   must be present in every operator's environment.
 
-- **Pull, out-of-band.** A separate `jjf check-gates` verb the
-  operator runs manually or via cron. Pros: `jjf ready` stays
+- **Pull, out-of-band.** A separate `iss check-gates` verb the
+  operator runs manually or via cron. Pros: `iss ready` stays
   fast and offline. Cons: someone has to run the verb;
   surfacing happens with operator-set latency.
 
 - **Push.** An external webhook (a GH/FJ post-merge hook) calls
-  `jjf clear <gate-id>` directly. Pros: zero polling; surfaces
+  `iss clear <gate-id>` directly. Pros: zero polling; surfaces
   on real-time event. Cons: requires webhook plumbing per
   remote; out of scope for v1.
 
@@ -128,8 +128,8 @@ verb that shells out to `gh` to query workflow / PR state, and
 the user (or a cron) decides cadence. `bd ready` does NOT
 poll.
 
-For jjforge, IF we shipped this, pull-out-of-band is the
-right shape. We never want `jjf ready` to be the slow verb.
+For git-issues, IF we shipped this, pull-out-of-band is the
+right shape. We never want `iss ready` to be the slow verb.
 
 ## 4. Which gate types are worth v1 (if we shipped)
 
@@ -145,10 +145,10 @@ Ranked by defensibility:
 
 3. **`fj:pr`** — useful but bring-your-own-auth. The Forgejo
    instance at `github.com` is THIS PROJECT's
-   remote, so this is the gate type a jjforge agent loop would
+   remote, so this is the gate type a git-issues agent loop would
    most plausibly use. Requires a `forgejo` CLI or a raw API
    call (with token in env). Polling cost is low (a few HTTP
-   calls per `jjf check-gates` invocation).
+   calls per `iss check-gates` invocation).
 
 4. **`gh:pr` / `gh:run`** — same shape as `fj:pr` but requires
    `gh` CLI auth. Useful for projects mirrored to GitHub; not
@@ -157,7 +157,7 @@ Ranked by defensibility:
 Naming question: beads chose `gh:pr` / `gh:run` as gate-type
 labels. For multi-host support, the cleaner shape is the
 generalized one: `pr:<host>:<owner>/<repo>/<num>`. Concretely:
-`pr:github.com/myers/jjforge/42`. This pushes
+`pr:github.com/myers/git-issues/42`. This pushes
 hostname into the gate ID itself, avoids the `fj:pr` vs `gh:pr`
 namespace duplication, and lets the gate-check dispatcher
 match on host rather than type prefix.
@@ -182,7 +182,7 @@ Two options for the on-disk shape:
   Pre-v2.5 readers see an Open issue with an unknown extra
   field — serde tolerates unknown fields by default (the
   current `IssueRecord` does not use
-  `#[serde(deny_unknown_fields)]`). Means `jjf ready` filters
+  `#[serde(deny_unknown_fields)]`). Means `iss ready` filters
   on `Open` AND `awaiting is None`.
 
 The flag-on-Open approach is more conservative
@@ -213,11 +213,11 @@ A single new variant on the existing `Status` enum:
 shape:
 
 ```
-jjf block <id> --reason "<text>"      # status=blocked + reason as a comment
-jjf open <id>                         # already exists; reuse for unblocking
+iss block <id> --reason "<text>"      # status=blocked + reason as a comment
+iss open <id>                         # already exists; reuse for unblocking
 ```
 
-`jjf ready` filters `Blocked` out the same way it filters
+`iss ready` filters `Blocked` out the same way it filters
 `Closed`. No polling. No new fields. No external auth.
 v2.5 spec bump is small and well-precedented (mirrors the
 v2.3 `InProgress` addition).
@@ -225,12 +225,12 @@ v2.3 `InProgress` addition).
 ### What this gives us
 
 - Scenario A (timer): the orchestrator runs
-  `jjf block <id> --reason "wait 24h"` and revisits
+  `iss block <id> --reason "wait 24h"` and revisits
   manually. Loses the auto-clear, but the orchestrator
   loop already revisits the queue regularly.
 - Scenario B (PR landed): an agent reading PR status via
   `gh` or `forgejo` CLI in its OWN workflow runs
-  `jjf open <id>` when the PR merges. No CLI-side polling
+  `iss open <id>` when the PR merges. No CLI-side polling
   needed; the gate-clearing logic lives in whatever script
   the agent is already running.
 - `wait-on:<thing>` labels can be added on top for tagging
@@ -239,7 +239,7 @@ v2.3 `InProgress` addition).
 ### What we DON'T ship
 
 - No `await_type` / `await_id` fields.
-- No `jjf check-gates` verb.
+- No `iss check-gates` verb.
 - No GH / FJ API integration in the CLI binary.
 - No `Status::Awaiting` separate from `Status::Blocked`. If
   later we want auto-clearing gates, we extend `Blocked` with
@@ -261,7 +261,7 @@ v2.3 `InProgress` addition).
 
 3. **The escape hatches stack.** `Status::Blocked` plus a
    `wait-on:<thing>` label gives operators a discoverable
-   filter (`jjf ls --label wait-on:fj-pr-42`) and a clear
+   filter (`iss ls --label wait-on:fj-pr-42`) and a clear
    ready-suppression mechanism. The combination covers the
    "what is blocked on what" question without polling.
 
@@ -277,10 +277,10 @@ follow-up to this research ticket — see the closing comment
 on `08bc9eb`). Scope:
 
 - Add `Status::Blocked` variant (wire: `blocked`).
-- New CLI verb: `jjf block <id> [--reason <text>]`. Sets
+- New CLI verb: `iss block <id> [--reason <text>]`. Sets
   status to blocked and (if `--reason` is given) posts a
   comment in the same multi-op commit.
-- Existing `jjf open <id>` is reused for clearing.
+- Existing `iss open <id>` is reused for clearing.
 - `Storage::list_ready` filters `Blocked` like it filters
   `Closed`.
 - Spec bump: v2.5 status enum addition. Mirror v2.3's
@@ -300,7 +300,7 @@ the full approach; extending it doesn't require a rewrite.
 - A second concrete use case beyond Scenarios A and B
   arises (e.g. an actual agent loop that needs to fan out
   N PRs and wait for them).
-- The operator finds themselves running `jjf open <id>`
+- The operator finds themselves running `iss open <id>`
   more than a handful of times per week and asks for
   automation.
 - A second remote (other than the chaos-inc Forgejo) gets
@@ -309,7 +309,7 @@ the full approach; extending it doesn't require a rewrite.
 
 If any of those land, file a follow-up that revisits
 this doc, adds the `await_*` fields to the `Blocked`
-shape, and ships `jjf check-gates`.
+shape, and ships `iss check-gates`.
 
 ## 7. Sequencing against `agent-claim-atomic`
 

@@ -1,4 +1,4 @@
-# jjforge quick start
+# git-issues quick start
 
 Five minutes from empty directory to a working planner. Every
 command below is reproducible end-to-end; the transcript is in
@@ -7,40 +7,40 @@ command below is reproducible end-to-end; the transcript is in
 ## Prerequisites
 
 - `jj` (Jujutsu) 0.40 or newer on `PATH`.
-- The `jjf` binary on `PATH`. From this repo:
-  `cargo install --path crates/jjf` — or symlink `bin/jjf`
-  (which prefers `target/release/jjf`, falls back to debug,
+- The `iss` binary on `PATH`. From this repo:
+  `cargo install --path crates/iss` — or symlink `bin/iss`
+  (which prefers `target/release/iss`, falls back to debug,
   builds release on demand) somewhere on `PATH`.
 - A jj identity configured (`jj config set --user user.name ...`,
   `user.email ...`). Without one, commit authorship is empty
-  and `jjf` will refuse to write.
+  and `iss` will refuse to write.
 
 ## 1. Create the repo
 
-`jjf` writes to a `refs/jjf/*` namespace on an existing jj repo;
+`iss` writes to a `refs/jjf/*` namespace on an existing jj repo;
 it does not create a repo for you. `jj git init` produces a
 colocated jj+git repo — you get `.git/` and `.jj/` side-by-side,
-and `git push` / `pull` and `jjf push` share the same remote:
+and `git push` / `pull` and `iss push` share the same remote:
 
 ```bash
 mkdir my-project && cd my-project
 jj git init
 ```
 
-## 2. Initialize jjforge
+## 2. Initialize git-issues
 
 ```bash
-jjf init
+iss init
 ```
 
-Output: `jjf: initialized`.
+Output: `iss: initialized`.
 
 Idempotent — running it again on the same repo is a no-op
-(`jjf: initialized` again, no error). This step creates the
+(`iss: initialized` again, no error). This step creates the
 `refs/jjf/meta/format-version` sentinel ref AND, if a git remote
 is already configured, writes
 `+refs/jjf/*:refs/remotes/<remote>/jjf/*` into `.git/config`
-so subsequent `git fetch` and `jjf pull` round-trip the
+so subsequent `git fetch` and `iss pull` round-trip the
 namespace.
 
 ## 3. File a roadmap
@@ -50,7 +50,7 @@ and the `roadmap` slug so future sessions can find it without
 memorizing a 7-char id:
 
 ```bash
-cat <<'EOF' | jjf new -t "Roadmap: my-project" --type roadmap --slug roadmap -F -
+cat <<'EOF' | iss new -t "Roadmap: my-project" --type roadmap --slug roadmap -F -
 # my-project roadmap
 
 1. Build the thing.
@@ -61,8 +61,8 @@ EOF
 Output: a 7-char id like `0f07bdf`. Read it back any time with:
 
 ```bash
-jjf show roadmap                         # by slug
-jjf show roadmap --include-memories      # ... plus the memory bank
+iss show roadmap                         # by slug
+iss show roadmap --include-memories      # ... plus the memory bank
 ```
 
 ## 4. File real work
@@ -71,7 +71,7 @@ Capture the id of each new issue from the `--json` envelope so
 later commands can reference it:
 
 ```bash
-EPIC=$(cat <<'EOF' | jjf new --json -t "Epic: ship v1" --type epic --slug ship-v1 -F - | jq -r .id
+EPIC=$(cat <<'EOF' | iss new --json -t "Epic: ship v1" --type epic --slug ship-v1 -F - | jq -r .id
 # Goal
 Get v1 out the door.
 
@@ -80,13 +80,13 @@ Two tickets: backend, then docs.
 EOF
 )
 
-BUG=$(cat <<'EOF' | jjf new --json -t "Backend handler crashes on empty input" --type bug --parent ship-v1 -F - | jq -r .id
+BUG=$(cat <<'EOF' | iss new --json -t "Backend handler crashes on empty input" --type bug --parent ship-v1 -F - | jq -r .id
 The /submit handler panics when body is empty.
 EOF
 )
 
 # Note the `-d $BUG` — the README ticket is gated on the bug.
-FEAT=$(cat <<'EOF' | jjf new --json -t "Write the README" --type feature --parent ship-v1 -d $BUG -F - | jq -r .id
+FEAT=$(cat <<'EOF' | iss new --json -t "Write the README" --type feature --parent ship-v1 -d $BUG -F - | jq -r .id
 Document the install/run flow once the crash is fixed.
 EOF
 )
@@ -95,7 +95,7 @@ EOF
 ## 5. Ask "what's next?"
 
 ```bash
-jjf ready
+iss ready
 ```
 
 Returns the unblocked open issues, sorted bug-first.  Because the
@@ -110,8 +110,8 @@ the bug closes:
 Close the bug and `ready` shifts:
 
 ```bash
-jjf close $BUG
-jjf ready
+iss close $BUG
+iss ready
 ```
 
 ```
@@ -127,7 +127,7 @@ The simple case above scales. For real projects you'll want
 **epics** (the top-level goals) with **child issues** (the
 units of work), `blocks` edges to enforce ordering, and
 `parent-child` edges to nest children under their epic so
-the cascade reaches them. `jjf ready` walks both, so
+the cascade reaches them. `iss ready` walks both, so
 "what's next?" stays honest.
 
 Set up two epics — backend then frontend — with the frontend
@@ -136,35 +136,35 @@ gated on the backend, and a few children each:
 ```bash
 # Two epics. -d EPIC_A on the frontend epic means
 # "frontend is blocked by backend until backend closes."
-EPIC_A=$(jjf new --json -t "Epic: backend rewrite" --type epic \
+EPIC_A=$(iss new --json -t "Epic: backend rewrite" --type epic \
     --slug backend -F /dev/null | jq -r .id)
-EPIC_B=$(jjf new --json -t "Epic: frontend ship" --type epic \
+EPIC_B=$(iss new --json -t "Epic: frontend ship" --type epic \
     --slug frontend -d $EPIC_A -F /dev/null | jq -r .id)
 
 # Backend children — chained with `blocks` so they run in order,
 # and attached to the backend epic with `--parent`.
-DB=$(jjf new --json -t "Migrate auth tables" --type bug \
+DB=$(iss new --json -t "Migrate auth tables" --type bug \
     --slug migrate-auth --parent backend -F /dev/null | jq -r .id)
-API=$(jjf new --json -t "Rewrite /login handler" --type feature \
+API=$(iss new --json -t "Rewrite /login handler" --type feature \
     --slug rewrite-login --parent backend -d $DB -F /dev/null | jq -r .id)
-TESTS=$(jjf new --json -t "Backend integration tests" --type feature \
+TESTS=$(iss new --json -t "Backend integration tests" --type feature \
     --slug backend-tests --parent backend -d $API -F /dev/null | jq -r .id)
 
 # Frontend children — parallel, no inter-child ordering,
 # and attached to the frontend epic with `--parent`.
-LOGIN=$(jjf new --json -t "Rewrite login page" --type feature \
+LOGIN=$(iss new --json -t "Rewrite login page" --type feature \
     --slug login-page --parent frontend -F /dev/null | jq -r .id)
-SETTINGS=$(jjf new --json -t "Settings page polish" --type feature \
+SETTINGS=$(iss new --json -t "Settings page polish" --type feature \
     --slug settings-page --parent frontend -F /dev/null | jq -r .id)
 ```
 
 Two edge kinds, two roles:
 
-- **`blocks`** (the default for `jjf new -d` and `jjf dep add`)
+- **`blocks`** (the default for `iss new -d` and `iss dep add`)
   — ordering constraint. The owner is blocked until the
-  target closes. Drives `jjf ready`.
+  target closes. Drives `iss ready`.
 - **`parent-child`** — hierarchy. The owner is a CHILD of the
-  target. `jjf ready` propagates the parent's blocked state
+  target. `iss ready` propagates the parent's blocked state
   to the child (fixpoint cascade). Used to nest children
   under epics, so when the epic is blocked the whole subtree
   is blocked too.
@@ -172,8 +172,8 @@ Two edge kinds, two roles:
 Inspect the hierarchy:
 
 ```bash
-jjf dep tree $EPIC_A   # walks parent-child in the CHILD direction
-jjf dep tree $EPIC_B
+iss dep tree $EPIC_A   # walks parent-child in the CHILD direction
+iss dep tree $EPIC_B
 ```
 
 ```
@@ -190,7 +190,7 @@ jjf dep tree $EPIC_B
 Now ask "what's workable right now?":
 
 ```bash
-jjf ready
+iss ready
 ```
 
 ```
@@ -210,15 +210,15 @@ their `parent-child` edges.
 Scope `ready` to one epic with `--parent`:
 
 ```bash
-jjf ready --parent backend   # 1 result: the migration
-jjf ready --parent frontend  # empty — everything cascaded blocked
+iss ready --parent backend   # 1 result: the migration
+iss ready --parent frontend  # empty — everything cascaded blocked
 ```
 
 Close the migration, watch the chain advance:
 
 ```bash
-jjf close $DB
-jjf ready
+iss close $DB
+iss ready
 ```
 
 ```
@@ -232,41 +232,41 @@ frontend epic stops being blocked and both frontend children
 appear in `ready` together (they're parallel — no `blocks`
 edges between them).
 
-**`jjf` rejects dependency cycles at write time.** If you
+**`iss` rejects dependency cycles at write time.** If you
 try to add an edge that would close a cycle in the
 `blocks` graph, the command exits 2 with a
 `dependency_cycle` envelope listing the offending chain —
 no silent "issue vanished from ready" failure mode:
 
 ```bash
-$ jjf dep add $API $TESTS    # TESTS already blocks-depends on API
-jjf: adding blocks-edge 3d1b6b7 -> 23ff23e would close a dependency cycle
+$ iss dep add $API $TESTS    # TESTS already blocks-depends on API
+iss: adding blocks-edge 3d1b6b7 -> 23ff23e would close a dependency cycle
 ```
 
 ## 7. Remember something for next session
 
 Persistent memories travel with the rest of the `refs/jjf/*`
-namespace — they round-trip via `jjf push`/`pull` and are surfaced by
-`jjf show roadmap --include-memories`.  Save the things future-you
+namespace — they round-trip via `iss push`/`pull` and are surfaced by
+`iss show roadmap --include-memories`.  Save the things future-you
 would otherwise re-derive:
 
 ```bash
-jjf remember "Backend's /submit handler can't take empty bodies."
-jjf memories
+iss remember "Backend's /submit handler can't take empty bodies."
+iss memories
 ```
 
 If you don't pass `--key`, the key is auto-slugged from the first
 ~40 characters of the value, so explicit keys are friendlier:
 
 ```bash
-jjf remember "Build is 3x faster with sccache enabled in CI." --key sccache-ci
+iss remember "Build is 3x faster with sccache enabled in CI." --key sccache-ci
 ```
 
 When a memory's underlying invariant changes (an env var
 retires, a file moves, a workflow rule is lifted), prune it:
 
 ```bash
-jjf forget sccache-ci
+iss forget sccache-ci
 ```
 
 Stale memories drift like stale comments do — review them on
@@ -274,39 +274,39 @@ your way out of a session that touched anything load-bearing.
 
 ## 8. Push to a remote (optional)
 
-`jjf` rides standard git transport. `jjf remote add` writes
+`iss` rides standard git transport. `iss remote add` writes
 the `refs/jjf/*` fetch refspec into `.git/config` for you, so
-plain `git fetch` and `jjf pull` both round-trip the namespace
+plain `git fetch` and `iss pull` both round-trip the namespace
 afterwards:
 
 ```bash
-jjf remote add origin git@example.com:me/my-project.git
-jjf push origin
+iss remote add origin git@example.com:me/my-project.git
+iss push origin
 ```
 
 Pulling merges any divergence with the built-in merge driver:
 
 ```bash
-jjf pull origin
+iss pull origin
 ```
 
 ## 9. Joining an existing project
 
-When you (or a collaborator) clone a jjforge project on a new
+When you (or a collaborator) clone a git-issues project on a new
 machine, the planner refs don't ride along by default — git's
 default fetch refspec only covers `refs/heads/*`. The recipe:
 
 ```bash
 jj git clone <url> <dir>
 cd <dir>
-jjf init               # writes the refs/jjf/* fetch refspec
-jjf pull origin        # fetches issues, memories, sentinel
-jjf ls                 # see the project's open issues
+iss init               # writes the refs/jjf/* fetch refspec
+iss pull origin        # fetches issues, memories, sentinel
+iss ls                 # see the project's open issues
 ```
 
-`jjf init` on an existing clone is idempotent — it doesn't
+`iss init` on an existing clone is idempotent — it doesn't
 overwrite local state, it just plants the refspec (and the
-sentinel ref if missing). After `jjf pull origin`, the
+sentinel ref if missing). After `iss pull origin`, the
 collaborator's planner mirrors the remote and subsequent
 pushes / pulls round-trip cleanly.
 
@@ -320,36 +320,36 @@ everything else should match.
 $ jj git init
 Initialized repo in "."
 
-$ jjf init
-jjf: initialized
+$ iss init
+iss: initialized
 
-$ jjf init        # idempotent
-jjf: initialized
+$ iss init        # idempotent
+iss: initialized
 
-$ jjf ls          # after creating roadmap + epic + bug + feature
+$ iss ls          # after creating roadmap + epic + bug + feature
 1245ac9  open  1L  Write the README
 86417df  open  1L  Epic: ship v1
 f42490c  open  1L  Backend handler crashes on empty input
 a4025c4  open  0L  Roadmap: demo project
 
-$ jjf ready       # README is hidden — blocked on the bug
+$ iss ready       # README is hidden — blocked on the bug
 f42490c  open  1L  Backend handler crashes on empty input
 86417df  open  1L  Epic: ship v1
 
-$ jjf close f42490c
+$ iss close f42490c
 closed f42490c
 
-$ jjf ready       # bug closed → README unblocked
+$ iss ready       # bug closed → README unblocked
 1245ac9  open  1L  Write the README
 86417df  open  1L  Epic: ship v1
 ```
 
 ## Where to go next
 
-- **Full CLI surface:** `jjf --help` and per-verb `jjf <verb> --help`.
+- **Full CLI surface:** `iss --help` and per-verb `iss <verb> --help`.
 - **Architecture:** [architecture.md](architecture.md).
 - **JSON output shapes:** [cli-json.md](cli-json.md).
 - **Working a single ticket from a subagent:** the
-  [subagent-working-a-jjforge-issue](../skills/subagent-working-a-jjforge-issue/SKILL.md)
+  [subagent-working-a-git-issues-issue](../skills/subagent-working-a-git-issues-issue/SKILL.md)
   skill, auto-loaded when the dispatch mentions "issue", "ticket",
-  "jjforge", or "jjf".
+  "git-issues", or "iss".
