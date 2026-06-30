@@ -2705,6 +2705,16 @@ fn print_issue_plain(issue: &Issue) {
         issue.labels.join(", ")
     };
     println!("labels: {labels}");
+    // Metadata block: render between labels and dependencies,
+    // mirroring the JSON field ordering (metadata sits after labels in
+    // the IssueRecord struct). Omitted entirely when the map is empty.
+    if !issue.metadata.is_empty() {
+        println!("metadata:");
+        for (k, v) in &issue.metadata {
+            // BTreeMap iterates in sorted key order — no re-sort needed.
+            println!("  {k}={v}");
+        }
+    }
     // v2.8: priority renders as `P0`..`P4` when set, `(none)` when
     // null — mirrors slug / assignee's Optional-presentation
     // convention rather than the row-format dash (the show output
@@ -2716,16 +2726,6 @@ fn print_issue_plain(issue: &Issue) {
     println!("priority: {priority}");
     let assignee = issue.assignee.as_deref().unwrap_or("(none)");
     println!("assignee: {assignee}");
-    // Metadata block: render between labels/assignee and dependencies,
-    // mirroring the JSON field ordering (metadata sits after labels in
-    // the IssueRecord struct). Omitted entirely when the map is empty.
-    if !issue.metadata.is_empty() {
-        println!("metadata:");
-        for (k, v) in &issue.metadata {
-            // BTreeMap iterates in sorted key order — no re-sort needed.
-            println!("  {k}={v}");
-        }
-    }
     // v2.4: the dependency section renders one line per kind so the
     // typed-edge model is visible at a glance. Empty kinds are
     // collapsed; an entirely empty dep set falls back to the v1 shape
