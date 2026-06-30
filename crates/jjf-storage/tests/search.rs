@@ -73,7 +73,7 @@ fn search_empty_query_returns_no_results() {
         })
         .unwrap();
 
-    let hits = storage.search("", false, DEFAULT_SNIPPET_CONTEXT).unwrap();
+    let hits = storage.search("", false, false, DEFAULT_SNIPPET_CONTEXT).unwrap();
     assert!(hits.is_empty(), "empty query must not match-everything");
 }
 
@@ -89,7 +89,7 @@ fn search_no_match_returns_empty() {
         })
         .unwrap();
 
-    let hits = storage.search("nonexistent", false, DEFAULT_SNIPPET_CONTEXT).unwrap();
+    let hits = storage.search("nonexistent", false, false, DEFAULT_SNIPPET_CONTEXT).unwrap();
     assert!(hits.is_empty());
 }
 
@@ -105,7 +105,7 @@ fn search_title_only_hit() {
         })
         .unwrap();
 
-    let hits = storage.search("segfault", false, DEFAULT_SNIPPET_CONTEXT).unwrap();
+    let hits = storage.search("segfault", false, false, DEFAULT_SNIPPET_CONTEXT).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].issue.id, id);
     assert_eq!(hits[0].matched_field, MatchedField::Title);
@@ -125,7 +125,7 @@ fn search_body_only_hit() {
         })
         .unwrap();
 
-    let hits = storage.search("marshmallow", false, DEFAULT_SNIPPET_CONTEXT).unwrap();
+    let hits = storage.search("marshmallow", false, false, DEFAULT_SNIPPET_CONTEXT).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].issue.id, id);
     assert_eq!(hits[0].matched_field, MatchedField::Body);
@@ -148,11 +148,11 @@ fn search_comments_only_with_flag_widens_results() {
         .unwrap();
 
     // Without the flag, the comment text is invisible to search.
-    let hits_off = storage.search("widget", false, DEFAULT_SNIPPET_CONTEXT).unwrap();
+    let hits_off = storage.search("widget", false, false, DEFAULT_SNIPPET_CONTEXT).unwrap();
     assert!(hits_off.is_empty(), "comments must be off by default");
 
     // With the flag, the same query hits.
-    let hits_on = storage.search("widget", true, DEFAULT_SNIPPET_CONTEXT).unwrap();
+    let hits_on = storage.search("widget", true, false, DEFAULT_SNIPPET_CONTEXT).unwrap();
     assert_eq!(hits_on.len(), 1);
     assert_eq!(hits_on[0].issue.id, id);
     assert_eq!(hits_on[0].matched_field, MatchedField::Comments);
@@ -174,7 +174,7 @@ fn search_is_case_insensitive() {
 
     // Lowercase query against a Mixed/UPPER source.
     for q in ["foo", "FOO", "Foo"] {
-        let hits = storage.search(q, false, DEFAULT_SNIPPET_CONTEXT).unwrap();
+        let hits = storage.search(q, false, false, DEFAULT_SNIPPET_CONTEXT).unwrap();
         assert_eq!(hits.len(), 1, "case-insensitive match for {q}");
         // Title beats body even though both hit.
         assert_eq!(hits[0].matched_field, MatchedField::Title);
@@ -199,7 +199,7 @@ fn search_multi_field_hit_picks_title_first_and_sums_score() {
         .unwrap();
 
     // include_comments = true so all three fields participate.
-    let hits = storage.search("needle", true, DEFAULT_SNIPPET_CONTEXT).unwrap();
+    let hits = storage.search("needle", true, false, DEFAULT_SNIPPET_CONTEXT).unwrap();
     assert_eq!(hits.len(), 1);
     // Title wins the priority race.
     assert_eq!(hits[0].matched_field, MatchedField::Title);
@@ -229,7 +229,7 @@ fn search_body_wins_when_no_title_hit() {
         .add_comment(&id, "lemming again", "alice <a@x>")
         .unwrap();
 
-    let hits = storage.search("lemming", true, DEFAULT_SNIPPET_CONTEXT).unwrap();
+    let hits = storage.search("lemming", true, false, DEFAULT_SNIPPET_CONTEXT).unwrap();
     assert_eq!(hits.len(), 1);
     // No title hit → body wins priority over comments even though
     // comments also hit.
@@ -342,7 +342,7 @@ fn search_does_not_apply_status_or_label_filters() {
         .unwrap();
     storage.set_status(&closed_id, jjf_storage::Status::Closed).unwrap();
 
-    let hits = storage.search("needle", false, DEFAULT_SNIPPET_CONTEXT).unwrap();
+    let hits = storage.search("needle", false, false, DEFAULT_SNIPPET_CONTEXT).unwrap();
     assert_eq!(hits.len(), 2, "storage layer returns every status");
     let ids: Vec<_> = hits.iter().map(|h| &h.issue.id).collect();
     assert!(ids.contains(&&open_id));

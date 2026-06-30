@@ -241,6 +241,93 @@ fn search_outside_jj_repo_is_preflight_failure() {
 }
 
 #[test]
+fn search_excludes_metadata_by_default() {
+    let repo = make_initialized_repo("search_meta_default_off");
+    let id = create_issue(&repo, "test-title-no-meta", b"body text", &[]);
+    let set_out = run_jjf(
+        &repo,
+        &["metadata", "set", &id, "key", "unique-needle-xyz"],
+    );
+    assert!(
+        set_out.status.success(),
+        "metadata set failed: stderr={}",
+        String::from_utf8_lossy(&set_out.stderr)
+    );
+
+    // Without --include-metadata the value should NOT match.
+    let out = run_jjf(&repo, &["search", "unique-needle-xyz", "--json"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not valid JSON: {e}\nstdout: {stdout}"));
+    let results = envelope["results"].as_array().unwrap();
+    assert!(
+        results.is_empty(),
+        "metadata value should NOT match by default; got: {stdout}"
+    );
+}
+
+#[test]
+fn search_includes_metadata_with_flag() {
+    let repo = make_initialized_repo("search_meta_flag_on");
+    let id = create_issue(&repo, "test-title-with-meta", b"body text", &[]);
+    let set_out = run_jjf(
+        &repo,
+        &["metadata", "set", &id, "key", "unique-needle-xyz"],
+    );
+    assert!(
+        set_out.status.success(),
+        "metadata set failed: stderr={}",
+        String::from_utf8_lossy(&set_out.stderr)
+    );
+
+    // With --include-metadata the value should match.
+    let out = run_jjf(
+        &repo,
+        &["search", "unique-needle-xyz", "--include-metadata", "--json"],
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not valid JSON: {e}\nstdout: {stdout}"));
+    let results = envelope["results"].as_array().unwrap();
+    assert_eq!(
+        results.len(),
+        1,
+        "metadata value should match with --include-metadata; got: {stdout}"
+    );
+    assert_eq!(results[0]["id"].as_str().unwrap(), id.as_str());
+    assert_eq!(results[0]["matched_field"].as_str().unwrap(), "metadata");
+}
+
+#[test]
+fn search_meta_filter_narrows_results() {
+    let repo = make_initialized_repo("search_meta_filter");
+    let id_a = create_issue(&repo, "issue-a-title", b"body", &[]);
+    let id_b = create_issue(&repo, "issue-b-title", b"body", &[]);
+
+    // Tag A; leave B without.
+    run_jjf(
+        &repo,
+        &["metadata", "set", &id_a, "team", "infra"],
+    );
+
+    // Search that hits both (by title keyword "title") but filter by meta.
+    let out = run_jjf(
+        &repo,
+        &["search", "title", "--meta", "team=infra", "--json"],
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not valid JSON: {e}\nstdout: {stdout}"));
+    let results = envelope["results"].as_array().unwrap();
+    let ids: Vec<&str> = results.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&id_a.as_str()), "should include id_a; got: {stdout}");
+    assert!(!ids.contains(&id_b.as_str()), "should NOT include id_b; got: {stdout}");
+}
+
+#[test]
 fn search_parent_flag_intersects_with_query() {
     let repo = make_initialized_repo("search_parent");
     let epic_id = parse_id_from_stdout(

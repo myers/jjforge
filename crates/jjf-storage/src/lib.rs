@@ -638,6 +638,11 @@ pub struct ReadyFilter {
     /// Mirrors the CLI's `--parent <handle>` flag. AND-composed
     /// with `labels` / `types`.
     pub parent: Option<IssueId>,
+    /// AND-composed metadata filter. Each `(key, value)` pair must
+    /// match exactly on the issue's `metadata` map. Empty vec means
+    /// "no metadata filter" — all issues pass. Mirrors the CLI's
+    /// `--meta key=value` flag. v2.12 (`issue-metadata`).
+    pub meta: Vec<(String, String)>,
 }
 
 /// Sortable key for the priority field: maps `Option<u8>` to a tuple
@@ -789,6 +794,11 @@ pub enum MatchedField {
     /// neither title nor body did). Only reachable when the search
     /// was invoked with `include_comments = true`.
     Comments,
+    /// One of the issue's metadata values carried the first hit (and
+    /// none of title, body, or comments did). Only reachable when the
+    /// search was invoked with `include_metadata = true`. Lowest
+    /// priority in the `Title > Body > Comments > Metadata` chain.
+    Metadata,
 }
 
 impl MatchedField {
@@ -800,6 +810,7 @@ impl MatchedField {
             MatchedField::Title => "title",
             MatchedField::Body => "body",
             MatchedField::Comments => "comments",
+            MatchedField::Metadata => "metadata",
         }
     }
 }
@@ -3660,6 +3671,12 @@ impl Storage {
                     true
                 }
             })
+            .filter(|i| {
+                filter
+                    .meta
+                    .iter()
+                    .all(|(k, v)| i.metadata.get(k) == Some(v))
+            })
             .collect();
 
         // Sort: priority (nulls last) → type priority → created_at
@@ -3728,6 +3745,7 @@ impl Storage {
         &self,
         q: &str,
         include_comments: bool,
+        include_metadata: bool,
         snippet_context: usize,
     ) -> Result<Vec<SearchHit>> {
         // Empty query is match-nothing. Returning the snapshot's full
@@ -3741,7 +3759,9 @@ impl Storage {
         let mut out: Vec<SearchHit> = Vec::new();
         for issue in snapshot.issues.values() {
             // Per-field hit counts. Title and body always searched;
-            // comments only when the toggle is on.
+            // comments only when the toggle is on; metadata values
+            // only when include_metadata is on (opt-in to keep the
+            // snapshot scan cheap for the common case).
             let title_hits = count_ci(&issue.title, &needle);
             let body_hits = count_ci(&issue.body, &needle);
             let comments_hits: usize = if include_comments {
@@ -3753,12 +3773,23 @@ impl Storage {
             } else {
                 0
             };
-            let score = title_hits + body_hits + comments_hits;
+            let metadata_hits: usize = if include_metadata {
+                issue
+                    .metadata
+                    .values()
+                    .map(|v| count_ci(v, &needle))
+                    .sum()
+            } else {
+                0
+            };
+            let score = title_hits + body_hits + comments_hits + metadata_hits;
             if score == 0 {
                 continue;
             }
             // Priority resolution: which field carries the snippet
-            // and the matched_field tag. Title > Body > Comments.
+            // and the matched_field tag.
+            // Order: Title > Body > Comments > Metadata (lowest — opt-in
+            // and short values, so it wins only when no other field hits).
             let (matched_field, snippet) = if title_hits > 0 {
                 (
                     MatchedField::Title,
@@ -3769,7 +3800,7 @@ impl Storage {
                     MatchedField::Body,
                     make_snippet(&issue.body, &needle, snippet_context),
                 )
-            } else {
+            } else if comments_hits > 0 {
                 // include_comments must be true here (otherwise
                 // comments_hits == 0 and we'd have continued above).
                 // The first comment whose body matches carries the
@@ -3783,6 +3814,19 @@ impl Storage {
                     .map(|c| make_snippet(&c.body, &needle, snippet_context))
                     .unwrap_or_default();
                 (MatchedField::Comments, first)
+            } else {
+                // include_metadata must be true here (otherwise
+                // metadata_hits == 0 and we'd have continued above).
+                // The first metadata value whose string matches carries
+                // the snippet. BTreeMap iteration order is alphabetical
+                // on key, so "first match" is deterministic.
+                let first = issue
+                    .metadata
+                    .values()
+                    .find(|v| count_ci(v, &needle) > 0)
+                    .map(|v| make_snippet(v, &needle, snippet_context))
+                    .unwrap_or_default();
+                (MatchedField::Metadata, first)
             };
             out.push(SearchHit {
                 issue: issue.clone(),
@@ -3825,7 +3869,7 @@ impl Storage {
     /// Reads through the snapshot cache (one probe + maybe one
     /// rebuild — same shape as [`Storage::search`] / [`Storage::list_ready`]).
     /// No new IO.
-    pub fn stale(&self, threshold_secs: u64) -> Result<Vec<StaleHit>> {
+    pub fn stale(&self, threshold_secs: u64, meta: &[(String, String)]) -> Result<Vec<StaleHit>> {
         let now_secs = current_epoch_secs()?;
         let snapshot = self.snapshot()?;
         let mut out: Vec<StaleHit> = Vec::new();
@@ -3846,12 +3890,18 @@ impl Storage {
             // positive threshold — so future-dated issues are never
             // stale, which matches intuition.
             let age = now_secs.saturating_sub(updated_secs);
-            if age > threshold_secs {
-                out.push(StaleHit {
-                    issue: issue.clone(),
-                    seconds_since_update: age,
-                });
+            if age <= threshold_secs {
+                continue;
             }
+            // AND-composed metadata filter. Each (key, value) pair
+            // must match exactly on the issue's metadata map.
+            if !meta.iter().all(|(k, v)| issue.metadata.get(k) == Some(v)) {
+                continue;
+            }
+            out.push(StaleHit {
+                issue: issue.clone(),
+                seconds_since_update: age,
+            });
         }
         // Oldest first. `updated_at` is RFC 3339 with second-resolution
         // and a trailing `Z`, so lexicographic order == chronological

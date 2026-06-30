@@ -423,6 +423,14 @@ enum Commands {
         /// handle exits 2 (`slug_not_found`).
         #[arg(long)]
         parent: Option<String>,
+
+        /// Filter by metadata key=value pair. Repeatable; AND-
+        /// composed — every listed pair must match exactly on the
+        /// issue's metadata map. Useful for GC-routing queries
+        /// such as `jjf ready --meta gc.routed_to=worker-1`.
+        /// v2.12 (`issue-metadata`).
+        #[arg(long = "meta", value_parser = parse_meta_kv)]
+        meta: Vec<(String, String)>,
     },
 
     /// Mutate one or more scalar fields of an issue in a single commit.
@@ -909,6 +917,20 @@ enum Commands {
         /// Unknown handle exits 2.
         #[arg(long)]
         parent: Option<String>,
+
+        /// Also search metadata values. Off by default so the common
+        /// query stays cheap and unambiguous; metadata values are
+        /// typically short GC keys, not natural-language text.
+        /// Mirrors `--include-comments`. v2.12 (`issue-metadata`).
+        #[arg(long = "include-metadata", default_value_t = false)]
+        include_metadata: bool,
+
+        /// Filter by metadata key=value pair. Repeatable; AND-composed
+        /// — every listed pair must match exactly on the issue's
+        /// metadata map. Applied after the substring search (composing
+        /// AND with the query). v2.12 (`issue-metadata`).
+        #[arg(long = "meta", value_parser = parse_meta_kv)]
+        meta: Vec<(String, String)>,
     },
 
     /// Surface issues not touched in the last N days — orchestrator
@@ -971,6 +993,14 @@ enum Commands {
         /// `--limit 10` to skim the top of the stale list.
         #[arg(long, default_value_t = 0)]
         limit: usize,
+
+        /// Filter by metadata key=value pair. Repeatable; AND-
+        /// composed — every listed pair must match exactly on the
+        /// issue's metadata map. Useful for GC-routing queries
+        /// such as `jjf stale --meta gc.routed_to=worker-1`.
+        /// v2.12 (`issue-metadata`).
+        #[arg(long = "meta", value_parser = parse_meta_kv)]
+        meta: Vec<(String, String)>,
     },
 
     /// Pull the `issues` bookmark from a git remote, then merge any
@@ -1971,6 +2001,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             claim,
             priorities,
             parent,
+            meta,
         } => run_ready(
             cli.json,
             labels,
@@ -1981,6 +2012,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             claim,
             priorities,
             parent,
+            meta,
         ),
         Commands::Close { id } => run_set_status(cli.json, id, Status::Closed),
         Commands::Open { id } => run_set_status(cli.json, id, Status::Open),
@@ -2028,6 +2060,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             limit,
             snippet_context,
             parent,
+            include_metadata,
+            meta,
         } => run_search(
             cli.json,
             query,
@@ -2038,6 +2072,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             limit,
             snippet_context,
             parent,
+            include_metadata,
+            meta,
         ),
         Commands::Stale {
             days,
@@ -2045,7 +2081,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             labels,
             types,
             limit,
-        } => run_stale(cli.json, days, status, labels, types, limit),
+            meta,
+        } => run_stale(cli.json, days, status, labels, types, limit, meta),
         Commands::Update {
             id,
             title,
@@ -4016,6 +4053,7 @@ fn run_ready(
     claim: bool,
     priorities: Vec<u8>,
     parent: Option<String>,
+    meta: Vec<(String, String)>,
 ) -> Result<(), CliError> {
     // Preflight: --claim only composes with --limit 1. Reject any
     // other shape up front so callers don't quietly claim the first
@@ -4053,6 +4091,7 @@ fn run_ready(
         include_claimed,
         include_blocked,
         parent: parent_id,
+        meta,
     };
     let mut issues = storage.list_ready(&filter)?;
     // Priority filter is composed at the CLI layer (storage's
@@ -4189,6 +4228,8 @@ fn run_search(
     limit: usize,
     snippet_context: usize,
     parent: Option<String>,
+    include_metadata: bool,
+    meta: Vec<(String, String)>,
 ) -> Result<(), CliError> {
     // Preflight: cwd is a jj repo AND `issues` bookmark exists.
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
@@ -4211,14 +4252,16 @@ fn run_search(
         None => None,
     };
 
-    let mut hits: Vec<SearchHit> = storage.search(&query, include_comments, snippet_context)?;
-    // Compose status/label/type filters on top of the substring
+    let mut hits: Vec<SearchHit> =
+        storage.search(&query, include_comments, include_metadata, snippet_context)?;
+    // Compose status/label/type/meta filters on top of the substring
     // match. AND semantics across all filters, matching `ls`.
     hits.retain(|h| {
         status_matches(&h.issue, status)
             && labels_match(&h.issue, &labels)
             && types_match(&h.issue, &wanted_types)
             && parent_matches(&h.issue, parent_id.as_ref())
+            && metadata_matches(&h.issue, &meta)
     });
 
     // Score descending, then created_at ascending. Stable sort means
@@ -4305,6 +4348,7 @@ fn run_stale(
     labels: Vec<String>,
     types: Vec<TypeArg>,
     limit: usize,
+    meta: Vec<(String, String)>,
 ) -> Result<(), CliError> {
     // Preflight: cwd is a jj repo AND `issues` bookmark exists. Same
     // order as `run_ls` / `run_search`.
@@ -4322,7 +4366,7 @@ fn run_stale(
     // than the pinned clock).
     let threshold_secs = days.saturating_mul(86_400);
 
-    let mut hits: Vec<StaleHit> = storage.stale(threshold_secs)?;
+    let mut hits: Vec<StaleHit> = storage.stale(threshold_secs, &meta)?;
     // Compose status/label/type filters on top of the staleness set.
     // AND semantics across all filters, matching `ls` / `search`.
     hits.retain(|h| {

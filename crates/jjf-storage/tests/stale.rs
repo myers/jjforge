@@ -78,7 +78,7 @@ fn stale_empty_repo_returns_empty() {
     let storage = Storage::open(&repo).unwrap();
 
     // No issues, no stale rows.
-    let hits = storage.stale(14 * DAY).unwrap();
+    let hits = storage.stale(14 * DAY, &[]).unwrap();
     assert!(hits.is_empty());
 }
 
@@ -109,7 +109,7 @@ fn stale_only_old_issues_returned() {
         })
         .unwrap();
 
-    let hits = storage.stale(14 * DAY).unwrap();
+    let hits = storage.stale(14 * DAY, &[]).unwrap();
     assert_eq!(hits.len(), 1, "only the 100d-old issue should be stale");
     assert_eq!(hits[0].issue.id, old);
     assert_ne!(hits[0].issue.id, fresh);
@@ -136,7 +136,7 @@ fn stale_boundary_is_strict_greater_than() {
 
     // Jump forward exactly 14 days. Age == 14 days == threshold.
     pin_clock(2_000_000_000);
-    let hits = storage.stale(14 * DAY).unwrap();
+    let hits = storage.stale(14 * DAY, &[]).unwrap();
     assert!(
         hits.is_empty(),
         "boundary-aged issue must NOT be stale (strict > semantics)"
@@ -144,7 +144,7 @@ fn stale_boundary_is_strict_greater_than() {
 
     // One second past the threshold IS stale.
     pin_clock(2_000_000_000 + 1);
-    let hits = storage.stale(14 * DAY).unwrap();
+    let hits = storage.stale(14 * DAY, &[]).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].seconds_since_update, 14 * DAY + 1);
 }
@@ -186,7 +186,7 @@ fn stale_sort_oldest_first() {
         .unwrap();
 
     pin_clock(now);
-    let hits = storage.stale(14 * DAY).unwrap();
+    let hits = storage.stale(14 * DAY, &[]).unwrap();
     assert_eq!(hits.len(), 3);
     assert_eq!(hits[0].issue.id, oldest);
     assert_eq!(hits[1].issue.id, middle);
@@ -233,7 +233,7 @@ fn stale_comment_bumps_updated_at_today() {
         .add_comment(&id, "fresh comment", "alice <a@x>")
         .unwrap();
 
-    let hits = storage.stale(14 * DAY).unwrap();
+    let hits = storage.stale(14 * DAY, &[]).unwrap();
     assert!(
         hits.is_empty(),
         "today's behavior: add_comment bumps updated_at, so the issue is no longer stale. \
@@ -265,7 +265,7 @@ fn stale_update_bumps_updated_at() {
     pin_clock(now);
     storage.set_title(&id, "new title").unwrap();
 
-    let hits = storage.stale(14 * DAY).unwrap();
+    let hits = storage.stale(14 * DAY, &[]).unwrap();
     assert!(
         hits.is_empty(),
         "set_title bumps updated_at; issue should not be stale"
@@ -294,7 +294,7 @@ fn stale_threshold_zero_returns_everything() {
         .unwrap();
 
     pin_clock(now);
-    let hits = storage.stale(0).unwrap();
+    let hits = storage.stale(0, &[]).unwrap();
     assert_eq!(hits.len(), 1, "1s-old issue must be stale at threshold 0s");
     assert_eq!(hits[0].seconds_since_update, 1);
 }
@@ -321,7 +321,7 @@ fn stale_future_updated_at_not_stale() {
 
     // Local clock is now BEFORE the issue's updated_at.
     pin_clock(7_000_000_000 - 100 * DAY);
-    let hits = storage.stale(14 * DAY).unwrap();
+    let hits = storage.stale(14 * DAY, &[]).unwrap();
     assert!(
         hits.is_empty(),
         "future-dated issue must never be stale (saturating_sub guard)"
@@ -355,7 +355,7 @@ fn stale_threshold_in_seconds_not_days() {
         .unwrap();
 
     pin_clock(now);
-    let hits = storage.stale(3600).unwrap();
+    let hits = storage.stale(3600, &[]).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].issue.id, two_hr_old);
 }
@@ -380,7 +380,7 @@ fn stale_returns_issue_record_intact() {
         .unwrap();
 
     pin_clock(now);
-    let hits = storage.stale(14 * DAY).unwrap();
+    let hits = storage.stale(14 * DAY, &[]).unwrap();
     assert_eq!(hits.len(), 1);
     let hit = &hits[0];
     assert_eq!(hit.issue.id, id);
@@ -421,7 +421,7 @@ fn stale_closed_issues_included_storage_layer() {
         .unwrap();
 
     pin_clock(now);
-    let hits = storage.stale(14 * DAY).unwrap();
+    let hits = storage.stale(14 * DAY, &[]).unwrap();
     assert_eq!(
         hits.len(),
         1,

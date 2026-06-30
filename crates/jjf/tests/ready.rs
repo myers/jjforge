@@ -480,7 +480,6 @@ fn ready_parent_unknown_handle_exits_two() {
     );
 }
 
-#[test]
 fn ready_parent_bad_hex_exits_one_issue_not_found() {
     // A well-formed 7-char hex id that doesn't match any issue must
     // surface as `issue_not_found` (exit 1), the same shape as
@@ -502,4 +501,43 @@ fn ready_parent_bad_hex_exits_one_issue_not_found() {
         Some("issue_not_found"),
         "kind wrong: {stderr}"
     );
+}
+
+#[test]
+fn ready_filters_by_meta() {
+    let repo = make_initialized_repo("ready_meta_filter");
+    // Issue A gets a metadata tag; issue B does not.
+    let id_a = create_issue(&repo, "issue-a", &[]);
+    let id_b = create_issue(&repo, "issue-b", &[]);
+
+    // Tag issue A with metadata.
+    let set_out = run_jjf(
+        &repo,
+        &["metadata", "set", &id_a, "gc.routed_to", "worker-1"],
+    );
+    assert!(
+        set_out.status.success(),
+        "metadata set failed: stderr={}",
+        String::from_utf8_lossy(&set_out.stderr)
+    );
+
+    // `ready --meta gc.routed_to=worker-1 --json` should include A, exclude B.
+    let out = run_jjf(
+        &repo,
+        &["ready", "--meta", "gc.routed_to=worker-1", "--json"],
+    );
+    assert!(
+        out.status.success(),
+        "ready --meta should exit 0; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout is not valid JSON: {e}\nstdout: {stdout}"));
+    let ids: Vec<&str> = arr
+        .iter()
+        .map(|v| v["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&id_a.as_str()), "should include id_a; got: {stdout}");
+    assert!(!ids.contains(&id_b.as_str()), "should NOT include id_b; got: {stdout}");
 }

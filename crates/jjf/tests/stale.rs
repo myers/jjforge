@@ -299,6 +299,44 @@ fn stale_age_render_months_form() {
 }
 
 #[test]
+fn stale_filters_by_meta() {
+    let repo = make_initialized_repo("stale_meta_filter");
+    // Both issues are 30 days old (stale under the default 14d threshold).
+    let id_a = create_issue_at(&repo, "issue-a", b"x", &[], NOW - 30 * DAY);
+    let id_b = create_issue_at(&repo, "issue-b", b"x", &[], NOW - 30 * DAY);
+
+    // Tag issue A with metadata at a past clock so `updated_at` stays
+    // old — `metadata set` is a mutating verb and bumps `updated_at`
+    // to the clock at call time. Pinning to the same past-timestamp
+    // keeps A stale from `stale`'s perspective.
+    let set_out = run_jjf_with_env(
+        &repo,
+        &["metadata", "set", &id_a, "team", "infra"],
+        NOW - 30 * DAY,
+    );
+    assert!(
+        set_out.status.success(),
+        "metadata set failed: code={:?} stderr={}",
+        set_out.status.code(),
+        String::from_utf8_lossy(&set_out.stderr)
+    );
+
+    // `stale --meta team=infra` should include A, exclude B.
+    let out = run_jjf_with_env(&repo, &["stale", "--days", "14", "--meta", "team=infra"], NOW);
+    assert!(
+        out.status.success(),
+        "stale --meta should exit 0; code={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let rows = parse_stale_rows(&stdout);
+    let ids: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    assert!(ids.contains(&id_a.as_str()), "should include id_a; got: {stdout}");
+    assert!(!ids.contains(&id_b.as_str()), "should NOT include id_b; got: {stdout}");
+}
+
+#[test]
 fn stale_type_filter_composes() {
     let repo = make_initialized_repo("stale_type_filter");
     let bug = create_issue_at(
