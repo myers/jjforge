@@ -653,6 +653,26 @@ fn ls_parent_composes_with_type_and_status() {
 }
 
 #[test]
+fn ls_meta_bare_key_rejected_at_clap_parse_time() {
+    // A bare `--meta foo` (no `=`) must fail at clap parse time with exit 2
+    // and a message explaining the required format. Before the value_parser
+    // was added, this was silently accepted and treated as key="" (bug).
+    let repo = make_initialized_repo("ls_meta_bare_key_rejected");
+    let out = run_jjf(&repo, &["ls", "--meta", "foo"]);
+    assert!(
+        !out.status.success(),
+        "bare --meta key (no '=') should be rejected; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("expected key=value"),
+        "stderr should explain the parser; got: {}",
+        stderr
+    );
+}
+
+#[test]
 fn ls_help_documents_status_and_label_flags() {
     // --help should mention both --status and --label. Keeps the public
     // surface stable against accidental renames.

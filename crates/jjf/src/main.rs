@@ -311,9 +311,10 @@ enum Commands {
         /// Filter by metadata key=value. Repeatable. Semantics:
         /// AND — an issue must carry every listed key with the exact
         /// value to match. Format is `key=value`; the first `=`
-        /// splits key from value (values may contain `=`).
-        #[arg(long = "meta")]
-        meta: Vec<String>,
+        /// splits key from value (values may contain `=`). Bare keys
+        /// (no `=`) are rejected at parse time.
+        #[arg(long = "meta", value_parser = parse_meta_kv)]
+        meta: Vec<(String, String)>,
 
         /// Filter by issue type. Repeatable. Semantics: OR — an
         /// issue matches if its type equals any of the listed
@@ -3880,7 +3881,7 @@ fn run_ls(
     json: bool,
     status: StatusFilter,
     labels: Vec<String>,
-    meta: Vec<String>,
+    meta: Vec<(String, String)>,
     types: Vec<TypeArg>,
     slug: Option<String>,
     priorities: Vec<u8>,
@@ -4430,20 +4431,31 @@ fn labels_match(issue: &Issue, wanted: &[String]) -> bool {
     wanted.iter().all(|w| issue.labels.iter().any(|l| l == w))
 }
 
+/// Clap `value_parser` for `--meta key=value`. Splits on the FIRST
+/// `=`. Rejects bare keys (no `=`) at parse time so a typo like
+/// `--meta gc.routed_to` exits 2 with a clear message instead of
+/// silently filtering on `key=""`. Values may contain `=` (only the
+/// first split matters).
+fn parse_meta_kv(s: &str) -> std::result::Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((k, v)) => Ok((k.to_owned(), v.to_owned())),
+        None => Err(format!(
+            "expected key=value, got `{}` — bare key (no `=`) is not a valid filter; \
+             use `key=` to match an empty value explicitly",
+            s
+        )),
+    }
+}
+
 /// `--meta` predicate. Empty filter matches every issue. A non-empty
 /// filter requires the issue's metadata map to carry EVERY listed
-/// `key=value` pair exactly (AND semantics, mirroring `--label`). Each
-/// filter token is split on the first `=`; a token with no `=` never
-/// matches (treated as `key` with empty value, which only matches an
-/// explicitly-empty value). Values may contain `=`.
-fn metadata_matches(issue: &Issue, wanted: &[String]) -> bool {
-    wanted.iter().all(|w| {
-        let (key, value) = match w.split_once('=') {
-            Some((k, v)) => (k, v),
-            None => (w.as_str(), ""),
-        };
-        issue.metadata.get(key).map(|v| v == value).unwrap_or(false)
-    })
+/// `key=value` pair exactly (AND semantics, mirroring `--label`).
+/// Parsing is done at argv-time by `parse_meta_kv`; bare keys are
+/// rejected before this function is ever called. Values may contain `=`.
+fn metadata_matches(issue: &Issue, wanted: &[(String, String)]) -> bool {
+    wanted
+        .iter()
+        .all(|(k, v)| issue.metadata.get(k) == Some(v))
 }
 
 /// `--type` predicate. Empty filter matches every issue. A non-empty
