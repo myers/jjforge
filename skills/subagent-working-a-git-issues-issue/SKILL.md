@@ -62,12 +62,12 @@ EOF
 
 ## Actor attribution
 
-If the orchestrator set `JJF_ACTOR=<your-name>` in your environment (or
+If the orchestrator set `ISS_ACTOR=<your-name>` in your environment (or
 told you to pass `--actor <name>` on mutating `iss` calls), use that
 attribution on every `iss update --claim` / `iss comment` / `iss close`
-you make. Parallel subagents share the same `jj user.name`; the actor
+you make. Parallel subagents share the same `git config user.name`; the actor
 override is the only way the eventual reader can tell who did what.
-Chain precedence: `--actor <name>` > `JJF_ACTOR` env > `jj user.name`.
+Chain precedence: `--actor <name>` > `ISS_ACTOR` env > `git config user.name`.
 
 If neither was set, don't invent one — the orchestrator decides whether
 attribution matters for this round.
@@ -117,5 +117,5 @@ left open and why), and any follow-ups you filed.
 | "Comment landed" in the return value but issue still open | Run `iss close <id>` or explain in Findings why not |
 | Confidence implied by tone but not stated | Add the `## Confidence` line with one of `low`/`medium`/`high` |
 | Did the work, wrote a great writeup, never posted it | The comment IS the artifact; nothing else counts |
-| Orchestrator set `JJF_ACTOR` but the comment landed under the shared `jj user.name` | The env var was in your shell, not in `iss`'s — check `iss show <id>` after; if the actor is wrong, pass `--actor <name>` explicitly on a corrective comment |
+| Orchestrator set `ISS_ACTOR` but the comment landed under the shared `git config user.name` | The env var was in your shell, not in `iss`'s — check `iss show <id>` after; if the actor is wrong, pass `--actor <name>` explicitly on a corrective comment |
 | Pre-cutover muscle memory typed `git-bug bug X` | git-issues replaced git-bug on 2026-06-22. Use `iss X`. Pre-cutover history lives in `refs/bugs/*` and is read via `git-bug bug show <id>` — but you write via `iss`. |

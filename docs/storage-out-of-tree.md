@@ -205,11 +205,11 @@ The implementation swaps `git push origin issues:issues` for:
 
 ```
 git push origin 'refs/jjf/*:refs/jjf/*'
-git fetch origin 'refs/jjf/*:refs/remotes/<remote>/iss/*'
+git fetch origin 'refs/jjf/*:refs/remotes/<remote>/jjf/*'
 ```
 
 The fetch refspec mirrors git-bug's convention — remote-tracking
-refs land under `refs/remotes/<remote>/iss/*` rather than
+refs land under `refs/remotes/<remote>/jjf/*` rather than
 overwriting local refs directly. The pull verb then merges
 remote-tracking refs into local refs (git-bug's five-scenario
 merge algorithm: fast-forward on ancestor, no-op on identical,
