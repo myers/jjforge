@@ -834,3 +834,88 @@ fn init_writes_jjf_fetch_refspec_for_existing_remotes() {
     let show = run_jjf(&bob, &["show", &id]);
     must_succeed(&show, "bob show alice's issue");
 }
+
+// ---------------------------------------------------------------
+// Metadata LWW via divergent remote tips (spec finding #11)
+// ---------------------------------------------------------------
+
+/// Metadata LWW via divergent remote tips — exercises `merge_ops::reduce_to_merged`.
+///
+/// The existing `metadata_lww_under_concurrent_writes` test in
+/// `crates/jjf-storage/tests/integration.rs` pins the write-path
+/// (sequential chain, CAS retry). This test exercises the READ path:
+/// two clones write the same metadata key offline, then the pull-merge
+/// driver at scenario 5 (diverged) calls `reduce_to_merged` to resolve
+/// the conflict. The post-merge read must see exactly one value for the
+/// key — never both, never neither.
+///
+/// Structure mirrors `pull_two_clones_same_field_lww_converges`.
+#[test]
+fn metadata_lww_under_divergent_remote_tips() {
+    let root = setup("meta_lww_divergent", &["alice", "bob"]);
+    let alice = root.join("alice");
+    let bob = root.join("bob");
+
+    must_succeed(&run_jjf(&alice, &["init"]), "init (alice)");
+    let new_out = run_jjf(&alice, &["new", "-t", "shared"]);
+    must_succeed(&new_out, "new (alice)");
+    let id = String::from_utf8_lossy(&new_out.stdout).trim().to_owned();
+    must_succeed(&run_jjf(&alice, &["push", "origin"]), "alice push");
+    must_succeed(&run_jjf(&bob, &["pull", "origin"]), "bob first pull");
+
+    // Concurrent offline edits: each clone sets the same metadata key
+    // to a different value without syncing — this creates a true fork
+    // in the refs/jjf/issues/<id> DAG. The pull-merge driver will hit
+    // scenario 5 (diverged) and call reduce_to_merged.
+    must_succeed(
+        &run_jjf(&alice, &["metadata", "set", &id, "gc.kind", "alice-value"]),
+        "alice set metadata",
+    );
+    must_succeed(&run_jjf(&alice, &["push", "origin"]), "alice push 2");
+    // Bob writes WITHOUT pulling first — his ref is still at the pre-push
+    // alice tip, so bob's commit diverges from alice's.
+    must_succeed(
+        &run_jjf(&bob, &["metadata", "set", &id, "gc.kind", "bob-value"]),
+        "bob set metadata",
+    );
+
+    // Pull triggers scenario 5: refs/jjf/issues/<id> on bob diverges
+    // from the remote tip. reduce_to_merged runs to resolve.
+    let pull = run_jjf(&bob, &["pull", "origin"]);
+    must_succeed(&pull, "bob pull (divergent metadata)");
+    let pull_stdout = String::from_utf8_lossy(&pull.stdout);
+    assert!(
+        pull_stdout.contains("merged 1 ref(s)"),
+        "pull stdout should mention merged ref count; got: {pull_stdout}"
+    );
+
+    // Post-merge: exactly one value for "gc.kind", never both.
+    let show = run_jjf(&bob, &["show", "--json", &id]);
+    must_succeed(&show, "bob show --json");
+    let v: serde_json::Value =
+        serde_json::from_slice(&show.stdout).expect("jjf show --json must emit valid JSON");
+    let metadata = v.get("metadata").expect("show --json must have 'metadata' field");
+    let gc_kind = metadata
+        .get("gc.kind")
+        .and_then(|v| v.as_str())
+        .expect("gc.kind must be present post-merge");
+    assert!(
+        gc_kind == "alice-value" || gc_kind == "bob-value",
+        "LWW winner must be one of the two written values; got {gc_kind:?}"
+    );
+    // The loser must not appear anywhere in the metadata map.
+    let metadata_str = metadata.to_string();
+    let (winner, loser) = if gc_kind == "alice-value" {
+        ("alice-value", "bob-value")
+    } else {
+        ("bob-value", "alice-value")
+    };
+    assert!(
+        metadata_str.contains(winner),
+        "winner {winner:?} must appear in metadata; got: {metadata_str}"
+    );
+    assert!(
+        !metadata_str.contains(loser),
+        "loser {loser:?} must not appear in metadata post-merge; got: {metadata_str}"
+    );
+}
