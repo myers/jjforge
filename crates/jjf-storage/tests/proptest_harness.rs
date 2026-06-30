@@ -205,6 +205,7 @@ prop_compose! {
             type_,
             slug,
             priority: None,
+            metadata: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -259,6 +260,7 @@ fn draft_strategy_no_slug() -> impl Strategy<Value = IssueDraft> {
             type_,
             slug: None,
             priority: None,
+            metadata: std::collections::BTreeMap::new(),
         })
 }
 

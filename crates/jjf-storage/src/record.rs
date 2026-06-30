@@ -502,6 +502,13 @@ pub struct IssueDraft {
     /// commit. Out-of-range integers are rejected at the boundary
     /// by `validate_priority` before write.
     pub priority: Option<u8>,
+    /// Seed-time metadata. Each (k, v) emits a `Jjf-Op: set-metadata`
+    /// stanza in the create-time multi-op commit, atomically with the
+    /// create. Keys and values are validated via `validate_metadata_key`
+    /// and `validate_metadata_value` before the op is emitted. Duplicate
+    /// keys from `--meta k=v1 --meta k=v2` collapse to "last wins" via
+    /// BTreeMap insertion semantics (v2 wins in the example).
+    pub metadata: std::collections::BTreeMap<String, String>,
 }
 
 /// One line of `issues/<id>.comments.jsonl`. Serialized one per line,

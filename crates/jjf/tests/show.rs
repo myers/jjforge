@@ -318,3 +318,80 @@ fn show_help_documents_positional_and_json_flag() {
         "show --help should document --json, got: {help}"
     );
 }
+
+#[test]
+fn show_plain_renders_metadata_block() {
+    // When an issue has metadata, plain-text `jjf show` must emit a
+    // `metadata:` block with one `key=value` line per entry.
+    let repo = make_initialized_repo("show_meta_block");
+    let out = run_jjf(
+        &repo,
+        &[
+            "new",
+            "-t",
+            "render test",
+            "--meta",
+            "foo=bar",
+            "-F",
+            "/dev/null",
+            "--json",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "jjf new --meta failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+            .expect("stdout must be valid JSON");
+    let id_str = envelope["id"].as_str().expect("envelope must have 'id'");
+
+    let show = run_jjf(&repo, &["show", id_str]);
+    assert!(
+        show.status.success(),
+        "jjf show failed: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        stdout.contains("metadata:"),
+        "plain text should include `metadata:` block; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("foo=bar"),
+        "should include the key=value line; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn show_plain_omits_metadata_when_empty() {
+    // Issues with no metadata must NOT emit a `metadata:` block in
+    // plain-text output — no empty section clutter.
+    let repo = make_initialized_repo("show_meta_empty");
+    let out = run_jjf(
+        &repo,
+        &["new", "-t", "no metadata", "-F", "/dev/null", "--json"],
+    );
+    assert!(
+        out.status.success(),
+        "jjf new failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+            .expect("stdout must be valid JSON");
+    let id_str = envelope["id"].as_str().expect("envelope must have 'id'");
+
+    let show = run_jjf(&repo, &["show", id_str]);
+    assert!(
+        show.status.success(),
+        "jjf show failed: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        !stdout.contains("metadata:"),
+        "plain text should OMIT `metadata:` when empty; got:\n{stdout}"
+    );
+}

@@ -500,6 +500,100 @@ fn new_with_file_flag_reads_path_not_stdin() {
     assert_eq!(bug.body, "from file, not stdin\n");
 }
 
+#[test]
+fn new_meta_seeds_metadata_atomically() {
+    // `jjf new --meta k=v` must seed metadata in the same create-time
+    // multi-op commit so the issue arrives with metadata already
+    // populated — no second mutation needed.
+    let repo = make_initialized_repo("new_meta_seeds");
+    let out = run_jjf(
+        &repo,
+        &[
+            "new",
+            "-t",
+            "test meta",
+            "--meta",
+            "gc.routed_to=worker-1",
+            "--meta",
+            "team=infra",
+            "-F",
+            "/dev/null",
+            "--json",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "new --meta should succeed; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let envelope: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
+    let id_str = envelope["id"].as_str().expect("envelope must have 'id'");
+
+    // Verify metadata is present immediately via show --json, proving
+    // it was seeded atomically at create time.
+    let show = run_jjf(&repo, &["show", id_str, "--json"]);
+    assert!(
+        show.status.success(),
+        "jjf show --json failed: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&show.stdout))
+            .expect("show --json must be valid JSON");
+    assert_eq!(
+        parsed["metadata"]["gc.routed_to"],
+        "worker-1",
+        "gc.routed_to metadata missing or wrong"
+    );
+    assert_eq!(
+        parsed["metadata"]["team"],
+        "infra",
+        "team metadata missing or wrong"
+    );
+}
+
+#[test]
+fn new_meta_duplicate_key_last_wins() {
+    // `--meta k=v1 --meta k=v2` → k=v2 (BTreeMap last-wins semantics).
+    let repo = make_initialized_repo("new_meta_dup");
+    let out = run_jjf(
+        &repo,
+        &[
+            "new",
+            "-t",
+            "dup meta",
+            "--meta",
+            "key=first",
+            "--meta",
+            "key=second",
+            "-F",
+            "/dev/null",
+            "--json",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "new --meta dup should succeed; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let envelope: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
+    let id_str = envelope["id"].as_str().expect("envelope must have 'id'");
+
+    let show = run_jjf(&repo, &["show", id_str, "--json"]);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&show.stdout))
+            .expect("show --json must be valid JSON");
+    assert_eq!(
+        parsed["metadata"]["key"],
+        "second",
+        "duplicate key should resolve to last value"
+    );
+}
+
 // --- helpers -------------------------------------------------------
 
 /// Capture the commit id of the `issues` bookmark tip. Used by tests

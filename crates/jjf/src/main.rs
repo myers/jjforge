@@ -264,6 +264,14 @@ enum Commands {
         /// outside `0..=4` as a preflight failure (exit 2).
         #[arg(short = 'p', long, value_parser = clap::value_parser!(u8).range(0..=4))]
         priority: Option<u8>,
+
+        /// Attach a metadata key=value pair at create time. Repeatable.
+        /// Format: `key=value` (first `=` splits key from value; values
+        /// may contain `=`). Bare keys with no `=` are rejected at parse
+        /// time. Duplicate keys: last wins (`--meta k=v1 --meta k=v2`
+        /// seeds `k=v2`).
+        #[arg(long = "meta", value_parser = parse_meta_kv)]
+        meta: Vec<(String, String)>,
     },
 
     /// Print a single issue from the `issues` bookmark — title,
@@ -1973,7 +1981,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             r#type,
             slug,
             priority,
-        } => run_new(cli.json, title, file, labels, deps, parents, assignee, r#type, slug, priority),
+            meta,
+        } => run_new(cli.json, title, file, labels, deps, parents, assignee, r#type, slug, priority, meta),
         Commands::Show { id, include_memories } => {
             run_show(cli.json, id, include_memories)
         }
@@ -2209,6 +2218,7 @@ fn run_new(
     type_arg: Option<TypeArg>,
     slug: Option<String>,
     priority: Option<u8>,
+    meta: Vec<(String, String)>,
 ) -> Result<(), CliError> {
     // 1. Parse `-d` dep specs first — purely-local validation, no IO.
     // v2.4 (`agent-dep-types`): each spec is either a bare 7-hex id
@@ -2305,6 +2315,11 @@ fn run_new(
     }
     let deps = all_deps;
 
+    // 5b. Collect --meta pairs into a BTreeMap. Duplicate keys: last
+    // wins (BTreeMap insertion order; documented in CLI help text).
+    let metadata: std::collections::BTreeMap<String, String> =
+        meta.into_iter().collect();
+
     // 6. Hand the draft to storage.
     let draft = IssueDraft {
         title,
@@ -2315,6 +2330,7 @@ fn run_new(
         type_: type_arg.map(IssueType::from),
         slug,
         priority,
+        metadata,
     };
     let id = storage.create_issue(&draft)?;
 
@@ -2700,6 +2716,16 @@ fn print_issue_plain(issue: &Issue) {
     println!("priority: {priority}");
     let assignee = issue.assignee.as_deref().unwrap_or("(none)");
     println!("assignee: {assignee}");
+    // Metadata block: render between labels/assignee and dependencies,
+    // mirroring the JSON field ordering (metadata sits after labels in
+    // the IssueRecord struct). Omitted entirely when the map is empty.
+    if !issue.metadata.is_empty() {
+        println!("metadata:");
+        for (k, v) in &issue.metadata {
+            // BTreeMap iterates in sorted key order — no re-sort needed.
+            println!("  {k}={v}");
+        }
+    }
     // v2.4: the dependency section renders one line per kind so the
     // typed-edge model is visible at a glance. Empty kinds are
     // collapsed; an entirely empty dep set falls back to the v1 shape

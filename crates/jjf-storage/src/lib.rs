@@ -2060,6 +2060,19 @@ impl Storage {
             return Err(Error::InvalidPriority { reason });
         }
 
+        // Pre-validate seed-time metadata. All (k, v) pairs must pass
+        // their respective validators BEFORE the id reroll and slug
+        // probe — a bad key or value rejects fast with no IO. If any
+        // pair fails, the whole create fails (no partial-create).
+        for (k, v) in &draft.metadata {
+            validate_metadata_key(k).map_err(|reason| {
+                Error::Invalid(format!("metadata key invalid: {:?}", reason))
+            })?;
+            validate_metadata_value(v).map_err(|reason| {
+                Error::Invalid(format!("metadata value invalid: {:?}", reason))
+            })?;
+        }
+
         // Pre-validate the slug, if any, BEFORE the (cheap) id reroll
         // and the (expensive) uniqueness probe. The first check is
         // purely local; the second is a list-and-read across every
@@ -2110,7 +2123,7 @@ impl Storage {
             type_,
             priority: draft.priority,
             labels: sorted_dedup(&draft.labels),
-            metadata: std::collections::BTreeMap::new(),
+            metadata: draft.metadata.clone(),
             dependencies: sorted_dedup_edges(&draft.dependencies),
             assignee: draft.assignee.clone(),
             created_at: now.clone(),
@@ -2171,6 +2184,16 @@ impl Storage {
                 issue_id: id.clone(),
                 dep: dep.target.clone(),
                 kind: dep.kind,
+            });
+        }
+        // Seed-time metadata ops. Emitted in BTreeMap iteration order
+        // (already sorted). Validated above; safe to emit without
+        // re-checking.
+        for (k, v) in &record.metadata {
+            ops.push(Op::SetMetadata {
+                issue_id: id.clone(),
+                key: k.clone(),
+                value: v.clone(),
             });
         }
         if let Some(assignee) = &record.assignee {
