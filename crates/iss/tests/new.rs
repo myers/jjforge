@@ -152,7 +152,7 @@ fn new_without_jjf_init_first_exits_two_with_run_jjf_init_first_message() {
 #[test]
 fn new_in_non_jj_directory_exits_two_with_not_a_jj_repo_message() {
     // Not a jj repo at all — the preflight should produce the same
-    // `not a jj repo` signal `iss init` produces in this situation.
+    // `not a git repo` signal `iss init` produces in this situation.
     let dir = scratch_non_git("new_non_jj");
 
     let out = run_jjf_with_stdin(&dir, &["new", "-t", "x", "-F", "-"], b"");
@@ -160,8 +160,8 @@ fn new_in_non_jj_directory_exits_two_with_not_a_jj_repo_message() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("not a jj repo"),
-        "stderr should mention `not a jj repo`, got: {stderr}"
+        stderr.contains("not a git repo"),
+        "stderr should mention `not a git repo`, got: {stderr}"
     );
 }
 

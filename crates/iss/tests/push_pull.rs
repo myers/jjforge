@@ -385,8 +385,8 @@ fn push_outside_jj_repo_exits_two_not_a_jj_repo() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("not a jj repo"),
-        "stderr should mention not a jj repo; got: {stderr}"
+        stderr.contains("not a git repo"),
+        "stderr should mention not a git repo; got: {stderr}"
     );
 }
 
@@ -398,8 +398,8 @@ fn pull_outside_jj_repo_exits_two_not_a_jj_repo() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("not a jj repo"),
-        "stderr should mention not a jj repo; got: {stderr}"
+        stderr.contains("not a git repo"),
+        "stderr should mention not a git repo; got: {stderr}"
     );
 }
 

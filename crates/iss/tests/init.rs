@@ -91,11 +91,11 @@ fn init_in_non_jj_directory_fails_with_exit_two_and_useful_stderr() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     // The exact phrasing comes from `StorageError::NotAJjRepo`'s
-    // Display impl ("not a jj repo: <path>"). We assert on both the
+    // Display impl ("not a git repo: <path>"). We assert on both the
     // tag and the path so a future error-message rewording can't
     // silently strip context.
     assert!(
-        stderr.contains("not a jj repo"),
+        stderr.contains("not a git repo"),
         "stderr should explain the failure, got: {stderr}"
     );
     assert!(

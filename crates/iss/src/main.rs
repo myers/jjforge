@@ -55,7 +55,7 @@ use iss_storage::{
 #[command(
     name = "iss",
     version,
-    about = "git-issues — a jj-native, agent-first issue tracker",
+    about = "iss — a git-native, agent-first issue tracker (git-issues)",
     long_about = None,
 )]
 struct Cli {
@@ -1243,7 +1243,7 @@ enum CliError {
     /// failed for a reason other than absence — e.g. the `jj`
     /// binary isn't on PATH, or returned an unexpected error. This
     /// is a runtime failure, not a preflight one.
-    #[error("could not probe jj state: {0}")]
+    #[error("could not probe git state: {0}")]
     Probe(std::io::Error),
 
     /// The user piped (or pointed `-F` at) an empty body for `iss
@@ -3715,7 +3715,7 @@ fn run_comment(
 
     // 3. Preflight: jj repo + `issues` bookmark present. We run this
     // BEFORE author resolution so a non-jj cwd surfaces the typed
-    // "not a jj repo" error rather than the (correct but less useful)
+    // "not a git repo" error rather than the (correct but less useful)
     // "no comment author available" — the user almost always wants to
     // hear about the repo problem first.
     preflight::issues_bookmark(&cwd)?;

@@ -14,7 +14,7 @@
 //! - `--assignee` + `--unset-assignee` → exit 2 (clap conflicts_with),
 //! - nonexistent bug id → exit 1 (runtime, via `IssueNotFound`),
 //! - bad id parse → exit 2,
-//! - non-jj cwd → exit 2 with `not a jj repo`,
+//! - non-jj cwd → exit 2 with `not a git repo`,
 //! - jj repo without `issues` bookmark → exit 2 with init hint,
 //! - unreadable `--body-file` path → exit 2,
 //! - `--help` documents every field flag + `--json`.
@@ -394,8 +394,8 @@ fn update_in_non_jj_directory_exits_two() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("not a jj repo"),
-        "stderr should mention `not a jj repo`, got: {stderr}"
+        stderr.contains("not a git repo"),
+        "stderr should mention `not a git repo`, got: {stderr}"
     );
 }
 

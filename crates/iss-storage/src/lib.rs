@@ -200,7 +200,7 @@ pub enum Error {
     /// hold a jj repo. Distinct from `Jj` so callers can tell "not a
     /// repo at all" from "jj broke for some other reason" without
     /// string-matching stderr.
-    #[error("not a jj repo: {0}")]
+    #[error("not a git repo: {0}")]
     NotAJjRepo(PathBuf),
 
     /// The v3 sentinel ref `refs/jjf/meta/format-version` exists but
