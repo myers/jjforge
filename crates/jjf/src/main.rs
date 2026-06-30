@@ -4617,25 +4617,14 @@ fn slug_matches(issue: &Issue, pattern: Option<&str>) -> bool {
 /// **V2 fallback.** If the repo is still v2-shape (env-var opt-out of
 /// the migrator set in tests), this verb falls back to
 /// `jj git push --bookmark issues` — the v2 transport. Operators don't
-/// hit this in production; the migrator runs on every `Storage::open`
-/// and brings v2 repos forward.
-///
-/// Preflight: full `issues_bookmark` probe — either the v3 sentinel ref
-/// or the v2 bookmark must exist locally for there to be anything to
-/// push.
+/// Preflight: full `issues_bookmark` probe — the v3 sentinel ref must
+/// exist locally for there to be anything to push.
 fn run_push(json: bool, remote: String) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
     preflight::issues_bookmark(&cwd)?;
-
-    // Storage::open detects v3 vs v2 from the sentinel ref. If the
-    // env-var opt-out is set (tests only), the migrator skips and we
-    // may land on V2 — fall back to the legacy `jj git push` path.
     let storage = Storage::open(&cwd).map_err(CliError::Storage)?;
-    if storage.is_v3() {
-        return run_push_v3(json, &remote, &storage);
-    }
-    run_push_v2_legacy(json, &remote, &cwd)
+    run_push_v3(json, &remote, &storage)
 }
 
 /// v3 push — delegate to the storage layer, classify failures.
@@ -4663,38 +4652,6 @@ fn run_push_v3(
         }
         Err(e) => Err(classify_storage_push_error(remote, e)),
     }
-}
-
-/// v2 push — legacy `jj git push --bookmark issues --remote <remote>`.
-/// Only reachable when the V2→V3 migrator was disabled via env var (in
-/// the integration test suite). Kept until ticket 7 prunes the v2
-/// surface.
-fn run_push_v2_legacy(
-    json: bool,
-    remote: &str,
-    cwd: &Path,
-) -> Result<(), CliError> {
-    let out = std::process::Command::new("jj")
-        .arg("--repository")
-        .arg(cwd)
-        .args(["git", "push", "--bookmark", "issues", "--remote", remote])
-        .output()
-        .map_err(CliError::Probe)?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        return Err(classify_push_error(remote, stderr));
-    }
-    if json {
-        let out = serde_json::json!({
-            "ok": true,
-            "remote": remote,
-            "bookmark": jjf_storage::ISSUES_BOOKMARK,
-        });
-        println!("{out}");
-    } else {
-        println!("pushed issues -> {remote}");
-    }
-    Ok(())
 }
 
 /// Translate a storage-layer push failure into the typed CLI error
@@ -4850,87 +4807,17 @@ fn parse_rejected_refs(stderr: &str) -> Vec<String> {
 /// v3 mode.
 ///
 /// stderr classification (auth / network / unknown remote / catch-all)
-/// mirrors the v2 path's `classify_fetch_error`.
-///
-/// **V2 fallback.** If the local repo is v2-shape (env-var opt-out of
-/// the migrator in tests), the verb falls back to the legacy pull flow
-/// (jj-git-fetch + op-space resolve + 4-CLI merge commit on the
-/// bookmark). Operators don't hit this in production.
+/// mirrors `classify_fetch_error`.
 fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
     // `pull` uses the jj-repo-only preflight: a fresh clone has no
-    // v3 sentinel ref and no v2 `issues` bookmark; `pull` is precisely
-    // the verb that materializes them. Requiring the sentinel up front
-    // would force an awkward `jjf init` on a clone whose remote already
-    // has all the v3 refs we want to fetch.
+    // v3 sentinel ref; `pull` is precisely the verb that materializes
+    // it. Requiring the sentinel up front would force an awkward
+    // `jjf init` on a clone whose remote already has all the v3 refs
+    // we want to fetch.
     preflight::jj_repo(&cwd)?;
-
-    // Mode dispatch is best-effort: open Storage, and if it opens
-    // cleanly (either v3 by sentinel, or v2 by bookmark), use the
-    // matching path. If `Storage::open` fails with `MissingIssuesBookmark`
-    // (a brand-new clone that's never seen issues data — neither v2
-    // bookmark nor v3 sentinel locally), assume v3 and route through
-    // the bare git fetch. The post-fetch state will have the sentinel
-    // landed locally, so subsequent `Storage::open` calls succeed
-    // without further ceremony.
-    let mode = probe_pull_mode(&cwd);
-    match mode {
-        PullMode::V3 | PullMode::V3Bootstrap => {
-            run_pull_v3(json, &remote, &cwd)
-        }
-        PullMode::V2 => run_pull_v2_legacy(json, &remote, &cwd),
-    }
-}
-
-/// What the `pull` verb learns about the local repo before deciding
-/// which transport to run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PullMode {
-    /// Local repo already has the v3 sentinel ref → v3 transport.
-    V3,
-    /// Local repo has neither v3 sentinel nor v2 bookmark → assume v3
-    /// (post-fetch, the sentinel will land via the wildcard refspec).
-    V3Bootstrap,
-    /// Local repo is v2-shape (env-var opt-out only; production never
-    /// hits this).
-    V2,
-}
-
-/// Detect which pull transport to use. The probe runs without opening
-/// Storage so we don't crash on the `MissingIssuesBookmark` path the
-/// fresh-clone case would otherwise hit.
-fn probe_pull_mode(cwd: &Path) -> PullMode {
-    // V3 sentinel?
-    let sentinel = std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args([
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            "refs/jjf/meta/format-version",
-        ])
-        .output();
-    if let Ok(o) = sentinel {
-        if o.status.success() {
-            return PullMode::V3;
-        }
-    }
-    // V2 bookmark?
-    let bm = std::process::Command::new("jj")
-        .arg("--repository")
-        .arg(cwd)
-        .args(["bookmark", "list", "-T", "name ++ \"\\n\"", "issues"])
-        .output();
-    if let Ok(o) = bm {
-        let stdout = String::from_utf8_lossy(&o.stdout);
-        if stdout.lines().any(|l| l.trim() == "issues") {
-            return PullMode::V2;
-        }
-    }
-    // Neither — bootstrap as v3.
-    PullMode::V3Bootstrap
+    run_pull_v3(json, &remote, &cwd)
 }
 
 /// v3 pull — bare git fetch into the standard remote-tracking namespace,
@@ -5035,137 +4922,6 @@ fn emit_pull_v3_success(
     }
 }
 
-/// v2 legacy pull — the old jj-bookmark-transport path. Only reachable
-/// when the V2→V3 migrator was disabled via env var (in the integration
-/// test suite). Kept until ticket 7 prunes the v2 surface.
-fn run_pull_v2_legacy(json: bool, remote: &str, cwd: &Path) -> Result<(), CliError> {
-    // 1. Fetch.
-    let out = std::process::Command::new("jj")
-        .arg("--repository")
-        .arg(cwd)
-        .args(["git", "fetch", "--remote", remote])
-        .output()
-        .map_err(CliError::Probe)?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        return Err(classify_fetch_error(remote, stderr));
-    }
-
-    // 2. Probe for remote-bookmark presence.
-    let bm_out = std::process::Command::new("jj")
-        .arg("--repository")
-        .arg(cwd)
-        .args([
-            "bookmark",
-            "list",
-            "--all-remotes",
-            "-T",
-            "name ++ \"@\" ++ remote ++ \"\\n\"",
-            "issues",
-        ])
-        .output()
-        .map_err(CliError::Probe)?;
-    if !bm_out.status.success() {
-        return Err(CliError::Probe(std::io::Error::other(format!(
-            "jj bookmark list failed: {}",
-            String::from_utf8_lossy(&bm_out.stderr)
-        ))));
-    }
-    let bm_text = String::from_utf8_lossy(&bm_out.stdout);
-    let remote_marker = format!("issues@{remote}");
-    let remote_present = bm_text.lines().any(|l| l.trim() == remote_marker);
-
-    if !remote_present {
-        emit_pull_success(json, remote, false, 0);
-        return Ok(());
-    }
-
-    // 3. Track-if-absent.
-    let track_out = std::process::Command::new("jj")
-        .arg("--repository")
-        .arg(cwd)
-        .args(["bookmark", "track", &remote_marker])
-        .output()
-        .map_err(CliError::Probe)?;
-    if !track_out.status.success() {
-        let stderr = String::from_utf8_lossy(&track_out.stderr);
-        if !stderr.contains("already tracked")
-            && !stderr.contains("is already tracking")
-        {
-            return Err(CliError::Probe(std::io::Error::other(format!(
-                "jj bookmark track failed: {stderr}"
-            ))));
-        }
-    }
-
-    // 4. Probe for divergence.
-    let storage = Storage::open(cwd)?;
-    let heads = storage.issues_heads()?;
-    if heads.len() < 2 {
-        emit_pull_success(json, remote, true, 0);
-        return Ok(());
-    }
-
-    // 5. Op-space resolution.
-    let report = storage.resolve_divergence()?;
-
-    if report.issues.is_empty() {
-        let merge_args = {
-            let mut v: Vec<&str> = vec!["new"];
-            for h in &heads {
-                v.push(h.as_str());
-            }
-            v.push("-m");
-            v.push("jjf: empty merge (no issue files touched)");
-            v
-        };
-        let merge_out = std::process::Command::new("jj")
-            .arg("--repository")
-            .arg(cwd)
-            .args(&merge_args)
-            .output()
-            .map_err(CliError::Probe)?;
-        if !merge_out.status.success() {
-            return Err(CliError::Probe(std::io::Error::other(format!(
-                "jj new (empty merge) failed: {}",
-                String::from_utf8_lossy(&merge_out.stderr)
-            ))));
-        }
-        let bm_set = std::process::Command::new("jj")
-            .arg("--repository")
-            .arg(cwd)
-            .args(["bookmark", "set", "issues", "-r", "@", "--allow-backwards"])
-            .output()
-            .map_err(CliError::Probe)?;
-        if !bm_set.status.success() {
-            return Err(CliError::Probe(std::io::Error::other(format!(
-                "jj bookmark set (clean-merge) failed: {}",
-                String::from_utf8_lossy(&bm_set.stderr)
-            ))));
-        }
-        let step = std::process::Command::new("jj")
-            .arg("--repository")
-            .arg(cwd)
-            .args(["new", "root()"])
-            .output()
-            .map_err(CliError::Probe)?;
-        if !step.status.success() {
-            return Err(CliError::Probe(std::io::Error::other(format!(
-                "jj new root() (clean-merge step-off) failed: {}",
-                String::from_utf8_lossy(&step.stderr)
-            ))));
-        }
-        emit_pull_success(json, remote, true, 0);
-        return Ok(());
-    }
-
-    let count = report.issues.len();
-    storage.record_merge_op_space(&heads, &report)?;
-    emit_pull_success(json, remote, true, count);
-    Ok(())
-}
-
-
 /// Map jj-git-fetch stderr to a typed `CliError`. Mirrors
 /// `classify_push_error`'s shape; the substring sets are the same set
 /// of "what does libgit2 say when it can't auth / can't reach" lines.
@@ -5209,49 +4965,6 @@ fn classify_fetch_error(remote: &str, stderr: String) -> CliError {
     CliError::JjGitFetch(stderr.trim().to_owned())
 }
 
-/// Emit the success path for `jjf pull`. Kept as a helper so all four
-/// success branches (no-remote-bookmark, clean-fetch-no-divergence,
-/// clean-merge-no-resolution, real-merge-with-resolution) render the
-/// same envelope shape with one shared call site.
-///
-/// The `resolved_issues` field replaces the older `merged_files` (the
-/// shape difference reflects the v1→v2 switch from a file-bytes driver
-/// to an op-space resolver, where the unit of resolution is an issue,
-/// not a file). The `merge_strategy` field pins which driver ran so
-/// downstream consumers can branch on the contract.
-fn emit_pull_success(json: bool, remote: &str, remote_present: bool, resolved_issues: usize) {
-    if json {
-        let mut obj = serde_json::Map::new();
-        obj.insert("ok".into(), serde_json::Value::Bool(true));
-        obj.insert("remote".into(), serde_json::Value::String(remote.to_owned()));
-        obj.insert(
-            "bookmark".into(),
-            serde_json::Value::String(jjf_storage::ISSUES_BOOKMARK.to_owned()),
-        );
-        obj.insert(
-            "remote_present".into(),
-            serde_json::Value::Bool(remote_present),
-        );
-        obj.insert(
-            "merge_strategy".into(),
-            serde_json::Value::String("op_space".into()),
-        );
-        obj.insert(
-            "resolved_issues".into(),
-            serde_json::Value::from(resolved_issues),
-        );
-        let envelope = serde_json::Value::Object(obj);
-        println!("{envelope}");
-    } else if !remote_present {
-        println!("pulled {remote}: no issues bookmark on remote yet");
-    } else if resolved_issues == 0 {
-        println!("pulled issues <- {remote}");
-    } else {
-        println!(
-            "pulled issues <- {remote}; resolved {resolved_issues} issue(s) op-space"
-        );
-    }
-}
 
 #[cfg(test)]
 mod tests {
