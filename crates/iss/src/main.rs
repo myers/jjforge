@@ -1305,10 +1305,10 @@ enum CliError {
 
     /// `iss remote *` shelled out to `jj git remote ...` and got a
     /// non-zero exit that wasn't one of the two typed cases above.
-    /// Runtime failure (exit 1) — surfaces jj's stderr verbatim so
-    /// the operator can see what jj said. URL syntax errors, network-
-    /// adjacent failures, and anything else jj rejects land here.
-    #[error("jj git remote failed: {0}")]
+    /// Runtime failure (exit 1) — surfaces git's stderr verbatim so
+    /// the operator can see what git said. URL syntax errors, network-
+    /// adjacent failures, and anything else git rejects land here.
+    #[error("git remote failed: {0}")]
     JjGitRemote(String),
 
     /// `iss push` could not reach the remote — network failure,
@@ -1354,7 +1354,7 @@ enum CliError {
 
     /// `iss push` shelled out and got a non-zero exit that wasn't
     /// one of the typed cases above. Runtime (exit 1).
-    #[error("jj git push failed: {0}")]
+    #[error("git push failed: {0}")]
     JjGitPush(String),
 
     /// `iss pull` could not reach the remote. Runtime (exit 1).
@@ -1366,10 +1366,10 @@ enum CliError {
     #[error("pull from {remote} failed (auth): {stderr}")]
     PullAuthFailure { remote: String, stderr: String },
 
-    /// `iss pull` shelled out to `jj git fetch` and got a non-zero
+    /// `iss pull` shelled out to `git fetch` and got a non-zero
     /// exit that wasn't one of the typed cases above. Runtime
     /// (exit 1).
-    #[error("jj git fetch failed: {0}")]
+    #[error("git fetch failed: {0}")]
     JjGitFetch(String),
 
     /// Legacy v1 file-bytes merge driver failure: the issue record's
