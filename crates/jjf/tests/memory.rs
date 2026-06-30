@@ -21,6 +21,28 @@ fn make_initialized(name: &str) -> PathBuf {
         .output()
         .expect("spawn git init");
     assert!(out.status.success(), "git init failed: {}", String::from_utf8_lossy(&out.stderr));
+    // Set repo-local identity so verbs that commit have an author even in
+    // bare CI where no global ~/.gitconfig exists.
+    let out = Command::new("git")
+        .args(["config", "user.name", "Test User"])
+        .current_dir(&dir)
+        .output()
+        .expect("spawn git config user.name");
+    assert!(
+        out.status.success(),
+        "git config user.name failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new("git")
+        .args(["config", "user.email", "test@jjforge.invalid"])
+        .current_dir(&dir)
+        .output()
+        .expect("spawn git config user.email");
+    assert!(
+        out.status.success(),
+        "git config user.email failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let init = Command::new(JJF_BIN)
         .arg("init")
         .current_dir(&dir)

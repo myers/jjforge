@@ -1275,7 +1275,7 @@ enum CliError {
     /// failure (exit 2) — there's nothing for the storage layer to do
     /// without an author.
     #[error(
-        "no comment author available; set jj user.name (e.g. `jj config set --user user.name 'Your Name'`) or pass --author <NAME>"
+        "no comment author available; set git user.name (e.g. `git config user.name 'Your Name'`) or pass --author <NAME>"
     )]
     MissingAuthor,
 
@@ -1532,7 +1532,7 @@ enum CliError {
     /// when every slot is empty. v2.3 (`agent-claim-atomic`); chain
     /// extended v2.12 (`actor-override-chain`).
     #[error(
-        "no current user available; set jj user.name (e.g. `jj config set --user user.name 'Your Name'`) OR export `JJF_ACTOR=<name>` to claim issues"
+        "no current user available; set git user.name (e.g. `git config user.name 'Your Name'`) OR export `JJF_ACTOR=<name>` to claim issues"
     )]
     NoCurrentUser,
 
