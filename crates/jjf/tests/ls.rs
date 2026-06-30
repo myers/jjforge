@@ -664,6 +664,7 @@ fn ls_meta_bare_key_rejected_at_clap_parse_time() {
         "bare --meta key (no '=') should be rejected; stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert_eq!(out.status.code(), Some(2), "clap parse error should exit 2");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("expected key=value"),
