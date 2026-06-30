@@ -8,9 +8,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use jjf_storage::IssueId;
+use iss_storage::IssueId;
 
-pub(crate) const JJF_BIN: &str = env!("CARGO_BIN_EXE_jjf");
+pub(crate) const JJF_BIN: &str = env!("CARGO_BIN_EXE_iss");
 
 pub(crate) fn scratch(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))

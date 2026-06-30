@@ -86,7 +86,7 @@ fn update_three_fields_lands_one_commit_with_three_trailers() {
     // carrying THREE `Jjf-Op:` trailers. We verify via
     // `Storage::read_history`: three new entries appear, all sharing
     // the same `commit` id.
-    use jjf_storage::{IssueId, Op, Storage};
+    use iss_storage::{IssueId, Op, Storage};
 
     let repo = make_initialized_repo("update_three_fields_one_commit");
     let id = create_issue(&repo, "initial title");
@@ -165,7 +165,7 @@ fn update_three_fields_lands_one_commit_with_three_trailers() {
     let bug = storage.read(&issue_id).expect("read");
     assert_eq!(bug.title, "new title");
     assert_eq!(bug.body, "new body from stdin");
-    assert!(matches!(bug.status, jjf_storage::Status::Closed));
+    assert!(matches!(bug.status, iss_storage::Status::Closed));
 }
 
 #[test]
@@ -204,7 +204,7 @@ fn update_assignee_set_then_unset_round_trip() {
     );
 
     // And the storage-side read returns `None` (not `Some("")`).
-    use jjf_storage::{IssueId, Storage};
+    use iss_storage::{IssueId, Storage};
     let storage = Storage::open(&repo).expect("Storage::open");
     let issue_id = IssueId::parse(&id).expect("parse id");
     let bug = storage.read(&issue_id).expect("read");

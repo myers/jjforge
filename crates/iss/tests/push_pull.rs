@@ -15,7 +15,7 @@
 //! All tests are hermetic: per-test scratch root under
 //! `tests/.scratch/`, gitignored. Each spins up its own bare git repo
 //! as the "remote" and one or two jj clones; the `jjf` binary lives
-//! at `env!("CARGO_BIN_EXE_jjf")` (no `assert_cmd` dep).
+//! at `env!("CARGO_BIN_EXE_iss")` (no `assert_cmd` dep).
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -179,7 +179,7 @@ fn label_double_add_lands_two_trailers_one_label() {
     // fresh `label-add` op so the audit log records the intent. We
     // verify both: the record carries exactly one `backend`, and the
     // history carries exactly two `LabelAdd` entries.
-    use jjf_storage::{IssueId, Op, Storage};
+    use iss_storage::{IssueId, Op, Storage};
 
     let repo = make_initialized_repo("label_double_add");
     let id = create_issue(&repo, "double add");
@@ -240,7 +240,7 @@ fn label_rm_absent_label_lands_trailer() {
     // Per spec §5.2: removing an absent label is a no-op at the
     // record level but still lands a fresh `label-rm` op. The CLI
     // exits 0 either way.
-    use jjf_storage::{IssueId, Op, Storage};
+    use iss_storage::{IssueId, Op, Storage};
 
     let repo = make_initialized_repo("label_rm_absent");
     let id = create_issue(&repo, "rm absent");

@@ -4,13 +4,13 @@
 //!
 //! Mirrors `init.rs`: hermetic per-test scratch under `tests/.scratch/`,
 //! wiped on each run, gitignored via `crates/**/tests/.scratch/`. No
-//! `assert_cmd` dep — `CARGO_BIN_EXE_jjf` + `std::process` is enough.
+//! `assert_cmd` dep — `CARGO_BIN_EXE_iss` + `std::process` is enough.
 
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use jjf_storage::{DepEdge, DepKind, IssueId, Storage};
+use iss_storage::{DepEdge, DepKind, IssueId, Storage};
 
 mod common;
 use common::*;

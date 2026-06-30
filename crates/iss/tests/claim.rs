@@ -133,7 +133,7 @@ fn update_claim_sets_assignee_and_status_in_progress() {
 
 #[test]
 fn update_claim_lands_one_commit_with_two_trailers() {
-    use jjf_storage::{IssueId, Op, Status, Storage};
+    use iss_storage::{IssueId, Op, Status, Storage};
 
     let repo = make_initialized_repo_with_user("claim_two_trailers", "alice");
     let id = create_issue(&repo, "x", &[]);
@@ -175,7 +175,7 @@ fn update_claim_lands_one_commit_with_two_trailers() {
 
 #[test]
 fn update_claim_idempotent_same_user_is_no_op_at_commit_level() {
-    use jjf_storage::{IssueId, Storage};
+    use iss_storage::{IssueId, Storage};
 
     let repo = make_initialized_repo_with_user("claim_idempotent", "alice");
     let id = create_issue(&repo, "x", &[]);
@@ -330,7 +330,7 @@ fn ready_include_claimed_shows_in_progress_too() {
 
 #[test]
 fn ready_claim_limit_one_picks_and_claims_atomically() {
-    use jjf_storage::{IssueId, Status, Storage};
+    use iss_storage::{IssueId, Status, Storage};
 
     let repo = make_initialized_repo_with_user("ready_claim_one", "alice");
     let _a = create_issue(&repo, "A", &["--type", "feature"]);

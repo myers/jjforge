@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use jjf_storage::{
+use iss_storage::{
     ClaimResult, DepEdge, DepKind, Error as StorageError, IssueDraft, IssueId, IssueType,
     METADATA_VALUE_MAX_BYTES, Op, ReadyFilter, SlugInvalidReason, Status, Storage,
     TitleInvalidReason, UpdateFields,
@@ -453,7 +453,7 @@ fn read_missing_bug_returns_issue_not_found() {
     let storage = Storage::open(&repo).unwrap();
     let missing = IssueId::parse("deadbee").unwrap();
     match storage.read(&missing) {
-        Err(jjf_storage::Error::IssueNotFound(got)) => assert_eq!(got, missing),
+        Err(iss_storage::Error::IssueNotFound(got)) => assert_eq!(got, missing),
         other => panic!("expected IssueNotFound, got {:?}", other),
     }
 }
@@ -799,7 +799,7 @@ fn read_history_missing_bug_returns_issue_not_found() {
     let storage = Storage::open(&repo).unwrap();
     let missing = IssueId::parse("deadbee").unwrap();
     match storage.read_history(&missing) {
-        Err(jjf_storage::Error::IssueNotFound(got)) => assert_eq!(got, missing),
+        Err(iss_storage::Error::IssueNotFound(got)) => assert_eq!(got, missing),
         other => panic!("expected IssueNotFound, got {:?}", other),
     }
 }
@@ -816,7 +816,7 @@ fn read_history_missing_bug_returns_issue_not_found() {
 
 #[test]
 fn update_lands_one_commit_with_one_trailer_per_populated_field() {
-    use jjf_storage::UpdateFields;
+    use iss_storage::UpdateFields;
 
     let repo = make_scratch_repo("update_multi_op");
     let storage = Storage::open(&repo).unwrap();
@@ -897,7 +897,7 @@ fn update_lands_one_commit_with_one_trailer_per_populated_field() {
 
 #[test]
 fn update_assignee_double_option_distinguishes_set_from_unset() {
-    use jjf_storage::UpdateFields;
+    use iss_storage::UpdateFields;
 
     let repo = make_scratch_repo("update_assignee_double_option");
     let storage = Storage::open(&repo).unwrap();
@@ -941,7 +941,7 @@ fn update_assignee_double_option_distinguishes_set_from_unset() {
 
 #[test]
 fn update_with_no_fields_is_an_error() {
-    use jjf_storage::UpdateFields;
+    use iss_storage::UpdateFields;
 
     let repo = make_scratch_repo("update_no_fields");
     let storage = Storage::open(&repo).unwrap();
@@ -957,7 +957,7 @@ fn update_with_no_fields_is_an_error() {
         .unwrap();
 
     match storage.update(&id, UpdateFields::default()) {
-        Err(jjf_storage::Error::Invalid(msg)) => {
+        Err(iss_storage::Error::Invalid(msg)) => {
             assert!(
                 msg.contains("no fields"),
                 "Invalid message should mention `no fields`, got: {msg}"
@@ -1105,7 +1105,7 @@ fn init_outside_any_git_repo_returns_typed_error() {
     // tests in `crates/jjf/tests/init.rs`.
     let bare = make_non_jj_dir("init_no_repo");
     match Storage::init(&bare) {
-        Err(jjf_storage::Error::Git(_)) => {}
+        Err(iss_storage::Error::Git(_)) => {}
         other => panic!("expected Error::Git, got {:?}", other),
     }
 }
@@ -1245,7 +1245,7 @@ fn validate_slug_accepts_canonical_shape() {
     // The good cases. Each must pass.
     for ok in ["abc", "agent-ready", "issue-type-and-slug-fields", "a1-2b"] {
         assert!(
-            jjf_storage::validate_slug(ok).is_ok(),
+            iss_storage::validate_slug(ok).is_ok(),
             "expected slug {ok:?} to validate"
         );
     }
@@ -1270,7 +1270,7 @@ fn validate_slug_rejects_each_failure_mode() {
         ("a--b", ConsecutiveHyphens),
     ];
     for (slug, expected) in cases {
-        match jjf_storage::validate_slug(slug) {
+        match iss_storage::validate_slug(slug) {
             Err(got) => assert_eq!(
                 got, *expected,
                 "slug {slug:?}: expected {expected:?}, got {got:?}"
@@ -2146,7 +2146,7 @@ fn set_memory_lands_file_under_memories_at_bookmark() {
 
     // V3: each memory lives at `refs/jjf/memories/<key>:memory.json`.
     let text = read_at_memory_ref(&repo, "dolt-phantoms");
-    let mem: jjf_storage::Memory = serde_json::from_str(&text).unwrap();
+    let mem: iss_storage::Memory = serde_json::from_str(&text).unwrap();
     assert_eq!(mem.key, "dolt-phantoms");
     assert_eq!(mem.value, "Dolt phantom DBs hide in three places");
     assert!(!mem.created_at.is_empty());
@@ -3592,7 +3592,7 @@ fn validate_title_accepts_unicode_and_punctuation() {
     ];
     for t in &ok_titles {
         assert!(
-            jjf_storage::validate_title(t).is_ok(),
+            iss_storage::validate_title(t).is_ok(),
             "validator wrongly rejected {t:?}"
         );
     }
@@ -3608,9 +3608,9 @@ fn validate_title_accepts_unicode_and_punctuation() {
 #[test]
 fn validate_body_accepts_exactly_max_bytes() {
     // At-cap (65,536 ASCII bytes) is a NEGATIVE — must accept.
-    let body = "a".repeat(jjf_storage::BODY_MAX_BYTES);
+    let body = "a".repeat(iss_storage::BODY_MAX_BYTES);
     assert!(
-        jjf_storage::validate_body(&body).is_ok(),
+        iss_storage::validate_body(&body).is_ok(),
         "validator rejected at-cap body"
     );
 }
@@ -3619,11 +3619,11 @@ fn validate_body_accepts_exactly_max_bytes() {
 fn validate_body_rejects_one_byte_over_cap() {
     // Cap + 1 ASCII byte is a POSITIVE — must reject with the
     // typed reason carrying both `limit` and `got`.
-    let body = "a".repeat(jjf_storage::BODY_MAX_BYTES + 1);
-    match jjf_storage::validate_body(&body) {
-        Err(jjf_storage::BodyInvalidReason::TooLong { limit, got }) => {
-            assert_eq!(limit, jjf_storage::BODY_MAX_BYTES);
-            assert_eq!(got, jjf_storage::BODY_MAX_BYTES + 1);
+    let body = "a".repeat(iss_storage::BODY_MAX_BYTES + 1);
+    match iss_storage::validate_body(&body) {
+        Err(iss_storage::BodyInvalidReason::TooLong { limit, got }) => {
+            assert_eq!(limit, iss_storage::BODY_MAX_BYTES);
+            assert_eq!(got, iss_storage::BODY_MAX_BYTES + 1);
         }
         other => panic!("expected TooLong, got {other:?}"),
     }
@@ -3634,20 +3634,20 @@ fn validate_body_measures_bytes_not_chars() {
     // A multi-byte string at-the-byte-cap is fine even though it has
     // fewer SCALARS. Construct a body where every char is 2 bytes
     // ('é' is U+00E9, UTF-8: 0xC3 0xA9). 32_768 chars = 65,536 bytes.
-    let mut body = String::with_capacity(jjf_storage::BODY_MAX_BYTES);
-    while body.len() < jjf_storage::BODY_MAX_BYTES {
+    let mut body = String::with_capacity(iss_storage::BODY_MAX_BYTES);
+    while body.len() < iss_storage::BODY_MAX_BYTES {
         body.push('é');
     }
-    assert_eq!(body.len(), jjf_storage::BODY_MAX_BYTES);
-    assert!(jjf_storage::validate_body(&body).is_ok());
+    assert_eq!(body.len(), iss_storage::BODY_MAX_BYTES);
+    assert!(iss_storage::validate_body(&body).is_ok());
 
     // Pushing one more 2-byte char now flips us 2 bytes over.
     body.push('é');
-    assert_eq!(body.len(), jjf_storage::BODY_MAX_BYTES + 2);
-    match jjf_storage::validate_body(&body) {
-        Err(jjf_storage::BodyInvalidReason::TooLong { limit, got }) => {
-            assert_eq!(limit, jjf_storage::BODY_MAX_BYTES);
-            assert_eq!(got, jjf_storage::BODY_MAX_BYTES + 2);
+    assert_eq!(body.len(), iss_storage::BODY_MAX_BYTES + 2);
+    match iss_storage::validate_body(&body) {
+        Err(iss_storage::BodyInvalidReason::TooLong { limit, got }) => {
+            assert_eq!(limit, iss_storage::BODY_MAX_BYTES);
+            assert_eq!(got, iss_storage::BODY_MAX_BYTES + 2);
         }
         other => panic!("expected TooLong, got {other:?}"),
     }
@@ -3657,7 +3657,7 @@ fn validate_body_measures_bytes_not_chars() {
 fn create_issue_rejects_oversize_seed_body() {
     let repo = make_scratch_repo("create_body_oversize");
     let storage = Storage::open(&repo).unwrap();
-    let body = "a".repeat(jjf_storage::BODY_MAX_BYTES + 1);
+    let body = "a".repeat(iss_storage::BODY_MAX_BYTES + 1);
     let err = storage
         .create_issue(&IssueDraft {
             title: "baseline".into(),
@@ -3667,10 +3667,10 @@ fn create_issue_rejects_oversize_seed_body() {
         .unwrap_err();
     match err {
         StorageError::InvalidBody {
-            reason: jjf_storage::BodyInvalidReason::TooLong { limit, got },
+            reason: iss_storage::BodyInvalidReason::TooLong { limit, got },
         } => {
-            assert_eq!(limit, jjf_storage::BODY_MAX_BYTES);
-            assert_eq!(got, jjf_storage::BODY_MAX_BYTES + 1);
+            assert_eq!(limit, iss_storage::BODY_MAX_BYTES);
+            assert_eq!(got, iss_storage::BODY_MAX_BYTES + 1);
         }
         other => panic!("expected InvalidBody/TooLong, got {other:?}"),
     }
@@ -3681,7 +3681,7 @@ fn create_issue_accepts_at_cap_seed_body() {
     // Boundary NEGATIVE: a body of exactly `BODY_MAX_BYTES` lands.
     let repo = make_scratch_repo("create_body_at_cap");
     let storage = Storage::open(&repo).unwrap();
-    let body = "a".repeat(jjf_storage::BODY_MAX_BYTES);
+    let body = "a".repeat(iss_storage::BODY_MAX_BYTES);
     let id = storage
         .create_issue(&IssueDraft {
             title: "baseline".into(),
@@ -3691,7 +3691,7 @@ fn create_issue_accepts_at_cap_seed_body() {
         .expect("at-cap body must be accepted");
     // Round-trip: the stored body keeps its length.
     let rec = storage.read(&id).unwrap();
-    assert_eq!(rec.body.len(), jjf_storage::BODY_MAX_BYTES);
+    assert_eq!(rec.body.len(), iss_storage::BODY_MAX_BYTES);
 }
 
 #[test]
@@ -3705,14 +3705,14 @@ fn set_body_rejects_oversize_with_typed_reason() {
         })
         .unwrap();
     let history_before = storage.read_history(&id).unwrap().len();
-    let body = "x".repeat(jjf_storage::BODY_MAX_BYTES + 1);
+    let body = "x".repeat(iss_storage::BODY_MAX_BYTES + 1);
     let err = storage.set_body(&id, &body).unwrap_err();
     match err {
         StorageError::InvalidBody {
-            reason: jjf_storage::BodyInvalidReason::TooLong { limit, got },
+            reason: iss_storage::BodyInvalidReason::TooLong { limit, got },
         } => {
-            assert_eq!(limit, jjf_storage::BODY_MAX_BYTES);
-            assert_eq!(got, jjf_storage::BODY_MAX_BYTES + 1);
+            assert_eq!(limit, iss_storage::BODY_MAX_BYTES);
+            assert_eq!(got, iss_storage::BODY_MAX_BYTES + 1);
         }
         other => panic!("expected InvalidBody/TooLong, got {other:?}"),
     }
@@ -3734,7 +3734,7 @@ fn update_with_oversize_body_is_rejected_before_commit() {
         })
         .unwrap();
     let history_before = storage.read_history(&id).unwrap().len();
-    let body = "y".repeat(jjf_storage::BODY_MAX_BYTES + 1);
+    let body = "y".repeat(iss_storage::BODY_MAX_BYTES + 1);
     let err = storage
         .update(
             &id,
@@ -3746,10 +3746,10 @@ fn update_with_oversize_body_is_rejected_before_commit() {
         .unwrap_err();
     match err {
         StorageError::InvalidBody {
-            reason: jjf_storage::BodyInvalidReason::TooLong { limit, got },
+            reason: iss_storage::BodyInvalidReason::TooLong { limit, got },
         } => {
-            assert_eq!(limit, jjf_storage::BODY_MAX_BYTES);
-            assert_eq!(got, jjf_storage::BODY_MAX_BYTES + 1);
+            assert_eq!(limit, iss_storage::BODY_MAX_BYTES);
+            assert_eq!(got, iss_storage::BODY_MAX_BYTES + 1);
         }
         other => panic!("expected InvalidBody/TooLong, got {other:?}"),
     }
@@ -3773,14 +3773,14 @@ fn add_comment_rejects_oversize_body_with_typed_reason() {
             ..Default::default()
         })
         .unwrap();
-    let body = "z".repeat(jjf_storage::BODY_MAX_BYTES + 1);
+    let body = "z".repeat(iss_storage::BODY_MAX_BYTES + 1);
     let err = storage.add_comment(&id, &body, "alice").unwrap_err();
     match err {
         StorageError::InvalidBody {
-            reason: jjf_storage::BodyInvalidReason::TooLong { limit, got },
+            reason: iss_storage::BodyInvalidReason::TooLong { limit, got },
         } => {
-            assert_eq!(limit, jjf_storage::BODY_MAX_BYTES);
-            assert_eq!(got, jjf_storage::BODY_MAX_BYTES + 1);
+            assert_eq!(limit, iss_storage::BODY_MAX_BYTES);
+            assert_eq!(got, iss_storage::BODY_MAX_BYTES + 1);
         }
         other => panic!("expected InvalidBody/TooLong, got {other:?}"),
     }

@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use jjf_storage::Error as StorageError;
+use iss_storage::Error as StorageError;
 
 use crate::CliError;
 

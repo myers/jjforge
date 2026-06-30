@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use jjf_storage::{
+use iss_storage::{
     DEFAULT_SNIPPET_CONTEXT, ISSUES_BOOKMARK, ClaimResult, DepEdge, DepKind, DepTreeNode,
     Error as StorageError, IdError, BodyInvalidReason, Issue, IssueDraft, IssueId, IssueType,
     Memory, PriorityInvalidReason, ReadyFilter, SearchHit, SlugInvalidReason, StaleHit, Status,
@@ -84,7 +84,7 @@ enum StatusFilter {
     All,
 }
 
-/// Clap-side mirror of [`jjf_storage::Status`] used for the `--status`
+/// Clap-side mirror of [`iss_storage::Status`] used for the `--status`
 /// flag on `jjf update`. We declare it here (rather than deriving
 /// `ValueEnum` directly on `Status` in the storage crate) so the
 /// storage crate doesn't pick up a `clap` dependency just for a
@@ -111,7 +111,7 @@ impl From<StatusArg> for Status {
     }
 }
 
-/// Clap-side mirror of [`jjf_storage::IssueType`] (less the
+/// Clap-side mirror of [`iss_storage::IssueType`] (less the
 /// `Unspecified` variant — the operator picks one of the named types
 /// with `--type`, and omitting the flag leaves the field at its
 /// `Unspecified` default). Same crate-isolation rationale as
@@ -137,7 +137,7 @@ impl From<TypeArg> for IssueType {
     }
 }
 
-/// Clap-side mirror of [`jjf_storage::DepKind`] for the `--kind` flag
+/// Clap-side mirror of [`iss_storage::DepKind`] for the `--kind` flag
 /// on `jjf dep add|rm`. Same crate-isolation rationale as `StatusArg`
 /// / `TypeArg`. Wire spelling matches the storage layer's kebab-case
 /// (`blocks`, `parent-child`, `related`, `discovered-from`).
@@ -794,7 +794,7 @@ enum Commands {
         value: Option<String>,
 
         /// Explicit key (kebab-case). Optional; when absent, the key
-        /// is derived from `value` via [`jjf_storage::slugify`].
+        /// is derived from `value` via [`iss_storage::slugify`].
         /// Required when `-F -` reads the value from stdin and the
         /// value's slugify would surprise the operator.
         #[arg(long)]
@@ -1380,7 +1380,7 @@ enum CliError {
     /// "unmergeable" failure mode, body-text divergence resolves
     /// LWW by `Jjf-At:` timestamp. The variant stays defined so the
     /// JSON envelope's error-kind enum, the exit-code table, and any
-    /// external caller of `jjf_merge::resolve` still see a stable
+    /// external caller of `iss_merge::resolve` still see a stable
     /// shape. See `docs/cli-json.md` `pull` section for the contract.
     #[allow(dead_code)]
     #[error("merge driver could not auto-resolve issue {issue_id}: {detail}\nworking copy left with conflict markers for manual resolution")]
@@ -2252,7 +2252,7 @@ fn run_new(
     // will re-validate. See `qa-title-validation` (issue
     // `e4e483b`): embedded `\n` corrupts `jjf ls` rows; embedded
     // `\0` was silently truncated before this guard landed.
-    if let Err(reason) = jjf_storage::validate_title(&title) {
+    if let Err(reason) = iss_storage::validate_title(&title) {
         return Err(CliError::InvalidTitle {
             title: title.clone(),
             reason,
@@ -2263,7 +2263,7 @@ fn run_new(
     // `679444a` (QA red-team 2026-06-25 sub-pass 4 C3): pre-fix,
     // a multi-MB body landed silently. We now match GitHub's
     // 65,536-byte cap. Storage re-validates.
-    if let Err(reason) = jjf_storage::validate_body(&body) {
+    if let Err(reason) = iss_storage::validate_body(&body) {
         return Err(CliError::InvalidBody { reason });
     }
 
@@ -2272,7 +2272,7 @@ fn run_new(
     // re-validate; the duplicate is cheap and the early surface is
     // the friendlier hint.
     if let Some(slug) = &slug {
-        if let Err(reason) = jjf_storage::validate_slug(slug) {
+        if let Err(reason) = iss_storage::validate_slug(slug) {
             return Err(CliError::InvalidSlug {
                 slug: slug.clone(),
                 reason,
@@ -2508,7 +2508,7 @@ fn run_remember(
     let key = match key {
         Some(k) => k,
         None => {
-            let auto = jjf_storage::slugify(&trimmed);
+            let auto = iss_storage::slugify(&trimmed);
             if auto.is_empty() {
                 return Err(CliError::EmptyMemoryKey {
                     value: trimmed.clone(),
@@ -3518,7 +3518,7 @@ fn run_update(
     // sees the typed exit-2 error before any IO. Storage will
     // re-validate. `qa-title-validation` (issue `e4e483b`).
     if let Some(title) = &title {
-        if let Err(reason) = jjf_storage::validate_title(title) {
+        if let Err(reason) = iss_storage::validate_title(title) {
             return Err(CliError::InvalidTitle {
                 title: title.clone(),
                 reason,
@@ -3530,7 +3530,7 @@ fn run_update(
     // sees the typed exit-2 error before any IO. Storage will
     // re-validate.
     if let Some(Some(slug)) = &slug_field {
-        if let Err(reason) = jjf_storage::validate_slug(slug) {
+        if let Err(reason) = iss_storage::validate_slug(slug) {
             return Err(CliError::InvalidSlug {
                 slug: slug.clone(),
                 reason,
@@ -3540,7 +3540,7 @@ fn run_update(
     // Pre-validate the body cap at the CLI boundary. Issue
     // `679444a` (QA red-team 2026-06-25 sub-pass 4 C3).
     if let Some(body) = &body {
-        if let Err(reason) = jjf_storage::validate_body(body) {
+        if let Err(reason) = iss_storage::validate_body(body) {
             return Err(CliError::InvalidBody { reason });
         }
     }
@@ -3705,7 +3705,7 @@ fn run_comment(
     // Pre-validate the comment body cap at the CLI boundary. Same
     // 65,536-byte limit as issue bodies (same shape, same on-disk
     // risk). Issue `679444a`.
-    if let Err(reason) = jjf_storage::validate_body(&body) {
+    if let Err(reason) = iss_storage::validate_body(&body) {
         return Err(CliError::InvalidBody { reason });
     }
 
@@ -4820,7 +4820,7 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
 
 /// v3 pull — bare git fetch into the standard remote-tracking namespace,
 /// then per-ref five-scenario reconcile. Implementation in
-/// `jjf_storage::sync_v3`.
+/// `iss_storage::sync_v3`.
 fn run_pull_v3(json: bool, remote: &str, cwd: &Path) -> Result<(), CliError> {
     // Lazy auto-config: a fresh clone may not have the jjforge fetch
     // refspec wired up yet (the user skipped `jjf init` or added the
@@ -4830,7 +4830,7 @@ fn run_pull_v3(json: bool, remote: &str, cwd: &Path) -> Result<(), CliError> {
     // the fetch CLI and will still work.
     let _ = ensure_jjf_fetch_refspec(cwd, remote);
 
-    match jjf_storage::pull_v3_bare(cwd, remote) {
+    match iss_storage::pull_v3_bare(cwd, remote) {
         Ok(report) => {
             emit_pull_v3_success(json, remote, &report);
             Ok(())
@@ -4859,7 +4859,7 @@ fn classify_storage_pull_error(remote: &str, e: StorageError) -> CliError {
 fn emit_pull_v3_success(
     json: bool,
     remote: &str,
-    report: &jjf_storage::PullReportV3,
+    report: &iss_storage::PullReportV3,
 ) {
     let total_refs = report.new_local
         + report.identical

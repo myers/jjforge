@@ -50,7 +50,7 @@ fn full_lifecycle_without_jj_on_path() {
     git(&["config", "user.name", "Tester"]);
     git(&["config", "user.email", "t@example.com"]);
 
-    let bin = env!("CARGO_BIN_EXE_jjf");
+    let bin = env!("CARGO_BIN_EXE_iss");
     let scrubbed_path = minimal_path_without_jj();
 
     let run = |args: &[&str]| -> std::process::Output {

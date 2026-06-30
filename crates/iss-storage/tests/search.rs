@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use jjf_storage::{
+use iss_storage::{
     DEFAULT_SNIPPET_CONTEXT, IssueDraft, IssueType, MatchedField, Storage, make_snippet,
 };
 
@@ -336,7 +336,7 @@ fn search_does_not_apply_status_or_label_filters() {
             ..Default::default()
         })
         .unwrap();
-    storage.set_status(&closed_id, jjf_storage::Status::Closed).unwrap();
+    storage.set_status(&closed_id, iss_storage::Status::Closed).unwrap();
 
     let hits = storage.search("needle", false, false, DEFAULT_SNIPPET_CONTEXT).unwrap();
     assert_eq!(hits.len(), 2, "storage layer returns every status");

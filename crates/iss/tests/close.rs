@@ -164,7 +164,7 @@ fn close_twice_lands_two_set_status_trailers() {
     // lands a fresh `set-status` op so the audit log records the
     // intent. We verify by counting `SetStatus` entries in the bug's
     // history.
-    use jjf_storage::{IssueId, Op, Storage};
+    use iss_storage::{IssueId, Op, Storage};
 
     let repo = make_initialized_repo("close_twice");
     let id = create_issue(&repo, "close me twice");

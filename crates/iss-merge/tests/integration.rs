@@ -6,7 +6,7 @@
 //! (canonical concurrent-set-title scenario) plus a hand-built
 //! pretty-printed v1 record per `docs/storage-format.md` §3.
 
-use jjf_merge::{MergeOptions, Side, resolve};
+use iss_merge::{MergeOptions, Side, resolve};
 use serde_json::{Value, json};
 
 #[test]

@@ -7,7 +7,7 @@
 //! wiped on each run, gitignored via `crates/**/tests/.scratch/`.
 //!
 //! We deliberately do NOT take a dep on `assert_cmd` here — locating
-//! the binary via `CARGO_BIN_EXE_jjf` (cargo sets it for any test
+//! the binary via `CARGO_BIN_EXE_iss` (cargo sets it for any test
 //! target in the same package as the `[[bin]]`) plus `std::process`
 //! is enough for what we need, and matches the rest of the
 //! workspace's "narrow dep list" discipline.

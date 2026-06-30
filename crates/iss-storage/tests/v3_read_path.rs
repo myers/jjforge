@@ -22,7 +22,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use jjf_storage::{
+use iss_storage::{
     DepEdge, DepKind, Error as StorageError, IssueDraft, IssueType,
     ReadyFilter, Status, Storage, UpdateFields,
 };
@@ -174,13 +174,13 @@ fn v3_read_comments_round_trips_thread() {
 
 #[test]
 fn v3_read_returns_issue_not_found_for_missing_ref() {
-    use jjf_storage::Error;
+    use iss_storage::Error;
     let repo = make_v3_scratch_repo("v3_read_missing");
     let storage = Storage::open(&repo).unwrap();
     // Synthesize a never-created id; the storage hex generator is
     // 7-char lowercase hex, so a hand-built "0000000" is structurally
     // valid (no ref points at it).
-    let parsed: jjf_storage::IssueId = "0000000".parse().unwrap();
+    let parsed: iss_storage::IssueId = "0000000".parse().unwrap();
     let err = storage.read(&parsed).unwrap_err();
     assert!(
         matches!(err, Error::IssueNotFound(_)),
@@ -327,7 +327,7 @@ fn v3_resolve_by_slug_matches_open_issue() {
 
 #[test]
 fn v3_resolve_unknown_slug_errors() {
-    use jjf_storage::Error;
+    use iss_storage::Error;
     let repo = make_v3_scratch_repo("v3_resolve_unknown");
     let storage = Storage::open(&repo).unwrap();
     let _ = storage
@@ -403,7 +403,7 @@ fn v3_read_history_walks_per_issue_ref_chain() {
     );
 
     // First op is create.
-    use jjf_storage::Op;
+    use iss_storage::Op;
     assert!(
         matches!(history.first().map(|e| &e.op), Some(Op::Create { .. })),
         "first history entry should be Create; got {:?}",
@@ -422,10 +422,10 @@ fn v3_read_history_walks_per_issue_ref_chain() {
 
 #[test]
 fn v3_read_history_returns_not_found_for_missing_id() {
-    use jjf_storage::Error;
+    use iss_storage::Error;
     let repo = make_v3_scratch_repo("v3_history_missing");
     let storage = Storage::open(&repo).unwrap();
-    let parsed: jjf_storage::IssueId = "1111111".parse().unwrap();
+    let parsed: iss_storage::IssueId = "1111111".parse().unwrap();
     let err = storage.read_history(&parsed).unwrap_err();
     assert!(
         matches!(err, Error::IssueNotFound(_)),

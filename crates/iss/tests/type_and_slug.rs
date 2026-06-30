@@ -13,7 +13,7 @@
 
 use std::fs;
 
-use jjf_storage::{IssueType, Status, Storage};
+use iss_storage::{IssueType, Status, Storage};
 
 mod common;
 use common::*;
@@ -39,7 +39,7 @@ fn new_with_type_and_slug_round_trips_via_storage() {
         String::from_utf8_lossy(&out.stderr)
     );
     let id_str = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    let id = jjf_storage::IssueId::parse(&id_str).unwrap();
+    let id = iss_storage::IssueId::parse(&id_str).unwrap();
 
     let storage = Storage::open(&repo).unwrap();
     let issue = storage.read(&id).unwrap();
@@ -159,7 +159,7 @@ fn update_type_and_slug_lands_one_commit() {
 
     let storage = Storage::open(&repo).unwrap();
     let issue = storage
-        .read(&jjf_storage::IssueId::parse(&id).unwrap())
+        .read(&iss_storage::IssueId::parse(&id).unwrap())
         .unwrap();
     assert_eq!(issue.type_, IssueType::Bug);
     assert_eq!(issue.slug.as_deref(), Some("baseline-slug"));
@@ -179,7 +179,7 @@ fn update_unset_slug_clears_field() {
 
     let storage = Storage::open(&repo).unwrap();
     let issue = storage
-        .read(&jjf_storage::IssueId::parse(&id).unwrap())
+        .read(&iss_storage::IssueId::parse(&id).unwrap())
         .unwrap();
     assert_eq!(issue.slug, None);
 }
@@ -269,7 +269,7 @@ fn id_taking_verbs_accept_slug_close_and_update_and_comment() {
 
     let storage = Storage::open(&repo).unwrap();
     let issue = storage
-        .read(&jjf_storage::IssueId::parse(&id).unwrap())
+        .read(&iss_storage::IssueId::parse(&id).unwrap())
         .unwrap();
     assert_eq!(issue.title, "renamed");
     assert_eq!(issue.status, Status::Open);

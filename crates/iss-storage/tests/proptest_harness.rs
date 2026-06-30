@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use jjf_storage::{
+use iss_storage::{
     DepEdge, DepKind, IssueDraft, IssueId, IssueType, Memory, ReadyFilter, Status, Storage,
 };
 use proptest::collection::vec;
@@ -479,7 +479,7 @@ fn drive_to_status(storage: &Storage, target: Status) -> IssueId {
 }
 
 /// Apply one verb against the live issue.
-fn apply_verb(storage: &Storage, id: &IssueId, verb: &Verb) -> jjf_storage::Result<()> {
+fn apply_verb(storage: &Storage, id: &IssueId, verb: &Verb) -> iss_storage::Result<()> {
     match verb {
         Verb::SetStatus(s) => storage.set_status(id, *s),
         Verb::Block => storage.block(id, None),
@@ -627,7 +627,7 @@ fn apply_list_ready_mutation(
     storage: &Storage,
     id: &IssueId,
     m: &ListReadyMutation,
-) -> jjf_storage::Result<()> {
+) -> iss_storage::Result<()> {
     match m {
         ListReadyMutation::Close => storage.set_status(id, Status::Closed),
         ListReadyMutation::Abandon => storage.set_status(id, Status::Abandoned),
@@ -970,7 +970,7 @@ proptest! {
                 PostStatus::Rejects(want_post) => {
                     // Must reject AND leave status untouched.
                     match result {
-                        Err(jjf_storage::Error::Invalid(_)) => {}
+                        Err(iss_storage::Error::Invalid(_)) => {}
                         Err(other) => prop_assert!(
                             false,
                             "verb {:?} on source {:?} predicted typed \
@@ -1150,7 +1150,7 @@ proptest! {
         prop_assert!(post_unset.is_none());
         let second_unset = storage.unset_memory(&key);
         match second_unset {
-            Err(jjf_storage::Error::Invalid(_)) => {}
+            Err(iss_storage::Error::Invalid(_)) => {}
             other => prop_assert!(
                 false,
                 "second unset_memory({:?}) on missing key expected \
@@ -1426,8 +1426,8 @@ proptest! {
                     extra, plan,
                 );
             }
-            Err(jjf_storage::Error::DependencyCycle { .. })
-            | Err(jjf_storage::Error::SelfDependency { .. }) => {
+            Err(iss_storage::Error::DependencyCycle { .. })
+            | Err(iss_storage::Error::SelfDependency { .. }) => {
                 // Reject path: graph must be unchanged.
                 let post_snapshot = snapshot_dep_graph(&storage);
                 prop_assert_eq!(

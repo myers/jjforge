@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use jjf_storage::{
+use iss_storage::{
     DepKind, IssueDraft, Status, Storage, UpdateFields,
 };
 

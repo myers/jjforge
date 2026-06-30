@@ -15,7 +15,7 @@
 
 use std::path::Path;
 
-use jjf_storage::{Op, IssueId};
+use iss_storage::{Op, IssueId};
 
 mod common;
 use common::*;

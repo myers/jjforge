@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use jjf_storage::{IssueDraft, Storage, UpdateFields};
+use iss_storage::{IssueDraft, Storage, UpdateFields};
 
 // --- bootstrap (mirror search.rs / integration.rs) -----------------
 
@@ -411,7 +411,7 @@ fn stale_closed_issues_included_storage_layer() {
         .update(
             &id,
             UpdateFields {
-                status: Some(jjf_storage::Status::Closed),
+                status: Some(iss_storage::Status::Closed),
                 ..Default::default()
             },
         )
@@ -425,5 +425,5 @@ fn stale_closed_issues_included_storage_layer() {
         "storage layer returns the closed issue; CLI does status filtering"
     );
     assert_eq!(hits[0].issue.id, id);
-    assert_eq!(hits[0].issue.status, jjf_storage::Status::Closed);
+    assert_eq!(hits[0].issue.status, iss_storage::Status::Closed);
 }

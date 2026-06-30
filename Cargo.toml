@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/jjf",
-    "crates/jjf-merge",
-    "crates/jjf-storage",
+    "crates/iss",
+    "crates/iss-merge",
+    "crates/iss-storage",
 ]
 # experiments/jj-shellout-hello has its own lockfile and intentionally
 # stays a standalone crate (it ships as a tiny example, separate from
