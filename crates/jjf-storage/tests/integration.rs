@@ -3582,6 +3582,60 @@ fn cache_hit_avoids_rebuild_n_issues() {
     );
 }
 
+#[test]
+fn cache_schema_bump_forces_rebuild() {
+    // Pin the schema-mismatch-forces-rebuild behavior introduced by
+    // the CACHE_SCHEMA_VERSION 1 → 2 bump (PR metadata field).
+    //
+    // Strategy: prime the cache at v2 (the current version), patch
+    // the on-disk JSON to report schema_version = 1, then re-open
+    // Storage and confirm the read path rebuilds (data still present,
+    // cache file updated back to version 2).
+    let abs = make_scratch_repo("cache_schema_bump_rebuild");
+    let storage = Storage::open(&abs).unwrap();
+    let id = storage
+        .create_issue(&IssueDraft {
+            title: "schema-bump test".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    storage.set_metadata(&id, "key", "value").unwrap();
+
+    // Prime the cache: a list_ready call forces a rebuild+persist.
+    let _ = storage.list_ready(&ReadyFilter::default()).unwrap();
+
+    let cache_path = cache_file_path(&abs);
+    assert!(cache_path.exists(), "cache must exist after first read");
+
+    // Patch the on-disk cache to look like a v1 cache.
+    let raw = std::fs::read_to_string(&cache_path).unwrap();
+    let mut parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    parsed["schema_version"] = serde_json::json!(1);
+    std::fs::write(&cache_path, parsed.to_string()).unwrap();
+
+    // Re-open Storage so the in-process memo is gone; the next read
+    // will probe, see the schema mismatch, discard the cache, and
+    // rebuild from the v3 refs.
+    let storage2 = Storage::open(&abs).unwrap();
+    let issue = storage2.read(&id).unwrap();
+
+    // The rebuild must surface the metadata written above.
+    assert_eq!(
+        issue.metadata.get("key"),
+        Some(&"value".to_string()),
+        "metadata must survive a schema-mismatch-triggered rebuild"
+    );
+
+    // The cache file on disk must now carry the current schema version.
+    let raw_after = std::fs::read_to_string(&cache_path).unwrap();
+    let parsed_after: serde_json::Value = serde_json::from_str(&raw_after).unwrap();
+    assert_eq!(
+        parsed_after["schema_version"],
+        serde_json::json!(2),
+        "rebuilt cache must report schema_version 2"
+    );
+}
+
 // --- qa-title-validation (issue e4e483b) ---------------------------------
 //
 // `validate_title` rejects four classes of input at the storage

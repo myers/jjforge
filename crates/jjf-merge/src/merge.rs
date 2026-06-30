@@ -43,6 +43,16 @@ pub struct MergePolicy {
 
 impl Default for MergePolicy {
     fn default() -> Self {
+        // TODO(2026-06-29): the `metadata` field added in the
+        // feat/issue-metadata PR is a per-key LWW map
+        // (BTreeMap<String,String>). The v1 driver here has no policy
+        // variant for that shape — only scalar_fields and array_fields
+        // exist. The runtime merge path for v3 repos goes through
+        // merge_ops.rs (which has a correct per-key reducer), so the
+        // absence here is not a correctness issue today. If anyone
+        // wires the v1 driver back into the write path, file a ticket
+        // to add a `map_fields: Vec<String>` variant to MergePolicy
+        // before doing so.
         Self {
             // Mirrors docs/storage-format.md §3.1 minus arrays and
             // minus `updated_at` (always taken from the winning

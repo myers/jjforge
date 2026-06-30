@@ -63,7 +63,7 @@ use crate::{Error, Result, ISSUES_BOOKMARK_REVSET};
 /// changes in a way that pre-existing cache files can't reliably
 /// deserialize. A mismatch triggers a rebuild from scratch — pure
 /// derived state, no migration required.
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 1;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// Filename relative to `.jj/`. The `.jj/` directory is gitignored
 /// by jj itself, so the cache is invisible to git by construction.
