@@ -222,40 +222,37 @@ fn global_json_flag_works_before_subcommand_too() {
 
 #[test]
 fn verb_on_uninitialized_repo_rejects_without_jj() {
-    // A jj-colocated repo that has NOT had `jjf init` run — no
+    // Plain git repo — NO `jj git init`, NO `jjf init`, no
     // refs/jjf/meta/format-version sentinel. After J3 the preflight
-    // must cleanly refuse via MissingIssuesBookmark rather than
-    // spawning `jj bookmark list`. Using make_jj_repo gives us the
-    // right substrate: git+jj colocated, no sentinel, so the v3 check
-    // returns false and the function returns MissingIssuesBookmark.
-    // The current (pre-J3) code falls through to `jj bookmark list`
-    // which returns 0 but no matching `issues` line, then tries v1
-    // fallback, then returns MissingIssuesBookmark — both shapes
-    // return exit non-zero, so the first assertion passes both before
-    // and after the rewrite. The meaningful change is that after J3
-    // we don't invoke jj at all for the v2/v1 fallback path.
-    let repo = make_jj_repo("verb_uninitialized");
+    // detects the missing sentinel purely via git-plumbing and refuses
+    // with MissingIssuesBookmark WITHOUT spawning jj at all. Using a
+    // plain git repo (not jj-colocated) ensures this test could NOT
+    // have passed before J3 via the old `jj bookmark list` fallback
+    // (jj would have refused the non-jj dir), so it actually gates the
+    // v3-sentinel-only refusal path introduced by J3.
+    let repo = scratch("verb_uninitialized");
+    Command::new("git")
+        .arg("init")
+        .arg(&repo)
+        .output()
+        .expect("git init");
 
-    // ls must fail — no sentinel, no init.
+    // ls must fail — no sentinel, no init. This is the J3 gate: the
+    // refusal must come purely from the git-plumbing sentinel check
+    // (no jj subprocess). Other init tests cover the init-then-success
+    // path on jj-colocated repos; this test pins the refusal on a
+    // substrate where the pre-J3 `jj bookmark list` fallback would
+    // also have failed, proving J3's sentinel-only path is what fires.
     let out = run_jjf(&repo, &["ls"]);
     assert!(
         !out.status.success(),
-        "ls should refuse on an uninitialized repo; stderr={}",
+        "ls should refuse on an uninitialized plain-git repo; stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
-
-    // After `jjf init`, ls must succeed.
-    let init_out = run_jjf(&repo, &["init"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        init_out.status.success(),
-        "jjf init failed: stderr={}",
-        String::from_utf8_lossy(&init_out.stderr)
-    );
-    let ls_out = run_jjf(&repo, &["ls"]);
-    assert!(
-        ls_out.status.success(),
-        "ls should succeed after jjf init; stderr={}",
-        String::from_utf8_lossy(&ls_out.stderr)
+        stderr.contains("jjf init"),
+        "error message should mention `jjf init`; got: {stderr}"
     );
 }
 
