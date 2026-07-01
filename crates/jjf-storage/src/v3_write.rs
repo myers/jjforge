@@ -16,11 +16,9 @@
 //! git HEAD is never moved. See [`refs::issue_ref`] for the ref
 //! namespace.
 //!
-//! This module is the v3 counterpart to the
-//! [`crate::Storage::try_commit_dance`] / `commit_record_change` pair
-//! in `lib.rs`. The dispatch happens at [`crate::Storage`]: when
-//! `mode == StorageMode::V3`, the mutators route here; when `V2`,
-//! they fall back to the `jj` dance for backward compat.
+//! This module holds the v3 write path. Every mutator on
+//! [`crate::Storage`] routes here unconditionally — the v1/v2 shapes
+//! and the `jj`-based commit dance they used were removed.
 
 use crate::git::{GitRepo, ZERO_OID};
 use crate::id::IssueId;

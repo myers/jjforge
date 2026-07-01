@@ -44,14 +44,12 @@
 
 use crate::git::GitRepo;
 use crate::id::IssueId;
-use crate::jj::JjRepo;
 #[cfg(any(debug_assertions, test))]
 use crate::op::Op;
 #[cfg(any(debug_assertions, test))]
 use crate::record::{DepEdge, IssueType, Status};
 use crate::record::{Comment, Issue, IssueRecord};
 use crate::v3_write;
-use crate::StorageMode;
 use crate::{Error, Result};
 
 /// Read a single issue from authoritative storage.
@@ -64,15 +62,9 @@ use crate::{Error, Result};
 /// Errors:
 /// - `IssueNotFound` if the record is absent.
 /// - `Json` if the on-disk record or any comment line is malformed.
-/// - `Jj` / `Git` if the underlying CLI fails for any non-missing-file
+/// - `Git` if the underlying CLI fails for any non-missing-file
 ///   reason.
-pub(crate) fn read(
-    repo: &JjRepo,
-    git: &GitRepo,
-    mode: StorageMode,
-    id: &IssueId,
-) -> Result<Issue> {
-    let _ = mode;
+pub(crate) fn read(git: &GitRepo, id: &IssueId) -> Result<Issue> {
     let (record, mut comments) = {
         let record = v3_write::read_record_v3(git, id)?;
         let comments = v3_write::read_comments_v3(git, id)?;
@@ -87,7 +79,7 @@ pub(crate) fn read(
 
     #[cfg(debug_assertions)]
     {
-        let op_view = replay_ops(repo, git, mode, id)?;
+        let op_view = replay_ops(git, id)?;
         // Cross-check runs unconditionally, including across merges.
         // With op-space resolution (`bfc732b`), the file on disk after
         // a merge IS a deterministic projection of the op chain: the
@@ -201,15 +193,9 @@ struct OpView {
 /// across merges where two heads' `set-*` ops compose by LWW. (Per
 /// spec §6.) The v2 bookmark-tip history path was removed in J5.
 #[cfg(debug_assertions)]
-fn replay_ops(
-    repo: &JjRepo,
-    git: &GitRepo,
-    mode: StorageMode,
-    id: &IssueId,
-) -> Result<OpView> {
+fn replay_ops(git: &GitRepo, id: &IssueId) -> Result<OpView> {
     use crate::merge_ops::sort_entries_lww;
 
-    let _ = (repo, mode);
     let mut entries = match crate::history::read_history_at_v3(git, id) {
         Ok(v) => v,
         Err(Error::IssueNotFound(_)) => return Err(Error::IssueNotFound(id.clone())),

@@ -57,7 +57,6 @@ mod cache;
 mod git;
 mod history;
 mod id;
-mod jj;
 mod memory;
 mod merge_ops;
 mod op;
@@ -73,7 +72,6 @@ pub use cache::UnreadableRef;
 pub use git::GitError;
 pub use history::HistoryEntry;
 pub use id::{IdError, IssueId};
-pub use jj::JjError;
 pub use memory::slugify;
 pub use merge_ops::{MergeReport, MergedIssue};
 pub use op::Op;
@@ -175,17 +173,11 @@ impl UpdateFields {
     }
 }
 
-use jj::JjRepo;
-
 /// What went wrong on the write path.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("jj cli: {0}")]
-    Jj(#[from] JjError),
-    /// A `git` subprocess failure on the v3 write path. Distinct from
-    /// [`Error::Jj`] so callers can tell "the jj dance failed" from
-    /// "the git-only write path failed" — same shape (typed stderr +
-    /// status), different CLI.
+    /// A `git` subprocess failure on the v3 write path. Carries the
+    /// typed stderr + status of the failing git CLI invocation.
     ///
     /// Concurrent-write conflicts on the v3 path don't surface here;
     /// they get translated to [`Error::ConcurrentWrite`] before the
@@ -397,39 +389,10 @@ pub enum Error {
     ConcurrentWrite { hint: String },
 }
 
-/// Predicate on a [`crate::Error`]: does the underlying cause look
-/// like a concurrent-write conflict (jj's "Concurrent checkout"
-/// fingerprint), as opposed to its translated
-/// [`Error::ConcurrentWrite`] form?
-///
-/// Used by the commit-dance translation in
-/// [`Storage::commit_record_change`] / [`Storage::commit_memory_change`]
-/// to decide whether to map the underlying [`Error::Jj`] to a typed
-/// [`Error::ConcurrentWrite`] for downstream callers.
-///
-/// Also used by the caller-side retry helpers
-/// ([`Storage::mutate`], [`Storage::add_comment`],
-/// [`Storage::create_issue`]) which match on
-/// [`Error::ConcurrentWrite`] directly after translation.
-fn is_concurrent_write(e: &Error) -> bool {
-    match e {
-        Error::Jj(je) => je.is_concurrent_write(),
-        // The v3 write path translates CAS failures to
-        // `Error::ConcurrentWrite` at the boundary in `v3_write.rs`,
-        // so raw `Error::Git` here represents a non-CAS git failure.
-        // Returning `false` keeps the translation symmetric with the
-        // v2 path (only the jj-side cascade is auto-recognized as
-        // concurrent on the inner Result).
-        Error::Git(_) => false,
-        _ => false,
-    }
-}
-
 /// Predicate on a [`crate::Error`]: is it the typed
 /// [`Error::ConcurrentWrite`] surfaced by the translation layer? This
-/// is what the higher-level retry helpers match on (they never see the
-/// raw [`Error::Jj`] form — the translation in `commit_record_change`
-/// has already happened).
+/// is what the higher-level retry helpers match on (the v3 write path
+/// translates CAS failures to this at the boundary in `v3_write.rs`).
 fn is_typed_concurrent_write(e: &Error) -> bool {
     matches!(e, Error::ConcurrentWrite { .. })
 }
@@ -1433,27 +1396,6 @@ pub struct DepTree {
     pub root: DepTreeNode,
 }
 
-/// On-disk storage shape this `Storage` is operating against.
-///
-/// Detected at [`Storage::open`] time and pinned for the life of the
-/// handle. Drives the write-path dispatch in
-/// [`Storage::commit_record_change`] / `commit_memory_change` and the
-/// create-path probes (id collision, slug collision).
-///
-/// Only the v3 shape (pinned by `docs/storage-out-of-tree.md`) is
-/// supported: each issue lives at `refs/jjf/issues/<id>` with a
-/// commit-chain of op-packs; each memory at `refs/jjf/memories/<key>`.
-/// Writes use git-only subprocess calls; the jj working copy is never
-/// touched. The v1/v2 shapes and their migrators were removed (J5); a
-/// legacy repo is refused at [`Storage::open`]. The enum is therefore
-/// single-variant — it stays as an enum so the (now-unconditional)
-/// write-path dispatch sites can be removed alongside the dead v2
-/// write path in a later task without re-introducing the type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StorageMode {
-    V3,
-}
-
 /// Verify the repo is in the v3 storage shape. Returns `Ok(())` iff
 /// `refs/jjf/meta/format-version` resolves to a commit.
 ///
@@ -1499,20 +1441,10 @@ fn verify_v3_format(git: &git::GitRepo) -> Result<()> {
 /// memo is invalidated on writes (the mutator drops it), so the next
 /// read sees fresh state.
 ///
-/// Also carries a [`StorageMode`] discriminator. Since J5 removed the
-/// v1/v2 migrators and made `open` refuse non-v3 repos, this is always
-/// [`StorageMode::V3`] — the field and the write-path dispatch checks
-/// it gates are retained pending removal of the now-dead v2 write path
-/// in a later task.
 #[derive(Debug, Clone)]
 pub struct Storage {
-    repo: JjRepo,
-    /// Git wrapper used by the v3 write path. Built alongside `repo`
-    /// in `open` / `init`; coexists with the jj wrapper.
+    /// Git wrapper used by the v3 write path. Built in `open` / `init`.
     git: git::GitRepo,
-    /// Storage shape — always [`StorageMode::V3`] now. Pinned at open
-    /// time; gates the (now-unconditional) write-path dispatch.
-    mode: StorageMode,
     /// In-process snapshot cache memo. Lazily populated on first
     /// read; cleared by every mutator so the next read sees the
     /// post-write bookmark state. `Arc<Mutex<...>>` so clones share
@@ -1545,9 +1477,7 @@ impl Storage {
         // sentinel is a legacy v1/v2 repo → UnsupportedLegacyFormat.
         verify_v3_format(&git)?;
         Ok(Self {
-            repo: JjRepo::open(root),
             git,
-            mode: StorageMode::V3,
             snapshot_memo: Default::default(),
         })
     }
@@ -1557,15 +1487,14 @@ impl Storage {
     /// Idempotent: calling twice against the same repo is a no-op the
     /// second time.
     ///
-    /// Three distinct outcomes:
+    /// Two distinct outcomes:
     ///
-    /// - `repo_root` is not a jj repo at all → [`Error::NotAJjRepo`].
     /// - `repo_root` is a v3-shape repo (the sentinel ref already
     ///   resolves to a commit) → idempotent no-op; return Storage.
-    /// - `repo_root` is a brand-new jj+git repo (no v3 sentinel) →
+    /// - `repo_root` is a brand-new git repo (no v3 sentinel) →
     ///   plant the v3 sentinel ref via
-    ///   [`v3_write::write_format_version_sentinel`]. Zero jj calls,
-    ///   zero bookmark mutations, zero working-copy mutations.
+    ///   [`v3_write::write_format_version_sentinel`]. Zero bookmark
+    ///   mutations, zero working-copy mutations.
     ///
     /// (A legacy v1/v2-shape repo — a `bugs`/`issues` bookmark with no
     /// sentinel — is no longer special-cased here; `init` plants a
@@ -1575,9 +1504,8 @@ impl Storage {
     /// **v3 init contract.** A fresh init writes EXACTLY one ref
     /// (`refs/jjf/meta/format-version`) under `refs/jjf/`. No
     /// `issues` bookmark is created, no seed commit lands, `git HEAD`
-    /// is unchanged, and the jj working copy is untouched. This is
-    /// the fix for the colocated-repo HEAD-drift footgun
-    /// (`docs/storage-out-of-tree.md` §"TL;DR").
+    /// is unchanged. This is the fix for the colocated-repo HEAD-drift
+    /// footgun (`docs/storage-out-of-tree.md` §"TL;DR").
     ///
     /// The `mvp-cli` `jjf init` verb is a thin wrapper over this.
     pub fn init(repo_root: impl Into<PathBuf>) -> Result<Self> {
@@ -1588,22 +1516,7 @@ impl Storage {
                 root.display()
             )));
         }
-        let repo = JjRepo::open(root.clone());
-        let git = git::GitRepo::open(root.clone());
-
-        // Probe: are we inside a jj repo at all? `jj workspace root`
-        // is cheap and its failure mode is unambiguous (stderr starts
-        // with `Error: There is no jj repo in`). We translate that one
-        // specific failure into `NotAJjRepo`; anything else bubbles
-        // up as a typed `Jj` error.
-        if let Err(e) = repo.run(&["workspace", "root"]) {
-            if let JjError::Cli { stderr, .. } = &e {
-                if stderr.contains("no jj repo") {
-                    return Err(Error::NotAJjRepo(root));
-                }
-            }
-            return Err(Error::Jj(e));
-        }
+        let git = git::GitRepo::open(root);
 
         // Detection: does the v3 sentinel ref already resolve to a
         // commit? If so, init is a no-op (idempotent). A
@@ -1613,9 +1526,7 @@ impl Storage {
             Ok(Some((_, kind))) if kind == "commit" => {
                 // v3 already initialized. Idempotent no-op.
                 return Ok(Self {
-                    repo,
                     git,
-                    mode: StorageMode::V3,
                     snapshot_memo: Default::default(),
                 });
             }
@@ -1633,9 +1544,7 @@ impl Storage {
         v3_write::write_format_version_sentinel(&git)?;
 
         Ok(Self {
-            repo,
             git,
-            mode: StorageMode::V3,
             snapshot_memo: Default::default(),
         })
     }
@@ -1678,7 +1587,7 @@ impl Storage {
         // the `refs/jjf/*` ref set and writes `.jj/jjforge-cache.json`.
         let snap = std::sync::Arc::new(cache::load_or_rebuild_v3(
             &self.git,
-            self.repo.root(),
+            self.git.root(),
         )?);
         let mut guard = self
             .snapshot_memo
@@ -1708,7 +1617,7 @@ impl Storage {
 
     /// The repo root this storage handle is rooted at.
     pub fn repo_root(&self) -> &Path {
-        self.repo.root()
+        self.git.root()
     }
 
     /// Per-ref diagnostics for refs under `refs/jjf/issues/*` /
@@ -1733,10 +1642,9 @@ impl Storage {
     /// `refs/jjf/meta/format-version` sentinel ref resolves). Always
     /// true now: since J5 removed the v1/v2 migrators, `Storage::open`
     /// refuses any non-v3 repo, so a live handle is v3 unconditionally.
-    /// Retained for the CLI's `push` / `pull` verb dispatch and as a
-    /// guard while the now-dead v2 write path awaits removal.
+    /// Retained for the CLI's `push` / `pull` verb dispatch.
     pub fn is_v3(&self) -> bool {
-        matches!(self.mode, StorageMode::V3)
+        true
     }
 
     /// Create a new issue from a draft. Returns the freshly-minted
@@ -1949,23 +1857,12 @@ impl Storage {
             });
         }
         let claimed_slug = record.slug.clone();
-        let commit_result = if self.mode == StorageMode::V3 {
-            // V3 write path: build the trailer block + commit, land
-            // it on `refs/jjf/issues/<id>` via git-only calls. No
-            // working-copy edits; no jj subprocess. Comments file is
-            // omitted from the tree at create time (the design's "if
-            // any" semantics) — the first `add_comment` will plant
-            // the blob in the tree, not the create.
-            self.commit_record_v3(&id, &record, None, &summary, &ops)
-        } else {
-            self.commit_record_change(&summary, &ops, |wc_root| {
-                write_record_json(&wc_root.join(issue_json_relpath(&id)), &record)?;
-                // Comments file: create empty so readers don't trip on
-                // ENOENT for new issues. Spec §4 allows empty == no comments.
-                write_comments_jsonl(&wc_root.join(issue_comments_relpath(&id)), &[])?;
-                Ok(())
-            })
-        };
+        // V3 write path: build the trailer block + commit, land it on
+        // `refs/jjf/issues/<id>` via git-only calls. No working-copy
+        // edits. Comments file is omitted from the tree at create time
+        // (the design's "if any" semantics) — the first `add_comment`
+        // will plant the blob in the tree, not the create.
+        let commit_result = self.commit_record_v3(&id, &record, None, &summary, &ops);
 
         match commit_result {
             Ok(()) => Ok(id),
@@ -3050,29 +2947,12 @@ impl Storage {
             issue_id: id.clone(),
             comment_id: comment_id.clone(),
         }];
-        if self.mode == StorageMode::V3 {
-            // V3: write the new record + the full comments stream to
-            // the per-issue ref's tree in one commit. The comments
-            // file is always present on a v3 commit-with-comments —
-            // we read the existing stream above, appended ours, and
-            // pass the full slice through.
-            self.commit_record_v3(
-                &id,
-                &record,
-                Some(&all_comments),
-                &summary,
-                &ops,
-            )?;
-        } else {
-            self.commit_record_change(&summary, &ops, |wc_root| {
-                write_record_json(&wc_root.join(issue_json_relpath(&id)), &record)?;
-                write_comments_jsonl(
-                    &wc_root.join(issue_comments_relpath(&id)),
-                    &all_comments,
-                )?;
-                Ok(())
-            })?;
-        }
+        // V3: write the new record + the full comments stream to the
+        // per-issue ref's tree in one commit. The comments file is
+        // always present on a v3 commit-with-comments — we read the
+        // existing stream above, appended ours, and pass the full slice
+        // through.
+        self.commit_record_v3(&id, &record, Some(&all_comments), &summary, &ops)?;
         Ok(())
     }
 
@@ -3121,13 +3001,7 @@ impl Storage {
         let summary = format!("jjf: memory {} - set", key);
         let jjf_at = now_rfc3339_nanos()?;
         let msg = memory::build_set_memory_commit_message(&summary, key, value, &jjf_at);
-        if self.mode == StorageMode::V3 {
-            return self.commit_memory_v3(key, Some(&record), &msg);
-        }
-        let key_owned = key.to_owned();
-        self.commit_memory_change(&msg, |wc_root| {
-            write_memory_json(&wc_root.join(memory::memory_json_relpath(&key_owned)), &record)
-        })
+        self.commit_memory_v3(key, Some(&record), &msg)
     }
 
     /// Remove a persistent memory by key. Lands one commit on the
@@ -3153,17 +3027,7 @@ impl Storage {
         let summary = format!("jjf: memory {} - unset", key);
         let jjf_at = now_rfc3339_nanos()?;
         let msg = memory::build_unset_memory_commit_message(&summary, key, &jjf_at);
-        if self.mode == StorageMode::V3 {
-            return self.commit_memory_v3(key, None, &msg);
-        }
-        let key_owned = key.to_owned();
-        self.commit_memory_change(&msg, |wc_root| {
-            let path = wc_root.join(memory::memory_json_relpath(&key_owned));
-            if path.exists() {
-                std::fs::remove_file(&path)?;
-            }
-            Ok(())
-        })
+        self.commit_memory_v3(key, None, &msg)
     }
 
     /// Read one memory by key from the `issues` bookmark tip. Returns
@@ -3223,7 +3087,7 @@ impl Storage {
         // a concurrent writer between probe and lookup, OR the id
         // genuinely isn't in authoritative storage). Fall through to
         // the per-id read for a sharp `IssueNotFound` error.
-        read::read(&self.repo, &self.git, self.mode, id)
+        read::read(&self.git, id)
     }
 
     /// Resolve a user-supplied handle to a concrete `IssueId`.
@@ -3679,144 +3543,6 @@ impl Storage {
         Ok(out)
     }
 
-    /// Enumerate the change_id shorts of every head of the `issues`
-    /// bookmark. Normally returns exactly one entry; returns more than
-    /// one only when the bookmark is in a divergent ("conflicted")
-    /// state — typically right after `jj git fetch` against a local
-    /// clone that made a concurrent edit. The `sync-push-pull` ticket
-    /// uses this to decide whether `pull` needs to invoke the merge
-    /// driver pass: count > 1 means yes.
-    ///
-    /// Empty result is impossible on a repo where `jjf init` has run
-    /// (the seed commit guarantees at least one head); we treat an
-    /// empty list as a `Jj` error from the caller's perspective rather
-    /// than a typed variant, because hitting it means the bookmark
-    /// vanished between probes.
-    pub fn issues_heads(&self) -> Result<Vec<String>> {
-        let text = self.repo.run(&[
-            "log",
-            "-r",
-            "heads(bookmarks(issues))",
-            "--no-graph",
-            "-T",
-            "change_id.short() ++ \"\\n\"",
-        ])?;
-        let mut out = Vec::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if !line.is_empty() {
-                out.push(line.to_owned());
-            }
-        }
-        Ok(out)
-    }
-
-    /// Land a merge commit that resolves a divergent `issues` bookmark.
-    ///
-    /// Takes the change_id shorts of the heads being merged (`heads` —
-    /// typically two, but jj supports n-way merges so we accept any
-    /// `>= 2`) and a list of `(issue_id, resolved_file_bytes)` pairs to
-    /// write into the working copy of the merge commit. The bytes are
-    /// what `jjf_merge::resolve` produced (or whatever the caller
-    /// decided is the post-merge content); we write them verbatim into
-    /// `issues/<id>.json` so what the file ends up containing on the
-    /// bookmark matches exactly.
-    ///
-    /// Per `docs/storage-format.md` §5.2, the resulting commit's
-    /// description carries one `Jjf-Op: merge` trailer per entry in
-    /// `merged_issues` — that's the per-issue audit signal that the
-    /// merge driver ran. Multi-issue merges land all trailers on one
-    /// commit (spec §5.5).
-    ///
-    /// Sequence (variant of the standard 4-CLI dance):
-    ///
-    /// 1. `jj new <head_a> <head_b> [...] -m '<msg with merge trailers>'`
-    ///    — creates the merge commit. jj materializes any conflicted
-    ///    files with its textual conflict markers.
-    /// 2. Write the resolved bytes into `issues/<id>.json` for each
-    ///    entry. Overwrites the conflict markers jj just wrote.
-    /// 3. `jj bookmark set issues -r @ --allow-backwards` — point the
-    ///    bookmark at the merge commit.
-    /// 4. `jj new root()` — step `@` off the bookmark.
-    ///
-    /// Errors with `Invalid` if `heads.len() < 2` (no merge needed) or
-    /// `merged_issues` is empty (nothing to write — the caller should
-    /// just `jj bookmark set` without going through the merge driver).
-    pub fn record_merge(
-        &self,
-        heads: &[String],
-        merged_issues: &[(IssueId, String)],
-    ) -> Result<()> {
-        if heads.len() < 2 {
-            return Err(Error::Invalid(format!(
-                "record_merge requires >= 2 heads, got {}",
-                heads.len()
-            )));
-        }
-        if merged_issues.is_empty() {
-            return Err(Error::Invalid(
-                "record_merge requires at least one merged issue".into(),
-            ));
-        }
-
-        // 1. Build the merge commit. `jj new` with N positional
-        // revisions creates an N-parent merge change.
-        let summary = if merged_issues.len() == 1 {
-            format!("jjf: issue {} - merge", merged_issues[0].0)
-        } else {
-            format!("jjf: merge {} issues", merged_issues.len())
-        };
-        let ops: Vec<Op> = merged_issues
-            .iter()
-            .map(|(id, _)| Op::Merge {
-                issue_id: id.clone(),
-            })
-            .collect();
-        let jjf_at = now_rfc3339_nanos()?;
-        let msg = build_commit_message(&summary, &ops, &jjf_at);
-
-        // `jj new <r1> <r2> ... -m <msg>` — args are owned `String`s so
-        // we build a `Vec<&str>` before handing to `run`.
-        let mut argv: Vec<&str> = vec!["new"];
-        for h in heads {
-            argv.push(h.as_str());
-        }
-        argv.push("-m");
-        argv.push(&msg);
-        self.repo.run(&argv)?;
-
-        // 2. Write resolved bytes into the working copy. We don't read
-        // the existing content; we overwrite. jj snapshots on the next
-        // command.
-        let wc_root = self.repo.root();
-        for (id, bytes) in merged_issues {
-            let path = wc_root.join(issue_json_relpath(id));
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&path, bytes)?;
-        }
-
-        // 3. Point the bookmark at the new merge commit.
-        self.repo.run(&[
-            "bookmark",
-            "set",
-            ISSUES_BOOKMARK,
-            "-r",
-            "@",
-            "--allow-backwards",
-        ])?;
-
-        // 4. Step `@` off the bookmark so subsequent mutations don't
-        // snapshot the merge commit again.
-        self.repo.run(&["new", "root()"])?;
-
-        // Drop the in-process snapshot memo — the bookmark moved.
-        self.invalidate_snapshot_memo();
-
-        Ok(())
-    }
-
     /// Read the full op-by-op timeline for an issue, oldest first.
     ///
     /// Returns one [`HistoryEntry`] per `Jjf-Op:` stanza on the issue's
@@ -3826,127 +3552,12 @@ impl Storage {
     /// `timestamp`. Comment ops appear in the stream alongside scalar
     /// mutations — they're commits like any other.
     ///
-    /// Errors with `IssueNotFound` if no commit on the `issues`
-    /// bookmark touches this issue's files.
+    /// Errors with `IssueNotFound` if no commit on the per-issue ref
+    /// (`refs/jjf/issues/<id>`) carries a `Jjf-Op:` trailer for it.
     pub fn read_history(&self, id: &IssueId) -> Result<Vec<HistoryEntry>> {
-        // V3: walk the per-issue ref's commit chain via git, not jj's
-        // bookmark-spanning revset. Same `HistoryEntry` shape, same
-        // trailer parser; the only difference is the commit source.
-        if self.mode == StorageMode::V3 {
-            return history::read_history_at_v3(&self.git, id);
-        }
-        history::read_history(&self.repo, id)
-    }
-
-    /// Op-space resolver entry point. Discovers heads via
-    /// [`Storage::issues_heads`]; for each issue touched on any head,
-    /// walks each head's op chain via [`Storage::read_history_at`] and
-    /// reduces field-by-field per spec §6's ordering tuple. Returns
-    /// the merged state for every touched issue.
-    ///
-    /// **Does not land a commit.** Pair with
-    /// [`Storage::record_merge_op_space`] to write the merged record
-    /// + comments back and land a single merge commit with one
-    /// `Jjf-Op: merge` trailer per resolved issue.
-    ///
-    /// Returns an empty [`MergeReport`] if `issues_heads()` finds zero
-    /// or one head — there's no divergence to resolve.
-    pub fn resolve_divergence(&self) -> Result<MergeReport> {
-        let heads = self.issues_heads()?;
-        if heads.len() < 2 {
-            return Ok(MergeReport { issues: Vec::new() });
-        }
-        merge_ops::resolve(&self.repo, &heads)
-    }
-
-    /// Land the resolved merge as a single multi-parent commit on the
-    /// `issues` bookmark. Companion to [`Storage::resolve_divergence`]:
-    /// the report it returns plus the heads it walked feed straight
-    /// into this call.
-    ///
-    /// Behavior:
-    /// - Creates a merge commit with `heads` as its parents and one
-    ///   `Jjf-Op: merge` trailer per issue in `report` (spec §5.7).
-    /// - Writes the merged `issues/<id>.json` and
-    ///   `issues/<id>.comments.jsonl` for every issue in the report,
-    ///   overwriting whatever jj materialized in the merge's working
-    ///   copy (including the textual conflict markers).
-    /// - Points the `issues` bookmark at the merge commit and steps
-    ///   `@` off it, matching the 4-CLI dance.
-    ///
-    /// Errors with `Invalid` if `heads.len() < 2` (no merge needed) or
-    /// the report is empty (nothing to resolve — the caller should
-    /// pin the bookmark via the file-bytes path or do nothing).
-    pub fn record_merge_op_space(
-        &self,
-        heads: &[String],
-        report: &MergeReport,
-    ) -> Result<()> {
-        if heads.len() < 2 {
-            return Err(Error::Invalid(format!(
-                "record_merge_op_space requires >= 2 heads, got {}",
-                heads.len()
-            )));
-        }
-        if report.issues.is_empty() {
-            return Err(Error::Invalid(
-                "record_merge_op_space requires at least one resolved issue".into(),
-            ));
-        }
-
-        // 1. Build the merge commit. One `Jjf-Op: merge` per issue.
-        let summary = if report.issues.len() == 1 {
-            format!("jjf: issue {} - merge", report.issues[0].id)
-        } else {
-            format!("jjf: merge {} issues", report.issues.len())
-        };
-        let ops: Vec<Op> = report
-            .issues
-            .iter()
-            .map(|b| Op::Merge {
-                issue_id: b.id.clone(),
-            })
-            .collect();
-        let jjf_at = now_rfc3339_nanos()?;
-        let msg = build_commit_message(&summary, &ops, &jjf_at);
-
-        let mut argv: Vec<&str> = vec!["new"];
-        for h in heads {
-            argv.push(h.as_str());
-        }
-        argv.push("-m");
-        argv.push(&msg);
-        self.repo.run(&argv)?;
-
-        // 2. Write resolved bytes — record + comments — for every issue.
-        let wc_root = self.repo.root();
-        for merged in &report.issues {
-            let json_path = wc_root.join(issue_json_relpath(&merged.id));
-            if let Some(parent) = json_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            write_record_json(&json_path, &merged.record)?;
-            let comments_path = wc_root.join(issue_comments_relpath(&merged.id));
-            write_comments_jsonl(&comments_path, &merged.comments)?;
-        }
-
-        // 3. Pin the bookmark at the merge commit.
-        self.repo.run(&[
-            "bookmark",
-            "set",
-            ISSUES_BOOKMARK,
-            "-r",
-            "@",
-            "--allow-backwards",
-        ])?;
-
-        // 4. Step `@` off the bookmark.
-        self.repo.run(&["new", "root()"])?;
-
-        // Drop the in-process snapshot memo — the bookmark moved.
-        self.invalidate_snapshot_memo();
-
-        Ok(())
+        // Walk the per-issue ref's commit chain via git. Same
+        // `HistoryEntry` shape, same trailer parser.
+        history::read_history_at_v3(&self.git, id)
     }
 
     /// Push every issue and memory ref to `remote` via standard git
@@ -3968,19 +3579,7 @@ impl Storage {
     /// docstring) sorts auth / network / non-fast-forward signals into
     /// distinct surface errors.
     ///
-    /// **v3-only.** Calling this on a v2-mode Storage returns
-    /// `Error::Invalid` — v2 push goes through the bookmark transport
-    /// in `crates/jjf/src/main.rs::run_push`. Mode is locked at
-    /// `Storage::open` time; a v2 → v3 migration runs on open if the
-    /// env-var opt-out isn't set, so under normal operator use mode is
-    /// always V3 here.
     pub fn push_v3(&self, remote: &str) -> Result<PushReportV3> {
-        if self.mode != StorageMode::V3 {
-            return Err(Error::Invalid(
-                "push_v3 requires v3-shape storage; this repo is v2"
-                    .to_owned(),
-            ));
-        }
         // Push doesn't mutate local refs, so the cache key is
         // unchanged. The memo doesn't need to drop.
         sync_v3::push_v3(&self.git, remote)
@@ -4011,44 +3610,13 @@ impl Storage {
     /// writes the merged record into the merge commit's tree. There is
     /// no human-surface "unmergeable" failure mode in this path.
     ///
-    /// **v3-only.** See [`Storage::push_v3`] for the V2 fallback note.
     pub fn pull_v3(&self, remote: &str) -> Result<PullReportV3> {
-        if self.mode != StorageMode::V3 {
-            return Err(Error::Invalid(
-                "pull_v3 requires v3-shape storage; this repo is v2"
-                    .to_owned(),
-            ));
-        }
         // Pull mutates local refs (fast-forward, merge, copy-on-new),
         // so the cache must drop its in-process memo — the next read
         // re-probes the ref-set and rebuilds against the new tips.
         let report = sync_v3::pull_v3(&self.git, remote)?;
         self.invalidate_snapshot_memo();
         Ok(report)
-    }
-
-    /// Read the per-issue op chain rooted at an explicit revision
-    /// rather than the bookmark tip. The default
-    /// [`Storage::read_history`] is this with `rev = "bookmarks(issues)"`.
-    ///
-    /// Used by the op-space merge driver to walk each head of a
-    /// divergent `issues` bookmark independently: pass each entry of
-    /// [`Storage::issues_heads`] as `rev` to get that head's full op
-    /// chain in isolation. The returned [`HistoryEntry`] vector is in
-    /// chronological commit order (oldest first) — the LWW reducer
-    /// sorts by the spec §6 ordering tuple `(jjf_at_or_commit_time,
-    /// commit, trailer_index)` itself.
-    ///
-    /// `rev` can be any revset jj accepts (typically a change_id short
-    /// from `issues_heads()`, but `bookmarks(issues)`, a commit_id
-    /// short, or any other shape works). Errors with `IssueNotFound`
-    /// if no commit reachable from `rev` touches this issue's files.
-    pub fn read_history_at(
-        &self,
-        rev: &str,
-        id: &IssueId,
-    ) -> Result<Vec<HistoryEntry>> {
-        history::read_history_at(&self.repo, rev, id)
     }
 
     // ---- internals ---------------------------------------------------
@@ -4131,95 +3699,37 @@ impl Storage {
             MutateOutcome::Conflict(err) => return Err(err),
         };
         record.updated_at = now_rfc3339()?;
-        if self.mode == StorageMode::V3 {
-            // V3: build the new tree from the mutated record. The
-            // existing comments stream stays in the tree byte-for-
-            // byte; we re-read it and pass it back so the new commit
-            // carries the same `comments.jsonl` blob as the previous
-            // tip. Re-reading vs. structurally re-pointing matters
-            // because git computes the tree oid from the blob set —
-            // and a tree that "preserves" comments must literally
-            // re-list the blob.
-            let existing_comments = self.read_comments_from_bookmark(id)?;
-            let comments: Option<&[Comment]> = if existing_comments.is_empty() {
-                None
-            } else {
-                Some(existing_comments.as_slice())
-            };
-            self.commit_record_v3(id, &record, comments, summary, &ops)?;
-            return Ok(true);
-        }
-        let id_clone = id.clone();
-        self.commit_record_change(summary, &ops, |wc_root| {
-            write_record_json(&wc_root.join(issue_json_relpath(&id_clone)), &record)?;
-            Ok(())
-        })?;
+        // V3: build the new tree from the mutated record. The existing
+        // comments stream stays in the tree byte-for-byte; we re-read
+        // it and pass it back so the new commit carries the same
+        // `comments.jsonl` blob as the previous tip. Re-reading vs.
+        // structurally re-pointing matters because git computes the
+        // tree oid from the blob set — and a tree that "preserves"
+        // comments must literally re-list the blob.
+        let existing_comments = self.read_comments_from_bookmark(id)?;
+        let comments: Option<&[Comment]> = if existing_comments.is_empty() {
+            None
+        } else {
+            Some(existing_comments.as_slice())
+        };
+        self.commit_record_v3(id, &record, comments, summary, &ops)?;
         Ok(true)
     }
 
     /// Read the current record for `id` from authoritative storage.
     ///
-    /// In V2 mode this reads `issues/<id>.json` at the `issues`
-    /// bookmark tip. In V3 mode this reads `issue.json` from the tip
-    /// commit's tree on `refs/jjf/issues/<id>`. Either way, returns
-    /// [`Error::IssueNotFound`] if the issue doesn't exist.
+    /// Reads `issue.json` from the tip commit's tree on
+    /// `refs/jjf/issues/<id>`. Returns [`Error::IssueNotFound`] if the
+    /// issue doesn't exist.
     fn read_record_from_bookmark(&self, id: &IssueId) -> Result<IssueRecord> {
-        if self.mode == StorageMode::V3 {
-            return v3_write::read_record_v3(&self.git, id);
-        }
-        let relpath = issue_json_relpath(id);
-        let text = match self.repo.run(&[
-            "file",
-            "show",
-            "-r",
-            ISSUES_BOOKMARK_REVSET,
-            &format!("root:{}", relpath.display()),
-        ]) {
-            Ok(s) => s,
-            Err(_) => {
-                // jj returns non-zero if the path doesn't exist at that
-                // revision. Treat that as issue-not-found rather than
-                // surfacing the raw jj error — callers expect a typed
-                // signal.
-                return Err(Error::IssueNotFound(id.clone()));
-            }
-        };
-        Ok(serde_json::from_str(&text)?)
+        v3_write::read_record_v3(&self.git, id)
     }
 
     /// Read the current comments stream for `id` from authoritative
     /// storage. Returns an empty vec if no comments file is present
-    /// (the writer creates an empty file at issue-create time in V2;
-    /// in V3, the file is only present once the first comment lands).
+    /// (in v3, the file is only present once the first comment lands).
     fn read_comments_from_bookmark(&self, id: &IssueId) -> Result<Vec<Comment>> {
-        if self.mode == StorageMode::V3 {
-            return v3_write::read_comments_v3(&self.git, id);
-        }
-        let relpath = issue_comments_relpath(id);
-        let text = match self.repo.run(&[
-            "file",
-            "show",
-            "-r",
-            ISSUES_BOOKMARK_REVSET,
-            &format!("root:{}", relpath.display()),
-        ]) {
-            Ok(s) => s,
-            Err(_) => {
-                // Missing comments file => no comments. The record's
-                // existence is the source of truth on whether the issue
-                // exists; callers should check that first.
-                return Ok(Vec::new());
-            }
-        };
-        let mut out = Vec::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            out.push(serde_json::from_str(line)?);
-        }
-        Ok(out)
+        v3_write::read_comments_v3(&self.git, id)
     }
 
     /// Run the 4-CLI dance once. `summary` is the human-readable first
@@ -4279,269 +3789,20 @@ impl Storage {
         result.map(|_| ())
     }
 
-    /// On any jj failure whose stderr matches the concurrent-write
-    /// fingerprint, this surfaces [`Error::ConcurrentWrite`] with a
-    /// hint string. The caller is responsible for the retry decision
-    /// — most mutations re-read state on retry (so a stale snapshot
-    /// doesn't clobber a concurrent writer's landed work), which has
-    /// to happen in the higher-level mutator (`mutate`, `add_comment`,
-    /// `create_issue`), not here.
-    ///
-    /// On non-conflict failures the underlying [`Error`] surfaces
-    /// unchanged.
-    ///
-    /// In either failure case the snapshot memo is invalidated so a
-    /// subsequent retry / probe sees fresh state.
-    fn commit_record_change<F>(
-        &self,
-        summary: &str,
-        ops: &[Op],
-        apply: F,
-    ) -> Result<()>
-    where
-        F: FnOnce(&Path) -> Result<()>,
-    {
-        // Stamp every op stanza in this commit with the same nano-
-        // precision op-time (spec §5: `Jjf-At:` per stanza). The
-        // record-level `created_at`/`updated_at` use second resolution
-        // and are stamped separately by the per-verb mutators; only the
-        // trailer carries nanos.
-        let jjf_at = now_rfc3339_nanos()?;
-        let msg = build_commit_message(summary, ops, &jjf_at);
-
-        match self.try_commit_dance(&msg, apply) {
-            Ok(()) => {
-                self.invalidate_snapshot_memo();
-                Ok(())
-            }
-            Err(e) if is_concurrent_write(&e) => {
-                self.invalidate_snapshot_memo();
-                Err(Error::ConcurrentWrite {
-                    hint: "another writer landed first. Retry your command.".into(),
-                })
-            }
-            Err(e) => {
-                self.invalidate_snapshot_memo();
-                Err(e)
-            }
-        }
-    }
-
-    /// Inner helper for `commit_record_change`: runs the 4-CLI dance
-    /// once with an `apply` closure that takes a `&Path`. Returns the
-    /// raw `Result<(), Error>` so the caller can decide on retry vs.
-    /// translation. Doesn't invalidate the snapshot memo — the caller
-    /// is responsible (so failure paths can re-probe consistent
-    /// state).
-    fn try_commit_dance<F>(&self, msg: &str, apply: F) -> Result<()>
-    where
-        F: FnOnce(&Path) -> Result<()>,
-    {
-        // 1. jj new bookmarks(issues) -m '<msg>'
-        self.repo.run(&["new", ISSUES_BOOKMARK_REVSET, "-m", msg])?;
-
-        // 2. Edit the working copy. jj snapshots on the next command.
-        apply(self.repo.root())?;
-
-        // 3. jj bookmark set issues -r @ --allow-backwards
-        self.repo.run(&[
-            "bookmark",
-            "set",
-            ISSUES_BOOKMARK,
-            "-r",
-            "@",
-            "--allow-backwards",
-        ])?;
-
-        // 4. jj new root() — step @ off the bookmark.
-        self.repo.run(&["new", "root()"])?;
-
-        Ok(())
-    }
-
-    /// Run the 4-CLI dance for a memory mutation. Memory commits carry
-    /// a single `Jjf-Op: set-memory` or `unset-memory` trailer (no
-    /// `Jjf-Issue:`), so we build the message directly rather than via
-    /// [`build_commit_message`] (which assumes per-issue ops).
-    ///
-    /// Concurrent-write failures are translated to typed
-    /// [`Error::ConcurrentWrite`] for clean operator UX (rather than
-    /// the raw jj-internal vomit). Memory mutations are scalar LWW
-    /// writes per spec — the resolver will pick whichever stamp lands
-    /// later — so no in-storage retry is necessary; an operator that
-    /// races their own `jjf remember` can retry the command. Out of
-    /// scope for the v1 auto-retry policy per
-    /// `qa-concurrent-write-ux`.
-    fn commit_memory_change<F>(&self, msg: &str, apply: F) -> Result<()>
-    where
-        F: FnOnce(&Path) -> Result<()>,
-    {
-        match self.try_commit_dance(msg, apply) {
-            Ok(()) => {
-                self.invalidate_snapshot_memo();
-                Ok(())
-            }
-            Err(e) if is_concurrent_write(&e) => {
-                self.invalidate_snapshot_memo();
-                Err(Error::ConcurrentWrite {
-                    hint: "another writer landed first. Retry your command.".into(),
-                })
-            }
-            Err(e) => {
-                self.invalidate_snapshot_memo();
-                Err(e)
-            }
-        }
-    }
-
     /// Read a single memory by key from authoritative storage.
-    /// Returns `Ok(None)` if the key doesn't exist (V2: no
-    /// `memories/<key>.json`; V3: no `refs/jjf/memories/<key>`, or
-    /// the ref's tip carries an empty tree from an `unset` op).
+    /// Returns `Ok(None)` if the key doesn't exist (no
+    /// `refs/jjf/memories/<key>`, or the ref's tip carries an empty
+    /// tree from an `unset` op).
     fn read_memory_from_bookmark(&self, key: &str) -> Result<Option<Memory>> {
-        if self.mode == StorageMode::V3 {
-            return v3_write::read_memory_v3(&self.git, key);
-        }
-        let relpath = memory::memory_json_relpath(key);
-        let text = match self.repo.run(&[
-            "file",
-            "show",
-            "-r",
-            ISSUES_BOOKMARK_REVSET,
-            &format!("root:{}", relpath.display()),
-        ]) {
-            Ok(s) => s,
-            Err(_) => return Ok(None),
-        };
-        Ok(Some(serde_json::from_str(&text)?))
-    }
-
-    /// Enumerate every memory key present in `memories/<key>.json` at
-    /// the `issues` bookmark tip. Sorted ascending, deduplicated.
-    ///
-    /// Kept around as a typed primitive even though `list_memories`
-    /// now uses the snapshot cache — internal callers that only
-    /// need keys can still use this without paying the full
-    /// per-record parse.
-    #[allow(dead_code)]
-    fn list_memory_keys(&self) -> Result<Vec<String>> {
-        let text = match self.repo.run(&[
-            "file",
-            "list",
-            "-r",
-            ISSUES_BOOKMARK_REVSET,
-            "-T",
-            "path ++ \"\\n\"",
-            "root:memories/",
-        ]) {
-            Ok(s) => s,
-            // No memories directory yet — empty list.
-            Err(_) => return Ok(Vec::new()),
-        };
-        let mut keys: Vec<String> = Vec::new();
-        for line in text.lines() {
-            let line = line.trim();
-            let Some(rest) = line.strip_prefix("memories/") else {
-                continue;
-            };
-            let Some(stem) = rest.strip_suffix(".json") else {
-                continue;
-            };
-            // Defensive: reject any path with directory separators.
-            if stem.contains('/') {
-                continue;
-            }
-            keys.push(stem.to_owned());
-        }
-        keys.sort();
-        keys.dedup();
-        Ok(keys)
+        v3_write::read_memory_v3(&self.git, key)
     }
 
     /// Does this issue id already have a record in authoritative
     /// storage? Used for the collision retry in `create_issue` and
     /// for phantom-dep validation at draft time.
     fn issue_exists_on_bookmark(&self, id: &IssueId) -> Result<bool> {
-        if self.mode == StorageMode::V3 {
-            return v3_write::issue_exists_v3(&self.git, id);
-        }
-        let relpath = issue_json_relpath(id);
-        // `jj file show` exits non-zero if the path is absent at the
-        // requested revision. We don't distinguish "missing file" from
-        // "jj broke"; the latter is vanishingly unlikely here and the
-        // next jj call in `commit_record_change` will surface it.
-        Ok(self
-            .repo
-            .run(&[
-                "file",
-                "show",
-                "-r",
-                ISSUES_BOOKMARK_REVSET,
-                &format!("root:{}", relpath.display()),
-            ])
-            .is_ok())
+        v3_write::issue_exists_v3(&self.git, id)
     }
-}
-
-// ---- record I/O ------------------------------------------------------
-
-/// Relative path of an issue's JSON record from repo root.
-pub(crate) fn issue_json_relpath(id: &IssueId) -> PathBuf {
-    PathBuf::from("issues").join(format!("{}.json", id))
-}
-
-/// Relative path of an issue's comments file from repo root.
-pub(crate) fn issue_comments_relpath(id: &IssueId) -> PathBuf {
-    PathBuf::from("issues").join(format!("{}.comments.jsonl", id))
-}
-
-/// Pre-cutover v1 path of an issue's JSON record (`bugs/<id>.json`).
-/// Records were renamed to `issues/<id>.*` before J5 removed the
-/// migrators, but commits *prior* to that rename touched the v1 paths.
-/// The history walker and read replay query include BOTH paths in
-/// their `jj log` filter so they don't drop pre-cutover ops out of the
-/// per-issue chain.
-pub(crate) fn v1_issue_json_relpath(id: &IssueId) -> PathBuf {
-    PathBuf::from("bugs").join(format!("{}.json", id))
-}
-
-/// Pre-migration v1 path of an issue's comments file. See
-/// [`v1_issue_json_relpath`] for why both paths are needed.
-pub(crate) fn v1_issue_comments_relpath(id: &IssueId) -> PathBuf {
-    PathBuf::from("bugs").join(format!("{}.comments.jsonl", id))
-}
-
-fn write_record_json(path: &Path, record: &IssueRecord) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut s = serde_json::to_string_pretty(record)?;
-    s.push('\n');
-    std::fs::write(path, s)?;
-    Ok(())
-}
-
-fn write_memory_json(path: &Path, mem: &Memory) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut s = serde_json::to_string_pretty(mem)?;
-    s.push('\n');
-    std::fs::write(path, s)?;
-    Ok(())
-}
-
-fn write_comments_jsonl(path: &Path, comments: &[Comment]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut s = String::new();
-    for c in comments {
-        s.push_str(&serde_json::to_string(c)?);
-        s.push('\n');
-    }
-    std::fs::write(path, s)?;
-    Ok(())
 }
 
 // ---- commit message --------------------------------------------------

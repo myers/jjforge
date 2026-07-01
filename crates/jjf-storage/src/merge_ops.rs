@@ -45,10 +45,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::history::HistoryEntry;
 use crate::id::IssueId;
-use crate::jj::JjRepo;
 use crate::op::Op;
 use crate::record::{Comment, DepEdge, DepKind, IssueRecord, IssueType};
-use crate::{issue_comments_relpath, issue_json_relpath, Error, Result};
+use crate::{Error, Result};
 
 /// One issue after the op-space reducer has folded all heads' chains
 /// into a single winning state. The merged on-disk file
@@ -61,10 +60,9 @@ pub struct MergedIssue {
     pub comments: Vec<Comment>,
 }
 
-/// What [`super::Storage::resolve_divergence`] returns: one
-/// [`MergedIssue`] per issue that needed resolution. An issue that
-/// exists only on one head still appears here so the caller can write
-/// its bytes into the merge commit's working copy without
+/// A batch of resolved issues: one [`MergedIssue`] per issue that
+/// needed resolution. An issue that exists only on one head still
+/// appears here so the caller can write its bytes without
 /// special-casing.
 #[derive(Debug, Clone)]
 pub struct MergeReport {
@@ -116,108 +114,20 @@ pub(crate) fn sort_entries_lww(entries: &mut [HistoryEntry]) {
     entries.sort_by(|a, b| OpKey::from_entry(a).cmp(&OpKey::from_entry(b)));
 }
 
-/// Run the op-space resolver against the given heads. Returns one
-/// [`MergedIssue`] per issue touched by any head's chain.
-///
-/// Errors:
-/// - `IssueNotFound` is impossible here — we only consider issues that
-///   at least one head saw, and `read_history_at` only returns
-///   `IssueNotFound` when we ask it about an issue no commit touches.
-/// - `Jj` if any of the `jj log` / `jj file show` shell-outs fail.
-pub(crate) fn resolve(repo: &JjRepo, heads: &[String]) -> Result<MergeReport> {
-    if heads.is_empty() {
-        return Ok(MergeReport { issues: Vec::new() });
-    }
-
-    // 1. Enumerate every issue id that appears on any head. Reuse the
-    //    same `issues/` directory listing pattern `list_ids` uses, but
-    //    parameterized on the head rev so we don't accidentally
-    //    enumerate the bookmark tip's view.
-    let mut issue_ids: BTreeSet<IssueId> = BTreeSet::new();
-    for head in heads {
-        for id in list_ids_at(repo, head)? {
-            issue_ids.insert(id);
-        }
-    }
-
-    let mut out: Vec<MergedIssue> = Vec::new();
-    for id in issue_ids {
-        let merged = resolve_one(repo, heads, &id)?;
-        out.push(merged);
-    }
-
-    Ok(MergeReport { issues: out })
-}
-
-/// List every issue id present in `issues/<id>.json` at the given rev.
-fn list_ids_at(repo: &JjRepo, rev: &str) -> Result<Vec<IssueId>> {
-    let text = repo.run(&[
-        "file",
-        "list",
-        "-r",
-        rev,
-        "-T",
-        "path ++ \"\\n\"",
-        "root:issues/",
-    ])?;
-    let mut ids: Vec<IssueId> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("issues/") else {
-            continue;
-        };
-        let Some(stem) = rest.strip_suffix(".json") else {
-            continue;
-        };
-        if let Ok(id) = IssueId::parse(stem) {
-            ids.push(id);
-        }
-    }
-    Ok(ids)
-}
-
 /// Per-head structural snapshot the pure reducer consumes. The reducer
 /// uses the op chain for everything that can be op-replayed
 /// (title/status/labels/…); the rendered files provide body bytes
 /// (matched to the winning `SetBody` hash) and comment bodies
 /// (matched to `CommentAdd` ids).
 ///
-/// Lifted out of `resolve_one` so the pure-reduction step
-/// [`reduce_to_merged`] is reachable from the unit-test module without
-/// a real `JjRepo`. The full operator path still goes through
-/// `resolve_one` → `reduce_to_merged`; this struct is the seam between
-/// the I/O loader and the pure folder.
+/// The v3 pull-merge driver (`sync_v3.rs`) builds one of these per head
+/// from the git-based per-issue ref walk, then hands the slice to
+/// [`reduce_to_merged`]; this struct is the seam between the I/O loader
+/// and the pure folder.
 pub(crate) struct HeadSnapshot {
     pub record: Option<IssueRecord>,
     pub comments: Vec<Comment>,
     pub entries: Vec<HistoryEntry>,
-}
-
-/// Replay one issue across every head and produce the merged
-/// [`MergedIssue`].
-///
-/// For each head:
-/// - Walk its op chain via `read_history_at`.
-/// - Read its rendered record + comments file (if present) so we can
-///   look up body bytes by hash and union comment bodies by id.
-fn resolve_one(repo: &JjRepo, heads: &[String], id: &IssueId) -> Result<MergedIssue> {
-    let mut snapshots: Vec<HeadSnapshot> = Vec::with_capacity(heads.len());
-    for head in heads {
-        let entries = match super::history::read_history_at(repo, head, id) {
-            Ok(v) => v,
-            Err(Error::IssueNotFound(_)) => Vec::new(),
-            Err(e) => return Err(e),
-        };
-        let record = read_record_at(repo, head, id)?;
-        let comments = read_comments_at(repo, head, id)?;
-        snapshots.push(HeadSnapshot {
-            record,
-            comments,
-            entries,
-        });
-    }
-
-    reduce_to_merged(id, &snapshots)
 }
 
 /// Pure reducer: given each head's `(entries, record, comments)`
@@ -504,49 +414,6 @@ pub(crate) fn reduce_to_merged(
         record,
         comments,
     })
-}
-
-/// Read `issues/<id>.json` at `rev`. Returns `Ok(None)` if the file is
-/// absent at that revision (e.g. one head deleted it, which v1 doesn't
-/// actually support but we tolerate defensively).
-fn read_record_at(repo: &JjRepo, rev: &str, id: &IssueId) -> Result<Option<IssueRecord>> {
-    let relpath = issue_json_relpath(id);
-    let text = match repo.run(&[
-        "file",
-        "show",
-        "-r",
-        rev,
-        &format!("root:{}", relpath.display()),
-    ]) {
-        Ok(s) => s,
-        Err(_) => return Ok(None),
-    };
-    Ok(Some(serde_json::from_str(&text)?))
-}
-
-/// Read `issues/<id>.comments.jsonl` at `rev`. Missing file => no
-/// comments. JSON-line errors bubble up as `Error::Json`.
-fn read_comments_at(repo: &JjRepo, rev: &str, id: &IssueId) -> Result<Vec<Comment>> {
-    let relpath = issue_comments_relpath(id);
-    let text = match repo.run(&[
-        "file",
-        "show",
-        "-r",
-        rev,
-        &format!("root:{}", relpath.display()),
-    ]) {
-        Ok(s) => s,
-        Err(_) => return Ok(Vec::new()),
-    };
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        out.push(serde_json::from_str(line)?);
-    }
-    Ok(out)
 }
 
 /// Pick the `created_at` value from an entry: prefer the truncated

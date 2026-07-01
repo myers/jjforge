@@ -7,19 +7,11 @@
 //! return typed results. No knowledge of issues, refs, or jjforge
 //! semantics — those live in [`crate::v3_write`].
 //!
-//! ## Why a separate wrapper from [`crate::jj::JjRepo`]?
-//!
-//! - We want a different subprocess (`git` vs `jj`). The two binaries
-//!   have different exit-status conventions and different stderr
-//!   shapes; one wrapper-per-CLI keeps the error-translation logic
-//!   sharp.
-//! - The v3 write path NEVER calls `jj`. Keeping the v3 helpers in a
-//!   dedicated module makes that contract grep-checkable (per ticket
-//!   `eb42f50`: "No `jj` subprocess invoked on a v3 write path.
-//!   Verify by grepping the write path code; no `Command::new(\"jj\")`.").
-//! - Future v3 read-path work (ticket `6e2c843`) ports over the same
-//!   set of helpers; centralizing them now means that ticket is a
-//!   pure caller-side refactor.
+//! The storage layer talks to `git` exclusively — there is no longer
+//! any `jj` subprocess anywhere in the codebase (the old `JjRepo`
+//! wrapper and the jj-based op-space merge resolver were deleted). The
+//! "no `Command::new(\"jj\")`" contract (ticket `eb42f50`) is now a
+//! whole-crate invariant, not just a per-module one.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -30,9 +22,7 @@ use std::process::{Command, Output, Stdio};
 /// semantics on the v3 write path's `create_issue` case.
 pub(crate) const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
-/// Handle to a colocated git repo. Built once per [`crate::Storage`]
-/// alongside [`crate::jj::JjRepo`]; the two coexist and share the same
-/// repo root on disk.
+/// Handle to a colocated git repo. Built once per [`crate::Storage`].
 #[derive(Debug, Clone)]
 pub(crate) struct GitRepo {
     /// Absolute path to the git work-tree root. We pass `--git-dir`
@@ -51,11 +41,8 @@ impl GitRepo {
         Self { root }
     }
 
-    /// Kept around as a future-facing accessor — the v3 read path
-    /// (ticket `6e2c843`) will want to project the repo root for
-    /// snapshot-cache placement, mirroring [`crate::jj::JjRepo::root`].
-    /// Suppressed via `dead_code` until that ticket lands.
-    #[allow(dead_code)]
+    /// The absolute git work-tree root this handle is rooted at. Used
+    /// by the snapshot-cache placement and `Storage::repo_root`.
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
@@ -635,9 +622,9 @@ pub(crate) struct WalkedCommit {
     pub(crate) message: String,
 }
 
-/// Typed error from the git CLI wrapper. Mirrors the shape of
-/// [`crate::jj::JjError`] so the storage-side error translation can
-/// reuse the same "is this a CAS / concurrent-write failure?" pattern.
+/// Typed error from the git CLI wrapper. Carries the "is this a CAS /
+/// concurrent-write failure?" detector ([`GitError::is_concurrent_write`])
+/// the storage-side error translation keys off.
 #[derive(Debug, thiserror::Error)]
 pub enum GitError {
     #[error("spawning git: {0}")]

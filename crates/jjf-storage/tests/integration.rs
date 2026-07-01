@@ -53,10 +53,15 @@ fn make_empty_jj_repo(name: &str) -> PathBuf {
 /// Build a scratch directory that's NOT a jj repo. Used by the
 /// `Storage::init` typed-error test.
 fn make_non_jj_dir(name: &str) -> PathBuf {
-    let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join(".scratch")
-        .join(name);
+    // Use the system temp dir, NOT a path under the crate tree: the
+    // crate tree is itself inside jjforge's own git repo, and the v3
+    // init probe (`git rev-parse`) walks ancestors, so a subdir of the
+    // repo would resolve to the outer repo and init would succeed. A
+    // temp-dir path is outside any git repo, so the probe genuinely
+    // fails. (The old jj-based probe used exact `--repository` paths
+    // and didn't ancestor-walk, which is why this previously worked
+    // from inside the tree.)
+    let scratch = std::env::temp_dir().join("jjf-storage-tests").join(name);
     if scratch.exists() {
         fs::remove_dir_all(&scratch).unwrap();
     }
@@ -1134,11 +1139,18 @@ fn init_is_idempotent_on_v3_repo() {
 }
 
 #[test]
-fn init_outside_any_jj_repo_returns_typed_error() {
+fn init_outside_any_git_repo_returns_typed_error() {
+    // `Storage::init` no longer spawns `jj` — it plants the v3 sentinel
+    // via git plumbing. On a directory that isn't a git repo, the
+    // `git rev-parse` sentinel probe fails, so init surfaces a typed
+    // `Error::Git` rather than the (deleted) jj-probe's `NotAJjRepo`.
+    // The binary's `preflight::jj_repo` is what now maps a non-repo cwd
+    // to the operator-facing `NotAJjRepo` (exit 2) — see the `jjf init`
+    // tests in `crates/jjf/tests/init.rs`.
     let bare = make_non_jj_dir("init_no_repo");
     match Storage::init(&bare) {
-        Err(jjf_storage::Error::NotAJjRepo(got)) => assert_eq!(got, bare),
-        other => panic!("expected NotAJjRepo, got {:?}", other),
+        Err(jjf_storage::Error::Git(_)) => {}
+        other => panic!("expected Error::Git, got {:?}", other),
     }
 }
 

@@ -42,19 +42,12 @@
 //! operator runs `jjf remember "<insight>"` without `--key` — the value
 //! gets slugified to derive the key.
 
-use std::path::PathBuf;
-
 /// Maximum memory-value length the inline trailer can carry without
 /// risking a folded git-trailer continuation. Long values are still
 /// stored in full in the on-disk JSON file; only the inline
 /// `Jjf-Memory-Value:` trailer is truncated. Picked at 200 chars to
 /// match git's recommended trailer-value brevity convention.
 const TRAILER_VALUE_TRUNC: usize = 200;
-
-/// Relative path of a memory's JSON record from repo root.
-pub(crate) fn memory_json_relpath(key: &str) -> PathBuf {
-    PathBuf::from("memories").join(format!("{}.json", key))
-}
 
 /// Convert a free-text insight to a kebab-case slug suitable for use as
 /// a memory key. Port of beads' `slugify()` from
@@ -204,12 +197,6 @@ mod tests {
         let slug = slugify(s);
         assert!(slug.len() <= 60, "got len={}, slug={}", slug.len(), slug);
         assert!(!slug.ends_with('-'));
-    }
-
-    #[test]
-    fn memory_json_relpath_shape() {
-        let p = memory_json_relpath("dolt-phantoms");
-        assert_eq!(p, PathBuf::from("memories/dolt-phantoms.json"));
     }
 
     #[test]

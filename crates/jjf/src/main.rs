@@ -1684,7 +1684,6 @@ impl CliError {
             CliError::Storage(StorageError::Clock(_)) => "clock_error",
             CliError::Storage(StorageError::Io(_)) => "io_error",
             CliError::Storage(StorageError::Json(_)) => "json_error",
-            CliError::Storage(StorageError::Jj(_)) => "jj_error",
             // v3 storage (`docs/storage-out-of-tree.md`, ticket
             // `eb42f50`): the v3 write path spawns `git` directly
             // rather than `jj`. A non-CAS git failure surfaces here.
@@ -2164,6 +2163,13 @@ enum DepOp {
 /// expected to act on the value besides logging it.
 fn run_init(json: bool) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
+    // Preflight: is cwd inside a git repo at all? A non-git directory
+    // surfaces the typed `NotAJjRepo` error (exit 2, "run inside a
+    // repo") rather than the raw `git_error` (exit 1) that
+    // `Storage::init`'s sentinel probe would otherwise emit. Storage
+    // no longer spawns `jj`, so this probe lives in the binary
+    // alongside the other `preflight` checks.
+    preflight::jj_repo(&cwd)?;
     Storage::init(&cwd)?;
 
     // Back-fill the v3 fetch refspec for every git remote already
