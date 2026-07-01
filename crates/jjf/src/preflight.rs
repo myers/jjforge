@@ -1,8 +1,7 @@
 //! Pre-storage probes the binary runs before handing off to
 //! `jjf-storage`. Today there's exactly one — [`issues_bookmark`] —
 //! but it lives in its own module so every read/write verb calls the
-//! same implementation rather than each open-coding the same two `jj`
-//! shell-outs.
+//! same implementation rather than each open-coding the same probes.
 //!
 //! # Why this is in the binary, not the storage crate
 //!
@@ -32,9 +31,9 @@ use crate::CliError;
 /// crate doesn't expose its `V1_BUGS_BOOKMARK` constant publicly.
 const V1_BUGS_BOOKMARK: &str = "bugs";
 
-/// Probe that `cwd` is inside a jj repo. Shells out to `jj workspace
-/// root` and translates the one specific "not a jj repo" stderr into
-/// `NotAJjRepo`; everything else becomes a generic `Probe` failure.
+/// Probe that `cwd` is inside a git repo. Shells out to `git rev-parse
+/// --git-dir` and translates a non-zero exit into `NotAJjRepo`;
+/// everything else becomes a generic `Probe` failure.
 ///
 /// Callers that ALSO need the `issues` bookmark (every read/write
 /// verb that touches an existing issue) should use

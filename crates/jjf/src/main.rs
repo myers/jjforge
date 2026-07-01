@@ -3195,19 +3195,20 @@ fn render_dep_tree_text(node: &DepTreeNode, depth: usize) {
     }
 }
 
-/// `jjf remote add <name> <url>` — wrap `jj git remote add <name>
-/// <url>` against the cwd's jj repo.
+/// `jjf remote add <name> <url>` — wrap `git remote add <name> <url>`
+/// against the cwd's git repo.
 ///
-/// jj does the actual remote-add work; we translate the two specific
+/// git does the actual remote-add work; we translate the two specific
 /// error stderrs we recognize (`already exists`, anything else) into
 /// typed `CliError` variants so `kind()` stays stable. URL syntax
-/// validation is jj's responsibility — we accept what it accepts and
+/// validation is git's responsibility — we accept what it accepts and
 /// surface its rejection unchanged.
 ///
-/// Preflight is jj-repo-only (no `issues` bookmark required), because
-/// adding a remote is meaningful before `jjf init` runs.
+/// Preflight is the repo-existence check only (no `issues` bookmark
+/// required), because adding a remote is meaningful before `jjf init`
+/// runs.
 ///
-/// After jj registers the remote we also add the v3 fetch refspec
+/// After git registers the remote we also add the v3 fetch refspec
 /// (`+refs/jjf/*:refs/remotes/<name>/jjf/*`) to `.git/config`. Without
 /// this, a plain `git fetch <name>` carries refs under `refs/heads/*`
 /// only and leaves the jjforge namespace empty on the new clone (see
@@ -3323,13 +3324,14 @@ fn ensure_jjf_fetch_refspec(cwd: &Path, remote: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `jjf remote ls` — wrap `jj git remote list` and re-render its
-/// output as tab-separated `<name>\t<url>` lines.
+/// `jjf remote ls` — wrap `git remote -v` and re-render its output as
+/// tab-separated `<name>\t<url>` lines.
 ///
-/// jj's own output uses SPACE as the column separator; we re-render
-/// because every other `ls`-style verb in jjforge emits tab-separated
-/// columns, and a stable separator means downstream `cut -f1` /
-/// `awk -F'\t'` pipelines don't have to guess at column widths.
+/// `git remote -v` prints two lines per remote (fetch + push); we
+/// dedupe to fetch-only and re-render because every other `ls`-style
+/// verb in jjforge emits tab-separated columns, and a stable separator
+/// means downstream `cut -f1` / `awk -F'\t'` pipelines don't have to
+/// guess at column widths.
 ///
 /// `--json` emits a JSON array of `{name, url}` objects. Empty result
 /// is `[]` (per the same `ls` / `show` convention — scripts piping to
@@ -3400,16 +3402,12 @@ fn run_remote_ls(json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-/// `jjf remote rm <name>` — wrap `jj git remote remove <name>`.
-///
-/// Note: jj also forgets bookmarks tracked from the removed remote
-/// (that's jj's behavior, not ours — it's why the underlying command
-/// is `remove`, not `rm`). Documented in the help text so a user
-/// stripping a remote after a pull doesn't get a surprise.
+/// `jjf remote rm <name>` — wrap `git remote remove <name>`.
 ///
 /// Preflight + error mapping mirror `run_remote_add`. Stderr matching
-/// on `No git remote named` is the typed `RemoteNotFound` (exit 2);
-/// anything else falls through to `JjGitRemote` (exit 1).
+/// on git's `No such remote` phrase (`error: No such remote: '<name>'`
+/// / `fatal: No such remote ...`) is the typed `RemoteNotFound`
+/// (exit 2); anything else falls through to `JjGitRemote` (exit 1).
 fn run_remote_rm(json: bool, name: String) -> Result<(), CliError> {
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
