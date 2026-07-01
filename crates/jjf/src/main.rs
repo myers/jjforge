@@ -841,10 +841,10 @@ enum Commands {
         key: String,
     },
 
-    /// Push the `issues` bookmark to a git remote. Wraps
-    /// `jj git push --bookmark issues --remote <remote>`.
+    /// Push the `refs/jjf/*` issue refs to a git remote via plain git
+    /// transport (v3 refspec: `refs/jjf/*:refs/jjf/*`).
     ///
-    /// Preflight: full `issues_bookmark` probe (the bookmark must
+    /// Preflight: full `issues_bookmark` probe (the sentinel ref must
     /// exist locally — there's nothing to push otherwise). Unknown
     /// remote surfaces as `remote_not_found` (exit 2); network /
     /// auth / non-fast-forward failures are runtime (exit 1) under
@@ -1011,27 +1011,12 @@ enum Commands {
         meta: Vec<(String, String)>,
     },
 
-    /// Pull the `issues` bookmark from a git remote, then merge any
-    /// divergence into a single commit via the jjforge merge driver.
+    /// Fetch the `refs/jjf/*` issue refs from a git remote via plain
+    /// git transport and reconcile them into the local issue store.
     ///
-    /// Sequence:
-    ///
-    /// 1. `jj git fetch --remote <remote>`. Network / auth failures
-    ///    bubble up as typed runtime errors (exit 1).
-    /// 2. If the remote bookmark `issues@<remote>` exists but the
-    ///    local `issues` doesn't yet track it, run
-    ///    `jj bookmark track issues --remote=<remote>` so subsequent
-    ///    fetches see new commits as bookmark moves rather than as new
-    ///    untracked remote bookmarks.
-    /// 3. If the bookmark is now in a divergent ("conflicted") state —
-    ///    `heads(bookmarks(issues))` resolves to >1 commit — run the
-    ///    merge driver: for each conflicted `issues/<id>.json`, call
-    ///    `jjf_merge::resolve` and write the result back. Lands a
-    ///    single merge commit on `issues` with one `Jjf-Op: merge`
-    ///    trailer per resolved issue (spec §5.2 / §5.5).
-    /// 4. If the remote has no `issues` bookmark yet (the other side
-    ///    hasn't pushed), exit 0 with `remote_present: false` in the
-    ///    JSON envelope. Not an error.
+    /// Network / auth failures bubble up as typed runtime errors
+    /// (exit 1). If the remote has no `refs/jjf/*` refs yet, exits 0
+    /// with `remote_present: false` in the JSON envelope — not an error.
     Pull {
         /// Remote name (must already be configured via
         /// `jjf remote add <name> <url>`).
@@ -4614,9 +4599,6 @@ fn slug_matches(issue: &Issue, pattern: Option<&str>) -> bool {
 /// match libgit2's stable phrases so a stderr-format tweak on either
 /// side stays detectable.
 ///
-/// **V2 fallback.** If the repo is still v2-shape (env-var opt-out of
-/// the migrator set in tests), this verb falls back to
-/// `jj git push --bookmark issues` — the v2 transport. Operators don't
 /// Preflight: full `issues_bookmark` probe — the v3 sentinel ref must
 /// exist locally for there to be anything to push.
 fn run_push(json: bool, remote: String) -> Result<(), CliError> {
