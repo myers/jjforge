@@ -244,7 +244,7 @@ fn ready_type_priority_sort_puts_bug_first() {
 
 #[test]
 fn ready_in_non_jj_directory_exits_two() {
-    let dir = scratch("ready_non_jj");
+    let dir = scratch_non_git("ready_non_jj");
     let out = run_jjf(&dir, &["ready"]);
     assert!(!out.status.success(), "ready in non-jj dir should fail");
     assert_eq!(out.status.code(), Some(2));
@@ -277,7 +277,7 @@ fn ready_in_jj_repo_without_issues_bookmark_exits_two_with_init_hint() {
 #[test]
 fn ready_json_error_envelope_on_non_jj_directory() {
     // `--json` outside a jj repo: error envelope on stderr.
-    let dir = scratch("ready_json_err_non_jj");
+    let dir = scratch_non_git("ready_json_err_non_jj");
     let out = run_jjf(&dir, &["--json", "ready"]);
     assert!(!out.status.success());
     assert_eq!(out.status.code(), Some(2));

@@ -24,6 +24,19 @@ pub(crate) fn scratch(name: &str) -> PathBuf {
     fs::canonicalize(&dir).unwrap()
 }
 
+/// Create a scratch directory that is guaranteed to be OUTSIDE any git
+/// repo. Used by tests that assert "not a git repo" preflight behavior.
+/// Lives under `std::env::temp_dir()` so it cannot be inside the
+/// jjforge source tree (which is itself a git repo).
+pub(crate) fn scratch_non_git(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join("jjf-tests").join(name);
+    if dir.exists() {
+        fs::remove_dir_all(&dir).unwrap();
+    }
+    fs::create_dir_all(&dir).unwrap();
+    fs::canonicalize(&dir).unwrap()
+}
+
 pub(crate) fn make_jj_repo(name: &str) -> PathBuf {
     let dir = scratch(name);
     let out = Command::new("jj")

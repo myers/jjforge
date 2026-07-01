@@ -3217,15 +3217,15 @@ fn run_remote_add(json: bool, name: String, url: String) -> Result<(), CliError>
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
     preflight::jj_repo(&cwd)?;
 
-    let out = std::process::Command::new("jj")
-        .arg("--repository")
+    let out = std::process::Command::new("git")
+        .arg("-C")
         .arg(&cwd)
-        .args(["git", "remote", "add", &name, &url])
+        .args(["remote", "add", &name, &url])
         .output()
         .map_err(CliError::Probe)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        // jj's canonical phrase: `Error: Git remote named '<name>' already exists`.
+        // git's phrase: `error: remote <name> already exists.`
         if stderr.contains("already exists") {
             return Err(CliError::RemoteAlreadyExists(name));
         }
@@ -3340,10 +3340,10 @@ fn run_remote_ls(json: bool) -> Result<(), CliError> {
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
     preflight::jj_repo(&cwd)?;
 
-    let out = std::process::Command::new("jj")
-        .arg("--repository")
+    let out = std::process::Command::new("git")
+        .arg("-C")
         .arg(&cwd)
-        .args(["git", "remote", "list"])
+        .args(["remote", "-v"])
         .output()
         .map_err(CliError::Probe)?;
     if !out.status.success() {
@@ -3353,18 +3353,29 @@ fn run_remote_ls(json: bool) -> Result<(), CliError> {
     }
 
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // `git remote -v` prints two lines per remote:
+    //   <name>\t<url> (fetch)
+    //   <name>\t<url> (push)
+    // We dedupe by collecting only the fetch lines (those ending with
+    // ` (fetch)`), which appear first for each remote. Using a
+    // Vec to preserve insertion order.
+    let mut seen = std::collections::HashSet::new();
     let remotes: Vec<(String, String)> = stdout
         .lines()
         .filter_map(|line| {
             let line = line.trim();
-            if line.is_empty() {
+            if line.is_empty() || !line.ends_with("(fetch)") {
                 return None;
             }
-            // jj emits `<name> <url>` — split on the FIRST whitespace
-            // run so URLs containing spaces (rare but possible for
-            // local paths on weirdly-named directories) stay intact.
-            let (name, url) = line.split_once(char::is_whitespace)?;
-            Some((name.to_owned(), url.trim().to_owned()))
+            // Format: `<name>\t<url> (fetch)`
+            let (name, rest) = line.split_once('\t')?;
+            // Strip trailing " (fetch)"
+            let url = rest.trim_end_matches("(fetch)").trim();
+            if seen.insert(name.to_owned()) {
+                Some((name.to_owned(), url.to_owned()))
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -3404,16 +3415,17 @@ fn run_remote_rm(json: bool, name: String) -> Result<(), CliError> {
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
     preflight::jj_repo(&cwd)?;
 
-    let out = std::process::Command::new("jj")
-        .arg("--repository")
+    let out = std::process::Command::new("git")
+        .arg("-C")
         .arg(&cwd)
-        .args(["git", "remote", "remove", &name])
+        .args(["remote", "remove", &name])
         .output()
         .map_err(CliError::Probe)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        // jj's canonical phrase: `Error: No git remote named '<name>'`.
-        if stderr.contains("No git remote named") {
+        // git's phrase: `error: No such remote: '<name>'` or
+        // `fatal: No such remote ...`
+        if stderr.contains("No such remote") {
             return Err(CliError::RemoteNotFound(name));
         }
         return Err(CliError::JjGitRemote(stderr.trim().to_owned()));

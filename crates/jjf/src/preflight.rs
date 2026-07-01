@@ -42,22 +42,16 @@ const V1_BUGS_BOOKMARK: &str = "bugs";
 /// bookmark check. Callers that meaningfully run before `jjf init`
 /// (today: `jjf remote add|ls|rm`) call this one directly.
 pub(crate) fn jj_repo(cwd: &Path) -> Result<(), CliError> {
-    let out = Command::new("jj")
-        .arg("--repository")
+    let out = Command::new("git")
+        .arg("-C")
         .arg(cwd)
-        .args(["workspace", "root"])
+        .args(["rev-parse", "--git-dir"])
         .output()
         .map_err(CliError::Probe)?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.contains("no jj repo") {
-            return Err(CliError::Storage(StorageError::NotAJjRepo(
-                PathBuf::from(cwd),
-            )));
-        }
-        return Err(CliError::Probe(std::io::Error::other(format!(
-            "jj workspace root failed: {stderr}"
-        ))));
+        return Err(CliError::Storage(StorageError::NotAJjRepo(
+            PathBuf::from(cwd),
+        )));
     }
     Ok(())
 }

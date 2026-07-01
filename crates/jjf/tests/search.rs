@@ -234,7 +234,7 @@ fn search_no_match_is_silent_exit_zero() {
 #[test]
 fn search_outside_jj_repo_is_preflight_failure() {
     // No `jjf init`, no jj repo at all.
-    let dir = scratch("search_no_repo");
+    let dir = scratch_non_git("search_no_repo");
     let out = run_jjf(&dir, &["search", "anything"]);
     assert!(!out.status.success(), "non-jj cwd must fail preflight");
     assert_eq!(out.status.code(), Some(2), "exit 2 = preflight");

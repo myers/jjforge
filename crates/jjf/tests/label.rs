@@ -411,7 +411,7 @@ fn label_rm_bad_id_exits_two() {
 
 #[test]
 fn label_in_non_jj_directory_exits_two() {
-    let dir = scratch("label_non_jj");
+    let dir = scratch_non_git("label_non_jj");
     // Well-formed id so we get past the parse step.
     let out = run_jjf(&dir, &["label", "add", "abcdef0", "backend"]);
     assert!(!out.status.success(), "label in non-jj dir should fail");

@@ -268,7 +268,7 @@ fn ls_json_error_envelope_on_non_jj_directory() {
     // `--json` outside a jj repo: error envelope on stderr, not the
     // plain `jjf: <text>` line. Pins the contract for read-verb
     // failures (the bare-array success shape does not apply on error).
-    let dir = scratch("ls_json_err_non_jj");
+    let dir = scratch_non_git("ls_json_err_non_jj");
     let out = run_jjf(&dir, &["--json", "ls"]);
     assert!(!out.status.success());
     assert_eq!(out.status.code(), Some(2));
@@ -295,7 +295,7 @@ fn ls_json_error_envelope_on_non_jj_directory() {
 
 #[test]
 fn ls_in_non_jj_directory_exits_two() {
-    let dir = scratch("ls_non_jj");
+    let dir = scratch_non_git("ls_non_jj");
     let out = run_jjf(&dir, &["ls"]);
     assert!(!out.status.success(), "ls in non-jj dir should fail");
     assert_eq!(out.status.code(), Some(2));

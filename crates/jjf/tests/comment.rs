@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 mod common;
-use common::{run_jjf, run_jjf_with_stdin, scratch, JJF_BIN};
+use common::{run_jjf, run_jjf_with_stdin, scratch, scratch_non_git, JJF_BIN};
 
 fn make_jj_repo(name: &str) -> PathBuf {
     let dir = scratch(name);
@@ -364,7 +364,7 @@ fn comment_bad_id_exits_two() {
 
 #[test]
 fn comment_in_non_jj_directory_exits_two() {
-    let dir = scratch("comment_non_jj");
+    let dir = scratch_non_git("comment_non_jj");
     // Well-formed id so we get past the parse step.
     let out =
         run_jjf_with_stdin(&dir, &["comment", "abcdef0", "-F", "-"], b"some body");

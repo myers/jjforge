@@ -86,7 +86,7 @@ fn init_on_fresh_jj_repo_succeeds_and_plants_v3_sentinel() {
 
 #[test]
 fn init_in_non_jj_directory_fails_with_exit_two_and_useful_stderr() {
-    let dir = scratch("init_non_jj");
+    let dir = scratch_non_git("init_non_jj");
 
     let out = run_jjf(&dir, &["init"]);
     assert!(!out.status.success(), "init should fail outside a jj repo");
@@ -165,7 +165,7 @@ fn init_json_error_envelope_on_non_jj_directory() {
     // `--json` plus a failing path: error must surface on stderr as the
     // documented error envelope, not the plain `jjf: <text>` line. Pins
     // the contract in `docs/cli-json.md` for the `not_a_jj_repo` kind.
-    let dir = scratch("init_json_err_non_jj");
+    let dir = scratch_non_git("init_json_err_non_jj");
 
     let out = run_jjf(&dir, &["--json", "init"]);
     assert!(!out.status.success(), "init should fail outside a jj repo");

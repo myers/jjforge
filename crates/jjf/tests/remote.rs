@@ -250,9 +250,11 @@ fn remote_rm_nonexistent_exits_two_with_typed_kind() {
 
 #[test]
 fn remote_add_in_non_jj_directory_exits_two() {
-    let dir = scratch("remote_add_non_jj");
+    // Must be outside the jjforge source tree — scratch() dirs live
+    // inside the project's git repo and would pass the git preflight.
+    let dir = scratch_non_git("remote_add_non_jj");
     let out = run_jjf(&dir, &["remote", "add", "origin", "https://example.com/x.git"]);
-    assert!(!out.status.success(), "remote add in non-jj dir should fail");
+    assert!(!out.status.success(), "remote add in non-git dir should fail");
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -263,7 +265,7 @@ fn remote_add_in_non_jj_directory_exits_two() {
 
 #[test]
 fn remote_ls_in_non_jj_directory_exits_two() {
-    let dir = scratch("remote_ls_non_jj");
+    let dir = scratch_non_git("remote_ls_non_jj");
     let out = run_jjf(&dir, &["remote", "ls"]);
     assert!(!out.status.success());
     assert_eq!(out.status.code(), Some(2));
@@ -271,7 +273,7 @@ fn remote_ls_in_non_jj_directory_exits_two() {
 
 #[test]
 fn remote_rm_in_non_jj_directory_exits_two() {
-    let dir = scratch("remote_rm_non_jj");
+    let dir = scratch_non_git("remote_rm_non_jj");
     let out = run_jjf(&dir, &["remote", "rm", "origin"]);
     assert!(!out.status.success());
     assert_eq!(out.status.code(), Some(2));
@@ -339,4 +341,42 @@ fn remote_add_help_documents_positionals() {
     let help = String::from_utf8_lossy(&out.stdout);
     assert!(help.contains("<NAME>"), "add --help should document <NAME>: {help}");
     assert!(help.contains("<URL>"), "add --help should document <URL>: {help}");
+}
+
+#[test]
+fn remote_add_ls_rm_in_plain_git_repo() {
+    // Bare git repo — NO `jj git init`. After J1 the remote verbs must
+    // work in any git repo, not only jj-colocated ones.
+    let tmp = scratch("remote_plain_git");
+    Command::new("git")
+        .arg("init")
+        .arg(&tmp)
+        .output()
+        .expect("git init");
+
+    let add = run_jjf(&tmp, &["remote", "add", "origin", "https://example.com/x.git"]);
+    assert!(
+        add.status.success(),
+        "remote add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let ls = run_jjf(&tmp, &["remote", "ls", "--json"]);
+    assert!(
+        ls.status.success(),
+        "remote ls failed: {}",
+        String::from_utf8_lossy(&ls.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&ls.stdout).contains("origin"),
+        "ls --json should contain 'origin': {}",
+        String::from_utf8_lossy(&ls.stdout)
+    );
+
+    let rm = run_jjf(&tmp, &["remote", "rm", "origin"]);
+    assert!(
+        rm.status.success(),
+        "remote rm failed: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
 }

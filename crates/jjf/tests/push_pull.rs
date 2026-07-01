@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 mod common;
-use common::{run_jjf, JJF_BIN};
+use common::{run_jjf, scratch_non_git, JJF_BIN};
 
 /// Per-test scratch root. Gitignored via the workspace-level rule.
 fn scratch(name: &str) -> PathBuf {
@@ -379,7 +379,7 @@ fn pull_unknown_remote_exits_two() {
 
 #[test]
 fn push_outside_jj_repo_exits_two_not_a_jj_repo() {
-    let dir = scratch("push_non_jj");
+    let dir = scratch_non_git("push_non_jj");
     let out = run_jjf(&dir, &["push", "origin"]);
     assert!(!out.status.success());
     assert_eq!(out.status.code(), Some(2));
@@ -392,7 +392,7 @@ fn push_outside_jj_repo_exits_two_not_a_jj_repo() {
 
 #[test]
 fn pull_outside_jj_repo_exits_two_not_a_jj_repo() {
-    let dir = scratch("pull_non_jj");
+    let dir = scratch_non_git("pull_non_jj");
     let out = run_jjf(&dir, &["pull", "origin"]);
     assert!(!out.status.success());
     assert_eq!(out.status.code(), Some(2));

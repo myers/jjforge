@@ -316,7 +316,7 @@ fn close_bad_id_exits_two() {
 
 #[test]
 fn close_in_non_jj_directory_exits_two() {
-    let dir = scratch("close_non_jj");
+    let dir = scratch_non_git("close_non_jj");
     // Well-formed id so we get past the parse step.
     let out = run_jjf(&dir, &["close", "abcdef0"]);
     assert!(!out.status.success(), "close in non-jj dir should fail");

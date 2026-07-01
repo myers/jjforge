@@ -388,7 +388,7 @@ fn update_bad_id_exits_two() {
 
 #[test]
 fn update_in_non_jj_directory_exits_two() {
-    let dir = scratch("update_non_jj");
+    let dir = scratch_non_git("update_non_jj");
     let out = run_jjf(&dir, &["update", "abcdef0", "--title", "x"]);
     assert!(!out.status.success(), "update in non-jj dir should fail");
     assert_eq!(out.status.code(), Some(2));

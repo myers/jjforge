@@ -153,7 +153,7 @@ fn new_without_jjf_init_first_exits_two_with_run_jjf_init_first_message() {
 fn new_in_non_jj_directory_exits_two_with_not_a_jj_repo_message() {
     // Not a jj repo at all — the preflight should produce the same
     // `not a jj repo` signal `jjf init` produces in this situation.
-    let dir = scratch("new_non_jj");
+    let dir = scratch_non_git("new_non_jj");
 
     let out = run_jjf_with_stdin(&dir, &["new", "-t", "x", "-F", "-"], b"");
     assert!(!out.status.success());

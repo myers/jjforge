@@ -260,7 +260,7 @@ fn show_with_bad_id_exits_two() {
 
 #[test]
 fn show_in_non_jj_directory_exits_two() {
-    let dir = scratch("show_non_jj");
+    let dir = scratch_non_git("show_non_jj");
 
     // Use a well-formed id so we get past the parse step and exercise
     // the preflight, not the BadIssueId branch.
