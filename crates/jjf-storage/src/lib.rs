@@ -22,22 +22,15 @@
 //! bookmarks(issues)` doesn't snapshot the previous edit into a stale
 //! working copy. Lifted directly from `experiments/jj-shellout-hello/`.
 //!
-//! # v1 → v2 migration
+//! # Legacy formats (removed)
 //!
-//! v1 spelled this bookmark `bugs` and put records under `bugs/`. v2
-//! uses `issues` and `issues/`. The trailer field that names the issue
-//! id was `Jjf-Bug:` in v1 and is `Jjf-Issue:` in v2. The parser in
-//! [`crate::trailer`] reads either spelling so existing op chains
-//! continue to replay; the writer here only emits the v2 spelling.
-//!
-//! Storage automatically detects a v1-shape repo (the `bugs` bookmark
-//! exists; `issues` does not) and runs an inline migration on the
-//! next [`Storage::open`] or [`Storage::init`] call. The migration
-//! lands one commit on the new `issues` bookmark that renames every
-//! `bugs/<id>.json` → `issues/<id>.json` (and the `.comments.jsonl`
-//! sibling), then deletes the v1 `bugs` bookmark. See [`Storage::open`]
-//! for the detection logic; the migration itself is in
-//! [`Storage::migrate_v1_to_v2`].
+//! v1 (`bugs` bookmark, `bugs/` records, `Jjf-Bug:` trailers) and v2
+//! (`issues` bookmark, `issues/` records) are no longer supported. The
+//! v1→v2 and v2→v3 migrators were removed in J5; [`Storage::open`] now
+//! refuses any repo without the `refs/jjf/meta/format-version` sentinel
+//! with [`Error::UnsupportedLegacyFormat`]. The trailer parser in
+//! [`crate::trailer`] still reads the old `Jjf-Bug:` spelling so v3 op
+//! chains migrated before J5 continue to replay.
 //!
 //! # Out of scope
 //!
@@ -67,7 +60,6 @@ mod id;
 mod jj;
 mod memory;
 mod merge_ops;
-mod migrate_v2_v3;
 mod op;
 mod read;
 mod record;
@@ -235,6 +227,18 @@ pub enum Error {
         "format-version sentinel ref points at {kind} {oid}, expected commit"
     )]
     CorruptSentinel { oid: String, kind: String },
+
+    /// The repo at `path` has no `refs/jjf/meta/format-version`
+    /// sentinel ref — it predates the v3 ref layout (a legacy v1
+    /// `bugs` or v2 `issues` bookmark shape). jjforge no longer reads
+    /// or migrates these in place: refuse with a clear message rather
+    /// than silently misreading a stale shape (per CLAUDE.md's "never
+    /// silently read a stale shape"). The operator re-creates the
+    /// issues on a current jjf, or restores from a v3 backup.
+    #[error(
+        "unsupported legacy storage format at {path}: this repo predates the v3 ref layout and is no longer readable; re-create its issues on a current jjf, or restore from a v3 backup"
+    )]
+    UnsupportedLegacyFormat { path: PathBuf },
 
     /// A slug failed the v2.1 validation rules (charset, length,
     /// hyphen placement). Surfaced from `Storage::create_issue` /
@@ -1402,12 +1406,6 @@ pub const ISSUES_BOOKMARK_REVSET: &str = "bookmarks(issues)";
 /// stable across versions.
 pub const ISSUES_SEED_DESCRIPTION: &str = "jjf: seed issues bookmark";
 
-/// The v1 bookmark name. Detected by [`Storage::init`] /
-/// [`Storage::open`] so the inline-detect migration can rename it.
-/// Storage never *writes* to this bookmark; it only checks for its
-/// presence so the migration knows when to run.
-const V1_BUGS_BOOKMARK: &str = "bugs";
-
 /// One node in a `parent-child` dependency tree (spec v2.4 §3.x).
 /// Returned by [`Storage::dep_tree`]; rendered by the CLI's
 /// `jjf dep tree` verb. The `children` list is sorted by id for
@@ -1442,43 +1440,35 @@ pub struct DepTree {
 /// [`Storage::commit_record_change`] / `commit_memory_change` and the
 /// create-path probes (id collision, slug collision).
 ///
-/// - [`StorageMode::V2`]: the on-disk shape pinned by
-///   `docs/storage-format.md` v2. Issues live as `issues/<id>.json`
-///   files on the `issues` jj bookmark; writes go through the 4-CLI
-///   working-copy dance. This is the original shape; the bulk of the
-///   v2 codebase is here.
-/// - [`StorageMode::V3`]: the on-disk shape pinned by
-///   `docs/storage-out-of-tree.md`. Each issue lives at
-///   `refs/jjf/issues/<id>` with a commit-chain of op-packs; each
-///   memory at `refs/jjf/memories/<key>`. Writes use git-only
-///   subprocess calls (`hash-object`, `mktree`, `commit-tree`,
-///   `update-ref`); the jj working copy is never touched.
-///
-/// **Detection.** v3 mode is selected iff
-/// [`v3_write::refs::FORMAT_VERSION_REF`] resolves to a commit. The
-/// presence of the ref is the marker; the ref's pointed-at tree
-/// carries a self-describing `version` blob but reads don't inspect
-/// it. A fresh-init repo today still gets v2 mode because
-/// `Storage::init` writes the v2 bookmark (ticket `add0646` will
-/// rewrite init for v3); a manually-planted sentinel ref upgrades
-/// detection to v3 even on a v1/v2-shape repo. The integration tests
-/// in this ticket use the planted-sentinel approach to exercise the
-/// v3 write path before the migrator (ticket `c14e1c1`) lands.
+/// Only the v3 shape (pinned by `docs/storage-out-of-tree.md`) is
+/// supported: each issue lives at `refs/jjf/issues/<id>` with a
+/// commit-chain of op-packs; each memory at `refs/jjf/memories/<key>`.
+/// Writes use git-only subprocess calls; the jj working copy is never
+/// touched. The v1/v2 shapes and their migrators were removed (J5); a
+/// legacy repo is refused at [`Storage::open`]. The enum is therefore
+/// single-variant — it stays as an enum so the (now-unconditional)
+/// write-path dispatch sites can be removed alongside the dead v2
+/// write path in a later task without re-introducing the type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StorageMode {
-    V2,
     V3,
 }
 
-/// Probe `refs/jjf/meta/format-version`. Returns
-/// [`StorageMode::V3`] iff the sentinel ref resolves to a commit;
-/// otherwise [`StorageMode::V2`].
+/// Verify the repo is in the v3 storage shape. Returns `Ok(())` iff
+/// `refs/jjf/meta/format-version` resolves to a commit.
+///
+/// A repo is v3 iff [`v3_write::refs::FORMAT_VERSION_REF`] resolves to
+/// a commit. The presence of the ref is the marker; the ref's
+/// pointed-at tree carries a self-describing `version` blob but reads
+/// don't inspect it. This enforces v3 on every `Storage::open` /
+/// `Storage::init`.
 ///
 /// Failure modes:
 /// - A real git failure (corrupt repo, missing object, IO error)
 ///   bubbles up as [`Error::Git`].
-/// - A simply-absent ref is NOT a failure — it's the v2 case, so we
-///   return `V2`.
+/// - An absent ref means the repo predates the v3 ref layout (a
+///   legacy v1/v2 shape) → [`Error::UnsupportedLegacyFormat`]. We
+///   refuse rather than silently misread or migrate a stale shape.
 /// - A present-but-wrong-type ref (sentinel hand-wired to a blob /
 ///   tree / tag rather than a commit) surfaces as
 ///   [`Error::CorruptSentinel`]. The sentinel's docstring claims
@@ -1487,15 +1477,15 @@ pub(crate) enum StorageMode {
 ///   nonsense ref. Per ticket `de59159` (the QA red-team `c1`
 ///   attack).
 ///
-/// This is the v3 vs v2 discriminator on every `Storage::open` and
-/// `Storage::init`. Healthy-path cost: one `git rev-parse --verify
-/// --quiet` for absent (v2) or that plus a `git cat-file -t` for
-/// present (v3) — both cheap, both single-spawn.
-fn detect_storage_mode(git: &git::GitRepo) -> Result<StorageMode> {
+/// Healthy-path cost: one `git rev-parse --verify --quiet` plus a
+/// `git cat-file -t` — both cheap, both single-spawn.
+fn verify_v3_format(git: &git::GitRepo) -> Result<()> {
     match git.resolve_ref_with_type(v3_write::refs::FORMAT_VERSION_REF) {
-        Ok(Some((_, kind))) if kind == "commit" => Ok(StorageMode::V3),
+        Ok(Some((_, kind))) if kind == "commit" => Ok(()),
         Ok(Some((oid, kind))) => Err(Error::CorruptSentinel { oid, kind }),
-        Ok(None) => Ok(StorageMode::V2),
+        Ok(None) => Err(Error::UnsupportedLegacyFormat {
+            path: git.root().to_path_buf(),
+        }),
         Err(e) => Err(Error::Git(e)),
     }
 }
@@ -1509,18 +1499,19 @@ fn detect_storage_mode(git: &git::GitRepo) -> Result<StorageMode> {
 /// memo is invalidated on writes (the mutator drops it), so the next
 /// read sees fresh state.
 ///
-/// Also carries a [`StorageMode`] discriminator that pins which write
-/// path mutating methods take. Detected at `open` / `init` time and
-/// stable for the life of the handle.
+/// Also carries a [`StorageMode`] discriminator. Since J5 removed the
+/// v1/v2 migrators and made `open` refuse non-v3 repos, this is always
+/// [`StorageMode::V3`] — the field and the write-path dispatch checks
+/// it gates are retained pending removal of the now-dead v2 write path
+/// in a later task.
 #[derive(Debug, Clone)]
 pub struct Storage {
     repo: JjRepo,
     /// Git wrapper used by the v3 write path. Built alongside `repo`
-    /// in `open` / `init`; coexists with the jj wrapper. v2-mode
-    /// callers don't touch it.
+    /// in `open` / `init`; coexists with the jj wrapper.
     git: git::GitRepo,
-    /// V2 vs V3 — pinned at open time, drives every write-path
-    /// dispatch.
+    /// Storage shape — always [`StorageMode::V3`] now. Pinned at open
+    /// time; gates the (now-unconditional) write-path dispatch.
     mode: StorageMode,
     /// In-process snapshot cache memo. Lazily populated on first
     /// read; cleared by every mutator so the next read sees the
@@ -1535,14 +1526,12 @@ impl Storage {
     /// caller's job (mvp-cli, tests). The `issues` bookmark must
     /// already exist; call [`Storage::init`] first if you're not sure.
     ///
-    /// **v1 → v2 inline migration.** If the v1 `bugs` bookmark is
-    /// present but `issues` is not, `open` runs the migration in place
-    /// (renames every `bugs/<id>.json` and `bugs/<id>.comments.jsonl`
-    /// to its `issues/` sibling on a single commit, lands it on the
-    /// new `issues` bookmark, and deletes the old `bugs` bookmark).
-    /// Repos that only have `issues` (the post-migration steady state)
-    /// fall through without changes; repos that have neither bookmark
-    /// surface their bookmark probe failure unchanged.
+    /// **Legacy refusal.** A repo with no
+    /// `refs/jjf/meta/format-version` sentinel predates the v3 ref
+    /// layout (a v1 `bugs` or v2 `issues` bookmark shape). jjforge no
+    /// longer reads or migrates these in place; `open` refuses with
+    /// [`Error::UnsupportedLegacyFormat`] rather than silently
+    /// misreading a stale shape.
     pub fn open(repo_root: impl Into<PathBuf>) -> Result<Self> {
         let root = repo_root.into();
         if !root.is_absolute() {
@@ -1552,81 +1541,15 @@ impl Storage {
             )));
         }
         let git = git::GitRepo::open(root.clone());
-        // Detect on-disk shape before running the v1→v2 migration
-        // (which only fires on v2-shape data). If the v3 sentinel ref
-        // exists, we're already on v3 and the v1→v2 dance must NOT
-        // run (it would write a v2 bookmark on a v3 repo, scrambling
-        // the source of truth). For now the only writer of the
-        // sentinel is `v3_write::write_format_version_sentinel` —
-        // used by tests in this ticket and (eventually) by the v2→v3
-        // migrator in ticket `c14e1c1`.
-        let mode = detect_storage_mode(&git)?;
-        let storage = Self {
+        // Refuse anything that isn't a v3-shape repo. A missing
+        // sentinel is a legacy v1/v2 repo → UnsupportedLegacyFormat.
+        verify_v3_format(&git)?;
+        Ok(Self {
             repo: JjRepo::open(root),
-            git: git.clone(),
-            mode,
+            git,
+            mode: StorageMode::V3,
             snapshot_memo: Default::default(),
-        };
-        if storage.mode == StorageMode::V2 {
-            // v1 → v2 first (renames `bugs/*` → `issues/*` on a
-            // single commit if the v1 bookmark is present). Idempotent;
-            // no-op on already-v2 repos.
-            storage.maybe_migrate_v1_to_v2()?;
-            // v2 → v3 second. This walks every issue's op chain off
-            // `bookmarks(issues)` and re-lands each commit on
-            // `refs/jjf/issues/<id>`, then deletes the `issues`
-            // bookmark and plants the v3 sentinel ref. If the
-            // bookmark doesn't exist (a hypothetical "no issues at
-            // all" repo), the migrator's bookmark probe makes it a
-            // no-op and we leave the repo without a sentinel —
-            // matching the v2 behavior for that edge case.
-            migrate_v2_v3::maybe_migrate_v2_to_v3(&storage.repo, &storage.git)?;
-            // Re-detect mode after migration. If the sentinel
-            // got planted, we're now V3 and subsequent reads
-            // must use the v3 path. Storage carries mode as an
-            // immutable field on the public type, so we rebuild
-            // it here rather than mutating in place — clones
-            // inherit the new mode.
-            let new_mode = detect_storage_mode(&git)?;
-            return Ok(Self {
-                repo: storage.repo,
-                git: storage.git,
-                mode: new_mode,
-                snapshot_memo: storage.snapshot_memo,
-            });
-        }
-        Ok(storage)
-    }
-
-    /// Like [`Storage::open`] but skips the v2 → v3 auto-migration.
-    /// Test-only — used by the v2 → v3 migration integration tests so
-    /// they can plant v2-shape state and then re-open without the
-    /// migrator running. Production code MUST NOT call this.
-    ///
-    /// Note: the v1 → v2 step still runs (the migration tests build
-    /// only v2 or v1 shapes and need v1 → v2 to land before they can
-    /// inspect or re-migrate to v3).
-    #[doc(hidden)]
-    pub fn open_skip_v2_to_v3_migration(repo_root: impl Into<PathBuf>) -> Result<Self> {
-        let root = repo_root.into();
-        if !root.is_absolute() {
-            return Err(Error::Invalid(format!(
-                "Storage::open requires an absolute path, got {}",
-                root.display()
-            )));
-        }
-        let git = git::GitRepo::open(root.clone());
-        let mode = detect_storage_mode(&git)?;
-        let storage = Self {
-            repo: JjRepo::open(root),
-            git: git.clone(),
-            mode,
-            snapshot_memo: Default::default(),
-        };
-        if storage.mode == StorageMode::V2 {
-            storage.maybe_migrate_v1_to_v2()?;
-        }
-        Ok(storage)
+        })
     }
 
     /// Open or create a storage handle, planting the v3
@@ -1634,25 +1557,20 @@ impl Storage {
     /// Idempotent: calling twice against the same repo is a no-op the
     /// second time.
     ///
-    /// Four distinct outcomes:
+    /// Three distinct outcomes:
     ///
     /// - `repo_root` is not a jj repo at all → [`Error::NotAJjRepo`].
     /// - `repo_root` is a v3-shape repo (the sentinel ref already
-    ///   resolves) → no-op; return Storage with `mode = V3`.
-    /// - `repo_root` is a v2-shape repo (the `issues` bookmark exists,
-    ///   no v3 sentinel) → no-op; return Storage with `mode = V2`. The
-    ///   v2 → v3 migrator (ticket `c14e1c1`) runs at the next
-    ///   [`Storage::open`], not here.
-    /// - `repo_root` is a v1-shape repo (the `bugs` bookmark exists,
-    ///   no `issues` bookmark, no v3 sentinel) → run the v1 → v2
-    ///   migration (matching today's behavior); the repo ends v2-shape
-    ///   and a follow-up `Storage::open` will hand the v2 → v3
-    ///   migration. `mode = V2` is returned.
-    /// - `repo_root` is a brand-new jj+git repo (no `bugs`, no
-    ///   `issues`, no v3 sentinel) → plant the v3 sentinel ref via
+    ///   resolves to a commit) → idempotent no-op; return Storage.
+    /// - `repo_root` is a brand-new jj+git repo (no v3 sentinel) →
+    ///   plant the v3 sentinel ref via
     ///   [`v3_write::write_format_version_sentinel`]. Zero jj calls,
     ///   zero bookmark mutations, zero working-copy mutations.
-    ///   `mode = V3`.
+    ///
+    /// (A legacy v1/v2-shape repo — a `bugs`/`issues` bookmark with no
+    /// sentinel — is no longer special-cased here; `init` plants a
+    /// fresh v3 sentinel over it, and the legacy bookmark data is
+    /// ignored. The v1/v2 migrators were removed in J5.)
     ///
     /// **v3 init contract.** A fresh init writes EXACTLY one ref
     /// (`refs/jjf/meta/format-version`) under `refs/jjf/`. No
@@ -1687,203 +1605,39 @@ impl Storage {
             return Err(Error::Jj(e));
         }
 
-        // Detection: presence of the v3 sentinel ref ⇒ V3, otherwise
-        // V2. Cheap (`git rev-parse --verify --quiet`). Idempotency
-        // for v3 repos is implicit — `mode == V3` short-circuits the
-        // bookmark probe below.
-        let mode = detect_storage_mode(&git)?;
-        let storage = Self {
-            repo: repo.clone(),
-            git: git.clone(),
-            mode,
-            snapshot_memo: Default::default(),
-        };
-
-        // V3 mode — sentinel already planted. Idempotent no-op; the
-        // per-issue refs are owned by the write path, and creating a
-        // v2 `issues` bookmark here would scramble the source of
-        // truth.
-        if mode == StorageMode::V3 {
-            return Ok(storage);
+        // Detection: does the v3 sentinel ref already resolve to a
+        // commit? If so, init is a no-op (idempotent). A
+        // present-but-wrong-type sentinel surfaces as CorruptSentinel.
+        // Absent ⇒ a fresh (or legacy) repo we plant the sentinel on.
+        match git.resolve_ref_with_type(v3_write::refs::FORMAT_VERSION_REF) {
+            Ok(Some((_, kind))) if kind == "commit" => {
+                // v3 already initialized. Idempotent no-op.
+                return Ok(Self {
+                    repo,
+                    git,
+                    mode: StorageMode::V3,
+                    snapshot_memo: Default::default(),
+                });
+            }
+            Ok(Some((oid, kind))) => {
+                return Err(Error::CorruptSentinel { oid, kind });
+            }
+            Ok(None) => {}
+            Err(e) => return Err(Error::Git(e)),
         }
 
-        // V2 mode. The repo can be shaped three ways here:
-        //   1. v1 (bugs bookmark, no issues): run v1 → v2 migrator.
-        //      After migration, issues bookmark exists ⇒ idempotent.
-        //   2. v2 (issues bookmark already present): idempotent.
-        //   3. fresh (no bugs, no issues): plant the v3 sentinel and
-        //      flip mode to V3. This is the new v3 init contract.
-        //
-        // Step 1 first — the migrator is also called by Storage::open
-        // and is a no-op when no v1 bookmark exists, so this is
-        // safe to call unconditionally before the v2 probe.
-        storage.maybe_migrate_v1_to_v2()?;
-
-        // Probe: does the `issues` bookmark already exist? `jj bookmark
-        // list -T 'name ++ "\n"' issues` prints just `issues\n` to
-        // stdout when present and an empty stdout (with a stderr
-        // warning) when absent. Exit status is 0 either way, so we
-        // key off stdout content.
-        let stdout = repo.run(&[
-            "bookmark",
-            "list",
-            "-T",
-            "name ++ \"\\n\"",
-            ISSUES_BOOKMARK,
-        ])?;
-        if stdout.lines().any(|line| line.trim() == ISSUES_BOOKMARK) {
-            // Already initialized as v2 (either pre-existing or just
-            // migrated from v1). Idempotent no-op. The v2 → v3
-            // migrator (ticket `c14e1c1`) will pick this up at the
-            // next `Storage::open`.
-            return Ok(storage);
-        }
-
-        // Brand-new repo: no bookmarks, no sentinel. Plant the v3
-        // sentinel ref. This is the new init contract: zero jj calls,
-        // zero bookmarks, zero working-copy mutations, zero HEAD
-        // drift. Just one `git update-ref` under `refs/jjf/`.
+        // No sentinel: plant the v3 sentinel ref. This is the init
+        // contract: zero jj calls, zero bookmarks, zero working-copy
+        // mutations, zero HEAD drift. Just one `git update-ref` under
+        // `refs/jjf/`.
         v3_write::write_format_version_sentinel(&git)?;
 
         Ok(Self {
             repo,
             git,
             mode: StorageMode::V3,
-            snapshot_memo: storage.snapshot_memo,
+            snapshot_memo: Default::default(),
         })
-    }
-
-    /// If a v1 `bugs` bookmark is present and the v2 `issues`
-    /// bookmark is not, perform the inline rename. Safe to call from
-    /// either [`Storage::init`] or [`Storage::open`]; idempotent on
-    /// repos that have already migrated (or have neither bookmark).
-    ///
-    /// The migration lands a single commit on top of the `bugs`
-    /// bookmark whose tree renames every `bugs/<id>.json` →
-    /// `issues/<id>.json` (and the `.comments.jsonl` sibling), then
-    /// creates the new `issues` bookmark pointing at that commit,
-    /// then deletes the old `bugs` bookmark.
-    ///
-    /// The commit description is a fixed string (no `Jjf-Op:` trailer)
-    /// so it doesn't appear in any per-issue op chain — the migration
-    /// isn't an issue mutation, it's a structural repo-level rename.
-    fn maybe_migrate_v1_to_v2(&self) -> Result<()> {
-        // Skip if the new bookmark already exists — already migrated.
-        if self.bookmark_exists(ISSUES_BOOKMARK)? {
-            return Ok(());
-        }
-        // Skip if the v1 bookmark is absent — nothing to migrate.
-        if !self.bookmark_exists(V1_BUGS_BOOKMARK)? {
-            return Ok(());
-        }
-
-        // Enumerate every issue id present on the v1 bookmark, by
-        // listing `bugs/*.json` files at that revision. We treat the
-        // `bugs/<id>.comments.jsonl` sibling as part of the rename
-        // — if a `.json` exists, its `.comments.jsonl` is also renamed
-        // (the writer always emits an empty `.comments.jsonl` at
-        // create time, so the sibling is always present).
-        let v1_revset = format!("bookmarks({})", V1_BUGS_BOOKMARK);
-        let listing = self.repo.run(&[
-            "file",
-            "list",
-            "-r",
-            &v1_revset,
-            "-T",
-            "path ++ \"\\n\"",
-            "root:bugs/",
-        ])?;
-        let mut ids: Vec<IssueId> = Vec::new();
-        for line in listing.lines() {
-            let line = line.trim();
-            let Some(rest) = line.strip_prefix("bugs/") else {
-                continue;
-            };
-            let Some(stem) = rest.strip_suffix(".json") else {
-                continue;
-            };
-            if let Ok(id) = IssueId::parse(stem) {
-                ids.push(id);
-            }
-        }
-        ids.sort();
-        ids.dedup();
-
-        // Build a new commit on top of the v1 bookmark and rewrite the
-        // tree. We need the FILE BYTES from each old path so we can
-        // write them into the new path; we read via `jj file show -r
-        // bookmarks(bugs)` (the working copy at this point is on
-        // root() or wherever the operator left it — we don't trust it).
-        let summary = "jjf: migrate v1 bugs/ → v2 issues/";
-        // `jj new <v1-bookmark>` creates a new commit on top of the v1
-        // bookmark; we'll edit the working copy to remove the old
-        // paths and add the new ones.
-        self.repo.run(&["new", &v1_revset, "-m", summary])?;
-
-        let wc_root = self.repo.root();
-        // Drain the working copy of any existing `bugs/`/`issues/`
-        // residue first — we want the renames to be authoritative.
-        let bugs_dir = wc_root.join("bugs");
-        let issues_dir = wc_root.join("issues");
-        if bugs_dir.exists() {
-            // jj has materialized the v1 tree here. We'll move files
-            // one by one rather than removing the whole dir, so any
-            // unexpected sibling under `bugs/` is preserved on the v1
-            // bookmark (we delete the `bugs` bookmark at the end; any
-            // stray content is unreachable but not silently deleted
-            // from history).
-        }
-        std::fs::create_dir_all(&issues_dir)?;
-
-        for id in &ids {
-            let json_name = format!("{}.json", id);
-            let comments_name = format!("{}.comments.jsonl", id);
-            let v1_json = bugs_dir.join(&json_name);
-            let v1_comments = bugs_dir.join(&comments_name);
-            let v2_json = issues_dir.join(&json_name);
-            let v2_comments = issues_dir.join(&comments_name);
-
-            if v1_json.is_file() {
-                std::fs::rename(&v1_json, &v2_json)?;
-            }
-            if v1_comments.is_file() {
-                std::fs::rename(&v1_comments, &v2_comments)?;
-            }
-        }
-        // After moving every recognized id, the bugs/ directory should
-        // be empty for ids we know about. Remove if empty; leave alone
-        // otherwise (defensive — a future schema-extension file under
-        // bugs/ would otherwise vanish silently).
-        if bugs_dir.is_dir() {
-            // best-effort empty-dir removal; ignore the error if the
-            // dir is non-empty (some stray file persists, which we
-            // don't want to delete).
-            let _ = std::fs::remove_dir(&bugs_dir);
-        }
-
-        // Land the new bookmark, delete the old one, step @ off.
-        self.repo
-            .run(&["bookmark", "create", ISSUES_BOOKMARK, "-r", "@"])?;
-        self.repo.run(&["bookmark", "delete", V1_BUGS_BOOKMARK])?;
-        self.repo.run(&["new", "root()"])?;
-
-        // Snapshot memo: a fresh Storage instance built by
-        // `Storage::open` / `init` has an empty memo, so dropping
-        // is a no-op here. We still call it for symmetry / future
-        // proofing (if `maybe_migrate_v1_to_v2` ever runs after a
-        // `snapshot()` lazy-load).
-        self.invalidate_snapshot_memo();
-
-        Ok(())
-    }
-
-    /// Does the named bookmark exist on this repo? Used internally for
-    /// the v1 → v2 migration detector.
-    fn bookmark_exists(&self, name: &str) -> Result<bool> {
-        let stdout = self
-            .repo
-            .run(&["bookmark", "list", "-T", "name ++ \"\\n\"", name])?;
-        Ok(stdout.lines().any(|line| line.trim() == name))
     }
 
     /// Load the snapshot cache, sharing the result across multiple
@@ -1920,16 +1674,12 @@ impl Storage {
         // just overwrites the first; net result is correct either
         // way.
         //
-        // V3 dispatches to the ref-set-keyed cache; V2 keeps the
-        // bookmark-tip-keyed path. Both write the same
-        // `.jj/jjforge-cache.json` file — the `format_kind` field
-        // discriminates and either side discards the other's cache
-        // file on load.
-        let snap = std::sync::Arc::new(if self.mode == StorageMode::V3 {
-            cache::load_or_rebuild_v3(&self.git, self.repo.root())?
-        } else {
-            cache::load_or_rebuild(&self.repo, self.repo.root())?
-        });
+        // The v3 ref-set-keyed cache is the only path; it's keyed off
+        // the `refs/jjf/*` ref set and writes `.jj/jjforge-cache.json`.
+        let snap = std::sync::Arc::new(cache::load_or_rebuild_v3(
+            &self.git,
+            self.repo.root(),
+        )?);
         let mut guard = self
             .snapshot_memo
             .lock()
@@ -1980,15 +1730,11 @@ impl Storage {
     }
 
     /// True iff this handle was opened on a v3-shape repo (the
-    /// `refs/jjf/meta/format-version` sentinel ref resolves). False
-    /// means the repo is still v2-shape — only reachable in the test
-    /// suite via [`Storage::open_skip_v2_to_v3_migration`]. Production
-    /// callers see V3 unconditionally because the migrator runs at
-    /// `Storage::open`.
-    ///
-    /// Used by the CLI's `push` / `pull` verbs to dispatch between the
-    /// v3 git-transport path ([`Storage::push_v3`] /
-    /// [`Storage::pull_v3`]) and the legacy v2 bookmark-transport path.
+    /// `refs/jjf/meta/format-version` sentinel ref resolves). Always
+    /// true now: since J5 removed the v1/v2 migrators, `Storage::open`
+    /// refuses any non-v3 repo, so a live handle is v3 unconditionally.
+    /// Retained for the CLI's `push` / `pull` verb dispatch and as a
+    /// guard while the now-dead v2 write path awaits removal.
     pub fn is_v3(&self) -> bool {
         matches!(self.mode, StorageMode::V3)
     }
@@ -4749,12 +4495,12 @@ pub(crate) fn issue_comments_relpath(id: &IssueId) -> PathBuf {
     PathBuf::from("issues").join(format!("{}.comments.jsonl", id))
 }
 
-/// Pre-migration v1 path of an issue's JSON record. The migration
-/// commit (`Storage::maybe_migrate_v1_to_v2`) renames `bugs/<id>.*`
-/// to `issues/<id>.*` on a single commit, but commits *prior* to
-/// the migration touched the v1 paths. The history walker and read
-/// replay query include BOTH paths in their `jj log` filter so they
-/// don't drop pre-migration ops out of the per-issue chain.
+/// Pre-cutover v1 path of an issue's JSON record (`bugs/<id>.json`).
+/// Records were renamed to `issues/<id>.*` before J5 removed the
+/// migrators, but commits *prior* to that rename touched the v1 paths.
+/// The history walker and read replay query include BOTH paths in
+/// their `jj log` filter so they don't drop pre-cutover ops out of the
+/// per-issue chain.
 pub(crate) fn v1_issue_json_relpath(id: &IssueId) -> PathBuf {
     PathBuf::from("bugs").join(format!("{}.json", id))
 }

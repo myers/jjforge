@@ -10,14 +10,14 @@
 //! result two ways and (in debug builds) asserts they agree on
 //! structural fields:
 //!
-//! 1. **File-read.** Pull `issues/<id>.json` and
-//!    `issues/<id>.comments.jsonl` straight off the bookmark tip via
-//!    `jj file show`.
-//! 2. **Op-replay.** Walk `ancestors(bookmarks(issues))` via
-//!    `history::read_history_at`, sort the resulting per-op entries by
-//!    the spec §6 LWW total order — `(jjf_at if Some else commit_time,
-//!    commit, trailer_index)`, the same key the op-space merge driver
-//!    uses — and fold them into a record.
+//! 1. **File-read.** Pull `issue.json` and `comments.jsonl` off the
+//!    per-issue ref `refs/jjf/issues/<id>`'s tree via `git cat-file
+//!    blob`. (The v2 bookmark-tip read path was removed in J5.)
+//! 2. **Op-replay.** Walk the per-issue ref's commit chain via
+//!    `history::read_history_at_v3`, sort the resulting per-op entries
+//!    by the spec §6 LWW total order — `(jjf_at if Some else
+//!    commit_time, commit, trailer_index)`, the same key the op-space
+//!    merge driver uses — and fold them into a record.
 //!
 //! When file-read and op-replay disagree on a structural field, that's
 //! a violation of the storage contract — either the writer didn't
@@ -52,15 +52,14 @@ use crate::record::{DepEdge, IssueType, Status};
 use crate::record::{Comment, Issue, IssueRecord};
 use crate::v3_write;
 use crate::StorageMode;
-use crate::{issue_comments_relpath, issue_json_relpath, Error, Result, ISSUES_BOOKMARK_REVSET};
+use crate::{Error, Result};
 
 /// Read a single issue from authoritative storage.
 ///
-/// V2 mode: sources `issues/<id>.json` and `issues/<id>.comments.jsonl`
-/// off the `issues` bookmark tip via `jj file show`.
-///
-/// V3 mode: sources `issue.json` and `comments.jsonl` off
-/// `refs/jjf/issues/<id>`'s tree via `git cat-file blob`.
+/// Sources `issue.json` and `comments.jsonl` off
+/// `refs/jjf/issues/<id>`'s tree via `git cat-file blob`. (The v2
+/// bookmark-tip read path was removed in J5; only the v3 ref layout is
+/// supported.)
 ///
 /// Errors:
 /// - `IssueNotFound` if the record is absent.
@@ -73,17 +72,11 @@ pub(crate) fn read(
     mode: StorageMode,
     id: &IssueId,
 ) -> Result<Issue> {
-    let (record, mut comments) = match mode {
-        StorageMode::V2 => {
-            let record = read_record(repo, id)?;
-            let comments = read_comments(repo, id)?;
-            (record, comments)
-        }
-        StorageMode::V3 => {
-            let record = v3_write::read_record_v3(git, id)?;
-            let comments = v3_write::read_comments_v3(git, id)?;
-            (record, comments)
-        }
+    let _ = mode;
+    let (record, mut comments) = {
+        let record = v3_write::read_record_v3(git, id)?;
+        let comments = v3_write::read_comments_v3(git, id)?;
+        (record, comments)
     };
 
     // Defensive sort: comments by created_at ascending. The writer
@@ -136,50 +129,6 @@ pub(crate) fn read(
         created_at: record.created_at,
         updated_at: record.updated_at,
     })
-}
-
-/// Read the JSON record straight off the bookmark tip. Returns
-/// `IssueNotFound` if the file is absent at that revision.
-fn read_record(repo: &JjRepo, id: &IssueId) -> Result<IssueRecord> {
-    let relpath = issue_json_relpath(id);
-    let text = match repo.run(&[
-        "file",
-        "show",
-        "-r",
-        ISSUES_BOOKMARK_REVSET,
-        &format!("root:{}", relpath.display()),
-    ]) {
-        Ok(s) => s,
-        Err(_) => return Err(Error::IssueNotFound(id.clone())),
-    };
-    Ok(serde_json::from_str(&text)?)
-}
-
-/// Read the comments JSONL straight off the bookmark tip. A missing
-/// file means "no comments" — the writer creates an empty file on
-/// issue creation, but tolerating absence keeps the read path resilient
-/// to repos created by future bootstrap paths that might not.
-fn read_comments(repo: &JjRepo, id: &IssueId) -> Result<Vec<Comment>> {
-    let relpath = issue_comments_relpath(id);
-    let text = match repo.run(&[
-        "file",
-        "show",
-        "-r",
-        ISSUES_BOOKMARK_REVSET,
-        &format!("root:{}", relpath.display()),
-    ]) {
-        Ok(s) => s,
-        Err(_) => return Ok(Vec::new()),
-    };
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        out.push(serde_json::from_str(line)?);
-    }
-    Ok(out)
 }
 
 // ---- op-replay view ---------------------------------------------------
@@ -243,20 +192,14 @@ struct OpView {
 
 /// Walk the per-issue op chain and fold it into a structural view.
 ///
-/// V2: uses `history::read_history_at` against `bookmarks(issues)` to
-/// enumerate the per-op entries reachable from the v2 bookmark.
-///
-/// V3: walks the per-issue ref's commit chain
-/// (`refs/jjf/issues/<id>`) via `history::read_history_at_v3`. Same
-/// trailer parser, same op vocabulary; just a different commit-chain
-/// source.
-///
-/// Both modes then sort with `merge_ops::sort_entries_lww` — the same
-/// `(jjf_at, commit, trailer_index)` total order the op-space merge
-/// driver applies when it writes the merged file. Folding in this
-/// order means file-read and op-replay project the same op chain
-/// identically, including across merges where two heads' `set-*` ops
-/// compose by LWW. (Per spec §6.)
+/// Walks the per-issue ref's commit chain (`refs/jjf/issues/<id>`) via
+/// `history::read_history_at_v3`, then sorts with
+/// `merge_ops::sort_entries_lww` — the same `(jjf_at, commit,
+/// trailer_index)` total order the op-space merge driver applies when
+/// it writes the merged file. Folding in this order means file-read
+/// and op-replay project the same op chain identically, including
+/// across merges where two heads' `set-*` ops compose by LWW. (Per
+/// spec §6.) The v2 bookmark-tip history path was removed in J5.
 #[cfg(debug_assertions)]
 fn replay_ops(
     repo: &JjRepo,
@@ -266,21 +209,11 @@ fn replay_ops(
 ) -> Result<OpView> {
     use crate::merge_ops::sort_entries_lww;
 
-    let mut entries = match mode {
-        StorageMode::V2 => {
-            match crate::history::read_history_at(repo, ISSUES_BOOKMARK_REVSET, id) {
-                Ok(v) => v,
-                Err(Error::IssueNotFound(_)) => return Err(Error::IssueNotFound(id.clone())),
-                Err(e) => return Err(e),
-            }
-        }
-        StorageMode::V3 => {
-            match crate::history::read_history_at_v3(git, id) {
-                Ok(v) => v,
-                Err(Error::IssueNotFound(_)) => return Err(Error::IssueNotFound(id.clone())),
-                Err(e) => return Err(e),
-            }
-        }
+    let _ = (repo, mode);
+    let mut entries = match crate::history::read_history_at_v3(git, id) {
+        Ok(v) => v,
+        Err(Error::IssueNotFound(_)) => return Err(Error::IssueNotFound(id.clone())),
+        Err(e) => return Err(e),
     };
 
     sort_entries_lww(&mut entries);

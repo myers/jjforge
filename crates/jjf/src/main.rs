@@ -1602,6 +1602,10 @@ impl CliError {
             // command; the on-disk repo is in an inconsistent state
             // (sentinel ref hand-wired to a non-commit object).
             CliError::Storage(StorageError::CorruptSentinel { .. }) => 1,
+            // Runtime failure: the repo is a legacy (pre-v3) shape and
+            // is no longer readable. Well-formed command, bad on-disk
+            // state.
+            CliError::Storage(StorageError::UnsupportedLegacyFormat { .. }) => 1,
             CliError::Storage(StorageError::InvalidSlug { .. }) => 2,
             CliError::Storage(StorageError::InvalidTitle { .. }) => 2,
             CliError::Storage(StorageError::InvalidBody { .. }) => 2,
@@ -1672,6 +1676,9 @@ impl CliError {
         match self {
             CliError::Storage(StorageError::NotAJjRepo(_)) => "not_a_jj_repo",
             CliError::Storage(StorageError::CorruptSentinel { .. }) => "corrupt_sentinel",
+            CliError::Storage(StorageError::UnsupportedLegacyFormat { .. }) => {
+                "unsupported_legacy_format"
+            }
             CliError::Storage(StorageError::IssueNotFound(_)) => "issue_not_found",
             CliError::Storage(StorageError::Invalid(_)) => "invalid_input",
             CliError::Storage(StorageError::Clock(_)) => "clock_error",
@@ -1752,6 +1759,9 @@ impl CliError {
             }
             CliError::Storage(StorageError::CorruptSentinel { oid, kind }) => {
                 json!({ "oid": oid, "object_type": kind })
+            }
+            CliError::Storage(StorageError::UnsupportedLegacyFormat { path }) => {
+                json!({ "path": path.display().to_string() })
             }
             CliError::Storage(StorageError::IssueNotFound(id)) => {
                 json!({ "id": id.as_str() })

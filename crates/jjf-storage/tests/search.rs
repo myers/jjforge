@@ -4,9 +4,8 @@
 //!
 //! Mirrors the hermetic-scratch style of `integration.rs`: a
 //! per-test directory under `tests/.scratch/`, wiped on each run,
-//! gitignored. The bootstrap helper plants a v2-shape `issues`
-//! bookmark; `Storage::open` migrates it to v3-shape refs the first
-//! time it's called.
+//! gitignored. The bootstrap helper plants a v3 sentinel via
+//! `Storage::init`; `Storage::open` then opens the v3 repo directly.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,14 +19,8 @@ use jjf_storage::{
 
 fn make_scratch_repo(name: &str) -> PathBuf {
     let abs = make_empty_jj_repo(name);
-    plant_v2_bookmark(&abs);
+    Storage::init(&abs).expect("Storage::init must plant the v3 sentinel");
     abs
-}
-
-fn plant_v2_bookmark(repo: &Path) {
-    sh("jj", &["new", "root()", "-m", "jjf: seed issues bookmark"], repo);
-    sh("jj", &["bookmark", "create", "issues", "-r", "@"], repo);
-    sh("jj", &["new", "root()"], repo);
 }
 
 fn make_empty_jj_repo(name: &str) -> PathBuf {

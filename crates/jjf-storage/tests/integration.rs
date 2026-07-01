@@ -16,36 +16,21 @@ use jjf_storage::{
 };
 use serde::Serialize;
 
-/// Build a scratch jj repo with a seeded v2 `issues` bookmark.
-/// Returns the absolute path to the repo root.
+/// Build a v3-shape scratch jj repo. Returns the absolute path to the
+/// repo root.
 ///
-/// **Why we still plant a v2 bookmark.** After the v3 init rewrite
-/// (ticket `add0646`), `Storage::init` plants only the v3 sentinel
-/// ref. The integration tests in this file are the v2 → v3 backstop:
-/// they plant a v2-shape repo by hand and then call `Storage::open`,
-/// which runs the v2 → v3 migrator. Post-migration, the data lives
-/// on `refs/jjf/issues/<id>` and the bookmark is gone. Assertions
-/// throughout this file use the v3 helpers ([`v3_blob_at`],
-/// [`git_log_v3_chain`]) to walk the per-issue ref instead of the
-/// bookmark.
-///
-/// The bootstrap commands here mirror the pre-v3 `Storage::init`
-/// body byte-for-byte: seed commit description per spec §1.1, the
-/// final `jj new root()` to step `@` off the bookmark so the
-/// writer dance doesn't snapshot stale working-copy state.
+/// Since J5 removed the v1/v2 migrators, `Storage::open` refuses any
+/// repo without the `refs/jjf/meta/format-version` sentinel. We plant
+/// that sentinel via `Storage::init` (the v3 init contract: one
+/// `git update-ref` under `refs/jjf/`, zero bookmarks). Tests then
+/// `Storage::open` and create issues, which land on `refs/jjf/issues/<id>`.
+/// Assertions throughout this file use the v3 helpers
+/// ([`read_at_issue_ref`], [`git_log_v3_chain`]) to walk the per-issue
+/// ref.
 fn make_scratch_repo(name: &str) -> PathBuf {
     let abs = make_empty_jj_repo(name);
-    plant_v2_bookmark(&abs);
+    Storage::init(&abs).expect("Storage::init must plant the v3 sentinel");
     abs
-}
-
-/// Plant the v2 `issues` bookmark with the spec-§1.1 seed commit on
-/// a fresh jj repo. Lifts the pre-v3 `Storage::init` body. The
-/// bookmark will be migrated to v3-shape refs by `Storage::open`.
-fn plant_v2_bookmark(repo: &Path) {
-    sh("jj", &["new", "root()", "-m", "jjf: seed issues bookmark"], repo);
-    sh("jj", &["bookmark", "create", "issues", "-r", "@"], repo);
-    sh("jj", &["new", "root()"], repo);
 }
 
 /// Build a scratch directory that's a jj repo but has no `bugs`
@@ -1149,42 +1134,6 @@ fn init_is_idempotent_on_v3_repo() {
 }
 
 #[test]
-fn init_is_idempotent_on_v2_repo() {
-    // v2 repos already in the wild (bookmark exists, no sentinel)
-    // must keep working with the v2 write path until the v2→v3
-    // migrator (ticket c14e1c1) flips them on `Storage::open`. Init
-    // must NOT plant the sentinel on top of a v2 bookmark — that
-    // would silently switch the next reader to v3 mode against
-    // bookmark-shaped data.
-    let repo = make_scratch_repo("init_on_v2_repo");
-
-    // Pre-condition: v2 shape — bookmark present, no sentinel.
-    let pre_sentinel = git_rev_parse(&repo, "refs/jjf/meta/format-version");
-    assert!(
-        pre_sentinel.is_empty(),
-        "pre-condition: v2 repo must not have the v3 sentinel"
-    );
-
-    Storage::init(&repo).expect("init on v2-shape repo must succeed");
-
-    // Post-condition: still no sentinel; the v2→v3 migration is the
-    // job of ticket c14e1c1's `Storage::open` path, NOT `init`.
-    let post_sentinel = git_rev_parse(&repo, "refs/jjf/meta/format-version");
-    assert!(
-        post_sentinel.is_empty(),
-        "init must NOT plant the v3 sentinel on a v2-shape repo, got: {post_sentinel:?}"
-    );
-
-    // And the issues bookmark stays right where it was.
-    let post_bookmarks =
-        jj_capture(&["bookmark", "list", "-T", "name ++ \"\\n\""], &repo);
-    assert!(
-        post_bookmarks.lines().any(|l| l.trim() == "issues"),
-        "init must keep the v2 issues bookmark, got: {post_bookmarks}"
-    );
-}
-
-#[test]
 fn init_outside_any_jj_repo_returns_typed_error() {
     let bare = make_non_jj_dir("init_no_repo");
     match Storage::init(&bare) {
@@ -1290,134 +1239,6 @@ fn list_ids_returns_three_bugs_sorted_with_no_duplicates() {
     let mut sorted = ids.clone();
     sorted.sort();
     assert_eq!(ids, sorted, "ids must be sorted ascending");
-}
-
-/// V1 → v2 migration end-to-end: synthesize a pre-migration repo by
-/// renaming a freshly-created v2 repo back to the v1 shape (paths
-/// `bugs/<id>.*` and bookmark `bugs`), then call `Storage::open` and
-/// assert the migration runs AND post-migration `Storage::read`
-/// finds the issue's full history.
-///
-/// This catches the regression that shipped in commit 20efe38: the
-/// migration renamed paths correctly but the read-side path filter
-/// only looked at `issues/<id>.*` — every pre-migration commit
-/// (containing the `create` op for the issue) dropped out of the
-/// chain and `read` failed with "no `create` op found."
-#[test]
-fn v1_to_v2_migration_preserves_history() {
-    // V3 era: this test exercises the v1 → v2 step (path rename
-    // bugs/* → issues/*), with v2 → v3 chained on top. We open via
-    // `open_skip_v2_to_v3_migration` while building the v1 shape so the
-    // auto-migrator doesn't pre-emptively re-shape the data into v3.
-    // Once the v1-shape has been laid down by hand, the production
-    // `Storage::open` runs v1 → v2 → v3 in sequence and we assert the
-    // issue's full op history is reachable post-migration.
-    let repo = make_scratch_repo("v1_to_v2_migration_preserves_history");
-
-    // Create an issue in v2 form so we have real `Jjf-Op:` trailers
-    // and real on-disk record files. Land two ops (create + close)
-    // so the history walker has a non-trivial chain to follow.
-    let storage = Storage::open_skip_v2_to_v3_migration(&repo).unwrap();
-    let id = storage
-        .create_issue(&IssueDraft {
-            title: "synthetic v1 issue".into(),
-            ..IssueDraft::default()
-        })
-        .unwrap();
-    storage.set_status(&id, Status::Closed).unwrap();
-    drop(storage);
-
-    // Rewrite the bookmark + paths to look like v1. We're synthesizing
-    // a pre-migration state from a known-good post-migration state.
-    // Three jj operations: rename the bookmark, move the files, then
-    // step off (so the next Storage::open sees a clean working copy).
-    let json_old = format!("issues/{}.json", id);
-    let comments_old = format!("issues/{}.comments.jsonl", id);
-    let json_new = format!("bugs/{}.json", id);
-    let comments_new = format!("bugs/{}.comments.jsonl", id);
-
-    // Edit the bookmark tip: a new commit that moves the files from
-    // issues/ to bugs/. This is the inverse of the migration commit
-    // the storage layer produces.
-    sh("jj", &["new", "bookmarks(issues)", "-m", "synthesize v1 layout"], &repo);
-    fs::create_dir_all(repo.join("bugs")).unwrap();
-    fs::rename(repo.join(&json_old), repo.join(&json_new)).unwrap();
-    fs::rename(repo.join(&comments_old), repo.join(&comments_new)).unwrap();
-    let _ = fs::remove_dir(repo.join("issues"));
-
-    // Rename bookmark issues → bugs.
-    sh("jj", &["bookmark", "create", "bugs", "-r", "@"], &repo);
-    sh("jj", &["bookmark", "delete", "issues"], &repo);
-    sh("jj", &["new", "root()"], &repo);
-
-    // Sanity check: we're now in v1 shape.
-    let bookmarks = jj_capture(
-        &["bookmark", "list", "-T", "name ++ \"\\n\""],
-        &repo,
-    );
-    assert!(
-        bookmarks.lines().any(|l| l.trim() == "bugs"),
-        "synthesized v1 must have a `bugs` bookmark, got:\n{bookmarks}"
-    );
-    assert!(
-        !bookmarks.lines().any(|l| l.trim() == "issues"),
-        "synthesized v1 must NOT have an `issues` bookmark, got:\n{bookmarks}"
-    );
-
-    // The actual test: production Storage::open detects v1, runs
-    // v1 → v2 (rename), then v2 → v3 (per-issue refs + sentinel), and
-    // Storage::read succeeds with the full chain.
-    let storage = Storage::open(&repo).expect("Storage::open must succeed on v1 repo");
-    let bug = storage
-        .read(&id)
-        .expect("Storage::read must succeed post-migration; the read-side path filter must include the v1 `bugs/` paths so pre-migration commits are visible");
-    assert_eq!(bug.title, "synthetic v1 issue");
-    assert_eq!(bug.status, Status::Closed);
-
-    // Post v1 → v2 → v3, the bookmarks are gone (v3 layout) and the
-    // sentinel ref is planted. The per-issue ref carries the issue.
-    let head_refs_out = Command::new("git")
-        .args(["for-each-ref", "--format=%(refname)", "refs/heads/"])
-        .current_dir(&repo)
-        .output()
-        .unwrap();
-    let head_refs = String::from_utf8_lossy(&head_refs_out.stdout);
-    assert!(
-        !head_refs.contains("refs/heads/issues"),
-        "post-v3 migration must NOT have an `issues` bookmark, got:\n{head_refs}"
-    );
-    assert!(
-        !head_refs.contains("refs/heads/bugs"),
-        "post-v3 migration must NOT have a `bugs` bookmark, got:\n{head_refs}"
-    );
-    let issue_ref = format!("refs/jjf/issues/{}", id);
-    assert!(
-        Command::new("git")
-            .args(["rev-parse", "--verify", "--quiet", &issue_ref])
-            .current_dir(&repo)
-            .output()
-            .unwrap()
-            .status
-            .success(),
-        "per-issue v3 ref {issue_ref} must exist post-migration"
-    );
-
-    // History reader sees the full chain (create + set-status +
-    // migration commit's op-free description = at least 2 trailer
-    // entries: create's multi-op stanza, set-status).
-    let history = storage.read_history(&id).expect("history readable after migration");
-    let has_create = history.iter().any(|h| matches!(h.op, Op::Create { .. }));
-    let has_set_status = history.iter().any(|h| matches!(h.op, Op::SetStatus { .. }));
-    assert!(
-        has_create,
-        "history must include the original `create` op; the v1 path filter is what makes it visible. got {} entries",
-        history.len()
-    );
-    assert!(
-        has_set_status,
-        "history must include the `set-status` op landed before the synthesized v1 rewrite. got {} entries",
-        history.len()
-    );
 }
 
 // ---------------------------------------------------------------------

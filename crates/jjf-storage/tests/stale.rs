@@ -19,14 +19,8 @@ use jjf_storage::{IssueDraft, Storage, UpdateFields};
 
 fn make_scratch_repo(name: &str) -> PathBuf {
     let abs = make_empty_jj_repo(name);
-    plant_v2_bookmark(&abs);
+    Storage::init(&abs).expect("Storage::init must plant the v3 sentinel");
     abs
-}
-
-fn plant_v2_bookmark(repo: &Path) {
-    sh("jj", &["new", "root()", "-m", "jjf: seed issues bookmark"], repo);
-    sh("jj", &["bookmark", "create", "issues", "-r", "@"], repo);
-    sh("jj", &["new", "root()"], repo);
 }
 
 fn make_empty_jj_repo(name: &str) -> PathBuf {

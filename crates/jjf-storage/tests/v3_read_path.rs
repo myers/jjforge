@@ -718,6 +718,37 @@ fn v3_open_rejects_tree_sentinel() {
     }
 }
 
+/// A jj+git colocated repo with NO `refs/jjf/meta/format-version`
+/// sentinel is a legacy (v1/v2-shape) repo. After J5, `Storage::open`
+/// must REFUSE it with `Error::UnsupportedLegacyFormat` rather than
+/// silently reading or migrating it.
+#[test]
+fn open_refuses_legacy_repo_without_v3_sentinel() {
+    let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join(".scratch")
+        .join("open_refuses_legacy");
+    if scratch.exists() {
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+    fs::create_dir_all(&scratch).unwrap();
+    let repo = fs::canonicalize(&scratch).unwrap();
+    sh("jj", &["git", "init", "--colocate"], &repo);
+    sh("git", &["config", "user.email", "test@jjforge.invalid"], &repo);
+    sh("git", &["config", "user.name", "jjforge test"], &repo);
+    // Deliberately do NOT plant the v3 sentinel — this is a legacy
+    // repo shape.
+
+    let err = Storage::open(&repo)
+        .expect_err("a repo without the v3 sentinel must be refused");
+    match err {
+        StorageError::UnsupportedLegacyFormat { path } => {
+            assert_eq!(path, repo);
+        }
+        other => panic!("expected UnsupportedLegacyFormat, got {other:?}"),
+    }
+}
+
 fn git_capture(args: &[&str], cwd: &Path) -> String {
     let out = Command::new("git").args(args).current_dir(cwd).output().unwrap();
     assert!(
