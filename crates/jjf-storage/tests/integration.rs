@@ -1157,9 +1157,8 @@ fn init_outside_any_git_repo_returns_typed_error() {
 #[test]
 fn init_then_create_issue_round_trips_on_v3_repo() {
     // Smoke test that tickets 1 + 2 + 3 compose: init plants the v3
-    // sentinel; create_issue routes through the v3 write path (per
-    // the StorageMode dispatch in commit_record_change); read finds
-    // the issue back. This is the v3 counterpart to the old
+    // sentinel; create_issue routes through the v3 write path; read
+    // finds the issue back. This is the v3 counterpart to the old
     // `init_then_create_issue_lands_on_top_of_seed` test.
     let repo = make_empty_jj_repo("init_then_create");
     let storage = Storage::init(&repo).expect("init plants sentinel");
