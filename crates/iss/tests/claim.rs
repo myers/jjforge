@@ -1,5 +1,5 @@
-//! Integration tests for `jjf update --claim` / `--unclaim` and
-//! `jjf ready --claim` / `--include-claimed` — drive the compiled
+//! Integration tests for `iss update --claim` / `--unclaim` and
+//! `iss ready --claim` / `--include-claimed` — drive the compiled
 //! binary against per-test scratch repos and assert the v2.3
 //! atomicity, idempotency, and parallel-claim safety contract.
 //!
@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 mod common;
-use common::{run_jjf, run_jjf_with_stdin, scratch, JJF_BIN};
+use common::{run_jjf, run_jjf_with_stdin, scratch, ISS_BIN};
 
 fn make_jj_repo_with_user(name: &str, user: &str) -> PathBuf {
     let dir = scratch(name);
@@ -70,7 +70,7 @@ fn make_initialized_repo(name: &str) -> PathBuf {
 
 fn make_initialized_repo_with_user(name: &str, user: &str) -> PathBuf {
     let repo = make_jj_repo_with_user(name, user);
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .arg("init")
         .current_dir(&repo)
         .output()
@@ -84,7 +84,7 @@ fn make_initialized_repo_with_user(name: &str, user: &str) -> PathBuf {
     repo
 }
 
-/// Create an issue via `jjf new`, return its id.
+/// Create an issue via `iss new`, return its id.
 fn create_issue(repo: &Path, title: &str, extra_args: &[&str]) -> String {
     let mut args: Vec<&str> = vec!["new", "-t", title, "-F", "-"];
     args.extend_from_slice(extra_args);
@@ -398,7 +398,7 @@ fn ready_claim_on_empty_set_succeeds_with_null_id() {
 
 #[test]
 fn parallel_ready_claim_limit_one_assigns_two_different_ids() {
-    // The race-safety acceptance criterion. Spawn two `jjf ready
+    // The race-safety acceptance criterion. Spawn two `iss ready
     // --claim --limit 1` instances in parallel against the same
     // repo and assert they end up holding TWO DIFFERENT ids — one
     // wins the bookmark race for the top id, the other re-reads

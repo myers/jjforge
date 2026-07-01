@@ -1,4 +1,4 @@
-//! Integration tests for `jjf ready` — drive the compiled binary
+//! Integration tests for `iss ready` — drive the compiled binary
 //! against per-test scratch repos and assert exit code, stdout
 //! (plain + `--json`), the dep-blocking filter, the type-priority
 //! sort, label intersection, `--limit`, the empty-bookmark case,
@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 mod common;
 use common::*;
 
-/// Create an issue via `jjf new`, return its id. `extra_args` lets
+/// Create an issue via `iss new`, return its id. `extra_args` lets
 /// the caller pin `--type`, `-d`, `-l`, etc. We always pass `-F -`
 /// with an empty body to keep the call non-interactive.
 fn create_issue(repo: &Path, title: &str, extra_args: &[&str]) -> String {
@@ -30,7 +30,7 @@ fn create_issue(repo: &Path, title: &str, extra_args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
-/// Close an issue via `jjf close <id>`.
+/// Close an issue via `iss close <id>`.
 fn close_issue(repo: &Path, id: &str) {
     let out = run_jjf(repo, &["close", id]);
     assert!(
@@ -269,8 +269,8 @@ fn ready_in_jj_repo_without_issues_bookmark_exits_two_with_init_hint() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
-        "stderr should tell the user to run `jjf init` first, got: {stderr}"
+        stderr.contains("`issues` bookmark") && stderr.contains("iss init"),
+        "stderr should tell the user to run `iss init` first, got: {stderr}"
     );
 }
 
@@ -300,7 +300,7 @@ fn ready_json_error_envelope_on_non_jj_directory() {
 #[test]
 fn ready_help_documents_label_limit_and_type_flags() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .args(["ready", "--help"])
         .current_dir(cwd)
         .output()
@@ -325,7 +325,7 @@ fn ready_help_documents_label_limit_and_type_flags() {
     );
 }
 
-/// `jjf ready` exhibits the same silent-drop-fix behavior as `jjf
+/// `iss ready` exhibits the same silent-drop-fix behavior as `jjf
 /// ls`: a corrupt `refs/jjf/issues/<id>` ref drops out of the
 /// candidate set but stderr carries a `jjf: warning:` line naming
 /// the ref. Ticket `4928ae6`.
@@ -379,7 +379,7 @@ fn ready_warns_on_corrupt_issue_ref() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("jjf: warning:"),
+        stderr.contains("iss: warning:"),
         "ready stderr must carry the `jjf: warning:` header, got: {stderr:?}"
     );
     assert!(
@@ -483,7 +483,7 @@ fn ready_parent_unknown_handle_exits_two() {
 fn ready_parent_bad_hex_exits_one_issue_not_found() {
     // A well-formed 7-char hex id that doesn't match any issue must
     // surface as `issue_not_found` (exit 1), the same shape as
-    // `jjf show <bad-hex>`. Today it silently matches nothing (exit 0).
+    // `iss show <bad-hex>`. Today it silently matches nothing (exit 0).
     let repo = make_initialized_repo("ready_parent_bad_hex");
     let out = run_jjf(&repo, &["--json", "ready", "--parent", "deadbee"]);
     assert!(

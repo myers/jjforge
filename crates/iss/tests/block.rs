@@ -1,5 +1,5 @@
-//! Integration tests for `jjf block <id> [--reason <text>]` and
-//! `jjf unblock <id>` (v2.5 — `agent-await-gates-impl`). Drives the
+//! Integration tests for `iss block <id> [--reason <text>]` and
+//! `iss unblock <id>` (v2.5 — `agent-await-gates-impl`). Drives the
 //! compiled binary against per-test scratch repos and asserts:
 //!
 //! - happy path: block + show reports `[blocked]` and the
@@ -7,9 +7,9 @@
 //! - `--json` envelope shape (`ok`, `id`, `status: "blocked"`,
 //!   `reason`, `blocked: true`).
 //! - unblock round-trip (status back to open, reason cleared).
-//! - `jjf ready` excludes blocked issues by default.
-//! - `jjf ready --include-blocked` re-includes them.
-//! - `jjf ls --status blocked` filters correctly.
+//! - `iss ready` excludes blocked issues by default.
+//! - `iss ready --include-blocked` re-includes them.
+//! - `iss ls --status blocked` filters correctly.
 //! - multi-line reason → exit 1 (`invalid_input` from storage).
 //!
 //! Same hermetic-scratch / no-`assert_cmd` discipline as the other
@@ -20,7 +20,7 @@ use std::path::Path;
 mod common;
 use common::*;
 
-/// Create an issue via `jjf new`; return its id.
+/// Create an issue via `iss new`; return its id.
 fn create_issue(repo: &Path, title: &str) -> String {
     let out = run_jjf_with_stdin(repo, &["new", "-t", title, "-F", "-"], b"");
     assert!(
@@ -151,7 +151,7 @@ fn ready_excludes_blocked_by_default() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         !stdout.contains(&id_a),
-        "blocked id_a must not appear in `jjf ready`: stdout={stdout}"
+        "blocked id_a must not appear in `iss ready`: stdout={stdout}"
     );
 }
 
@@ -207,7 +207,7 @@ fn block_multiline_reason_errors_invalid_input() {
 fn ready_json_envelope_with_blocked_visible_carries_reason() {
     // When --include-blocked surfaces a blocked issue under --json,
     // the `block_reason` field is present on the Issue payload so a
-    // script can read it without `jjf show`.
+    // script can read it without `iss show`.
     let repo = make_initialized_repo("ready_json_blocked_reason");
     let id_a = create_issue(&repo, "A");
     let out = run_jjf(&repo, &["block", &id_a, "--reason", "waiting on x"]);

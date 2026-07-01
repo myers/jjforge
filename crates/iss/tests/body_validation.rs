@@ -1,10 +1,10 @@
 //! Integration tests for the body-cap boundary (issue `679444a`,
 //! QA red-team 2026-06-25 sub-pass 4 C3). Drives the compiled `jjf`
 //! binary against per-test scratch repos and asserts the typed
-//! `body_too_large` rejection on `jjf new -F`, `jjf update
-//! --body-file`, and `jjf comment -F`.
+//! `body_too_large` rejection on `iss new -F`, `iss update
+//! --body-file`, and `iss comment -F`.
 //!
-//! Background: pre-fix, `jjf new -F <bigfile>` silently accepted a
+//! Background: pre-fix, `iss new -F <bigfile>` silently accepted a
 //! multi-megabyte body, landing a fat commit with no declared
 //! contract. The new cap matches GitHub's documented issue-body
 //! limit — 65,536 bytes of raw UTF-8.
@@ -31,7 +31,7 @@ fn write_body_file(dir: &Path, name: &str, n: usize) -> PathBuf {
     path
 }
 
-// --- `jjf new -F <too-large>` ----------------------------------------------
+// --- `iss new -F <too-large>` ----------------------------------------------
 
 #[test]
 fn new_rejects_oversize_body_with_typed_envelope() {
@@ -75,7 +75,7 @@ fn new_accepts_at_cap_body() {
     );
 }
 
-// --- `jjf update --body-file <too-large>` -----------------------------------
+// --- `iss update --body-file <too-large>` -----------------------------------
 
 #[test]
 fn update_rejects_oversize_body_file_with_typed_envelope() {
@@ -107,7 +107,7 @@ fn update_rejects_oversize_body_file_with_typed_envelope() {
     assert_eq!(v["error"]["details"]["got"], BODY_MAX_BYTES + 1);
 }
 
-// --- `jjf comment -F <too-large>` -------------------------------------------
+// --- `iss comment -F <too-large>` -------------------------------------------
 
 #[test]
 fn comment_rejects_oversize_body_file_with_typed_envelope() {

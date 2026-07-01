@@ -1,16 +1,16 @@
-//! Integration tests for `jjf abandon <id>` — drive the compiled
+//! Integration tests for `iss abandon <id>` — drive the compiled
 //! binary against per-test scratch repos and assert exit code,
 //! stdout (plain + `--json`), and the spec-mandated semantics:
 //!
-//! - `jjf abandon` flips status to `abandoned` and emits the same
+//! - `iss abandon` flips status to `abandoned` and emits the same
 //!   envelope shape as `close`,
-//! - `jjf ls` (default `--status open`) does NOT show the
+//! - `iss ls` (default `--status open`) does NOT show the
 //!   abandoned issue,
-//! - `jjf ls --status all` DOES show it (with status `abandoned`),
-//! - `jjf ls --status abandoned` shows only abandoned ones,
-//! - `jjf ready` does NOT show it, even with
+//! - `iss ls --status all` DOES show it (with status `abandoned`),
+//! - `iss ls --status abandoned` shows only abandoned ones,
+//! - `iss ready` does NOT show it, even with
 //!   `--include-blocked --include-claimed`,
-//! - `jjf show <id>` still works on abandoned issues,
+//! - `iss show <id>` still works on abandoned issues,
 //! - the JSON error envelope on `abandon <bad-id>` matches the
 //!   shape `close` emits.
 //!
@@ -23,7 +23,7 @@ use std::process::Command;
 mod common;
 use common::*;
 
-/// Create an issue via `jjf new`, return its id. `extra` is appended
+/// Create an issue via `iss new`, return its id. `extra` is appended
 /// after the title flag (e.g. `&["--slug", "junk"]`).
 fn create_issue(repo: &Path, title: &str, extra: &[&str]) -> String {
     let mut args: Vec<&str> = vec!["new", "-t", title, "-F", "-"];
@@ -265,8 +265,8 @@ fn abandon_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
-        "stderr should tell the user to run `jjf init` first, got: {stderr}"
+        stderr.contains("`issues` bookmark") && stderr.contains("iss init"),
+        "stderr should tell the user to run `iss init` first, got: {stderr}"
     );
 }
 
@@ -304,8 +304,8 @@ fn abandoning_does_not_release_slug() {
 
 #[test]
 fn update_status_open_revives_an_abandoned_issue() {
-    // No `jjf unabandon` inverse verb — the documented revive
-    // path is `jjf update <id> --status open`. Pin that.
+    // No `iss unabandon` inverse verb — the documented revive
+    // path is `iss update <id> --status open`. Pin that.
     let repo = make_initialized_repo("abandon_revive_via_update");
     let id = create_issue(&repo, "revive me", &[]);
     let out = run_jjf(&repo, &["abandon", &id]);
@@ -328,7 +328,7 @@ fn update_status_open_revives_an_abandoned_issue() {
 #[test]
 fn abandon_help_documents_positional_and_json() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .args(["abandon", "--help"])
         .current_dir(cwd)
         .output()

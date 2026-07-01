@@ -36,7 +36,7 @@
 //!   shrinking assumes pure functions. The scratch dirs are named off
 //!   a monotonically incrementing counter + process pid so concurrent
 //!   property-test runs don't collide on path.
-//! - **Pinned wall clock** (`JJF_TEST_CLOCK_SECS`): timestamps don't
+//! - **Pinned wall clock** (`ISS_TEST_CLOCK_SECS`): timestamps don't
 //!   drift across cases so round-trip equality checks are
 //!   deterministic. Each nextest test runs in its own process, so the
 //!   env-var pin doesn't leak between siblings.
@@ -115,7 +115,7 @@ fn sh(prog: &str, args: &[&str], cwd: &Path) {
 fn pin_clock(secs: u64) {
     // SAFETY: single-threaded test process per nextest sandbox.
     unsafe {
-        std::env::set_var("JJF_TEST_CLOCK_SECS", secs.to_string());
+        std::env::set_var("ISS_TEST_CLOCK_SECS", secs.to_string());
     }
 }
 

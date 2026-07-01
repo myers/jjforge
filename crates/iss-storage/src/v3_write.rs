@@ -411,7 +411,7 @@ pub(crate) fn issue_exists_v3(repo: &GitRepo, id: &IssueId) -> Result<bool> {
 /// caller with `for_each_ref_with_type` so corrupt (non-commit)
 /// refs surface as `UnreadableRef` instead of being silently
 /// dropped at parse time. Kept for symmetry with `list_memory_keys_v3`
-/// and as a potential building block for `jjf doctor` (the heavier
+/// and as a potential building block for `iss doctor` (the heavier
 /// follow-up to the lighter ls/ready warning).
 #[allow(dead_code)]
 pub(crate) fn list_issue_ids_v3(repo: &GitRepo) -> Result<Vec<IssueId>> {

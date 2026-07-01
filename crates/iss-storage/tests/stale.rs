@@ -3,7 +3,7 @@
 //!
 //! Mirrors the hermetic-scratch style of `search.rs` / `integration.rs`:
 //! a per-test directory under `tests/.scratch/`, wiped on each run,
-//! gitignored. Tests pin the wall clock via `JJF_TEST_CLOCK_SECS` so
+//! gitignored. Tests pin the wall clock via `ISS_TEST_CLOCK_SECS` so
 //! age math is deterministic regardless of suite parallelism. Each
 //! nextest test runs in its own process, so the env var here does
 //! NOT leak to siblings — see the `read_history_walks_same_second_*`
@@ -59,7 +59,7 @@ fn pin_clock(secs: u64) {
     // SAFETY: single-threaded test process; nextest gives each test
     // its own process so we don't race siblings on this env var.
     unsafe {
-        std::env::set_var("JJF_TEST_CLOCK_SECS", secs.to_string());
+        std::env::set_var("ISS_TEST_CLOCK_SECS", secs.to_string());
     }
 }
 
@@ -208,7 +208,7 @@ fn stale_comment_bumps_updated_at_today() {
     // `add_comment` (intentional or accidental) trips the alarm.
     // The ticket's "Out of scope" stale-by-activity caveat is a
     // documentation mismatch with the running code, not a contract
-    // change `jjf stale` should make on its own — surfacing in the
+    // change `iss stale` should make on its own — surfacing in the
     // closing comment under Open follow-ups.
     let now = 4_000_000_000u64;
 
@@ -224,7 +224,7 @@ fn stale_comment_bumps_updated_at_today() {
 
     // Advance clock; drop a comment. The comment-add bumps
     // `updated_at` to `now` — making the issue fresh again as far
-    // as `jjf stale --days 14` is concerned.
+    // as `iss stale --days 14` is concerned.
     pin_clock(now);
     storage
         .add_comment(&id, "fresh comment", "alice <a@x>")
@@ -243,7 +243,7 @@ fn stale_comment_bumps_updated_at_today() {
 fn stale_update_bumps_updated_at() {
     // Symmetric to the comment-doesn't-bump test: confirm that a
     // mutating verb DOES bump `updated_at`, taking the issue out of
-    // the stale set. This is the contract that makes `jjf stale`
+    // the stale set. This is the contract that makes `iss stale`
     // useful — a recently-renamed issue isn't stale.
     let now = 5_000_000_000u64;
 

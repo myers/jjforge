@@ -2,14 +2,14 @@
 //! ticket `326bbf7`. Drives the compiled `jjf` binary against
 //! per-test scratch repos and asserts:
 //!
-//! - Round-trip: `jjf new -p N` lands the priority on the record
-//!   and `jjf show --json` reads it back.
+//! - Round-trip: `iss new -p N` lands the priority on the record
+//!   and `iss show --json` reads it back.
 //! - Default null: omitting `-p` lands `priority: null`.
-//! - `jjf update --priority` / `--unset-priority` mutate the field.
+//! - `iss update --priority` / `--unset-priority` mutate the field.
 //! - Out-of-range values rejected at the CLI boundary (exit 2,
 //!   `invalid_priority` envelope).
-//! - `jjf ready` primary sort key is priority (nulls last).
-//! - `jjf ls --priority` filters with OR semantics.
+//! - `iss ready` primary sort key is priority (nulls last).
+//! - `iss ls --priority` filters with OR semantics.
 //! - Plain-text row renders `P0`..`P4` or `-` in column 3.
 //! - `set-priority` op trailer round-trips through the parser.
 

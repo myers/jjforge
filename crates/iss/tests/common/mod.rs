@@ -10,7 +10,7 @@ use std::process::{Command, Output, Stdio};
 
 use iss_storage::IssueId;
 
-pub(crate) const JJF_BIN: &str = env!("CARGO_BIN_EXE_iss");
+pub(crate) const ISS_BIN: &str = env!("CARGO_BIN_EXE_iss");
 
 pub(crate) fn scratch(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -75,7 +75,7 @@ pub(crate) fn make_jj_repo(name: &str) -> PathBuf {
 
 pub(crate) fn make_initialized_repo(name: &str) -> PathBuf {
     let repo = make_jj_repo(name);
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .arg("init")
         .current_dir(&repo)
         .output()
@@ -90,7 +90,7 @@ pub(crate) fn make_initialized_repo(name: &str) -> PathBuf {
 }
 
 pub(crate) fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(JJF_BIN)
+    Command::new(ISS_BIN)
         .args(args)
         .current_dir(cwd)
         .output()
@@ -98,7 +98,7 @@ pub(crate) fn run_jjf(cwd: &Path, args: &[&str]) -> Output {
 }
 
 pub(crate) fn run_jjf_with_stdin(cwd: &Path, args: &[&str], stdin_bytes: &[u8]) -> Output {
-    let mut child = Command::new(JJF_BIN)
+    let mut child = Command::new(ISS_BIN)
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())

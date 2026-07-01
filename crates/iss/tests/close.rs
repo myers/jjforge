@@ -1,4 +1,4 @@
-//! Integration tests for `jjf close <id>` and `jjf open <id>` — drive
+//! Integration tests for `iss close <id>` and `iss open <id>` — drive
 //! the compiled binary against per-test scratch repos and assert exit
 //! code, stdout (plain + `--json`), the round-trip semantics
 //! (close-then-open, open-then-close), the spec-mandated
@@ -28,7 +28,7 @@ use std::process::Command;
 mod common;
 use common::*;
 
-/// Create a bug via `jjf new`, return its id.
+/// Create a bug via `iss new`, return its id.
 fn create_issue(repo: &Path, title: &str) -> String {
     let out = run_jjf_with_stdin(repo, &["new", "-t", title, "-F", "-"], b"");
     assert!(
@@ -342,8 +342,8 @@ fn close_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
-        "stderr should tell the user to run `jjf init` first, got: {stderr}"
+        stderr.contains("`issues` bookmark") && stderr.contains("iss init"),
+        "stderr should tell the user to run `iss init` first, got: {stderr}"
     );
 }
 
@@ -358,15 +358,15 @@ fn open_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
-        "stderr should tell the user to run `jjf init` first, got: {stderr}"
+        stderr.contains("`issues` bookmark") && stderr.contains("iss init"),
+        "stderr should tell the user to run `iss init` first, got: {stderr}"
     );
 }
 
 #[test]
 fn close_help_documents_positional_and_json() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .args(["close", "--help"])
         .current_dir(cwd)
         .output()
@@ -380,7 +380,7 @@ fn close_help_documents_positional_and_json() {
 #[test]
 fn open_help_documents_positional_and_json() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .args(["open", "--help"])
         .current_dir(cwd)
         .output()

@@ -1,4 +1,4 @@
-//! Integration tests for `jjf comment <id> -F - [--author <NAME>]
+//! Integration tests for `iss comment <id> -F - [--author <NAME>]
 //! [--json]` — drive the compiled binary against per-test scratch repos
 //! and assert the full matrix the ticket calls out:
 //!
@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 mod common;
-use common::{run_jjf, run_jjf_with_stdin, scratch, scratch_non_git, JJF_BIN};
+use common::{run_jjf, run_jjf_with_stdin, scratch, scratch_non_git, ISS_BIN};
 
 fn make_jj_repo(name: &str) -> PathBuf {
     let dir = scratch(name);
@@ -38,7 +38,7 @@ fn make_jj_repo(name: &str) -> PathBuf {
         String::from_utf8_lossy(&out.stderr)
     );
     // Set a stable repo-local identity so the default-author path in
-    // `jjf comment` has something to find (the actor chain reads
+    // `iss comment` has something to find (the actor chain reads
     // `git config user.name`; without this, tests fall through to the
     // dev's ~/.gitconfig, breaking hermetic CI).
     let out = Command::new("git")
@@ -66,7 +66,7 @@ fn make_jj_repo(name: &str) -> PathBuf {
 
 fn make_initialized_repo(name: &str) -> PathBuf {
     let repo = make_jj_repo(name);
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .arg("init")
         .current_dir(&repo)
         .output()
@@ -80,7 +80,7 @@ fn make_initialized_repo(name: &str) -> PathBuf {
     repo
 }
 
-/// Create a bug via `jjf new`, return its id.
+/// Create a bug via `iss new`, return its id.
 fn create_issue(repo: &Path, title: &str) -> String {
     let out = run_jjf_with_stdin(repo, &["new", "-t", title, "-F", "-"], b"");
     assert!(
@@ -395,8 +395,8 @@ fn comment_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
-        "stderr should tell the user to run `jjf init` first, got: {stderr}"
+        stderr.contains("`issues` bookmark") && stderr.contains("iss init"),
+        "stderr should tell the user to run `iss init` first, got: {stderr}"
     );
 }
 
@@ -420,13 +420,13 @@ fn comment_unreadable_file_exits_two() {
     );
 }
 
-/// `c5078e4` acceptance: 5 concurrent `jjf comment` subprocesses
+/// `c5078e4` acceptance: 5 concurrent `iss comment` subprocesses
 /// against the SAME issue all land their comments. Pre-fix the
 /// storage layer retried once and ~3/5 would fail with a typed
 /// `ConcurrentWrite`; with the bounded-retry policy the budget
 /// absorbs the contention.
 ///
-/// We set `JJF_RETRY_BASE_MS=0` in the subprocess env so the test
+/// We set `ISS_RETRY_BASE_MS=0` in the subprocess env so the test
 /// doesn't pay the (geometric) backoff wall-clock cost.
 ///
 /// Tolerance: assert `>= 4` rather than strict-5 because in heavy
@@ -442,10 +442,10 @@ fn concurrent_comments_cli_all_land() {
         let repo = repo.clone();
         let id = id.clone();
         handles.push(std::thread::spawn(move || {
-            let mut child = Command::new(JJF_BIN)
+            let mut child = Command::new(ISS_BIN)
                 .args(["comment", &id, "-F", "-"])
                 .current_dir(&repo)
-                .env("JJF_RETRY_BASE_MS", "0")
+                .env("ISS_RETRY_BASE_MS", "0")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -499,7 +499,7 @@ fn concurrent_comments_cli_all_land() {
 #[test]
 fn comment_help_documents_positional_file_author_and_json() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .args(["comment", "--help"])
         .current_dir(cwd)
         .output()

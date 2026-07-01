@@ -1,4 +1,4 @@
-//! Integration tests for `jjf search` — drive the compiled binary
+//! Integration tests for `iss search` — drive the compiled binary
 //! against per-test scratch repos and assert exit code, stdout
 //! (plain + `--json`), the filter matrix, and the envelope shape:
 //!
@@ -29,7 +29,7 @@ fn create_issue(repo: &Path, title: &str, body: &[u8], extra_args: &[&str]) -> S
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
-/// Append a comment to an issue via the real `jjf comment` verb.
+/// Append a comment to an issue via the real `iss comment` verb.
 fn add_comment(repo: &Path, id: &str, body: &[u8]) {
     let out = run_jjf_with_stdin(
         repo,
@@ -44,7 +44,7 @@ fn add_comment(repo: &Path, id: &str, body: &[u8]) {
     );
 }
 
-/// Parse `jjf search` plain-text rows into `(id, title, field, snippet)`.
+/// Parse `iss search` plain-text rows into `(id, title, field, snippet)`.
 fn parse_search_rows(stdout: &str) -> Vec<(String, String, String, String)> {
     stdout
         .lines()
@@ -233,7 +233,7 @@ fn search_no_match_is_silent_exit_zero() {
 
 #[test]
 fn search_outside_jj_repo_is_preflight_failure() {
-    // No `jjf init`, no jj repo at all.
+    // No `iss init`, no jj repo at all.
     let dir = scratch_non_git("search_no_repo");
     let out = run_jjf(&dir, &["search", "anything"]);
     assert!(!out.status.success(), "non-jj cwd must fail preflight");
@@ -350,7 +350,7 @@ fn search_parent_flag_intersects_with_query() {
 fn search_parent_bad_hex_exits_one_issue_not_found() {
     // A well-formed 7-char hex id that doesn't match any issue must
     // surface as `issue_not_found` (exit 1), the same shape as
-    // `jjf show <bad-hex>`. Today it silently matches nothing (exit 0).
+    // `iss show <bad-hex>`. Today it silently matches nothing (exit 0).
     let repo = make_initialized_repo("search_parent_bad_hex");
     let out = run_jjf(&repo, &["--json", "search", "--parent", "deadbee", "anything"]);
     assert!(

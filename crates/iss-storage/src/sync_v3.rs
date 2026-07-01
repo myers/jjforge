@@ -1,4 +1,4 @@
-//! v3 sync (`jjf push` / `jjf pull`).
+//! v3 sync (`iss push` / `iss pull`).
 //!
 //! Spec: `docs/storage-out-of-tree.md` "Sync (push/pull)".
 //!
@@ -50,7 +50,7 @@ const PUSH_REFSPEC_ISSUES: &str = "refs/jjf/issues/*:refs/jjf/issues/*";
 const PUSH_REFSPEC_MEMORIES: &str = "refs/jjf/memories/*:refs/jjf/memories/*";
 
 /// Push refspec for the `meta/*` sentinel namespace. **Force** (`+`
-/// prefix): every peer plants its own sentinel at `jjf init` time and
+/// prefix): every peer plants its own sentinel at `iss init` time and
 /// the two are non-fast-forward against each other, but the sentinel
 /// is a presence flag whose content isn't validated (see ticket
 /// `95fb2d6` for the design call). Force-overwriting is safe: any peer
@@ -165,7 +165,7 @@ fn is_ancestor(git: &GitRepo, ancestor: &str, descendant: &str) -> Result<bool> 
 /// time so the report carries a meaningful tally.
 ///
 /// **Why force-push meta.** Every peer plants its own
-/// `refs/jjf/meta/format-version` at `jjf init` time, and those
+/// `refs/jjf/meta/format-version` at `iss init` time, and those
 /// sentinels will be non-fast-forward against each other even though
 /// both sides represent v3. The sentinel is a presence flag — its
 /// content isn't validated by any reader (see ticket `95fb2d6` for the
@@ -263,7 +263,7 @@ fn fetch_v3(git: &GitRepo, remote: &str) -> Result<()> {
     // the per-ref reconciler in `pull_v3` then compares the new
     // remote-tracking tip against the local data ref using the
     // five-scenario classifier. Without the `+`, two peers each
-    // running `jjf init` (planting divergent `meta/format-version`
+    // running `iss init` (planting divergent `meta/format-version`
     // commits) cause `git fetch` itself to reject — see ticket
     // `0c0e7d8`.
     let fetch_refspec = format!("+refs/jjf/*:refs/remotes/{}/jjf/*", remote);
@@ -384,7 +384,7 @@ fn merge_diverged_ref(
         // both sides have a sentinel but they're different commits,
         // either value is fine because the readers only check presence.
         // Keep the local value; the operator is the side that ran
-        // `jjf init` locally, so their sentinel is what later writes on
+        // `iss init` locally, so their sentinel is what later writes on
         // this clone will chain off.
         let _ = (local_oid, remote_oid, local_ref);
         return Ok(());

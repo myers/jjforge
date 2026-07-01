@@ -7,7 +7,7 @@
 //!
 //! 1. **Probe** the `refs/jjf/*` ref set with one `git for-each-ref` +
 //!    `git hash-object` to compute an invalidation key.
-//! 2. If `.jj/jjforge-cache.json` exists and its key matches the live
+//! 2. If `.git/iss-cache.json` exists and its key matches the live
 //!    ref set, deserialize and return.
 //! 3. Otherwise **rebuild**: enumerate `refs/jjf/issues/*` +
 //!    `refs/jjf/memories/*` and read each ref's tree blobs directly via
@@ -27,7 +27,7 @@
 //! - Cache file missing → rebuild from scratch.
 //! - Cache file corrupt or unparseable → log info on stderr, rebuild.
 //! - Schema-version mismatch → rebuild.
-//! - `.jj/` directory unwritable → cache is built in memory but not
+//! - `.git/` directory unwritable → cache is built in memory but not
 //!   persisted; subsequent reads pay the rebuild cost again. We log
 //!   one info-level line on stderr and keep going.
 //!
@@ -54,9 +54,9 @@ use crate::{Error, Result};
 /// derived state, no migration required.
 pub(crate) const CACHE_SCHEMA_VERSION: u32 = 2;
 
-/// Filename relative to `.jj/`. The `.jj/` directory is gitignored
-/// by jj itself, so the cache is invisible to git by construction.
-pub(crate) const CACHE_FILENAME: &str = "jjforge-cache.json";
+/// Filename relative to `.git/`. The cache lives alongside git's own
+/// state, which is always present in any host repo.
+pub(crate) const CACHE_FILENAME: &str = "iss-cache.json";
 
 /// Atomic-write temp suffix. We write to `.tmp` then rename so a
 /// crashing process never leaves a half-written cache.
@@ -95,7 +95,7 @@ fn default_format_kind() -> String {
 /// id — indistinguishable from the issue genuinely not existing.
 ///
 /// The field shape is deliberately small: just the full ref name and
-/// a one-line human-readable reason. Callers (the `jjf ls` and `jjf
+/// a one-line human-readable reason. Callers (the `iss ls` and `iss
 /// ready` CLI verbs) format the list into a stderr warning so the
 /// operator can see which refs went missing without poring over `git
 /// for-each-ref` output.
@@ -244,9 +244,9 @@ impl SnapshotCache {
     }
 }
 
-/// Path to the on-disk cache file: `<repo_root>/.jj/jjforge-cache.json`.
+/// Path to the on-disk cache file: `<repo_root>/.git/iss-cache.json`.
 pub(crate) fn cache_path(repo_root: &Path) -> PathBuf {
-    repo_root.join(".jj").join(CACHE_FILENAME)
+    repo_root.join(".git").join(CACHE_FILENAME)
 }
 
 /// Load the cache from disk if it exists, is parseable, and is on
@@ -267,7 +267,7 @@ fn try_load_from_disk(repo_root: &Path) -> Option<SnapshotCache> {
                 // rebuild will try to write and produce its own
                 // warning if persistence fails.
                 eprintln!(
-                    "jjforge: snapshot cache read failed ({}), rebuilding",
+                    "git-issues: snapshot cache read failed ({}), rebuilding",
                     e
                 );
             }
@@ -278,14 +278,14 @@ fn try_load_from_disk(repo_root: &Path) -> Option<SnapshotCache> {
         Ok(c) if c.schema_version == CACHE_SCHEMA_VERSION => Some(c),
         Ok(c) => {
             eprintln!(
-                "jjforge: snapshot cache schema version {} != {}, rebuilding",
+                "git-issues: snapshot cache schema version {} != {}, rebuilding",
                 c.schema_version, CACHE_SCHEMA_VERSION,
             );
             None
         }
         Err(e) => {
             eprintln!(
-                "jjforge: snapshot cache corrupt ({}), rebuilding",
+                "git-issues: snapshot cache corrupt ({}), rebuilding",
                 e
             );
             None
@@ -307,14 +307,14 @@ fn try_persist_to_disk(repo_root: &Path, cache: &SnapshotCache) {
         Some(p) => p,
         None => {
             eprintln!(
-                "jjforge: snapshot cache path has no parent, not persisting"
+                "git-issues: snapshot cache path has no parent, not persisting"
             );
             return;
         }
     };
     if let Err(e) = std::fs::create_dir_all(parent) {
         eprintln!(
-            "jjforge: snapshot cache parent dir not creatable ({}), not persisting",
+            "git-issues: snapshot cache parent dir not creatable ({}), not persisting",
             e
         );
         return;
@@ -328,20 +328,20 @@ fn try_persist_to_disk(repo_root: &Path, cache: &SnapshotCache) {
     let serialized = match serde_json::to_string(cache) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("jjforge: snapshot cache serialization failed ({})", e);
+            eprintln!("git-issues: snapshot cache serialization failed ({})", e);
             return;
         }
     };
     if let Err(e) = std::fs::write(&tmp_path, serialized) {
         eprintln!(
-            "jjforge: snapshot cache temp write failed ({}), not persisting",
+            "git-issues: snapshot cache temp write failed ({}), not persisting",
             e
         );
         return;
     }
     if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
         eprintln!(
-            "jjforge: snapshot cache rename failed ({}), not persisting",
+            "git-issues: snapshot cache rename failed ({}), not persisting",
             e
         );
         // Best-effort cleanup of the temp file.
@@ -351,7 +351,7 @@ fn try_persist_to_disk(repo_root: &Path, cache: &SnapshotCache) {
 
 /// Probe + load + rebuild as needed. Returns a fully-populated
 /// SnapshotCache that matches the current `refs/jjf/*` ref set.
-/// Probe the ref-set fingerprint, load `.jj/jjforge-cache.json` on a
+/// Probe the ref-set fingerprint, load `.git/iss-cache.json` on a
 /// key-match (and a matching `format_kind`), rebuild via direct `git
 /// cat-file` reads otherwise.
 ///
@@ -362,7 +362,7 @@ fn try_persist_to_disk(repo_root: &Path, cache: &SnapshotCache) {
 /// planted once and never moves, so including it would buy us
 /// nothing.
 ///
-/// **Cache file path.** `.jj/jjforge-cache.json`; the `format_kind`
+/// **Cache file path.** `.git/iss-cache.json`; the `format_kind`
 /// field in the JSON discriminates the key space. A stale cache file
 /// whose `format_kind` doesn't match will be discarded and replaced
 /// atomically by the rebuild's write.

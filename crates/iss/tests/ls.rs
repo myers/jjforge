@@ -1,4 +1,4 @@
-//! Integration tests for `jjf ls` — drive the compiled binary against
+//! Integration tests for `iss ls` — drive the compiled binary against
 //! per-test scratch repos and assert exit code, stdout (plain +
 //! `--json`), the filter matrix, and the error shapes:
 //!
@@ -21,7 +21,7 @@ use std::process::{Command, Stdio};
 mod common;
 use common::*;
 
-/// Create a bug via `jjf new`, return its id.
+/// Create a bug via `iss new`, return its id.
 fn create_issue(
     repo: &Path,
     title: &str,
@@ -40,7 +40,7 @@ fn create_issue(
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
-/// Close a bug via the real `jjf close <id>` verb. Drives the same
+/// Close a bug via the real `iss close <id>` verb. Drives the same
 /// code path operators use, so any regression in close-from-the-CLI
 /// surfaces here too (rather than tests passing while the verb is
 /// broken).
@@ -54,7 +54,7 @@ fn close_bug(repo: &Path, id: &str) {
     );
 }
 
-/// Parse `jjf ls` plain-text output into one row per bug. Each row is
+/// Parse `iss ls` plain-text output into one row per bug. Each row is
 /// `<id>\t<status>\t<priority>\t<type>\t<title>` (326bbf7, v2.8 row
 /// rework); we split on tabs and drop empty lines. The tuple shape
 /// is `(id, status, priority, type, title)`.
@@ -246,7 +246,7 @@ fn ls_json_emits_array_of_bug_records() {
 
 #[test]
 fn ls_in_empty_bugs_bookmark_exits_zero_with_no_output() {
-    // `jjf init` ran, nothing else — the bookmark has zero bug files.
+    // `iss init` ran, nothing else — the bookmark has zero bug files.
     let repo = make_initialized_repo("ls_empty_bookmark");
 
     let out = run_jjf(&repo, &["ls"]);
@@ -308,7 +308,7 @@ fn ls_in_non_jj_directory_exits_two() {
 
 #[test]
 fn ls_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
-    // Fresh jj repo, no `jjf init` — the missing-bookmark probe should
+    // Fresh jj repo, no `iss init` — the missing-bookmark probe should
     // fire with the typed `run jjf init first` message.
     let repo = make_jj_repo("ls_no_bookmark");
     let out = run_jjf(&repo, &["ls"]);
@@ -322,8 +322,8 @@ fn ls_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
-        "stderr should tell the user to run `jjf init` first, got: {stderr}"
+        stderr.contains("`issues` bookmark") && stderr.contains("iss init"),
+        "stderr should tell the user to run `iss init` first, got: {stderr}"
     );
 }
 
@@ -386,7 +386,7 @@ fn corrupt_issue_ref(repo: &Path, id: &str) {
 #[test]
 fn ls_warns_on_corrupt_issue_ref_plain_text() {
     // Ticket `4928ae6`: pointing an issue ref at a non-commit object
-    // used to silently drop the issue from `jjf ls` with no
+    // used to silently drop the issue from `iss ls` with no
     // diagnostic. The fix: stdout still shows the survivors, but
     // stderr names the casualty via a `jjf: warning:` line.
     let repo = make_initialized_repo("ls_warn_corrupt_issue");
@@ -414,8 +414,8 @@ fn ls_warns_on_corrupt_issue_ref_plain_text() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("jjf: warning:"),
-        "stderr must carry the `jjf: warning:` header, got: {stderr:?}"
+        stderr.contains("iss: warning:"),
+        "stderr must carry the `iss: warning:` header, got: {stderr:?}"
     );
     let expected_ref = format!("refs/jjf/issues/{}", corrupt);
     assert!(
@@ -525,7 +525,7 @@ fn corrupt_sentinel_to_blob(repo: &Path) -> String {
 fn ls_exits_1_with_corrupt_sentinel_envelope() {
     // Ticket `de59159` (QA sub-pass 3, attack `c1`): when someone
     // hand-wires the v3 format-version sentinel to a blob,
-    // `jjf ls` used to silently exit 0 with normal output because
+    // `iss ls` used to silently exit 0 with normal output because
     // `detect_storage_mode` only checked presence of the ref. The
     // fix surfaces the typed `corrupt_sentinel` envelope.
     let repo = make_initialized_repo("ls_corrupt_sentinel");
@@ -584,7 +584,7 @@ fn ls_parent_unknown_handle_exits_two() {
 fn ls_parent_bad_hex_exits_one_issue_not_found() {
     // A well-formed 7-char hex id that doesn't match any issue must
     // surface as `issue_not_found` (exit 1), the same shape as
-    // `jjf show <bad-hex>`. Today it silently matches nothing (exit 0).
+    // `iss show <bad-hex>`. Today it silently matches nothing (exit 0).
     let repo = make_initialized_repo("ls_parent_bad_hex");
     let out = run_jjf(&repo, &["--json", "ls", "--parent", "deadbee"]);
     assert!(
@@ -678,7 +678,7 @@ fn ls_help_documents_status_and_label_flags() {
     // --help should mention both --status and --label. Keeps the public
     // surface stable against accidental renames.
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .args(["ls", "--help"])
         .current_dir(cwd)
         .output()

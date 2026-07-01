@@ -1,5 +1,5 @@
 //! Integration tests for the four `jjf` memory verbs (`remember`,
-//! `memories`, `recall`, `forget`) plus the `jjf show --include-memories`
+//! `memories`, `recall`, `forget`) plus the `iss show --include-memories`
 //! flag. v2.2 spec §10.
 //!
 //! Mirrors the hermetic-scratch style of `init.rs` and the other test
@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 mod common;
-use common::{scratch, run_jjf, JJF_BIN};
+use common::{scratch, run_jjf, ISS_BIN};
 
 /// Make a directory that's an initialized jj+jjf repo (i.e. the
 /// `issues` bookmark exists).
@@ -43,7 +43,7 @@ fn make_initialized(name: &str) -> PathBuf {
         "git config user.email failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let init = Command::new(JJF_BIN)
+    let init = Command::new(ISS_BIN)
         .arg("init")
         .current_dir(&dir)
         .output()
@@ -59,7 +59,7 @@ fn make_initialized(name: &str) -> PathBuf {
 fn run_jjf_stdin(cwd: &Path, args: &[&str], stdin: &str) -> Output {
     use std::io::Write;
     use std::process::Stdio;
-    let mut child = Command::new(JJF_BIN)
+    let mut child = Command::new(ISS_BIN)
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())

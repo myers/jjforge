@@ -1,4 +1,4 @@
-//! Integration tests for `jjf assign <id> <name>` — drive the compiled
+//! Integration tests for `iss assign <id> <name>` — drive the compiled
 //! binary against per-test scratch repos and assert exit code, stdout
 //! (plain + `--json`), the round-trip semantics (set / clear / re-set),
 //! and the preflight / runtime error matrix:
@@ -18,7 +18,7 @@ use std::process::Command;
 mod common;
 use common::*;
 
-/// Create a bug via `jjf new`, return its id.
+/// Create a bug via `iss new`, return its id.
 fn create_issue(repo: &Path, title: &str) -> String {
     let out = run_jjf_with_stdin(repo, &["new", "-t", title, "-F", "-"], b"");
     assert!(
@@ -229,7 +229,7 @@ fn assign_name_with_newline_surfaces_invalid_input() {
 #[test]
 fn assign_help_documents_positionals_and_json() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .args(["assign", "--help"])
         .current_dir(cwd)
         .output()

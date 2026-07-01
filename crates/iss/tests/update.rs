@@ -1,4 +1,4 @@
-//! Integration tests for `jjf update <id> [--title T] [--status S]
+//! Integration tests for `iss update <id> [--title T] [--status S]
 //! [--body-file PATH|-] [--assignee NAME] [--unset-assignee] [--json]`
 //! — drive the compiled binary against per-test scratch repos and
 //! assert the full ticket matrix:
@@ -31,7 +31,7 @@ use std::process::Command;
 mod common;
 use common::*;
 
-/// Create a bug via `jjf new`, return its id.
+/// Create a bug via `iss new`, return its id.
 fn create_issue(repo: &Path, title: &str) -> String {
     let out = run_jjf_with_stdin(repo, &["new", "-t", title, "-F", "-"], b"");
     assert!(
@@ -413,8 +413,8 @@ fn update_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
-        "stderr should tell the user to run `jjf init` first, got: {stderr}"
+        stderr.contains("`issues` bookmark") && stderr.contains("iss init"),
+        "stderr should tell the user to run `iss init` first, got: {stderr}"
     );
 }
 
@@ -441,7 +441,7 @@ fn update_unreadable_body_file_exits_two() {
 #[test]
 fn update_help_documents_every_field_flag_and_json() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .args(["update", "--help"])
         .current_dir(cwd)
         .output()

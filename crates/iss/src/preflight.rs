@@ -8,7 +8,7 @@
 //! `jjf-storage` deliberately does NOT check for the `issues`
 //! bookmark in `Storage::open` — the storage layer treats
 //! "bookmark exists" as a precondition the caller is responsible for.
-//! The CLI wants a distinct, typed "run `jjf init` first" signal
+//! The CLI wants a distinct, typed "run `iss init` first" signal
 //! (exit 2, message pointing at the fix) rather than the raw
 //! jj-stderr that would bubble up from a first storage write against
 //! an empty `bookmarks(issues)` revset, so it runs the probe itself.
@@ -32,8 +32,8 @@ use crate::CliError;
 /// Callers that ALSO need the `issues` bookmark (every read/write
 /// verb that touches an existing issue) should use
 /// [`issues_bookmark`] instead — it composes this probe with the
-/// bookmark check. Callers that meaningfully run before `jjf init`
-/// (today: `jjf remote add|ls|rm`) call this one directly.
+/// bookmark check. Callers that meaningfully run before `iss init`
+/// (today: `iss remote add|ls|rm`) call this one directly.
 pub(crate) fn jj_repo(cwd: &Path) -> Result<(), CliError> {
     let out = Command::new("git")
         .arg("-C")
@@ -50,22 +50,22 @@ pub(crate) fn jj_repo(cwd: &Path) -> Result<(), CliError> {
 }
 
 /// Probe that (a) `cwd` is inside a git repo and (b) the repo is
-/// `jjf init`-ed — meaning the v3 `refs/jjf/meta/format-version`
+/// `iss init`-ed — meaning the v3 `refs/jjf/meta/format-version`
 /// sentinel ref resolves.
 ///
 /// The v3 sentinel is the only supported init marker. v2 (`issues`
 /// bookmark) and v1 (`bugs` bookmark) shapes are no longer accepted;
-/// repos using those shapes must migrate via `jjf init`.
+/// repos using those shapes must migrate via `iss init`.
 ///
-/// Most read/write verbs (`jjf new`, `jjf show`, `jjf ls`, etc.) call
-/// this. The `jjf remote *` verbs use the simpler [`jj_repo`] probe
-/// because remote setup is meaningful before `jjf init`.
+/// Most read/write verbs (`iss new`, `iss show`, `iss ls`, etc.) call
+/// this. The `iss remote *` verbs use the simpler [`jj_repo`] probe
+/// because remote setup is meaningful before `iss init`.
 pub(crate) fn issues_bookmark(cwd: &Path) -> Result<(), CliError> {
     // Check 1: is this a git repo at all?
     jj_repo(cwd)?;
 
     // Check 2: v3 sentinel ref. Its presence means the repo is
-    // `jjf init`-ed. v2/v1 bookmark shapes are no longer supported.
+    // `iss init`-ed. v2/v1 bookmark shapes are no longer supported.
     if git_ref_exists(cwd, "refs/jjf/meta/format-version")? {
         return Ok(());
     }

@@ -1,4 +1,4 @@
-//! Integration tests for `jjf push <remote>` and `jjf pull <remote>` —
+//! Integration tests for `iss push <remote>` and `iss pull <remote>` —
 //! drive the compiled binary against per-test scratch jj-clones-of-a-
 //! bare-git-remote and assert the v3 transport: refspec
 //! `refs/jjf/*:refs/jjf/*` on push, refspec
@@ -8,7 +8,7 @@
 //! As of ticket 5 of the v3 storage epic (`07c1dc9`), these tests
 //! exercise the v3 push/pull verbs end-to-end. The migrator on
 //! `Storage::open` runs unconditionally (no env-var opt-out here); but
-//! since v3 `jjf init` lays down the format-version sentinel directly,
+//! since v3 `iss init` lays down the format-version sentinel directly,
 //! no v2-to-v3 migration ever needs to actually run on the test
 //! fixtures.
 //!
@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 mod common;
-use common::{run_jjf, scratch_non_git, JJF_BIN};
+use common::{run_jjf, scratch_non_git, ISS_BIN};
 
 /// Per-test scratch root. Gitignored via the workspace-level rule.
 fn scratch(name: &str) -> PathBuf {
@@ -52,7 +52,7 @@ fn must_succeed(out: &Output, what: &str) {
 ///
 /// Uses `git clone` (no jj — J7). The clones are plain git repos
 /// with `origin` already pointing at the bare remote, which is all
-/// `jjf push`/`jjf pull` needs.
+/// `iss push`/`iss pull` needs.
 fn setup(name: &str, clones: &[&str]) -> PathBuf {
     let root = scratch(name);
     let remote = root.join("remote.git");
@@ -99,8 +99,8 @@ fn push_pull_single_clone_round_trip() {
     let alice = root.join("alice");
     let bob = root.join("bob");
 
-    // Alice inits + creates + pushes. `jjf init` lays down the v3
-    // sentinel ref; `jjf new` lands a `refs/jjf/issues/<id>` ref.
+    // Alice inits + creates + pushes. `iss init` lays down the v3
+    // sentinel ref; `iss new` lands a `refs/jjf/issues/<id>` ref.
     must_succeed(&run_jjf(&alice, &["init"]), "jjf init (alice)");
     let new_out = run_jjf(&alice, &["new", "-t", "shared title"]);
     must_succeed(&new_out, "jjf new (alice)");
@@ -192,7 +192,7 @@ fn pull_json_envelope_with_no_remote_data_yet() {
     must_succeed(&out, "pull (empty remote)");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("no jjf refs on remote yet"),
+        stdout.contains("no git-issues refs on remote yet"),
         "plain stdout should mention empty remote; got: {stdout}"
     );
 }
@@ -405,7 +405,7 @@ fn pull_outside_jj_repo_exits_two_not_a_jj_repo() {
 
 #[test]
 fn push_without_init_exits_two_missing_marker() {
-    // jj repo exists but `jjf init` was never run — no v3 sentinel and
+    // jj repo exists but `iss init` was never run — no v3 sentinel and
     // no v2 bookmark. `push` requires the marker (either kind).
     let root = setup("push_no_init", &["alice"]);
     let alice = root.join("alice");
@@ -425,7 +425,7 @@ fn push_without_init_exits_two_missing_marker() {
 #[test]
 fn pull_help_lists_remote_positional() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .args(["pull", "--help"])
         .current_dir(cwd)
         .output()
@@ -441,7 +441,7 @@ fn pull_help_lists_remote_positional() {
 #[test]
 fn push_help_lists_remote_positional() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .args(["push", "--help"])
         .current_dir(cwd)
         .output()
@@ -557,13 +557,13 @@ fn pull_clean_round_trip_is_fast_forwards_only() {
 
 // ---------------------------------------------------------------
 // meta/* sentinel divergence cluster (tickets eaf0674 / 0c0e7d8 /
-// 8034dc1). Each peer plants its own sentinel at `jjf init` time;
+// 8034dc1). Each peer plants its own sentinel at `iss init` time;
 // pull must not error on the divergence and push must not exit 1 on
 // the resulting non-fast-forward against the remote sentinel.
 // ---------------------------------------------------------------
 
-/// Ticket `0c0e7d8` (F-002): `jjf pull` from a fresh clone that ran
-/// `jjf init` (which plants a fresh local sentinel) must return ok
+/// Ticket `0c0e7d8` (F-002): `iss pull` from a fresh clone that ran
+/// `iss init` (which plants a fresh local sentinel) must return ok
 /// even when the remote's `refs/jjf/meta/format-version` resolves to
 /// a different commit than the local one. The pre-fix classifier
 /// routed `meta/*` divergence to the "refusing to merge" error path;
@@ -582,7 +582,7 @@ fn pull_meta_sentinel_divergence_is_noop_not_error() {
     let id = String::from_utf8_lossy(&new_out.stdout).trim().to_owned();
     must_succeed(&run_jjf(&alice, &["push", "origin"]), "alice push");
 
-    // Bob runs `jjf init` on his fresh clone — this plants a LOCAL
+    // Bob runs `iss init` on his fresh clone — this plants a LOCAL
     // sentinel. To guarantee divergence with alice's sentinel in
     // this test (otherwise wall-clock-coincident `git commit-tree`
     // calls can produce identical OIDs), we then overwrite bob's
@@ -683,8 +683,8 @@ fn pull_meta_sentinel_divergence_is_noop_not_error() {
     );
 }
 
-/// Ticket `8034dc1` (F-003): `jjf push` from a fresh clone that ran
-/// `jjf init` must return ok even when the local sentinel is
+/// Ticket `8034dc1` (F-003): `iss push` from a fresh clone that ran
+/// `iss init` must return ok even when the local sentinel is
 /// non-fast-forward against the remote sentinel. Pre-fix the push
 /// refspec was `refs/jjf/*:refs/jjf/*` (no force on meta/*) and the
 /// push exited 1 forever. Post-fix the meta refspec is `+`-prefixed
@@ -733,12 +733,12 @@ fn push_meta_sentinel_non_fast_forward_succeeds_with_data() {
     must_succeed(&push2, "bob push #2");
 }
 
-/// Ticket `eaf0674` (F-001): after running `jjf init` on a freshly-
+/// Ticket `eaf0674` (F-001): after running `iss init` on a freshly-
 /// cloned repo whose remote is already configured, the v3 fetch
 /// refspec gets written into `.git/config` so a plain `git fetch
 /// origin` carries `refs/jjf/*` into the local namespace. Without
 /// this, the operator must hand-write `git fetch origin
-/// 'refs/jjf/*:refs/jjf/*'` before `jjf ls` will work — the original
+/// 'refs/jjf/*:refs/jjf/*'` before `iss ls` will work — the original
 /// papercut the ticket reports.
 #[test]
 fn init_writes_jjf_fetch_refspec_for_existing_remotes() {
@@ -768,7 +768,7 @@ fn init_writes_jjf_fetch_refspec_for_existing_remotes() {
         "precondition: bob's clone should not have a jjforge fetch refspec yet; got:\n{pre_text}"
     );
 
-    // `jjf init` should plant the refspec.
+    // `iss init` should plant the refspec.
     must_succeed(&run_jjf(&bob, &["init"]), "init (bob)");
     let post = Command::new("git")
         .arg("-C")
@@ -784,7 +784,7 @@ fn init_writes_jjf_fetch_refspec_for_existing_remotes() {
         "init should have planted the jjforge fetch refspec; got:\n{post_text}"
     );
 
-    // Re-running `jjf init` is idempotent: the refspec is not
+    // Re-running `iss init` is idempotent: the refspec is not
     // duplicated.
     must_succeed(&run_jjf(&bob, &["init"]), "init (bob) #2");
     let after = Command::new("git")
@@ -828,7 +828,7 @@ fn init_writes_jjf_fetch_refspec_for_existing_remotes() {
         !s.trim().is_empty(),
         "plain git fetch should have brought alice's issue ref under refs/remotes/origin/jjf/issues/; got:\n{s}"
     );
-    // And `jjf show` finds alice's issue without any extra fetch.
+    // And `iss show` finds alice's issue without any extra fetch.
     let pull = run_jjf(&bob, &["pull", "origin"]);
     must_succeed(&pull, "bob pull");
     let show = run_jjf(&bob, &["show", &id]);

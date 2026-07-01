@@ -1,4 +1,4 @@
-//! Integration tests for `jjf label add <id> <label>` and `jjf label
+//! Integration tests for `iss label add <id> <label>` and `iss label
 //! rm <id> <label>` — drive the compiled binary against per-test
 //! scratch repos and assert exit code, stdout (plain + `--json`), the
 //! round-trip semantics (add-then-rm), the spec-mandated
@@ -32,7 +32,7 @@ use std::process::Command;
 mod common;
 use common::*;
 
-/// Create a bug via `jjf new`, return its id.
+/// Create a bug via `iss new`, return its id.
 fn create_issue(repo: &Path, title: &str) -> String {
     let out = run_jjf_with_stdin(repo, &["new", "-t", title, "-F", "-"], b"");
     assert!(
@@ -437,8 +437,8 @@ fn label_add_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
-        "stderr should tell the user to run `jjf init` first, got: {stderr}"
+        stderr.contains("`issues` bookmark") && stderr.contains("iss init"),
+        "stderr should tell the user to run `iss init` first, got: {stderr}"
     );
 }
 
@@ -452,15 +452,15 @@ fn label_rm_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
-        "stderr should tell the user to run `jjf init` first, got: {stderr}"
+        stderr.contains("`issues` bookmark") && stderr.contains("iss init"),
+        "stderr should tell the user to run `iss init` first, got: {stderr}"
     );
 }
 
 #[test]
 fn label_help_documents_subcommands() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .args(["label", "--help"])
         .current_dir(cwd)
         .output()
@@ -474,7 +474,7 @@ fn label_help_documents_subcommands() {
 #[test]
 fn label_add_help_documents_positionals_and_json() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .args(["label", "add", "--help"])
         .current_dir(cwd)
         .output()
@@ -489,7 +489,7 @@ fn label_add_help_documents_positionals_and_json() {
 #[test]
 fn label_rm_help_documents_positionals_and_json() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .args(["label", "rm", "--help"])
         .current_dir(cwd)
         .output()

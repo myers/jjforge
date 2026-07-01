@@ -34,8 +34,8 @@
 //!
 //! # Out of scope
 //!
-//! - The merge driver (`jjf-merge`).
-//! - The `jjf` binary (mvp-cli).
+//! - The merge driver (`iss-merge`).
+//! - The `iss` binary (mvp-cli).
 //! - The `comments.jsonl` merge policy.
 //!
 //! # In scope (now landed)
@@ -43,7 +43,7 @@
 //! - Write path: [`Storage::create_issue`], the mutators, [`Storage::add_comment`].
 //! - Read path: [`Storage::read`], [`Storage::read_history`].
 //! - Bookmark bootstrap: [`Storage::init`] (idempotent; the `mvp-cli`
-//!   `jjf init` verb is a thin wrapper).
+//!   `iss init` verb is a thin wrapper).
 //!
 //! # Verdict pins
 //!
@@ -141,7 +141,7 @@ pub use record::{
 /// All populated fields land as ops in a single commit, per spec §5.5
 /// (multi-op-per-commit). An `UpdateFields` with every field `None`
 /// is a programming error and surfaces as
-/// [`Error::Invalid`] — callers (notably the `jjf update` CLI) should
+/// [`Error::Invalid`] — callers (notably the `iss update` CLI) should
 /// reject the empty-bundle case at their own layer with a more
 /// targeted message before reaching here.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -226,9 +226,9 @@ pub enum Error {
     /// or migrates these in place: refuse with a clear message rather
     /// than silently misreading a stale shape (per CLAUDE.md's "never
     /// silently read a stale shape"). The operator re-creates the
-    /// issues on a current jjf, or restores from a v3 backup.
+    /// issues on a current iss, or restores from a v3 backup.
     #[error(
-        "unsupported legacy storage format at {path}: this repo predates the v3 ref layout and is no longer readable; re-create its issues on a current jjf, or restore from a v3 backup"
+        "unsupported legacy storage format at {path}: this repo predates the v3 ref layout and is no longer readable; re-create its issues on a current iss, or restore from a v3 backup"
     )]
     UnsupportedLegacyFormat { path: PathBuf },
 
@@ -243,7 +243,7 @@ pub enum Error {
     },
 
     /// A title contained a control character that would corrupt
-    /// downstream surfaces (`jjf ls` text rows, JSON envelopes, the
+    /// downstream surfaces (`iss ls` text rows, JSON envelopes, the
     /// trailer payload), or was empty after trim. Surfaced from
     /// `Storage::create_issue`, `Storage::set_title`, and
     /// `Storage::update` whenever a candidate title doesn't pass
@@ -333,7 +333,7 @@ pub enum Error {
     /// blocks-graph. The check walks forward from `target` over
     /// existing `blocks` edges; if `source` is reachable, landing the
     /// new edge would create a back-edge. Issues caught in a `blocks`
-    /// cycle are permanently invisible to `jjf ready` (every node in
+    /// cycle are permanently invisible to `iss ready` (every node in
     /// the cycle has at least one active blocks-dep), so the boundary
     /// rejects the write rather than land a silent landmine.
     ///
@@ -399,8 +399,8 @@ fn is_typed_concurrent_write(e: &Error) -> bool {
 
 /// Retry policy for CAS-loss conflicts. Read once per retry-driver
 /// call from env so tests can pin specific behavior (e.g.
-/// `JJF_RETRY_BASE_MS=0` to skip the wall-clock wait;
-/// `JJF_MAX_RETRIES=0` to force first-conflict-wins).
+/// `ISS_RETRY_BASE_MS=0` to skip the wall-clock wait;
+/// `ISS_MAX_RETRIES=0` to force first-conflict-wins).
 ///
 /// `max_retries` is the number of RETRY attempts after the initial
 /// try, so total attempts = `1 + max_retries`. A `max_retries` of 5
@@ -419,12 +419,12 @@ struct RetryPolicy {
 
 impl RetryPolicy {
     fn from_env() -> Self {
-        let max_retries = std::env::var("JJF_MAX_RETRIES")
+        let max_retries = std::env::var("ISS_MAX_RETRIES")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .map(|n| n.min(20))
             .unwrap_or(5);
-        let base_ms = std::env::var("JJF_RETRY_BASE_MS")
+        let base_ms = std::env::var("ISS_RETRY_BASE_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .map(|n| n.min(10_000))
@@ -463,7 +463,7 @@ impl RetryPolicy {
 
 /// Human-friendly hint for the `ConcurrentWrite` error after all
 /// retries are exhausted. Mentions the actual retry budget so the
-/// message stays honest when `JJF_MAX_RETRIES` is overridden.
+/// message stays honest when `ISS_MAX_RETRIES` is overridden.
 fn retries_exhausted_hint(max_retries: u32) -> String {
     format!(
         "another writer landed first; retried {max_retries} time{plural} and still raced. \
@@ -511,7 +511,7 @@ where
 /// commit landed (idempotent)."
 ///
 /// Callers that propose a fresh claim against an issue they don't yet
-/// own (notably `jjf ready --claim`, where the ready filter excluded
+/// own (notably `iss ready --claim`, where the ready filter excluded
 /// claimed issues) need to know which case fired: an `AlreadyOurs`
 /// against a freshly-picked ready id means the racer beat us to the
 /// CAS, NOT that we genuinely re-claimed our own issue. The CLI
@@ -569,7 +569,7 @@ enum MutateOutcome {
 ///
 /// All filters AND with the implicit "active + unblocked + unclaimed
 /// + not-parked" criteria; within each filter axis the semantics
-/// match `jjf ls`:
+/// match `iss ls`:
 ///
 /// - `labels`: AND — an issue must carry EVERY listed label.
 /// - `types`: OR — an issue's type must equal AT LEAST ONE listed
@@ -588,7 +588,7 @@ enum MutateOutcome {
 ///   issues are included so an operator can see "what's parked."
 ///
 /// The default value (`ReadyFilter::default()`) is "no extra
-/// filters" — equivalent to `jjf ready` with no flags.
+/// filters" — equivalent to `iss ready` with no flags.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReadyFilter {
     pub labels: Vec<String>,
@@ -685,7 +685,7 @@ fn compute_blocked_set(all: &[Issue]) -> std::collections::HashSet<IssueId> {
     // issue still blocks the dependent (the work isn't complete).
     // An `Abandoned` target (v2.7) behaves like Closed: the work
     // will never be done so dependents are free of it. (Operators
-    // reviving an abandoned dep via `jjf update --status open` will
+    // reviving an abandoned dep via `iss update --status open` will
     // see the dependent fall out of the ready set again.)
     let is_active = |target: &IssueId| -> bool {
         match by_id.get(target) {
@@ -769,7 +769,7 @@ pub enum MatchedField {
 }
 
 impl MatchedField {
-    /// Wire spelling used by the `jjf search` plain-text row and the
+    /// Wire spelling used by the `iss search` plain-text row and the
     /// JSON envelope's `matched_field` key. Lowercase to match
     /// [`Status::as_str`] / [`IssueType::as_str`]'s shape.
     pub fn as_str(self) -> &'static str {
@@ -826,7 +826,7 @@ pub const DEFAULT_SNIPPET_CONTEXT: usize = 40;
 /// `updated_at` field. Carried alongside the [`Issue`] so the CLI's
 /// `--json` envelope can serialize `days_since_update` without a
 /// second clock read at the render layer (any re-derivation would
-/// race the pinned clock contract under `JJF_TEST_CLOCK_SECS`).
+/// race the pinned clock contract under `ISS_TEST_CLOCK_SECS`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaleHit {
     /// The matching issue (full read-side projection — same shape
@@ -1010,7 +1010,7 @@ impl std::fmt::Display for SlugInvalidReason {
 /// are immediate data-loss / corruption defects: an embedded
 /// `\0` is silently truncated by the JSON-as-C-string round-trip
 /// somewhere in the write path; an embedded `\n` (or `\r`) breaks
-/// the tab-separated `jjf ls` / `jjf ready` text row format. Tabs
+/// the tab-separated `iss ls` / `iss ready` text row format. Tabs
 /// (`\t`) ALSO break that text row format (the row separator IS a
 /// tab), so we reject them under [`TitleInvalidReason::ControlChar`]
 /// for consistency.
@@ -1019,7 +1019,7 @@ pub enum TitleInvalidReason {
     /// Title was empty or whitespace-only after trim.
     Empty,
     /// Title contained `\n` (line feed) or `\r` (carriage return).
-    /// The tab-separated `jjf ls` row format has no escape rule, so a
+    /// The tab-separated `iss ls` row format has no escape rule, so a
     /// newline splits one row across multiple lines and breaks
     /// downstream pipelines.
     Newline,
@@ -1032,7 +1032,7 @@ pub enum TitleInvalidReason {
     /// `char::is_control`) that isn't already covered by
     /// [`TitleInvalidReason::Newline`] or
     /// [`TitleInvalidReason::NullByte`]. Tabs (`\t`, U+0009) land
-    /// here because they break the `jjf ls` row format too. The
+    /// here because they break the `iss ls` row format too. The
     /// `codepoint` field carries the offending Unicode scalar so
     /// the operator can tell which control char tripped the
     /// rejection.
@@ -1077,12 +1077,12 @@ impl std::fmt::Display for TitleInvalidReason {
 /// - Must be non-empty after `trim` (the existing "empty title"
 ///   rule, now folded into a typed reason).
 /// - Must not contain `\n` (U+000A) or `\r` (U+000D) — these break
-///   the tab-separated `jjf ls` / `jjf ready` text row format.
+///   the tab-separated `iss ls` / `iss ready` text row format.
 /// - Must not contain `\0` (U+0000) — embedded nulls hit a silent
 ///   truncation path between argv parsing and on-disk storage.
 /// - Must not contain any other control character per
 ///   `char::is_control` (tabs included — `\t` is the row separator
-///   in `jjf ls` text output, so it breaks parsing too).
+///   in `iss ls` text output, so it breaks parsing too).
 ///
 /// Returns `Ok(())` if every rule passes; otherwise the first
 /// failing rule's typed reason. The check order is: empty, then
@@ -1371,7 +1371,7 @@ pub const ISSUES_SEED_DESCRIPTION: &str = "jjf: seed issues bookmark";
 
 /// One node in a `parent-child` dependency tree (spec v2.4 §3.x).
 /// Returned by [`Storage::dep_tree`]; rendered by the CLI's
-/// `jjf dep tree` verb. The `children` list is sorted by id for
+/// `iss dep tree` verb. The `children` list is sorted by id for
 /// determinism. The `cycle` flag is `true` if the node was reached
 /// via a cycle (the second time through), in which case recursion
 /// stops and `children` is empty.
@@ -1507,7 +1507,7 @@ impl Storage {
     /// is unchanged. This is the fix for the colocated-repo HEAD-drift
     /// footgun (`docs/storage-out-of-tree.md` §"TL;DR").
     ///
-    /// The `mvp-cli` `jjf init` verb is a thin wrapper over this.
+    /// The `mvp-cli` `iss init` verb is a thin wrapper over this.
     pub fn init(repo_root: impl Into<PathBuf>) -> Result<Self> {
         let root = repo_root.into();
         if !root.is_absolute() {
@@ -1584,7 +1584,7 @@ impl Storage {
         // way.
         //
         // The v3 ref-set-keyed cache is the only path; it's keyed off
-        // the `refs/jjf/*` ref set and writes `.jj/jjforge-cache.json`.
+        // the `refs/jjf/*` ref set and writes `.git/iss-cache.json`.
         let snap = std::sync::Arc::new(cache::load_or_rebuild_v3(
             &self.git,
             self.git.root(),
@@ -1604,7 +1604,7 @@ impl Storage {
 
     /// Drop the in-process snapshot memo so the next read re-probes
     /// the bookmark head. Every mutator calls this after the 4-CLI
-    /// dance lands. The on-disk cache (`.jj/jjforge-cache.json`)
+    /// dance lands. The on-disk cache (`.git/iss-cache.json`)
     /// stays put; it'll be detected as stale on the next probe and
     /// rebuilt.
     fn invalidate_snapshot_memo(&self) {
@@ -1699,7 +1699,7 @@ impl Storage {
         // self-dep is structurally impossible at create time;
         // only phantom-target rejection applies. v2.x
         // (`qa-dep-validation`, issue `d1a01f0`): without this, `jjf
-        // new -d <fake-id>` (and `jjf new --dep blocks:<fake-id>`)
+        // new -d <fake-id>` (and `iss new --dep blocks:<fake-id>`)
         // silently lands a dangling edge in the new issue's record.
         for edge in &draft.dependencies {
             if !self.issue_exists_on_bookmark(&edge.target)? {
@@ -2204,7 +2204,7 @@ impl Storage {
                 Status::Abandoned => {
                     // v2.7: soft-deleted. Claiming would silently
                     // resurrect the issue. Same shape as closed —
-                    // force an explicit `jjf update --status open`
+                    // force an explicit `iss update --status open`
                     // to revive (the audit trail then carries
                     // the intent).
                     return MutateOutcome::Conflict(Error::Invalid(format!(
@@ -2216,7 +2216,7 @@ impl Storage {
                     // blocked issue would silently flip its status
                     // to in-progress AND drop the reason on the
                     // floor — confusing for the next reader. Force
-                    // the operator to `jjf unblock` first; the
+                    // the operator to `iss unblock` first; the
                     // explicit step preserves the audit trail.
                     return MutateOutcome::Conflict(Error::Invalid(format!(
                         "issue {id_owned} is blocked; unblock before claiming"
@@ -2293,7 +2293,7 @@ impl Storage {
             if rec.status == Status::Abandoned {
                 // v2.7: abandoned terminal state. Unclaiming would
                 // silently flip to Open. Force the operator to
-                // `jjf update --status open` first.
+                // `iss update --status open` first.
                 return MutateOutcome::Conflict(Error::Invalid(format!(
                     "issue {id_owned} is abandoned; nothing to unclaim"
                 )));
@@ -2375,7 +2375,7 @@ impl Storage {
             if rec.status == Status::Abandoned {
                 // v2.7: abandoned terminal state. Same shape as
                 // the closed rejection — force an explicit revive
-                // (`jjf update --status open`) before blocking.
+                // (`iss update --status open`) before blocking.
                 return MutateOutcome::Conflict(Error::Invalid(format!(
                     "issue {id_owned} is abandoned; reopen before blocking"
                 )));
@@ -2877,7 +2877,7 @@ impl Storage {
 
     /// Append a comment. Generates a fresh 7-hex comment id and updates
     /// the issue record's `updated_at`. Returns the freshly-generated
-    /// comment id so callers (notably `jjf comment`) can surface it in
+    /// comment id so callers (notably `iss comment`) can surface it in
     /// machine-readable output.
     ///
     /// On a concurrent-write race (another writer landed first), this
@@ -2888,7 +2888,7 @@ impl Storage {
     ///
     /// Retry budget is governed by [`RetryPolicy::from_env`] —
     /// defaults to 5 retries (6 total attempts) with a 10/25/60/150/350
-    /// ms backoff. `JJF_MAX_RETRIES` and `JJF_RETRY_BASE_MS` env vars
+    /// ms backoff. `ISS_MAX_RETRIES` and `ISS_RETRY_BASE_MS` env vars
     /// tune this for tests.
     pub fn add_comment(&self, id: &IssueId, body: &str, author: &str) -> Result<IssueId> {
         if author.trim().is_empty() {
@@ -3107,7 +3107,7 @@ impl Storage {
     /// Implementation is read-all-then-match: O(N) over every
     /// issue in the snapshot cache. For v3's small N this is fine.
     /// The match scans both open AND closed issues (so the
-    /// operator can `jjf show <slug>` against a closed handle).
+    /// operator can `iss show <slug>` against a closed handle).
     /// Per spec v2.6, slug uniqueness is now enforced across the
     /// full history at write time — but historical pre-v2.6 repos
     /// may carry duplicate slugs across an open/closed pair. In
@@ -3197,7 +3197,7 @@ impl Storage {
     /// `created_at` afterward.
     ///
     /// This is the storage layer's first multi-issue enumeration
-    /// primitive — `jjf ls` is the v1 caller, but `jjf log
+    /// primitive — `iss ls` is the v1 caller, but `iss log
     /// --issue-changes`, agent `ready` selection, and the PWA's home
     /// view will all sit on top of it.
     pub fn list_ids(&self) -> Result<Vec<IssueId>> {
@@ -3228,9 +3228,9 @@ impl Storage {
     ///   deps don't. (An `InProgress` dep blocks just like an Open
     ///   one — it's not done yet.)
     /// - It passes any `filter.labels` (AND across labels — same
-    ///   semantics as `jjf ls --label`).
+    ///   semantics as `iss ls --label`).
     /// - It passes any `filter.types` (OR across types — same
-    ///   semantics as `jjf ls --type`).
+    ///   semantics as `iss ls --type`).
     ///
     /// Return order is the agent priority:
     ///
@@ -3256,7 +3256,7 @@ impl Storage {
         //
         // Snapshot cache (per `docs/storage-index-design.md`): probe
         // the invalidation key (bookmark head on V2, ref-set sha on
-        // V3), load `.jj/jjforge-cache.json` on a hit, rebuild via
+        // V3), load `.git/iss-cache.json` on a hit, rebuild via
         // one batched `jj file show` (V2) or N `git cat-file` calls
         // (V3) on a miss. See `cache.rs::load_or_rebuild_v3`.
         let snapshot = self.snapshot()?;
@@ -3343,7 +3343,7 @@ impl Storage {
     /// - Substring, not regex. `q.to_lowercase().contains(...)` is the
     ///   primitive.
     /// - Empty query (`""`) returns an empty vec — match-everything is
-    ///   `jjf ls`'s job, not `search`'s. Skipping early also keeps the
+    ///   `iss ls`'s job, not `search`'s. Skipping early also keeps the
     ///   storage layer's contract honest (no surprise full-table scan
     ///   on the empty input).
     /// - Comments are searched only when `include_comments` is true.
@@ -3485,7 +3485,7 @@ impl Storage {
     ///
     /// `now` reads through the same env-pinned clock path
     /// [`now_rfc3339`] uses, so tests can hold the clock steady via
-    /// `JJF_TEST_CLOCK_SECS`. Production code never sets that env
+    /// `ISS_TEST_CLOCK_SECS`. Production code never sets that env
     /// var.
     ///
     /// The threshold is in seconds (not days) so the storage layer
@@ -3567,8 +3567,8 @@ impl Storage {
     /// The push refspec deliberately excludes `refs/jjf/meta/*`. The
     /// `format-version` sentinel is a per-clone presence flag; pushing
     /// it would non-fast-forward whenever two peers each ran
-    /// `jjf init` (see ticket `95fb2d6` for the design call). The
-    /// remote acquires its sentinel from whoever ran `jjf init` against
+    /// `iss init` (see ticket `95fb2d6` for the design call). The
+    /// remote acquires its sentinel from whoever ran `iss init` against
     /// it first. Server-side config is vanilla git — Forgejo / Gitea /
     /// GitLab / GitHub all accept this.
     ///
@@ -3888,7 +3888,7 @@ fn hex_nybble(n: u8) -> char {
 /// pulling `chrono` / `time` just to render the timestamps the spec
 /// asks for; format is well-known and the math is small.
 ///
-/// Tests may pin the clock by setting `JJF_TEST_CLOCK_SECS` to a
+/// Tests may pin the clock by setting `ISS_TEST_CLOCK_SECS` to a
 /// fixed `u64` epoch-seconds value (e.g. `1735660800`). The override
 /// affects both this function and [`now_rfc3339_nanos`], which derives
 /// its seconds from the same source. Production code never sets this
@@ -3901,7 +3901,7 @@ fn now_rfc3339() -> Result<String> {
 }
 
 fn current_epoch_secs() -> Result<u64> {
-    if let Ok(v) = std::env::var("JJF_TEST_CLOCK_SECS") {
+    if let Ok(v) = std::env::var("ISS_TEST_CLOCK_SECS") {
         if let Ok(n) = v.parse::<u64>() {
             return Ok(n);
         }
@@ -3920,10 +3920,10 @@ fn current_epoch_secs() -> Result<u64> {
 /// continue to use [`now_rfc3339`] per spec §3.1 — only trailers get
 /// nanos.
 pub(crate) fn now_rfc3339_nanos() -> Result<String> {
-    // When `JJF_TEST_CLOCK_SECS` is set, nanos resolve to live
+    // When `ISS_TEST_CLOCK_SECS` is set, nanos resolve to live
     // sub-second so trailer ordering still works; only the second
     // component is pinned.
-    if std::env::var_os("JJF_TEST_CLOCK_SECS").is_some() {
+    if std::env::var_os("ISS_TEST_CLOCK_SECS").is_some() {
         let secs = current_epoch_secs()?;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

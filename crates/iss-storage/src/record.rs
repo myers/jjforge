@@ -74,10 +74,10 @@ impl DepKind {
         }
     }
 
-    /// Owner-perspective human label for the text-mode `jjf show`
+    /// Owner-perspective human label for the text-mode `iss show`
     /// renderer (fix for `show-deps-blocked-by`, fj#2). The wire
     /// spelling at [`DepKind::as_str`] reads inverted when used to
-    /// label edges in `jjf show <A>`: `blocks: B` reads as "A blocks
+    /// label edges in `iss show <A>`: `blocks: B` reads as "A blocks
     /// B" but the storage semantics ("A is blocked until B closes")
     /// say the opposite. This label flips the perspective so the
     /// printed line scans correctly to a human.
@@ -111,7 +111,7 @@ mod dep_kind_tests {
 
     #[test]
     fn as_show_label_returns_owner_perspective_label() {
-        // The `jjf show <id>` text renderer uses these; the labels
+        // The `iss show <id>` text renderer uses these; the labels
         // describe the owner's relationship to the target.
         assert_eq!(DepKind::Blocks.as_show_label(), "blocked by");
         assert_eq!(DepKind::ParentChild.as_show_label(), "parent");
@@ -230,12 +230,12 @@ pub(crate) mod dep_edges_serde {
 /// "mis-filed — soft-deleted" state: the issue stays in
 /// history (audit-trail friendly), the slug stays claimed
 /// (per spec §3.4 all-statuses uniqueness), but the ticket
-/// is excluded from `jjf ls` (default) and `jjf ready`
+/// is excluded from `iss ls` (default) and `iss ready`
 /// (unconditionally). `Open`, `Blocked`, and `InProgress`
 /// are all "active" in the sense that the issue isn't
 /// terminal; `Closed` and `Abandoned` are both terminal —
 /// they don't count as work in flight for ready / dep
-/// computation. `jjf ready` excludes `Blocked` and
+/// computation. `iss ready` excludes `Blocked` and
 /// `InProgress` by default (overridable via flags), and
 /// excludes `Abandoned` unconditionally (no override —
 /// abandoning means "never come up again"). Variant
@@ -257,7 +257,7 @@ pub enum Status {
     InProgress,
     Closed,
     /// Soft-deleted: mis-filed and intentionally hidden from
-    /// `jjf ls` (default) and `jjf ready` (unconditional).
+    /// `iss ls` (default) and `iss ready` (unconditional).
     /// Wire spelling: `abandoned`. v2.7 (`abandon-verb`,
     /// issue `c1ffea7`). Slug stays claimed (spec §3.4
     /// all-statuses uniqueness). Dep targets in this state
@@ -484,7 +484,7 @@ pub struct IssueDraft {
     pub body: String,
     pub labels: Vec<String>,
     /// Typed dependency edges to seed at create time. v2.4 — a
-    /// bare-id input from `jjf new -d <id>` defaults to
+    /// bare-id input from `iss new -d <id>` defaults to
     /// [`DepKind::Blocks`] at the CLI layer before reaching here.
     pub dependencies: Vec<DepEdge>,
     pub assignee: Option<String>,
@@ -543,7 +543,7 @@ pub struct Memory {
 ///
 /// This is a flattened projection of the on-disk pair
 /// (`issues/<id>.json` + `issues/<id>.comments.jsonl`) that callers (the
-/// `jjf` CLI, the merge driver once it consumes records) can use
+/// `iss` CLI, the merge driver once it consumes records) can use
 /// without knowing about the underlying file layout.
 ///
 /// Fields mirror `IssueRecord` plus a `comments` vector. `labels` and
@@ -551,7 +551,7 @@ pub struct Memory {
 /// the read path re-sorts defensively); `comments` are sorted by
 /// `created_at` ascending (chronological).
 ///
-/// The `Serialize` impl is the structured payload `jjf show --json`
+/// The `Serialize` impl is the structured payload `iss show --json`
 /// emits — field declaration order doubles as on-the-wire JSON field
 /// order, mirroring `IssueRecord`'s schema-stability rule (spec §3.3)
 /// even though no merge ever sees this projection on disk.
@@ -578,12 +578,12 @@ pub struct Issue {
     pub labels: Vec<String>,
     /// Arbitrary string→string metadata map. Mirrors
     /// [`IssueRecord::metadata`]; emitted after `labels` on
-    /// `jjf show --json`. Empty map when the issue has no metadata.
+    /// `iss show --json`. Empty map when the issue has no metadata.
     #[serde(default)]
     pub metadata: std::collections::BTreeMap<String, String>,
     /// Typed dependency edges. Same shape as
     /// [`IssueRecord::dependencies`] but emitted directly on
-    /// `jjf show --json` (this projection IS the JSON envelope).
+    /// `iss show --json` (this projection IS the JSON envelope).
     #[serde(with = "dep_edges_serde")]
     pub dependencies: Vec<DepEdge>,
     pub assignee: Option<String>,

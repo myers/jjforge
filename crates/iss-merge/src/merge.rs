@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 /// Which input "wins" the deterministic tiebreaker for scalar
 /// last-write-wins fields.
 ///
-/// v1 defers the author-timestamp tiebreaker. The caller (e.g. `jjf
+/// v1 defers the author-timestamp tiebreaker. The caller (e.g. `iss
 /// sync`) is expected to inspect the two parent commits and pass
 /// `Side::A` or `Side::B` based on whichever parent has the later
 /// `author.timestamp` (per the ticket body). For the merge crate in

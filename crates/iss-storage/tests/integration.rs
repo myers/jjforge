@@ -1101,7 +1101,7 @@ fn init_outside_any_git_repo_returns_typed_error() {
     // `git rev-parse` sentinel probe fails, so init surfaces a typed
     // `Error::Git` rather than the (deleted) jj-probe's `NotAJjRepo`.
     // The binary's `preflight::jj_repo` is what now maps a non-repo cwd
-    // to the operator-facing `NotAJjRepo` (exit 2) — see the `jjf init`
+    // to the operator-facing `NotAJjRepo` (exit 2) — see the `iss init`
     // tests in `crates/jjf/tests/init.rs`.
     let bare = make_non_jj_dir("init_no_repo");
     match Storage::init(&bare) {
@@ -1147,7 +1147,7 @@ fn init_then_create_issue_round_trips_on_v3_repo() {
 // ---------------------------------------------------------------------
 // Enumeration-path tests (issue 6b2b555).
 //
-// `Storage::list_ids` is the first multi-bug primitive — `jjf ls`'s
+// `Storage::list_ids` is the first multi-bug primitive — `iss ls`'s
 // foundation. Tests cover: empty bookmark returns empty; three bugs
 // return their ids sorted ascending; comments-jsonl siblings don't
 // cause double-counting.
@@ -1364,7 +1364,7 @@ fn slug_uniqueness_scope_spans_all_statuses_including_closed() {
     // Spec v2.6 (issue `a105e0b`): closed issues retain their
     // slug forever. A new ticket must pick a fresh one — silently
     // re-using a closed issue's slug is the wrong default for an
-    // audit-trail planner because `jjf show <slug>` would
+    // audit-trail planner because `iss show <slug>` would
     // resolve to the new issue, shadowing the closed one.
     let repo = make_scratch_repo("slug_all_statuses");
     let storage = Storage::open(&repo).unwrap();
@@ -1429,7 +1429,7 @@ fn slug_uniqueness_blocks_against_blocked_holder() {
 
 #[test]
 fn resolve_still_finds_closed_issue_by_slug() {
-    // Regression guard: `jjf show <slug>` must still resolve a
+    // Regression guard: `iss show <slug>` must still resolve a
     // closed issue's slug. v2.6 changed the WRITE-path uniqueness
     // rule, not the resolver.
     let repo = make_scratch_repo("slug_resolve_closed");
@@ -2075,7 +2075,7 @@ fn read_history_walks_same_second_comment_appends() {
     // SAFETY: single-threaded test process; no other code reads this
     // env var concurrently.
     unsafe {
-        std::env::set_var("JJF_TEST_CLOCK_SECS", "1735660800");
+        std::env::set_var("ISS_TEST_CLOCK_SECS", "1735660800");
     }
 
     let repo = make_scratch_repo("same_second_comments");
@@ -2104,7 +2104,7 @@ fn read_history_walks_same_second_comment_appends() {
     assert_eq!(issue.comments.len(), N);
     assert_eq!(
         issue.comments[0].created_at, issue.comments[1].created_at,
-        "with JJF_TEST_CLOCK_SECS pinned, both comments must share created_at; \
+        "with ISS_TEST_CLOCK_SECS pinned, both comments must share created_at; \
          got {} vs {}",
         issue.comments[0].created_at, issue.comments[1].created_at,
     );
@@ -3145,7 +3145,7 @@ fn abandoned_dep_does_not_block_dependent_from_ready() {
 /// Path to the on-disk cache file. Mirrors `cache::cache_path`
 /// internally — exposed here as a string for stat-checking.
 fn cache_file_path(repo: &Path) -> PathBuf {
-    repo.join(".jj").join("jjforge-cache.json")
+    repo.join(".git").join("iss-cache.json")
 }
 
 #[test]
@@ -3795,7 +3795,7 @@ fn add_comment_rejects_oversize_body_with_typed_reason() {
 
 #[test]
 fn add_dep_edge_with_phantom_target_rejects_with_issue_not_found() {
-    // `jjf dep add A <phantom>` — `<phantom>` has never existed on
+    // `iss dep add A <phantom>` — `<phantom>` has never existed on
     // the bookmark. Pre-validation rejects so the trailer doesn't
     // land.
     let repo = make_scratch_repo("dep_phantom_target_rejects");
@@ -3829,7 +3829,7 @@ fn add_dep_edge_with_phantom_target_rejects_with_issue_not_found() {
 
 #[test]
 fn add_dep_edge_with_self_target_rejects_with_self_dependency() {
-    // `jjf dep add A A` — self-dep would make A permanently
+    // `iss dep add A A` — self-dep would make A permanently
     // blocked by itself. Reject at the boundary; no commit.
     let repo = make_scratch_repo("dep_self_rejects");
     let storage = Storage::open(&repo).unwrap();
@@ -3887,7 +3887,7 @@ fn add_dep_edge_self_dep_rejected_for_all_kinds() {
 
 #[test]
 fn create_issue_with_phantom_dep_target_rejects() {
-    // `jjf new -d <phantom>` — the inline-on-create form. Validate
+    // `iss new -d <phantom>` — the inline-on-create form. Validate
     // each dep target at create time so the resulting record can't
     // carry a dangling edge.
     let repo = make_scratch_repo("create_phantom_dep_rejects");
@@ -3920,7 +3920,7 @@ fn create_issue_with_phantom_dep_target_rejects() {
 // would close a cycle in the `blocks`-edge graph. Closed issues are
 // still graph nodes — the walk doesn't short-circuit on status. Only
 // the `blocks` kind is cycle-checked; the other kinds don't affect
-// `jjf ready`.
+// `iss ready`.
 // ---------------------------------------------------------------------
 
 #[test]
@@ -4159,7 +4159,7 @@ fn mixed_kind_blocks_and_parent_child_cycle_rejected() {
     // `121f48b`: A blocks B + B parent-of A creates a mixed-kind
     // cycle in the combined blocking graph. Before the fix this
     // was silently accepted, then both A and B fell out of
-    // `jjf ready` forever because `compute_blocked_set` flagged
+    // `iss ready` forever because `compute_blocked_set` flagged
     // both: A blocked by B (active), B blocked because its parent
     // A is blocked-and-active.
     let repo = make_scratch_repo("dep_cycle_mixed_blocks_first");
@@ -4347,7 +4347,7 @@ fn cycle_check_applies_even_when_issues_are_closed() {
 
 #[test]
 fn remove_dep_edge_against_phantom_target_is_no_op() {
-    // `jjf dep rm` against a dep target that doesn't resolve is
+    // `iss dep rm` against a dep target that doesn't resolve is
     // permissive — removing a non-existent edge is harmless and
     // useful for cleanup. The op-side `retain` is a no-op when no
     // edge matches.
@@ -5017,8 +5017,8 @@ fn claim_by_different_user_does_not_silently_overwrite() {
 // N concurrent writers to the same issue often saw only ~2 land and
 // the rest fail with a typed `ConcurrentWrite`. The fix gives every
 // caller 5 retries (6 total attempts) with a 10/25/60/150/350 ms
-// geometric backoff. Two env vars (`JJF_MAX_RETRIES`,
-// `JJF_RETRY_BASE_MS`) tune the budget for tests; the latter at 0
+// geometric backoff. Two env vars (`ISS_MAX_RETRIES`,
+// `ISS_RETRY_BASE_MS`) tune the budget for tests; the latter at 0
 // instructs the retry loop to skip the wall-clock sleep entirely.
 
 /// Regression guard: sequential comments on the same issue still
@@ -5106,7 +5106,7 @@ fn concurrent_comments_absorb_contention_with_retry_budget() {
     );
 }
 
-/// `JJF_MAX_RETRIES=0` short-circuits the retry loop entirely —
+/// `ISS_MAX_RETRIES=0` short-circuits the retry loop entirely —
 /// the first ConcurrentWrite conflict surfaces immediately.
 ///
 /// We can't deterministically provoke a race in a single-threaded
@@ -5119,8 +5119,8 @@ fn concurrent_comments_absorb_contention_with_retry_budget() {
 fn zero_max_retries_surfaces_first_conflict() {
     // SAFETY: nextest runs each test in its own process.
     unsafe {
-        std::env::set_var("JJF_MAX_RETRIES", "0");
-        std::env::set_var("JJF_RETRY_BASE_MS", "0");
+        std::env::set_var("ISS_MAX_RETRIES", "0");
+        std::env::set_var("ISS_RETRY_BASE_MS", "0");
     }
 
     let repo = make_scratch_repo("retry_max_0_surfaces_conflict");
@@ -5173,13 +5173,13 @@ fn zero_max_retries_surfaces_first_conflict() {
     );
 
     unsafe {
-        std::env::remove_var("JJF_MAX_RETRIES");
-        std::env::remove_var("JJF_RETRY_BASE_MS");
+        std::env::remove_var("ISS_MAX_RETRIES");
+        std::env::remove_var("ISS_RETRY_BASE_MS");
     }
 }
 
 /// The exhausted-retry error message reflects the actual configured
-/// retry count. With `JJF_MAX_RETRIES=3`, the hint should say
+/// retry count. With `ISS_MAX_RETRIES=3`, the hint should say
 /// "retried 3 times" — keeping the operator-facing message honest
 /// when the budget is overridden.
 ///
@@ -5192,8 +5192,8 @@ fn zero_max_retries_surfaces_first_conflict() {
 fn exhausted_retry_hint_mentions_configured_count() {
     // SAFETY: nextest runs each test in its own process.
     unsafe {
-        std::env::set_var("JJF_MAX_RETRIES", "1");
-        std::env::set_var("JJF_RETRY_BASE_MS", "0");
+        std::env::set_var("ISS_MAX_RETRIES", "1");
+        std::env::set_var("ISS_RETRY_BASE_MS", "0");
     }
 
     let repo = make_scratch_repo("retry_hint_honest_count");
@@ -5231,8 +5231,8 @@ fn exhausted_retry_hint_mentions_configured_count() {
     }
 
     unsafe {
-        std::env::remove_var("JJF_MAX_RETRIES");
-        std::env::remove_var("JJF_RETRY_BASE_MS");
+        std::env::remove_var("ISS_MAX_RETRIES");
+        std::env::remove_var("ISS_RETRY_BASE_MS");
     }
 }
 
@@ -5245,7 +5245,7 @@ fn exhausted_retry_hint_mentions_configured_count() {
 // <<<"junk")`) made the affected id vanish from `list_ids` /
 // `list_ready` with no diagnostic. Trust-eroding for the operator
 // ("where did my ticket go?") and indistinguishable from "issue
-// doesn't exist" via `jjf show <id>`.
+// doesn't exist" via `iss show <id>`.
 //
 // The fix records each unparseable ref into
 // `SnapshotCache::unreadable_refs` (exposed via

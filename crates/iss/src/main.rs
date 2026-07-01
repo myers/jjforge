@@ -1,7 +1,7 @@
-//! `jjf` — the jjforge CLI binary.
+//! `iss` — the git-issues CLI binary.
 //!
-//! This crate is the user-facing entry point for jjforge: a thin
-//! clap-derive harness over the typed APIs in `jjf-storage`. Each
+//! This crate is the user-facing entry point for git-issues: a thin
+//! clap-derive harness over the typed APIs in `iss-storage`. Each
 //! sub-verb (`new`, `show`, `ls`, `update`, `comment`, `close`,
 //! `open`, `label`, `init`) maps to one storage call (or, for stubs,
 //! a `not yet implemented` placeholder so the parser surface is
@@ -25,11 +25,11 @@
 //! output is `{"ok": true, "bookmark": "issues"}` per the
 //! `cli-skeleton` ticket.
 //!
-//! # What lives here vs. `jjf-storage`
+//! # What lives here vs. `iss-storage`
 //!
 //! All the actual work — the git-ref write path, the trailers,
-//! the merge policy — lives in `jjf-storage` (and, for
-//! conflict-resolution, `jjf-merge`). This crate's only jobs
+//! the merge policy — lives in `iss-storage` (and, for
+//! conflict-resolution, `iss-merge`). This crate's only jobs
 //! are: parse args, hand the parsed shape to storage, render the
 //! result, map errors to exit codes. No business logic.
 
@@ -53,9 +53,9 @@ use iss_storage::{
 /// the option on each subcommand.
 #[derive(Debug, Parser)]
 #[command(
-    name = "jjf",
+    name = "iss",
     version,
-    about = "jjforge — a jj-native, agent-first issue tracker",
+    about = "git-issues — a jj-native, agent-first issue tracker",
     long_about = None,
 )]
 struct Cli {
@@ -68,7 +68,7 @@ struct Cli {
     command: Commands,
 }
 
-/// What `jjf ls --status <X>` accepts. Distinct from `Status` because
+/// What `iss ls --status <X>` accepts. Distinct from `Status` because
 /// `all` (no filter) is a CLI-only affordance with no storage-layer
 /// equivalent. v2.3 added `in-progress` mirroring `Status::InProgress`;
 /// v2.5 added `blocked` mirroring `Status::Blocked`. v2.7 added
@@ -85,7 +85,7 @@ enum StatusFilter {
 }
 
 /// Clap-side mirror of [`iss_storage::Status`] used for the `--status`
-/// flag on `jjf update`. We declare it here (rather than deriving
+/// flag on `iss update`. We declare it here (rather than deriving
 /// `ValueEnum` directly on `Status` in the storage crate) so the
 /// storage crate doesn't pick up a `clap` dependency just for a
 /// derive — the binary is the only `ValueEnum` site.
@@ -138,7 +138,7 @@ impl From<TypeArg> for IssueType {
 }
 
 /// Clap-side mirror of [`iss_storage::DepKind`] for the `--kind` flag
-/// on `jjf dep add|rm`. Same crate-isolation rationale as `StatusArg`
+/// on `iss dep add|rm`. Same crate-isolation rationale as `StatusArg`
 /// / `TypeArg`. Wire spelling matches the storage layer's kebab-case
 /// (`blocks`, `parent-child`, `related`, `discovered-from`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -203,7 +203,7 @@ enum Commands {
     /// Idempotent — running twice in the same repo is a no-op.
     Init,
 
-    /// Create a new issue on the `issues` bookmark. Requires `jjf init`
+    /// Create a new issue on the `issues` bookmark. Requires `iss init`
     /// to have been run first. Prints the new issue's id on stdout
     /// (or the `{"ok": true, "id": "..."}` object under `--json`);
     /// exits 0.
@@ -236,7 +236,7 @@ enum Commands {
         /// `<id>`. Repeatable. Shorthand for `-d parent-child:<id>`;
         /// composes with `-d` to mix kinds in one create. The common
         /// "file a ticket under an epic" case:
-        /// `jjf new -t "..." --parent <epic-id>`.
+        /// `iss new -t "..." --parent <epic-id>`.
         #[arg(long = "parent")]
         parents: Vec<String>,
 
@@ -278,7 +278,7 @@ enum Commands {
     /// status, labels, assignee, body, and comment thread. Plain-text
     /// by default; `--json` emits the structured `Issue` record
     /// verbatim (no envelope — the issue IS the payload). Requires
-    /// `jjf init` to have been run first.
+    /// `iss init` to have been run first.
     Show {
         /// Issue handle: a full 7-char hex id or a slug. Slug lookup
         /// scans both open and closed issues. A 7-char hex id that
@@ -290,9 +290,9 @@ enum Commands {
         /// Append a `## Persistent Memories (N)` block after the
         /// issue body, listing every memory at the bookmark tip
         /// alphabetically by key. v2.2 — primarily intended for
-        /// `jjf show roadmap --include-memories` at session start.
+        /// `iss show roadmap --include-memories` at session start.
         /// Has no effect on `--json` output (memories are reachable
-        /// via `jjf memories --json` for machine consumers).
+        /// via `iss memories --json` for machine consumers).
         #[arg(long = "include-memories")]
         include_memories: bool,
     },
@@ -365,20 +365,20 @@ enum Commands {
     /// `ls` (`<id>\t<status>\t<labelN>L\t<title>`); `--json` emits
     /// an array of `Issue` records.
     ///
-    /// The headline agent-ergonomics primitive: `jjf ready --limit 1
+    /// The headline agent-ergonomics primitive: `iss ready --limit 1
     /// --json` returns one unblocked issue to feed into the next
     /// action of an automation loop.
     Ready {
         /// Filter by label. Repeatable. Semantics: AND — an issue
         /// must carry every listed label to match. Mirrors
-        /// `jjf ls --label`.
+        /// `iss ls --label`.
         #[arg(short = 'l', long = "label")]
         labels: Vec<String>,
 
         /// Filter by issue type. Repeatable. Semantics: OR — an
         /// issue matches if its type equals any of the listed
         /// types. Omit the flag to include every type. Mirrors
-        /// `jjf ls --type`. Note: `Roadmap`-typed issues are
+        /// `iss ls --type`. Note: `Roadmap`-typed issues are
         /// excluded from the ready set entirely (the roadmap
         /// ticket isn't work to do), regardless of this filter.
         #[arg(long = "type", value_enum)]
@@ -386,7 +386,7 @@ enum Commands {
 
         /// Truncate the result to the first N entries after the
         /// priority sort. Omit for unlimited. The canonical
-        /// agent-loop call is `jjf ready --limit 1 --json`.
+        /// agent-loop call is `iss ready --limit 1 --json`.
         #[arg(long)]
         limit: Option<usize>,
 
@@ -407,8 +407,8 @@ enum Commands {
         /// Atomically claim the top result and emit its id. Only
         /// makes sense with `--limit 1` (claiming multiple at once
         /// would be ambiguous); other values are rejected at exit 2.
-        /// Equivalent to `jjf ready --limit 1` followed by
-        /// `jjf update <id> --claim`, but as one atomic compound:
+        /// Equivalent to `iss ready --limit 1` followed by
+        /// `iss update <id> --claim`, but as one atomic compound:
         /// the same `jj` rejection that blocks two parallel claims
         /// of the same id rolls this call back too. v2.3
         /// (`agent-claim-atomic`).
@@ -435,7 +435,7 @@ enum Commands {
         /// Filter by metadata key=value pair. Repeatable; AND-
         /// composed — every listed pair must match exactly on the
         /// issue's metadata map. Useful for GC-routing queries
-        /// such as `jjf ready --meta gc.routed_to=worker-1`.
+        /// such as `iss ready --meta gc.routed_to=worker-1`.
         /// v2.12 (`issue-metadata`).
         #[arg(long = "meta", value_parser = parse_meta_kv)]
         meta: Vec<(String, String)>,
@@ -457,7 +457,7 @@ enum Commands {
     /// at-least-one rule for us). `--assignee` and `--unset-assignee`
     /// are mutually exclusive (clap `conflicts_with`).
     ///
-    /// `--status` overlaps with `jjf close` / `jjf open` by design —
+    /// `--status` overlaps with `iss close` / `iss open` by design —
     /// use the standalone verbs for the single-shot ergonomic path,
     /// this verb for the multi-field case.
     Update {
@@ -553,7 +553,7 @@ enum Commands {
 
         /// Override the actor used by `--claim` (the identity that
         /// lands in the `assignee` field). Precedence:
-        /// `--actor <name>` > `JJF_ACTOR` env > `git config
+        /// `--actor <name>` > `ISS_ACTOR` env > `git config
         /// user.name`. Empty string falls through to the next slot
         /// rather than writing an empty assignee. Intended for
         /// multi-agent orchestrators that fan out N processes from
@@ -605,7 +605,7 @@ enum Commands {
     /// Close an issue. Lands a `set-status` op on a new commit on the
     /// `issues` bookmark. Not idempotent per the spec — closing an
     /// already-closed issue still writes a fresh trailer so the audit
-    /// log records the intent. Requires `jjf init` to have been run
+    /// log records the intent. Requires `iss init` to have been run
     /// first.
     Close {
         /// Full 7-char hex issue id. A bad parse is a preflight
@@ -628,9 +628,9 @@ enum Commands {
     ///
     /// Abandoned issues stay in history (audit-trail friendly), their
     /// slug stays claimed (spec §3.4 — slug uniqueness spans every
-    /// status), but they're hidden from `jjf ls` by default
+    /// status), but they're hidden from `iss ls` by default
     /// (`--status all` or `--status abandoned` to see them) and
-    /// excluded from `jjf ready` unconditionally (no override flag,
+    /// excluded from `iss ready` unconditionally (no override flag,
     /// unlike `--include-blocked` / `--include-claimed`).
     ///
     /// Use this for mis-filed issues (typo, wrong type, test
@@ -642,7 +642,7 @@ enum Commands {
     /// Same shape and non-idempotency rules as `close`: each call
     /// lands a fresh `set-status` trailer so the audit log records
     /// every intent. To revive an abandoned issue, use
-    /// `jjf update <id> --status open` (no inverse `unabandon` —
+    /// `iss update <id> --status open` (no inverse `unabandon` —
     /// the asymmetry is deliberate; abandon is meant as soft-
     /// delete, not a parking lot).
     Abandon {
@@ -653,18 +653,18 @@ enum Commands {
     },
 
     /// Set (or clear) an issue's assignee. Thin shorthand for
-    /// `jjf update <id> --assignee <name>` and `jjf update <id>
+    /// `iss update <id> --assignee <name>` and `iss update <id>
     /// --unset-assignee`. Modeled on beads' `bd assign <id> <name>`
     /// (`reference/beads/cmd/bd/assign.go`).
     ///
-    /// `jjf assign <id> <name>` sets the assignee; an empty `name`
-    /// (e.g. `jjf assign <id> ""`) clears it. Same preflight
+    /// `iss assign <id> <name>` sets the assignee; an empty `name`
+    /// (e.g. `iss assign <id> ""`) clears it. Same preflight
     /// (issues_bookmark probe, handle resolution) and the same
     /// typed errors as `update --assignee`: `issue_not_found` /
     /// `slug_not_found` on unknown handles, `invalid_input` from
     /// storage when the name contains a newline.
     ///
-    /// This is sugar only — it doesn't flip status. Use `jjf update
+    /// This is sugar only — it doesn't flip status. Use `iss update
     /// <id> --claim` (or its `--claim` shorthand on `ready`) when
     /// you want assignee + `in-progress` in one atomic commit.
     Assign {
@@ -680,15 +680,15 @@ enum Commands {
     /// Park an issue: set status to `blocked` and record a free-text
     /// reason, in ONE multi-op commit. v2.5 (`agent-await-gates-impl`).
     ///
-    /// Blocked issues are excluded from `jjf ready` by default — an
+    /// Blocked issues are excluded from `iss ready` by default — an
     /// idle agent shouldn't see them as workable. Use this when an
     /// issue is parked on an external signal (a PR landing, a
     /// timer, a human response) that the orchestrator (or a separate
     /// script) is responsible for clearing. The companion verb
-    /// `jjf unblock <id>` flips the status back to `open` and clears
+    /// `iss unblock <id>` flips the status back to `open` and clears
     /// the reason.
     ///
-    /// Inverse: `jjf unblock <id>`. (`jjf open <id>` also clears the
+    /// Inverse: `iss unblock <id>`. (`iss open <id>` also clears the
     /// status but does NOT clear the reason — use `unblock` for the
     /// canonical round-trip.)
     Block {
@@ -705,7 +705,7 @@ enum Commands {
     },
 
     /// Unpark an issue: clear status back to `open` and clear the
-    /// `block_reason` in ONE multi-op commit. Inverse of `jjf block`.
+    /// `block_reason` in ONE multi-op commit. Inverse of `iss block`.
     /// v2.5 (`agent-await-gates-impl`).
     Unblock {
         /// Issue handle (7-char hex id OR a slug).
@@ -732,7 +732,7 @@ enum Commands {
 
     /// Manage per-issue string→string metadata (last-write-wins per
     /// key). Mirrors `label` but stores a key/value map instead of a
-    /// set. Emitted on `jjf show --json` / `jjf ls --json` as a
+    /// set. Emitted on `iss show --json` / `iss ls --json` as a
     /// `"metadata"` object.
     Metadata {
         #[command(subcommand)]
@@ -743,14 +743,14 @@ enum Commands {
     /// `agent-dep-types`). Four edge kinds with distinct semantics:
     ///
     /// - `blocks`: hard prerequisite. The owning issue is blocked
-    ///   until the target closes; `jjf ready` honors this.
+    ///   until the target closes; `iss ready` honors this.
     /// - `parent-child`: hierarchical. The owning issue is a CHILD
-    ///   of the target; `jjf ready` cascades the parent's blocked
+    ///   of the target; `iss ready` cascades the parent's blocked
     ///   state to its children via fixpoint.
     /// - `related`: soft cross-link. Reference only.
     /// - `discovered-from`: provenance. "Found while working on X."
     ///
-    /// Per-verb help: `jjf dep add|rm|tree --help`.
+    /// Per-verb help: `iss dep add|rm|tree --help`.
     Dep {
         #[command(subcommand)]
         action: DepAction,
@@ -763,8 +763,8 @@ enum Commands {
     /// refspec config. Verified in `experiments/sync-remote/`.
     ///
     /// Preflight is jj-repo-only (no `issues` bookmark required) —
-    /// adding a remote is meaningful BEFORE `jjf init` runs, and the
-    /// soon-to-come `jjf push` will be how the bookmark first reaches
+    /// adding a remote is meaningful BEFORE `iss init` runs, and the
+    /// soon-to-come `iss push` will be how the bookmark first reaches
     /// a remote.
     Remote {
         #[command(subcommand)]
@@ -775,13 +775,13 @@ enum Commands {
     ///
     /// Memories are short declarative facts (operational rules,
     /// codebase folklore, architectural decisions) that travel with the
-    /// planner data via `jjf push` / `jjf pull`. v2.2 spec §10.
+    /// planner data via `iss push` / `iss pull`. v2.2 spec §10.
     ///
     /// Examples:
     ///
-    ///   jjf remember "always run tests with -race flag"
-    ///   jjf remember "Dolt phantom DBs hide in three places" --key dolt-phantoms
-    ///   jjf remember --key big-note -F notes.md
+    ///   iss remember "always run tests with -race flag"
+    ///   iss remember "Dolt phantom DBs hide in three places" --key dolt-phantoms
+    ///   iss remember --key big-note -F notes.md
     ///
     /// When `--key` is omitted, the key is derived from the value via
     /// the slugify rule (first ~8 hyphen-separated tokens, lowercase,
@@ -824,7 +824,7 @@ enum Commands {
     ///
     /// Exits 0 with the value on stdout when found, 1 with no output
     /// (or `{"found": false}` under `--json`) when absent. Useful in
-    /// scripts: `value=$(jjf recall some-key)`.
+    /// scripts: `value=$(iss recall some-key)`.
     Recall {
         /// Memory key to look up.
         key: String,
@@ -851,7 +851,7 @@ enum Commands {
     /// typed kinds so scripts can branch.
     Push {
         /// Remote name (must already be configured via
-        /// `jjf remote add <name> <url>`).
+        /// `iss remote add <name> <url>`).
         remote: String,
     },
 
@@ -873,14 +873,14 @@ enum Commands {
     /// mirroring `ls`.
     ///
     /// The empty query (`""`) returns no results — match-everything
-    /// is `jjf ls`'s job. Filters (`--status`, `--label`, `--type`)
+    /// is `iss ls`'s job. Filters (`--status`, `--label`, `--type`)
     /// compose with AND semantics against the search hits.
     Search {
         /// Substring to search for. Case-insensitive. Empty query
-        /// returns no results (use `jjf ls` to list every issue).
+        /// returns no results (use `iss ls` to list every issue).
         query: String,
 
-        /// Filter the search hits by status. Mirrors `jjf ls
+        /// Filter the search hits by status. Mirrors `iss ls
         /// --status`. Default `all` — search is fundamentally a
         /// "find anything containing X" verb, so we don't pre-restrict
         /// to open issues the way `ls` does.
@@ -888,14 +888,14 @@ enum Commands {
         status: StatusFilter,
 
         /// Filter by label. Repeatable. Semantics: AND — an issue
-        /// must carry every listed label to match. Mirrors `jjf ls
+        /// must carry every listed label to match. Mirrors `iss ls
         /// --label`.
         #[arg(short = 'l', long = "label")]
         labels: Vec<String>,
 
         /// Filter by issue type. Repeatable. Semantics: OR — an
         /// issue matches if its type equals any of the listed
-        /// types. Mirrors `jjf ls --type`.
+        /// types. Mirrors `iss ls --type`.
         #[arg(long = "type", value_enum)]
         types: Vec<TypeArg>,
 
@@ -958,7 +958,7 @@ enum Commands {
     /// section of `docs/cli-json.md` for the exact rendering rule.
     /// `--json` emits a bare array of `{id, title, status,
     /// updated_at, days_since_update}` records (no envelope —
-    /// structural cousin of `jjf ls --json`, which the ticket
+    /// structural cousin of `iss ls --json`, which the ticket
     /// explicitly mirrors). Empty result is `[]` under `--json`,
     /// silence under plain text.
     ///
@@ -978,7 +978,7 @@ enum Commands {
         #[arg(long, default_value_t = 14)]
         days: u64,
 
-        /// Filter by status. Mirrors `jjf ls --status`. Default
+        /// Filter by status. Mirrors `iss ls --status`. Default
         /// `open` — the orchestrator question is "what actionable
         /// work has gone quiet?".
         #[arg(long, value_enum, default_value_t = StatusFilter::Open)]
@@ -1005,7 +1005,7 @@ enum Commands {
         /// Filter by metadata key=value pair. Repeatable; AND-
         /// composed — every listed pair must match exactly on the
         /// issue's metadata map. Useful for GC-routing queries
-        /// such as `jjf stale --meta gc.routed_to=worker-1`.
+        /// such as `iss stale --meta gc.routed_to=worker-1`.
         /// v2.12 (`issue-metadata`).
         #[arg(long = "meta", value_parser = parse_meta_kv)]
         meta: Vec<(String, String)>,
@@ -1019,12 +1019,12 @@ enum Commands {
     /// with `remote_present: false` in the JSON envelope — not an error.
     Pull {
         /// Remote name (must already be configured via
-        /// `jjf remote add <name> <url>`).
+        /// `iss remote add <name> <url>`).
         remote: String,
     },
 }
 
-/// Inner enum for `jjf label <action>`. Separating the action from the
+/// Inner enum for `iss label <action>`. Separating the action from the
 /// outer verb keeps the clap-derive `--help` clean (one help page per
 /// add/rm rather than two flag combinations on one verb) and gives
 /// `cli-update`'s scalar fan-out a pattern to copy if it wants nested
@@ -1058,7 +1058,7 @@ enum LabelAction {
     },
 }
 
-/// Inner enum for `jjf metadata <action>`. Same shape rationale as
+/// Inner enum for `iss metadata <action>`. Same shape rationale as
 /// `LabelAction` (one help page per subcommand). `set` writes a
 /// key/value (overwriting any prior value — last-write-wins per key);
 /// `unset` removes a key.
@@ -1094,7 +1094,7 @@ enum MetadataAction {
     },
 }
 
-/// Inner enum for `jjf dep <action>` — v2.4 (`agent-dep-types`).
+/// Inner enum for `iss dep <action>` — v2.4 (`agent-dep-types`).
 /// Same shape rationale as `LabelAction` (one help page per
 /// subcommand, clean clap-derive output). The three verbs are
 /// `add` / `rm` / `tree`; `add` and `rm` take a `--kind` flag
@@ -1142,7 +1142,7 @@ enum DepAction {
     },
 }
 
-/// Inner enum for `jjf remote <action>`. Same shape rationale as
+/// Inner enum for `iss remote <action>`. Same shape rationale as
 /// `LabelAction` — one help page per subcommand, clean clap-derive
 /// `--help` output, plus distinct positional shapes per arm.
 #[derive(Debug, Subcommand)]
@@ -1216,7 +1216,7 @@ enum CliError {
     #[error("invalid dep kind {kind:?} in spec {value:?}")]
     BadDepKind { value: String, kind: String },
 
-    /// A positional issue id (e.g. `jjf show <id>`) didn't parse as
+    /// A positional issue id (e.g. `iss show <id>`) didn't parse as
     /// a valid `IssueId`. Preflight failure (exit 2) — the user typed
     /// something the storage layer can never resolve.
     ///
@@ -1233,10 +1233,10 @@ enum CliError {
 
     /// We're inside a jj repo, but the `issues` bookmark doesn't
     /// exist yet. Surfaced as a preflight (exit 2) so the user gets
-    /// a typed signal that they need to run `jjf init` rather than
+    /// a typed signal that they need to run `iss init` rather than
     /// the raw jj-stderr we'd get from trying to write against an
     /// empty `bookmarks(issues)` revset.
-    #[error("the `issues` bookmark does not exist in {0}; run `jjf init` first")]
+    #[error("the `issues` bookmark does not exist in {0}; run `iss init` first")]
     MissingIssuesBookmark(PathBuf),
 
     /// Probing for the `issues` bookmark (or for jj-repo-presence)
@@ -1246,30 +1246,30 @@ enum CliError {
     #[error("could not probe jj state: {0}")]
     Probe(std::io::Error),
 
-    /// The user piped (or pointed `-F` at) an empty body for `jjf
+    /// The user piped (or pointed `-F` at) an empty body for `iss
     /// comment`. An empty comment is almost certainly a mistake; we
     /// reject at the CLI layer (exit 2) rather than let the storage
     /// layer record a zero-byte comment.
     #[error("comment body is empty; pipe non-empty content via -F - or pass -F <path>")]
     EmptyCommentBody,
 
-    /// The user passed an empty string for `jjf label add|rm <id>
+    /// The user passed an empty string for `iss label add|rm <id>
     /// <label>`. The storage layer doesn't validate this — it would
     /// happily land a `label-add`/`label-rm` op with `label=""` — so
     /// we reject at the CLI layer (exit 2). An empty label is almost
-    /// certainly a shell-quoting mistake (`jjf label add $ID $L` with
+    /// certainly a shell-quoting mistake (`iss label add $ID $L` with
     /// `$L` unset) rather than intent.
     #[error("label must not be empty")]
     EmptyLabel,
 
-    /// The user passed an empty key for `jjf metadata set|unset <id>
+    /// The user passed an empty key for `iss metadata set|unset <id>
     /// <key> …`. Same rationale as `EmptyLabel`: the storage layer
     /// doesn't validate emptiness, and an empty key is almost
     /// certainly a shell-quoting mistake. Preflight failure (exit 2).
     #[error("metadata key must not be empty")]
     EmptyMetadataKey,
 
-    /// `jjf comment` couldn't resolve a comment author. Either jj's
+    /// `iss comment` couldn't resolve a comment author. Either jj's
     /// `user.name` isn't configured AND no `--author` override was
     /// supplied, or the override itself is empty/whitespace. Preflight
     /// failure (exit 2) — there's nothing for the storage layer to do
@@ -1279,7 +1279,7 @@ enum CliError {
     )]
     MissingAuthor,
 
-    /// `jjf update <id>` ran with no field flags. Clap can't enforce
+    /// `iss update <id>` ran with no field flags. Clap can't enforce
     /// the at-least-one rule for us (all the field flags are
     /// `Option<_>` or bool), so we check in the run fn and surface a
     /// typed exit-2 hint pointing at the available flags.
@@ -1288,7 +1288,7 @@ enum CliError {
     )]
     NoUpdateFields,
 
-    /// `jjf remote add <name> <url>` was asked to add a remote whose
+    /// `iss remote add <name> <url>` was asked to add a remote whose
     /// name is already taken. jj surfaces this via stderr containing
     /// "already exists"; we translate that one phrase to a typed
     /// preflight error (exit 2) so callers get a stable `kind` to
@@ -1296,14 +1296,14 @@ enum CliError {
     #[error("git remote already exists: {0}")]
     RemoteAlreadyExists(String),
 
-    /// `jjf remote rm <name>` was asked to remove a remote that
+    /// `iss remote rm <name>` was asked to remove a remote that
     /// doesn't exist. jj surfaces this via stderr containing "No git
     /// remote named"; we translate to a typed preflight error
     /// (exit 2) for the same reason as `RemoteAlreadyExists`.
     #[error("git remote not found: {0}")]
     RemoteNotFound(String),
 
-    /// `jjf remote *` shelled out to `jj git remote ...` and got a
+    /// `iss remote *` shelled out to `jj git remote ...` and got a
     /// non-zero exit that wasn't one of the two typed cases above.
     /// Runtime failure (exit 1) — surfaces jj's stderr verbatim so
     /// the operator can see what jj said. URL syntax errors, network-
@@ -1311,18 +1311,18 @@ enum CliError {
     #[error("jj git remote failed: {0}")]
     JjGitRemote(String),
 
-    /// `jjf push` could not reach the remote — network failure,
+    /// `iss push` could not reach the remote — network failure,
     /// hostname unresolvable, TCP closed, etc. Runtime (exit 1): the
     /// command was well-formed, the network just wasn't.
     #[error("push to {remote} failed (network): {stderr}")]
     PushNetworkFailure { remote: String, stderr: String },
 
-    /// `jjf push` reached the remote but the remote rejected our
+    /// `iss push` reached the remote but the remote rejected our
     /// credentials. Runtime (exit 1).
     #[error("push to {remote} failed (auth): {stderr}")]
     PushAuthFailure { remote: String, stderr: String },
 
-    /// `jjf push` reached the remote but the remote rejected the
+    /// `iss push` reached the remote but the remote rejected the
     /// update (non-fast-forward, hook rejection, etc.). Runtime
     /// (exit 1).
     ///
@@ -1352,21 +1352,21 @@ enum CliError {
         refs_rejected: Vec<String>,
     },
 
-    /// `jjf push` shelled out and got a non-zero exit that wasn't
+    /// `iss push` shelled out and got a non-zero exit that wasn't
     /// one of the typed cases above. Runtime (exit 1).
     #[error("jj git push failed: {0}")]
     JjGitPush(String),
 
-    /// `jjf pull` could not reach the remote. Runtime (exit 1).
+    /// `iss pull` could not reach the remote. Runtime (exit 1).
     #[error("pull from {remote} failed (network): {stderr}")]
     PullNetworkFailure { remote: String, stderr: String },
 
-    /// `jjf pull` reached the remote but credentials were rejected.
+    /// `iss pull` reached the remote but credentials were rejected.
     /// Runtime (exit 1).
     #[error("pull from {remote} failed (auth): {stderr}")]
     PullAuthFailure { remote: String, stderr: String },
 
-    /// `jjf pull` shelled out to `jj git fetch` and got a non-zero
+    /// `iss pull` shelled out to `jj git fetch` and got a non-zero
     /// exit that wasn't one of the typed cases above. Runtime
     /// (exit 1).
     #[error("jj git fetch failed: {0}")]
@@ -1376,7 +1376,7 @@ enum CliError {
     /// body field had free-text conflicts the LWW/union policy
     /// couldn't dispatch. Runtime (exit 1). **As of the
     /// `sync-conflict-fallback` switch (`bfc732b`), this variant is
-    /// unreachable from `jjf pull`** — the op-space resolver has no
+    /// unreachable from `iss pull`** — the op-space resolver has no
     /// "unmergeable" failure mode, body-text divergence resolves
     /// LWW by `Jjf-At:` timestamp. The variant stays defined so the
     /// JSON envelope's error-kind enum, the exit-code table, and any
@@ -1390,7 +1390,7 @@ enum CliError {
     /// `issues/<id>.comments.jsonl` file had conflict markers the v1
     /// driver couldn't handle. Runtime (exit 1). **As of
     /// `sync-conflict-fallback` (`bfc732b`), this variant is
-    /// unreachable from `jjf pull`** — the op-space resolver builds
+    /// unreachable from `iss pull`** — the op-space resolver builds
     /// the merged comments file as a union of each head's pristine
     /// `.comments.jsonl` (read via `jj file show -r <head>`), so
     /// jj's conflict markers never appear in the working copy on
@@ -1400,7 +1400,7 @@ enum CliError {
     #[error("merge driver does not handle conflicted comment file for issue {issue_id} (v1 limitation)\nworking copy left with conflict markers for manual resolution")]
     CommentFileConflict { issue_id: String },
 
-    /// `jjf update --slug` / `jjf new --slug` was handed a slug that
+    /// `iss update --slug` / `iss new --slug` was handed a slug that
     /// failed validation (charset, length, hyphen rules). Preflight
     /// failure (exit 2). The `reason` field is the typed
     /// rejection variant; `slug` is what the operator supplied.
@@ -1410,7 +1410,7 @@ enum CliError {
         reason: SlugInvalidReason,
     },
 
-    /// `jjf new -t` / `jjf update --title` was handed a title that
+    /// `iss new -t` / `iss update --title` was handed a title that
     /// failed validation (empty, embedded newline, embedded null
     /// byte, other control character). Preflight failure (exit 2).
     /// The `reason` field is the typed rejection variant; `title`
@@ -1422,7 +1422,7 @@ enum CliError {
         reason: TitleInvalidReason,
     },
 
-    /// `jjf new -F`, `jjf update --body-file`, or `jjf comment -F`
+    /// `iss new -F`, `iss update --body-file`, or `iss comment -F`
     /// was handed a body that exceeded the documented cap
     /// (`BODY_MAX_BYTES` = 65,536 bytes, matching GitHub's issue-
     /// body limit). Preflight failure (exit 2). The CLI envelope
@@ -1431,7 +1431,7 @@ enum CliError {
     #[error("invalid body: {reason}")]
     InvalidBody { reason: BodyInvalidReason },
 
-    /// `jjf new -p` or `jjf update --priority` was handed an
+    /// `iss new -p` or `iss update --priority` was handed an
     /// integer outside the documented `0..=4` window. Preflight
     /// failure (exit 2). The CLI envelope kind is
     /// `invalid_priority`. Added in `priority-field` (ticket
@@ -1439,7 +1439,7 @@ enum CliError {
     #[error("invalid priority: {reason}")]
     InvalidPriority { reason: PriorityInvalidReason },
 
-    /// `jjf dep add <X> <X>` (or the inline `jjf new -d <self-id>`)
+    /// `iss dep add <X> <X>` (or the inline `iss new -d <self-id>`)
     /// was asked to land an edge from an issue to itself. Self-deps
     /// make the child permanently blocked by itself, so the
     /// boundary rejects them. Preflight failure (exit 2). The
@@ -1456,9 +1456,9 @@ enum CliError {
     #[error("issue {id} cannot depend on itself")]
     SelfDependency { id: String },
 
-    /// `jjf dep add <source> <target>` would close a cycle in the
+    /// `iss dep add <source> <target>` would close a cycle in the
     /// `blocks`-edge graph. Issues caught in a `blocks` cycle are
-    /// permanently invisible to `jjf ready` (every node has at
+    /// permanently invisible to `iss ready` (every node has at
     /// least one active blocks-dep), so the boundary rejects the
     /// write rather than land the silent landmine. Preflight failure
     /// (exit 2). v2.6 (`dep-cycle-undetected`, issue `43c7615`).
@@ -1507,43 +1507,43 @@ enum CliError {
     #[error("no issue with handle {handle:?}")]
     SlugNotFound { handle: String },
 
-    /// `jjf remember` ran with no value source — neither a positional
+    /// `iss remember` ran with no value source — neither a positional
     /// arg nor `-F`. Preflight failure (exit 2).
     #[error("no memory value supplied; pass a positional argument or `-F <path|->`")]
     MissingMemoryValue,
 
-    /// `jjf remember` was unable to derive a key from the value (the
+    /// `iss remember` was unable to derive a key from the value (the
     /// value contained no alphanumeric characters). Preflight failure
     /// (exit 2). The operator should pass `--key`.
     #[error("could not derive memory key from {value:?}; pass --key <slug>")]
     EmptyMemoryKey { value: String },
 
-    /// `jjf recall <key>` or `jjf forget <key>` looked up a memory key
+    /// `iss recall <key>` or `iss forget <key>` looked up a memory key
     /// that doesn't exist at the bookmark tip. Runtime failure
     /// (exit 1) — the input was well-formed, the answer is "no such
     /// memory."
     #[error("no memory with key {key:?}")]
     MemoryNotFound { key: String },
 
-    /// `jjf update --claim` (or `jjf ready --claim`) couldn't find
+    /// `iss update --claim` (or `iss ready --claim`) couldn't find
     /// a current user. Preflight failure (exit 2) — claims require
     /// an identity to assign to. The chain is `--actor <name>` >
-    /// `JJF_ACTOR` env > `git config user.name`; this error fires
+    /// `ISS_ACTOR` env > `git config user.name`; this error fires
     /// when every slot is empty. v2.3 (`agent-claim-atomic`); chain
     /// extended v2.12 (`actor-override-chain`).
     #[error(
-        "no current user available; set git user.name (e.g. `git config user.name 'Your Name'`) OR export `JJF_ACTOR=<name>` to claim issues"
+        "no current user available; set git user.name (e.g. `git config user.name 'Your Name'`) OR export `ISS_ACTOR=<name>` to claim issues"
     )]
     NoCurrentUser,
 
-    /// `jjf ready --claim` was used with `--limit` other than 1.
+    /// `iss ready --claim` was used with `--limit` other than 1.
     /// Atomically claiming multiple issues at once doesn't compose
     /// — agents work one ticket at a time. Preflight failure
     /// (exit 2). v2.3 (`agent-claim-atomic`).
     #[error("--claim requires --limit 1; claiming multiple at once doesn't compose")]
     ClaimRequiresLimitOne,
 
-    /// `jjf update --claim` was asked to claim an issue already in
+    /// `iss update --claim` was asked to claim an issue already in
     /// the InProgress state with a different assignee. Preflight
     /// failure (exit 2) so the orchestrator can branch on
     /// `already_claimed`. The `by` field carries the existing
@@ -1578,7 +1578,7 @@ enum CliError {
     #[error("concurrent write conflict; {hint}")]
     ConcurrentWrite { hint: String },
 
-    /// `jjf ready --claim` raced another claimer for the same id and
+    /// `iss ready --claim` raced another claimer for the same id and
     /// the storage layer's CAS-loss retry found that the id was
     /// already claimed by the SAME user (i.e., another parallel
     /// `ready --claim` of ours took the slot). The orchestrator
@@ -1810,7 +1810,7 @@ impl CliError {
                 };
                 json!({
                     "remote": remote,
-                    "hint": format!("run `jjf pull {remote}` first, then retry the push"),
+                    "hint": format!("run `iss pull {remote}` first, then retry the push"),
                     "refs_rejected": refs_value,
                     "stderr_raw": stderr,
                 })
@@ -1927,7 +1927,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Render a `CliError` to stderr in either the plain `jjf: <msg>` form
+/// Render a `CliError` to stderr in either the plain `iss: <msg>` form
 /// or the `--json` error envelope:
 ///
 /// ```json
@@ -1958,7 +1958,7 @@ fn report_error(e: &CliError) {
         });
         eprintln!("{envelope}");
     } else {
-        eprintln!("jjf: {e}");
+        eprintln!("iss: {e}");
     }
 }
 
@@ -2148,7 +2148,7 @@ enum DepOp {
     Rm,
 }
 
-/// `jjf init` — wrap `Storage::init` against the cwd. Idempotent;
+/// `iss init` — wrap `Storage::init` against the cwd. Idempotent;
 /// emits either a one-line success message or, with `--json`, the
 /// ticket-spec `{"ok": true, "bookmark": "issues"}`.
 ///
@@ -2174,7 +2174,7 @@ fn run_init(json: bool) -> Result<(), CliError> {
 
     // Back-fill the v3 fetch refspec for every git remote already
     // configured on this repo. If the user cloned first and is now
-    // running `jjf init`, the standard `+refs/heads/*:refs/remotes/.../*`
+    // running `iss init`, the standard `+refs/heads/*:refs/remotes/.../*`
     // refspec their `git clone` (or `jj git clone`) wrote does NOT
     // carry `refs/jjf/*`. Add the jjforge namespace so subsequent
     // `git fetch <remote>` round-trips it (ticket `eaf0674`).
@@ -2193,12 +2193,12 @@ fn run_init(json: bool) -> Result<(), CliError> {
         });
         println!("{out}");
     } else {
-        println!("jjf: initialized");
+        println!("iss: initialized");
     }
     Ok(())
 }
 
-/// `jjf new -t <title> [-F <path|->] [-l <label>...] [-d <id>...] [-a <name>]`
+/// `iss new -t <title> [-F <path|->] [-l <label>...] [-d <id>...] [-a <name>]`
 /// — create one issue on the `issues` bookmark via the storage write
 /// path and emit its id.
 ///
@@ -2206,7 +2206,7 @@ fn run_init(json: bool) -> Result<(), CliError> {
 /// BEFORE shelling out to jj, so user-typo / stdin-empty failures don't
 /// land any half-state on the bookmark. The bookmark-presence probe
 /// then runs against the cwd; if the bookmark is missing we surface a
-/// `run jjf init first` message rather than letting the storage layer
+/// `run `iss init` first` message rather than letting the storage layer
 /// fail mid-write on an empty `bookmarks(issues)` revset.
 fn run_new(
     json: bool,
@@ -2231,7 +2231,7 @@ fn run_new(
     // `--parent <id-or-slug>` (fj#3) is the discoverable shorthand for
     // the dominant child-of-epic case. Its values are resolved AFTER
     // storage opens (step 4), so slugs work the same way they do for
-    // `jjf ls --parent`, `jjf ready --parent`, etc. (b417864).
+    // `iss ls --parent`, `iss ready --parent`, etc. (b417864).
     //
     // We emit parent `DepAdd` ops first, but storage sorts
     // `dependencies` on each write — read-back order is
@@ -2250,7 +2250,7 @@ fn run_new(
     // 2a. Pre-validate the title at the CLI boundary so the user
     // gets a typed exit-2 error before any IO kicks off. Storage
     // will re-validate. See `qa-title-validation` (issue
-    // `e4e483b`): embedded `\n` corrupts `jjf ls` rows; embedded
+    // `e4e483b`): embedded `\n` corrupts `iss ls` rows; embedded
     // `\0` was silently truncated before this guard landed.
     if let Err(reason) = iss_storage::validate_title(&title) {
         return Err(CliError::InvalidTitle {
@@ -2306,7 +2306,7 @@ fn run_new(
     let storage = Storage::open(&cwd)?;
 
     // 5a. Resolve every `--parent <handle>` value against the open
-    // storage so slugs work the same way they do for `jjf ls --parent`
+    // storage so slugs work the same way they do for `iss ls --parent`
     // and friends (b417864). A 7-hex handle short-circuits inside
     // `resolve_handle` with no bookmark walk; a non-hex handle with
     // no matching slug surfaces as `slug_not_found` (exit 2).
@@ -2402,7 +2402,7 @@ fn read_body(file: Option<&Path>) -> Result<String, CliError> {
     })
 }
 
-/// `jjf show <id> [--json]` — fetch one issue's structured record from
+/// `iss show <id> [--json]` — fetch one issue's structured record from
 /// the `issues` bookmark via `Storage::read` and render it.
 ///
 /// The preflight order matches `run_new`: parse the id, resolve the
@@ -2416,7 +2416,7 @@ fn run_show(json: bool, id: String, include_memories: bool) -> Result<(), CliErr
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
 
-    // 2. Preflight the same checks the write path runs. `run jjf
+    // 2. Preflight the same checks the write path runs. `run iss
     // init first` is the right error when the bookmark is missing,
     // not a raw jj-stderr.
     preflight::issues_bookmark(&cwd)?;
@@ -2436,7 +2436,7 @@ fn run_show(json: bool, id: String, include_memories: bool) -> Result<(), CliErr
         // use the envelope because they have no payload beyond a
         // success signal; `show`'s whole job is to expose the record.)
         // `--include-memories` is plain-text only — JSON consumers
-        // call `jjf memories --json` for that.
+        // call `iss memories --json` for that.
         let s = serde_json::to_string_pretty(&issue)
             .map_err(|e| CliError::Storage(StorageError::Json(e)))?;
         println!("{s}");
@@ -2463,7 +2463,7 @@ fn print_memories_block(memories: &[Memory]) {
     println!("## Persistent Memories ({})", memories.len());
     println!();
     println!(
-        "Stored via `jjf remember`. Update in place with `jjf remember --key <key> \"new content\"`. Search with `jjf memories <keyword>`. Remove with `jjf forget <key>`."
+        "Stored via `iss remember`. Update in place with `iss remember --key <key> \"new content\"`. Search with `iss memories <keyword>`. Remove with `iss forget <key>`."
     );
     println!();
     for m in memories {
@@ -2473,10 +2473,10 @@ fn print_memories_block(memories: &[Memory]) {
     }
 }
 
-/// `jjf remember "<value>" [--key <slug>] [-F <path|->]` — write a
+/// `iss remember "<value>" [--key <slug>] [-F <path|->]` — write a
 /// persistent memory to the `issues` bookmark.
 ///
-/// Body source rules mirror `jjf new`'s `-F` convention: a positional
+/// Body source rules mirror `iss new`'s `-F` convention: a positional
 /// `value` is the value verbatim; `-F <path>` reads from a file; `-F -`
 /// reads from stdin. Exactly one source must be present; clap enforces
 /// the `conflicts_with` between `value` and `file`.
@@ -2549,7 +2549,7 @@ fn run_remember(
     Ok(())
 }
 
-/// `jjf memories [<search>] [--json]` — list memories, optionally
+/// `iss memories [<search>] [--json]` — list memories, optionally
 /// filtered by a case-insensitive substring match across key + value.
 ///
 /// Plain-text shape per the ticket: `<key>\n  <value-truncated>\n` per
@@ -2581,7 +2581,7 @@ fn run_memories(json: bool, search: Option<String>) -> Result<(), CliError> {
             println!("no memories matching {s:?}");
         } else {
             println!(
-                "no memories stored. Use `jjf remember \"insight\"` to add one."
+                "no memories stored. Use `iss remember \"insight\"` to add one."
             );
         }
         return Ok(());
@@ -2600,7 +2600,7 @@ fn run_memories(json: bool, search: Option<String>) -> Result<(), CliError> {
     Ok(())
 }
 
-/// `jjf recall <key> [--json]` — print the full value of one memory.
+/// `iss recall <key> [--json]` — print the full value of one memory.
 ///
 /// Plain-text shape: the value verbatim on stdout (newline-appended),
 /// exit 1 with a stderr error if absent. `--json` shape: `{key, value,
@@ -2630,7 +2630,7 @@ fn run_recall(json: bool, key: String) -> Result<(), CliError> {
     }
 }
 
-/// `jjf forget <key> [--json]` — remove one memory by key.
+/// `iss forget <key> [--json]` — remove one memory by key.
 ///
 /// Exit 0 with a confirmation on success; exit 1 with `memory_not_found`
 /// when the key doesn't exist. The storage layer's `unset_memory`
@@ -2788,7 +2788,7 @@ fn print_issue_plain(issue: &Issue) {
     }
 }
 
-/// `jjf close <id>` / `jjf open <id>` — flip an issue's status via the
+/// `iss close <id>` / `iss open <id>` — flip an issue's status via the
 /// storage write path. Both verbs differ only in the `Status` value
 /// they pass to `Storage::set_status`, so they share one helper.
 ///
@@ -2801,7 +2801,7 @@ fn print_issue_plain(issue: &Issue) {
 ///
 /// Preflight order matches `run_show`: parse the id (exit 2 on bad
 /// shape), resolve the cwd, probe for the jj repo + `issues` bookmark
-/// (exit 2 with `run jjf init first` if absent), then hand off to
+/// (exit 2 with `run `iss init` first` if absent), then hand off to
 /// storage. A well-formed id that doesn't exist on the bookmark
 /// surfaces as `IssueNotFound` and exits 1.
 fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError> {
@@ -2851,7 +2851,7 @@ fn run_set_status(json: bool, id: String, status: Status) -> Result<(), CliError
     Ok(())
 }
 
-/// `jjf block <id> --reason <text>` — park an issue. Sets status to
+/// `iss block <id> --reason <text>` — park an issue. Sets status to
 /// `blocked` and records the (optional) reason in ONE multi-op
 /// commit via [`Storage::block`]. v2.5 (`agent-await-gates-impl`).
 ///
@@ -2905,7 +2905,7 @@ fn run_block(json: bool, id: String, reason: Option<String>) -> Result<(), CliEr
     Ok(())
 }
 
-/// `jjf unblock <id>` — unpark an issue. Sets status back to `open`
+/// `iss unblock <id>` — unpark an issue. Sets status back to `open`
 /// AND clears the `block_reason` in ONE multi-op commit via
 /// [`Storage::unblock`]. v2.5 (`agent-await-gates-impl`).
 fn run_unblock(json: bool, id: String) -> Result<(), CliError> {
@@ -2931,7 +2931,7 @@ fn run_unblock(json: bool, id: String) -> Result<(), CliError> {
     Ok(())
 }
 
-/// `jjf assign <id> <name>` — sugar for `jjf update <id>
+/// `iss assign <id> <name>` — sugar for `iss update <id>
 /// --assignee <name>` / `--unset-assignee`. Modeled on beads'
 /// `bd assign` (`reference/beads/cmd/bd/assign.go`); the entire
 /// heavy lift lives in [`Storage::set_assignee`].
@@ -2980,7 +2980,7 @@ fn run_assign(json: bool, id: String, name: String) -> Result<(), CliError> {
     Ok(())
 }
 
-/// `jjf label add|rm <id> <label>` — flip one label on an issue via
+/// `iss label add|rm <id> <label>` — flip one label on an issue via
 /// the storage write path. Both arms differ only in which `Storage`
 /// mutator they call (`add_label` vs `remove_label`) and which
 /// past-tense verb they render, so they share one helper.
@@ -2993,7 +2993,7 @@ fn run_assign(json: bool, id: String, name: String) -> Result<(), CliError> {
 ///
 /// Preflight order mirrors `run_set_status`: parse the id (exit 2),
 /// reject an empty label (exit 2), canonicalize cwd, probe for the jj
-/// repo + `issues` bookmark (exit 2 with `run jjf init first` if
+/// repo + `issues` bookmark (exit 2 with `run `iss init` first` if
 /// absent), then hand off to storage. A well-formed id that doesn't
 /// exist on the bookmark surfaces as `IssueNotFound` and exits 1.
 fn run_label(json: bool, id: String, label: String, op: LabelOp) -> Result<(), CliError> {
@@ -3043,7 +3043,7 @@ fn run_label(json: bool, id: String, label: String, op: LabelOp) -> Result<(), C
     Ok(())
 }
 
-/// `jjf metadata set|unset <id> <key> [<value>]` — wrap
+/// `iss metadata set|unset <id> <key> [<value>]` — wrap
 /// `Storage::set_metadata` / `Storage::unset_metadata`. Mirrors
 /// [`run_label`]: reject an empty key at the CLI layer (exit 2),
 /// canonicalize cwd, probe for the `issues` bookmark, resolve the
@@ -3106,7 +3106,7 @@ fn run_metadata(
     Ok(())
 }
 
-/// `jjf dep add|rm <child> <parent> [--kind <kind>]` — wrap
+/// `iss dep add|rm <child> <parent> [--kind <kind>]` — wrap
 /// `Storage::add_dep_edge` / `Storage::remove_dep_edge`. v2.4
 /// (`agent-dep-types`). Preflight mirrors `run_label`: refuse to run
 /// from the source repo, probe for the `issues` bookmark, resolve
@@ -3156,7 +3156,7 @@ fn run_dep(
     Ok(())
 }
 
-/// `jjf dep tree <id>` — print the parent-child tree rooted at `<id>`.
+/// `iss dep tree <id>` — print the parent-child tree rooted at `<id>`.
 /// v2.4 (`agent-dep-types`). Read-only verb; no source-repo guard
 /// needed.
 fn run_dep_tree(json: bool, id: String) -> Result<(), CliError> {
@@ -3196,7 +3196,7 @@ fn render_dep_tree_text(node: &DepTreeNode, depth: usize) {
     }
 }
 
-/// `jjf remote add <name> <url>` — wrap `git remote add <name> <url>`
+/// `iss remote add <name> <url>` — wrap `git remote add <name> <url>`
 /// against the cwd's git repo.
 ///
 /// git does the actual remote-add work; we translate the two specific
@@ -3206,7 +3206,7 @@ fn render_dep_tree_text(node: &DepTreeNode, depth: usize) {
 /// surface its rejection unchanged.
 ///
 /// Preflight is the repo-existence check only (no `issues` bookmark
-/// required), because adding a remote is meaningful before `jjf init`
+/// required), because adding a remote is meaningful before `iss init`
 /// runs.
 ///
 /// After git registers the remote we also add the v3 fetch refspec
@@ -3235,7 +3235,7 @@ fn run_remote_add(json: bool, name: String, url: String) -> Result<(), CliError>
     }
 
     // Best-effort: append the v3 fetch refspec. Failures here are not
-    // fatal (the remote IS added; the user can still `jjf pull` since
+    // fatal (the remote IS added; the user can still `iss pull` since
     // that uses an explicit refspec), but they're worth surfacing as a
     // hint.
     let _ = ensure_jjf_fetch_refspec(&cwd, &name);
@@ -3255,7 +3255,7 @@ fn run_remote_add(json: bool, name: String, url: String) -> Result<(), CliError>
 
 /// Iterate every git remote configured on `<cwd>` and call
 /// [`ensure_jjf_fetch_refspec`] for each. Best-effort — individual
-/// failures are logged-by-ignored; the caller (`jjf init`) doesn't
+/// failures are logged-by-ignored; the caller (`iss init`) doesn't
 /// want a stale refspec write to break init.
 fn backfill_fetch_refspec_for_all_remotes(cwd: &Path) -> std::io::Result<()> {
     let out = std::process::Command::new("git")
@@ -3282,9 +3282,9 @@ fn backfill_fetch_refspec_for_all_remotes(cwd: &Path) -> std::io::Result<()> {
 ///
 /// Without this refspec, a plain `git fetch <remote>` only pulls
 /// `refs/heads/*`, so the jjforge `refs/jjf/*` namespace stays empty on
-/// a fresh clone — `jjf ls` then errors with "run jjf init first" even
+/// a fresh clone — `iss ls` then errors with "run `iss init` first" even
 /// though the remote has every ref the local repo needs (ticket
-/// `eaf0674`). `jjf pull` itself uses an explicit refspec and works
+/// `eaf0674`). `iss pull` itself uses an explicit refspec and works
 /// regardless, but downstream tooling (and curious users running raw
 /// git) expects fetch to carry the namespace.
 fn ensure_jjf_fetch_refspec(cwd: &Path, remote: &str) -> std::io::Result<()> {
@@ -3325,7 +3325,7 @@ fn ensure_jjf_fetch_refspec(cwd: &Path, remote: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `jjf remote ls` — wrap `git remote -v` and re-render its output as
+/// `iss remote ls` — wrap `git remote -v` and re-render its output as
 /// tab-separated `<name>\t<url>` lines.
 ///
 /// `git remote -v` prints two lines per remote (fetch + push); we
@@ -3403,7 +3403,7 @@ fn run_remote_ls(json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-/// `jjf remote rm <name>` — wrap `git remote remove <name>`.
+/// `iss remote rm <name>` — wrap `git remote remove <name>`.
 ///
 /// Preflight + error mapping mirror `run_remote_add`. Stderr matching
 /// on git's `No such remote` phrase (`error: No such remote: '<name>'`
@@ -3442,7 +3442,7 @@ fn run_remote_rm(json: bool, name: String) -> Result<(), CliError> {
     Ok(())
 }
 
-/// `jjf update <id> [--title T] [--status S] [--body-file PATH|-]
+/// `iss update <id> [--title T] [--status S] [--body-file PATH|-]
 /// [--assignee NAME] [--unset-assignee] [--json]` — mutate one or more
 /// scalar fields of an issue in a single commit.
 ///
@@ -3646,7 +3646,7 @@ fn run_update(
 
 /// Enumerate the field-name strings for the populated fields of an
 /// `UpdateFields`, in field-declaration order. Used to render both the
-/// plain-text and `--json` outputs of `jjf update` so they list the
+/// plain-text and `--json` outputs of `iss update` so they list the
 /// same set of names in the same order — and the same order the
 /// storage layer's trailers appear in on the resulting commit.
 fn changed_field_names(fields: &UpdateFields) -> Vec<&'static str> {
@@ -3675,7 +3675,7 @@ fn changed_field_names(fields: &UpdateFields) -> Vec<&'static str> {
     out
 }
 
-/// `jjf comment <id> -F <path|-> [--author <NAME>] [--json]` — append
+/// `iss comment <id> -F <path|-> [--author <NAME>] [--json]` — append
 /// one comment to an existing issue via the storage write path.
 ///
 /// Preflight order mirrors `run_set_status`: parse the id, read the
@@ -3752,10 +3752,10 @@ fn run_comment(
 /// otherwise we fall through to the next):
 ///
 /// 1. `actor_override` — the `--actor <name>` CLI flag on
-///    `jjf update`. Empty / whitespace falls through (per the
+///    `iss update`. Empty / whitespace falls through (per the
 ///    `actor-override-chain` ticket: `--actor ""` is "skip me," not
 ///    "set empty assignee").
-/// 2. `JJF_ACTOR` env var. Same emptiness rule as the flag.
+/// 2. `ISS_ACTOR` env var. Same emptiness rule as the flag.
 /// 3. `git config user.name` (J2: was `jj config get user.name`).
 ///
 /// Returns [`CliError::NoCurrentUser`] when the chain runs dry.
@@ -3781,13 +3781,13 @@ fn resolve_current_user(actor_override: Option<&str>) -> Result<String, CliError
     }
 }
 
-/// Read `JJF_ACTOR` from the environment, returning the trimmed
+/// Read `ISS_ACTOR` from the environment, returning the trimmed
 /// value when present and non-empty. Empty / whitespace-only values
-/// behave as "unset" so a stray `JJF_ACTOR=` in a parent process
+/// behave as "unset" so a stray `ISS_ACTOR=` in a parent process
 /// doesn't override the next-slot fallback. v2.12
 /// (`actor-override-chain`).
 fn jjf_actor_env() -> Option<String> {
-    match std::env::var("JJF_ACTOR") {
+    match std::env::var("ISS_ACTOR") {
         Ok(v) => {
             let trimmed = v.trim();
             if trimmed.is_empty() {
@@ -3804,11 +3804,11 @@ fn jjf_actor_env() -> Option<String> {
 /// present and non-empty after trimming, wins; otherwise we fall
 /// through to the next):
 ///
-/// 1. `override_name` — the `--author` CLI flag on `jjf comment`,
+/// 1. `override_name` — the `--author` CLI flag on `iss comment`,
 ///    written verbatim (caller is responsible for formatting it
 ///    `Name <email>` if they want that shape).
-/// 2. `JJF_ACTOR` env var, synthesized as `$JJF_ACTOR <user.email>`
-///    (or just `$JJF_ACTOR` if `user.email` is unset). v2.12
+/// 2. `ISS_ACTOR` env var, synthesized as `$ISS_ACTOR <user.email>`
+///    (or just `$ISS_ACTOR` if `user.email` is unset). v2.12
 ///    (`actor-override-chain`).
 /// 3. `git config user.name` + `user.email` synthesized as
 ///    `Name <email>` (or just `name` if `user.email` is unset). J2:
@@ -3821,7 +3821,7 @@ fn jjf_actor_env() -> Option<String> {
 /// Edge cases:
 /// - Override is empty / whitespace → falls through to the next
 ///   slot (matches the `--actor` chain semantics).
-/// - `JJF_ACTOR` is set but empty / whitespace → falls through.
+/// - `ISS_ACTOR` is set but empty / whitespace → falls through.
 /// - `user.name` is unset (or empty) and the prior slots fell
 ///   through → `MissingAuthor`.
 /// - `user.name` is set but `user.email` is unset → return just the
@@ -3935,12 +3935,12 @@ fn emit_unreadable_warning(unreadable: &[UnreadableRef], json: bool) {
         String::new()
     };
     eprintln!(
-        "jjf: warning: {count} ref(s) unreadable: {names}{tail} (skipped from listing)",
+        "iss: warning: {count} ref(s) unreadable: {names}{tail} (skipped from listing)",
         names = names.join(", ")
     );
 }
 
-/// `jjf ls [--status <S>] [--label <L>...] [--json]` — enumerate every
+/// `iss ls [--status <S>] [--label <L>...] [--json]` — enumerate every
 /// issue on the `issues` bookmark, filter by status and labels (AND
 /// across labels), render newest-first.
 ///
@@ -3962,7 +3962,7 @@ fn run_ls(
     parent: Option<String>,
 ) -> Result<(), CliError> {
     // Preflight: cwd is a jj repo AND `issues` bookmark exists. Same
-    // order as `run_show` — typed `run jjf init first` message rather
+    // order as `run_show` — typed `run `iss init` first` message rather
     // than raw jj stderr if the bookmark is missing.
     let cwd: PathBuf = std::env::current_dir().map_err(CliError::Cwd)?;
     let cwd = std::fs::canonicalize(&cwd).map_err(CliError::Cwd)?;
@@ -3980,7 +3980,7 @@ fn run_ls(
             // on any well-formed 7-char hex id without confirming it
             // matches an issue, so a typoed hex would silently filter
             // to nothing. A read surfaces `issue_not_found` (exit 1),
-            // matching the contract of `jjf show <bad-hex>`.
+            // matching the contract of `iss show <bad-hex>`.
             storage.read(&resolved)?;
             Some(resolved)
         }
@@ -4067,12 +4067,12 @@ fn run_ls(
     Ok(())
 }
 
-/// `jjf ready [--label L...] [--type T...] [--limit N] [--json]`
+/// `iss ready [--label L...] [--type T...] [--limit N] [--json]`
 /// — list the open issues whose dependencies are all closed (the
 /// agent-ready set), sorted by type priority then created_at
 /// ascending.
 ///
-/// This is the headline agent-ergonomics verb. `jjf ready --limit 1
+/// This is the headline agent-ergonomics verb. `iss ready --limit 1
 /// --json` is the canonical orchestrator-loop call: one unblocked
 /// issue, machine-readable, ready to feed into the next action.
 ///
@@ -4239,7 +4239,7 @@ fn run_ready(
     Ok(())
 }
 
-/// `jjf search <query> [--status S] [--label L...] [--type T...]
+/// `iss search <query> [--status S] [--label L...] [--type T...]
 /// [--include-comments] [--limit N] [--snippet-context N] [--json]`
 /// — substring search across issue titles, bodies, and (optionally)
 /// comment bodies.
@@ -4363,7 +4363,7 @@ fn run_search(
     Ok(())
 }
 
-/// `jjf stale [--days N] [--status S] [--label L...] [--type T...]
+/// `iss stale [--days N] [--status S] [--label L...] [--type T...]
 /// [--limit N] [--json]` — surface issues whose `updated_at` is older
 /// than `N` days. The orchestrator's "what work has gone quiet?"
 /// hygiene query.
@@ -4602,7 +4602,7 @@ fn slug_matches(issue: &Issue, pattern: Option<&str>) -> bool {
     }
 }
 
-/// `jjf push <remote>` — push every `refs/jjf/*` ref to `<remote>` via
+/// `iss push <remote>` — push every `refs/jjf/*` ref to `<remote>` via
 /// standard git transport.
 ///
 /// The v3 refspec is `refs/jjf/*:refs/jjf/*`, covering issues, memories,
@@ -4783,7 +4783,7 @@ fn parse_rejected_refs(stderr: &str) -> Vec<String> {
     refs
 }
 
-/// `jjf pull <remote>` — fetch every `refs/jjf/*` from `<remote>` into
+/// `iss pull <remote>` — fetch every `refs/jjf/*` from `<remote>` into
 /// the standard remote-tracking namespace
 /// (`refs/remotes/<remote>/jjf/*`), then reconcile each remote-tracking
 /// ref against its local `refs/jjf/<rest>` counterpart using the
@@ -4812,7 +4812,7 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
     // `pull` uses the jj-repo-only preflight: a fresh clone has no
     // v3 sentinel ref; `pull` is precisely the verb that materializes
     // it. Requiring the sentinel up front would force an awkward
-    // `jjf init` on a clone whose remote already has all the v3 refs
+    // `iss init` on a clone whose remote already has all the v3 refs
     // we want to fetch.
     preflight::jj_repo(&cwd)?;
     run_pull_v3(json, &remote, &cwd)
@@ -4823,8 +4823,8 @@ fn run_pull(json: bool, remote: String) -> Result<(), CliError> {
 /// `iss_storage::sync_v3`.
 fn run_pull_v3(json: bool, remote: &str, cwd: &Path) -> Result<(), CliError> {
     // Lazy auto-config: a fresh clone may not have the jjforge fetch
-    // refspec wired up yet (the user skipped `jjf init` or added the
-    // remote outside `jjf remote add`). Pull is the first verb that
+    // refspec wired up yet (the user skipped `iss init` or added the
+    // remote outside `iss remote add`). Pull is the first verb that
     // actually wants the refspec, so plant it now if missing. Failures
     // are tolerated — `sync_v3::pull_v3` uses an explicit refspec on
     // the fetch CLI and will still work.
@@ -4909,7 +4909,7 @@ fn emit_pull_v3_success(
         let envelope = serde_json::Value::Object(obj);
         println!("{envelope}");
     } else if !remote_present {
-        println!("pulled {remote}: no jjf refs on remote yet");
+        println!("pulled {remote}: no git-issues refs on remote yet");
     } else if report.merged == 0 {
         println!("pulled {} refs/jjf/* ref(s) <- {remote}", total_refs);
     } else {
@@ -5104,7 +5104,7 @@ error: failed to push some refs\n";
         assert_eq!(details["remote"], "origin");
         assert_eq!(
             details["hint"],
-            "run `jjf pull origin` first, then retry the push"
+            "run `iss pull origin` first, then retry the push"
         );
         assert_eq!(
             details["refs_rejected"],
@@ -5150,7 +5150,7 @@ error: failed to push some refs\n";
     // lives in `crates/jjf/tests/actor.rs`, which scopes every
     // env tweak to a child `Command::env(...)`.
 
-    /// `jjf_actor_env` reads `JJF_ACTOR` lazily; passing
+    /// `jjf_actor_env` reads `ISS_ACTOR` lazily; passing
     /// whitespace-only or empty values has to fall through (the
     /// chain semantics say "skip me," not "set empty"). This test
     /// removes the var first so the parent env can't pollute it.
@@ -5158,11 +5158,11 @@ error: failed to push some refs\n";
     fn jjf_actor_env_unset_returns_none() {
         // SAFETY: nextest runs each test in a shared process; we
         // only `remove_var` here (no set), and we restore nothing
-        // because the canonical state of `JJF_ACTOR` for the test
+        // because the canonical state of `ISS_ACTOR` for the test
         // process is "unset." If a parent set it, the orchestrator
         // wanted it gone for this assertion to be meaningful.
         unsafe {
-            std::env::remove_var("JJF_ACTOR");
+            std::env::remove_var("ISS_ACTOR");
         }
         assert_eq!(jjf_actor_env(), None);
     }

@@ -1,4 +1,4 @@
-//! Integration tests for `jjf init` — drive the compiled binary
+//! Integration tests for `iss init` — drive the compiled binary
 //! against per-test scratch repos and assert exit code, stderr,
 //! stdout (including `--json` shape), and observable repo state.
 //!
@@ -19,7 +19,7 @@ mod common;
 use common::*;
 
 /// Convenience: check whether the v2 `issues` git branch exists.
-/// Used to assert that v3 `jjf init` does NOT create the old v2
+/// Used to assert that v3 `iss init` does NOT create the old v2
 /// bookmark. Implemented via pure git (no jj — J7).
 fn bugs_bookmark_present(repo: &Path) -> bool {
     let out = Command::new("git")
@@ -214,7 +214,7 @@ fn global_json_flag_works_before_subcommand_too() {
 
 #[test]
 fn verb_on_uninitialized_repo_rejects_without_jj() {
-    // Plain git repo — NO `jj git init`, NO `jjf init`, no
+    // Plain git repo — NO `jj git init`, NO `iss init`, no
     // refs/jjf/meta/format-version sentinel. After J3 the preflight
     // detects the missing sentinel purely via git-plumbing and refuses
     // with MissingIssuesBookmark WITHOUT spawning jj at all. Using a
@@ -243,8 +243,8 @@ fn verb_on_uninitialized_repo_rejects_without_jj() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("jjf init"),
-        "error message should mention `jjf init`; got: {stderr}"
+        stderr.contains("iss init"),
+        "error message should mention `iss init`; got: {stderr}"
     );
 }
 
@@ -254,7 +254,7 @@ fn help_lists_every_epic_verb() {
     // filesystem so the cwd doesn't matter, but using a stable path
     // keeps the test reproducible.
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .arg("--help")
         .current_dir(cwd)
         .output()

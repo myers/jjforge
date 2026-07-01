@@ -1,4 +1,4 @@
-//! Integration tests for `jjf show <id>` — drive the compiled binary
+//! Integration tests for `iss show <id>` — drive the compiled binary
 //! against per-test scratch repos and assert exit code, stderr, stdout
 //! (plain + `--json`), and the error matrix:
 //!
@@ -6,9 +6,9 @@
 //! - bug not found at the bookmark tip → exit 1,
 //! - bad id parse → exit 2,
 //! - non-jj repo → exit 2,
-//! - jj repo without `issues` bookmark → exit 2 (run `jjf init` first).
+//! - jj repo without `issues` bookmark → exit 2 (run `iss init` first).
 //!
-//! End-to-end: each happy-path test chains `jjf new` → `jjf show`, so
+//! End-to-end: each happy-path test chains `iss new` → `iss show`, so
 //! we exercise the full write-then-read cycle through the binary
 //! (rather than peeking via `Storage::read` directly the way
 //! `tests/new.rs` does for write-side assertions). Same hermetic
@@ -20,7 +20,7 @@ use std::process::Command;
 mod common;
 use common::*;
 
-/// Create a bug with the given title/body via `jjf new` and return its
+/// Create a bug with the given title/body via `iss new` and return its
 /// freshly-minted id. Centralized so each `show` test reads one line
 /// for the setup step and the test body focuses on the assertion.
 fn create_issue(
@@ -276,7 +276,7 @@ fn show_in_non_jj_directory_exits_two() {
 
 #[test]
 fn show_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
-    // Fresh jj repo, no `jjf init` yet — the missing-bookmark probe
+    // Fresh jj repo, no `iss init` yet — the missing-bookmark probe
     // should fire with the typed `run jjf init first` message rather
     // than the raw jj stderr from a downstream read attempt.
     let repo = make_jj_repo("show_no_bookmark");
@@ -292,8 +292,8 @@ fn show_in_jj_repo_without_bugs_bookmark_exits_two_with_init_hint() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
-        "stderr should tell the user to run `jjf init` first, got: {stderr}"
+        stderr.contains("`issues` bookmark") && stderr.contains("iss init"),
+        "stderr should tell the user to run `iss init` first, got: {stderr}"
     );
 }
 
@@ -302,7 +302,7 @@ fn show_help_documents_positional_and_json_flag() {
     // `--help` should mention the id positional and the --json flag.
     // Keeps the public surface stable against accidental renames.
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .args(["show", "--help"])
         .current_dir(cwd)
         .output()
@@ -321,7 +321,7 @@ fn show_help_documents_positional_and_json_flag() {
 
 #[test]
 fn show_plain_renders_metadata_block() {
-    // When an issue has metadata, plain-text `jjf show` must emit a
+    // When an issue has metadata, plain-text `iss show` must emit a
     // `metadata:` block with one `key=value` line per entry.
     let repo = make_initialized_repo("show_meta_block");
     let out = run_jjf(

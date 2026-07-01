@@ -2,10 +2,10 @@
 //! issue `7100b51`. Drives the compiled `jjf` binary against per-test
 //! scratch repos and asserts:
 //!
-//! - `jjf new --type` / `--slug` round-trip via `Storage::read`.
-//! - `jjf update --type` / `--slug` / `--unset-slug` mutate the
+//! - `iss new --type` / `--slug` round-trip via `Storage::read`.
+//! - `iss update --type` / `--slug` / `--unset-slug` mutate the
 //!   record.
-//! - `jjf ls --type` / `--slug` filter correctly.
+//! - `iss ls --type` / `--slug` filter correctly.
 //! - Every id-taking verb (`show`, `update`, `close`, `comment`,
 //!   `label add`) accepts a slug in place of the id.
 //! - The new error envelopes (`invalid_slug`, `slug_collision`,
@@ -90,7 +90,7 @@ fn new_slug_collision_among_open_issues_is_exit_two() {
 #[test]
 fn new_slug_collision_against_closed_holder_is_exit_two() {
     // Spec v2.6 (issue `a105e0b`): closed issues retain their
-    // slug forever. `jjf new --slug X` after closing X-slugged
+    // slug forever. `iss new --slug X` after closing X-slugged
     // issue must fail with slug_collision carrying the closed
     // issue's id.
     let repo = make_initialized_repo("type_and_slug_collision_closed");

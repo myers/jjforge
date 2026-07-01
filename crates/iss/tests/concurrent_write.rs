@@ -13,7 +13,7 @@
 //!   slug-claim and the slug is now taken).
 //! - The raw `jj_error` envelope must NEVER escape: that's the whole
 //!   point of the typed translation.
-//! - Two `jjf comment <id>` processes appending to the same issue
+//! - Two `iss comment <id>` processes appending to the same issue
 //!   end up with BOTH comments in the comments file. The loser
 //!   auto-retries once with a fresh re-read so the winner's comment
 //!   isn't clobbered.
@@ -23,7 +23,7 @@
 //! first to complete its bookmark write), in which case both writes
 //! land successfully — but on a bookmark that ends up DIVERGENT
 //! (two heads). The divergent-bookmark merge case is a separate
-//! concern (handled by `jjf pull` / merge resolver); this ticket is
+//! concern (handled by `iss pull` / merge resolver); this ticket is
 //! about the typed error surfaced when jj DOES raise "Concurrent
 //! checkout". The tests below tolerate either outcome of the race
 //! (some serializations succeed, some genuinely conflict) and pin
@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod common;
-use common::{run_jjf, run_jjf_with_stdin, scratch, JJF_BIN};
+use common::{run_jjf, run_jjf_with_stdin, scratch, ISS_BIN};
 
 fn make_jj_repo(name: &str) -> PathBuf {
     let dir = scratch(name);
@@ -75,7 +75,7 @@ fn make_jj_repo(name: &str) -> PathBuf {
 
 fn make_initialized_repo(name: &str) -> PathBuf {
     let repo = make_jj_repo(name);
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .arg("init")
         .current_dir(&repo)
         .output()
@@ -121,7 +121,7 @@ fn parse_error_envelope(stderr: &[u8]) -> Option<serde_json::Value> {
 
 #[test]
 fn parallel_new_same_slug_loser_never_surfaces_raw_jj_error() {
-    // The slug-claim race acceptance. Spawn two `jjf new --slug
+    // The slug-claim race acceptance. Spawn two `iss new --slug
     // race-slot` processes against the same repo and assert the
     // invariant that the typed-error translation must hold:
     //
@@ -142,9 +142,9 @@ fn parallel_new_same_slug_loser_never_surfaces_raw_jj_error() {
     //   committed; both writes then land on what becomes a
     //   divergent bookmark). The slug-uniqueness violation under a
     //   divergent bookmark is a SEPARATE concern (handled by
-    //   `jjf pull` / merge resolver, not this ticket). The
+    //   `iss pull` / merge resolver, not this ticket). The
     //   merge-resolver work would surface the divergence on the
-    //   next `jjf pull` — but that's not the failure mode this
+    //   next `iss pull` — but that's not the failure mode this
     //   ticket addresses.
     //
     // The invariant the test PINS regardless of which outcome
@@ -208,7 +208,7 @@ fn parallel_new_same_slug_loser_never_surfaces_raw_jj_error() {
 
 #[test]
 fn parallel_comment_loser_never_surfaces_raw_jj_error() {
-    // The auto-retry acceptance. Spawn two `jjf comment <id>`
+    // The auto-retry acceptance. Spawn two `iss comment <id>`
     // processes against the same issue. Verify the same typed-
     // error invariant as the slug-claim test: any process that
     // fails must surface a typed `concurrent_write` envelope, NOT
@@ -270,7 +270,7 @@ fn parallel_comment_loser_never_surfaces_raw_jj_error() {
 fn comment_retry_preserves_both_writes_under_serialized_race() {
     // The "BOTH comments land" acceptance under the typical
     // serialized-race timing. In practice the local-process
-    // race for two `jjf comment` calls almost always serializes
+    // race for two `iss comment` calls almost always serializes
     // through jj's working-copy lock — the second process waits
     // for the first to finish, then runs against the post-first
     // bookmark cleanly. The retry path is what saves us in the

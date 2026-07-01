@@ -2,9 +2,9 @@
 //!
 //! Memories are short declarative facts (operational rules, codebase
 //! folklore, architectural decisions) keyed by a kebab-case slug. They
-//! ride the `issues` bookmark via `jjf push` / `jjf pull` like the
+//! ride the `issues` bookmark via `iss push` / `iss pull` like the
 //! per-issue records do, surfacing at session start via
-//! `jjf show roadmap --include-memories`.
+//! `iss show roadmap --include-memories`.
 //!
 //! ## On-disk layout
 //!
@@ -39,7 +39,7 @@
 //!
 //! [`slugify`] mirrors beads' shape: lowercase, non-alphanumeric → `-`,
 //! first ~8 hyphen-separated tokens, capped at 60 chars. Used when the
-//! operator runs `jjf remember "<insight>"` without `--key` — the value
+//! operator runs `iss remember "<insight>"` without `--key` — the value
 //! gets slugified to derive the key.
 
 /// Maximum memory-value length the inline trailer can carry without

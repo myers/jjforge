@@ -1,7 +1,7 @@
-//! Integration tests for `jjf stale` — drive the compiled binary
+//! Integration tests for `iss stale` — drive the compiled binary
 //! against per-test scratch repos and assert exit code, stdout
 //! (plain + `--json`), the filter matrix, age rendering, and the
-//! limit cap. Pins the wall clock via `JJF_TEST_CLOCK_SECS` per
+//! limit cap. Pins the wall clock via `ISS_TEST_CLOCK_SECS` per
 //! subprocess so age math is deterministic.
 //!
 //! Same hermetic-scratch / no-`assert_cmd` discipline as `search.rs`
@@ -12,12 +12,12 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 mod common;
-use common::{make_initialized_repo, JJF_BIN};
+use common::{make_initialized_repo, ISS_BIN};
 
 fn run_jjf_with_env(cwd: &Path, args: &[&str], clock_secs: u64) -> Output {
-    Command::new(JJF_BIN)
+    Command::new(ISS_BIN)
         .args(args)
-        .env("JJF_TEST_CLOCK_SECS", clock_secs.to_string())
+        .env("ISS_TEST_CLOCK_SECS", clock_secs.to_string())
         .current_dir(cwd)
         .output()
         .expect("spawn jjf")
@@ -29,9 +29,9 @@ fn run_jjf_with_stdin_and_env(
     stdin_bytes: &[u8],
     clock_secs: u64,
 ) -> Output {
-    let mut child = Command::new(JJF_BIN)
+    let mut child = Command::new(ISS_BIN)
         .args(args)
-        .env("JJF_TEST_CLOCK_SECS", clock_secs.to_string())
+        .env("ISS_TEST_CLOCK_SECS", clock_secs.to_string())
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -68,7 +68,7 @@ fn create_issue_at(
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
-/// Parse `jjf stale` plain-text rows into `(id, age, title, status)`.
+/// Parse `iss stale` plain-text rows into `(id, age, title, status)`.
 fn parse_stale_rows(stdout: &str) -> Vec<(String, String, String, String)> {
     stdout
         .lines()

@@ -1,21 +1,21 @@
 //! Integration tests for the v2.12 actor-override-chain
 //! (`actor-override-chain`, ticket `ae0866b`).
 //!
-//! Covers the precedence chain shared by `jjf update --claim` (and
-//! `jjf comment` for its author field):
+//! Covers the precedence chain shared by `iss update --claim` (and
+//! `iss comment` for its author field):
 //!
 //! ```text
-//! --actor flag > JJF_ACTOR env > git config user.name > error
+//! --actor flag > ISS_ACTOR env > git config user.name > error
 //! ```
 //!
 //! Plus the empty-string fall-through rule (`--actor ""` and
-//! `JJF_ACTOR=""` skip the slot rather than claim with an empty
+//! `ISS_ACTOR=""` skip the slot rather than claim with an empty
 //! assignee).
 //!
 //! Env-var hygiene: every test scopes its env tweaks to the child
 //! `Command::env(...)` / `Command::env_remove(...)`. Tests do NOT
 //! call `std::env::set_var` (would leak across nextest's
-//! process-shared tests). Tests that exercise the "JJF_ACTOR
+//! process-shared tests). Tests that exercise the "ISS_ACTOR
 //! unset" path explicitly `env_remove` so the orchestrator's env
 //! can't poison the assertion.
 //!
@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 mod common;
-use common::{scratch, JJF_BIN};
+use common::{scratch, ISS_BIN};
 
 /// Build a jj repo with the given user.name + user.email pinned in
 /// repo-local config. Pass `user = None` to leave user.name unset
@@ -73,7 +73,7 @@ fn make_jj_repo_with_user(name: &str, user: Option<&str>) -> PathBuf {
 
 fn make_initialized_repo_with_user(name: &str, user: Option<&str>) -> PathBuf {
     let repo = make_jj_repo_with_user(name, user);
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .arg("init")
         .current_dir(&repo)
         .output()
@@ -88,7 +88,7 @@ fn make_initialized_repo_with_user(name: &str, user: Option<&str>) -> PathBuf {
 }
 
 fn run_jjf_with_env(cwd: &Path, args: &[&str], env: &[(&str, Option<&str>)]) -> Output {
-    let mut cmd = Command::new(JJF_BIN);
+    let mut cmd = Command::new(ISS_BIN);
     cmd.args(args).current_dir(cwd);
     for (k, v) in env {
         match v {
@@ -109,7 +109,7 @@ fn run_jjf_with_stdin_env(
     stdin_bytes: &[u8],
     env: &[(&str, Option<&str>)],
 ) -> Output {
-    let mut cmd = Command::new(JJF_BIN);
+    let mut cmd = Command::new(ISS_BIN);
     cmd.args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -135,12 +135,12 @@ fn run_jjf_with_stdin_env(
     child.wait_with_output().expect("wait for jjf")
 }
 
-/// Create an issue via `jjf new`. Always strips `JJF_ACTOR` so the
+/// Create an issue via `iss new`. Always strips `ISS_ACTOR` so the
 /// test fixture isn't accidentally created under an actor override.
 fn create_issue(repo: &Path, title: &str, extra_args: &[&str]) -> String {
     let mut args: Vec<&str> = vec!["new", "--json", "-t", title, "-F", "-"];
     args.extend_from_slice(extra_args);
-    let out = run_jjf_with_stdin_env(repo, &args, b"", &[("JJF_ACTOR", None)]);
+    let out = run_jjf_with_stdin_env(repo, &args, b"", &[("ISS_ACTOR", None)]);
     assert!(
         out.status.success(),
         "jjf new failed during setup: code={:?} stderr={}",
@@ -153,10 +153,10 @@ fn create_issue(repo: &Path, title: &str, extra_args: &[&str]) -> String {
     v["id"].as_str().expect("id field").to_owned()
 }
 
-/// Read assignee via `show --json` (with `JJF_ACTOR` stripped so the
+/// Read assignee via `show --json` (with `ISS_ACTOR` stripped so the
 /// read path is hermetic).
 fn show_assignee(repo: &Path, id: &str) -> Option<String> {
-    let out = run_jjf_with_env(repo, &["show", "--json", id], &[("JJF_ACTOR", None)]);
+    let out = run_jjf_with_env(repo, &["show", "--json", id], &[("ISS_ACTOR", None)]);
     assert!(
         out.status.success(),
         "jjf show failed: stderr={}",
@@ -169,7 +169,7 @@ fn show_assignee(repo: &Path, id: &str) -> Option<String> {
 
 /// Last comment's author via `show --json`.
 fn last_comment_author(repo: &Path, id: &str) -> Option<String> {
-    let out = run_jjf_with_env(repo, &["show", "--json", id], &[("JJF_ACTOR", None)]);
+    let out = run_jjf_with_env(repo, &["show", "--json", id], &[("ISS_ACTOR", None)]);
     assert!(
         out.status.success(),
         "jjf show failed: stderr={}",
@@ -194,7 +194,7 @@ fn claim_actor_flag_overrides_env_and_config() {
     let out = run_jjf_with_env(
         &repo,
         &["update", &id, "--claim", "--actor", "flag-bob"],
-        &[("JJF_ACTOR", Some("env-alice"))],
+        &[("ISS_ACTOR", Some("env-alice"))],
     );
     assert!(
         out.status.success(),
@@ -205,7 +205,7 @@ fn claim_actor_flag_overrides_env_and_config() {
     assert_eq!(
         assignee.as_deref(),
         Some("flag-bob"),
-        "--actor flag must win over JJF_ACTOR env and git config"
+        "--actor flag must win over ISS_ACTOR env and git config"
     );
 }
 
@@ -217,7 +217,7 @@ fn claim_env_used_when_flag_absent() {
     let out = run_jjf_with_env(
         &repo,
         &["update", &id, "--claim"],
-        &[("JJF_ACTOR", Some("env-alice"))],
+        &[("ISS_ACTOR", Some("env-alice"))],
     );
     assert!(
         out.status.success(),
@@ -228,7 +228,7 @@ fn claim_env_used_when_flag_absent() {
     assert_eq!(
         assignee.as_deref(),
         Some("env-alice"),
-        "JJF_ACTOR env must beat git config when flag is absent"
+        "ISS_ACTOR env must beat git config when flag is absent"
     );
 }
 
@@ -240,7 +240,7 @@ fn claim_config_used_when_flag_and_env_absent() {
     let out = run_jjf_with_env(
         &repo,
         &["update", &id, "--claim"],
-        &[("JJF_ACTOR", None)],
+        &[("ISS_ACTOR", None)],
     );
     assert!(
         out.status.success(),
@@ -263,7 +263,7 @@ fn claim_empty_env_falls_through_to_config() {
     let out = run_jjf_with_env(
         &repo,
         &["update", &id, "--claim"],
-        &[("JJF_ACTOR", Some(""))],
+        &[("ISS_ACTOR", Some(""))],
     );
     assert!(
         out.status.success(),
@@ -274,7 +274,7 @@ fn claim_empty_env_falls_through_to_config() {
     assert_eq!(
         assignee.as_deref(),
         Some("config-user"),
-        "JJF_ACTOR=\"\" must fall through, not write an empty assignee"
+        "ISS_ACTOR=\"\" must fall through, not write an empty assignee"
     );
 }
 
@@ -286,7 +286,7 @@ fn claim_empty_flag_falls_through_to_env() {
     let out = run_jjf_with_env(
         &repo,
         &["update", &id, "--claim", "--actor", ""],
-        &[("JJF_ACTOR", Some("env-alice"))],
+        &[("ISS_ACTOR", Some("env-alice"))],
     );
     assert!(
         out.status.success(),
@@ -297,14 +297,14 @@ fn claim_empty_flag_falls_through_to_env() {
     assert_eq!(
         assignee.as_deref(),
         Some("env-alice"),
-        "--actor \"\" must fall through to JJF_ACTOR env, not write empty"
+        "--actor \"\" must fall through to ISS_ACTOR env, not write empty"
     );
 }
 
 #[test]
 fn claim_all_slots_empty_errors_no_current_user() {
     // Set up a fixture where every chain slot is empty: no
-    // `--actor` (or empty), no `JJF_ACTOR`, and no user.name in
+    // `--actor` (or empty), no `ISS_ACTOR`, and no user.name in
     // ANY config scope. The repo-local config is unset by construction
     // (we pass `user = None` to the fixture). We block both global
     // config sources: `JJ_CONFIG` → nonexistent path (for legacy jj
@@ -312,12 +312,12 @@ fn claim_all_slots_empty_errors_no_current_user() {
     // resolution path added in J2). v2.12 (`actor-override-chain`).
     let repo = make_initialized_repo_with_user("actor_no_current_user", None);
 
-    // Create the issue under a JJF_ACTOR fallback so the
+    // Create the issue under a ISS_ACTOR fallback so the
     // create_issue helper doesn't itself hit the no-user error.
-    let mut cmd = Command::new(JJF_BIN);
+    let mut cmd = Command::new(ISS_BIN);
     cmd.args(["new", "--json", "-t", "no-user", "-F", "-"])
         .current_dir(&repo)
-        .env("JJF_ACTOR", "setup-actor")
+        .env("ISS_ACTOR", "setup-actor")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -338,7 +338,7 @@ fn claim_all_slots_empty_errors_no_current_user() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("parse");
     let id = v["id"].as_str().expect("id").to_owned();
 
-    // Now run --claim with JJF_ACTOR explicitly unset AND both config
+    // Now run --claim with ISS_ACTOR explicitly unset AND both config
     // escape hatches engaged:
     //   - `JJ_CONFIG` → nonexistent path: blocks jj's global config
     //     (`~/.config/jj/config.toml`, which carries `user.name = Tester`).
@@ -356,7 +356,7 @@ fn claim_all_slots_empty_errors_no_current_user() {
         &repo,
         &["update", "--json", &id, "--claim", "--actor", ""],
         &[
-            ("JJF_ACTOR", None),
+            ("ISS_ACTOR", None),
             ("JJ_CONFIG", Some(empty_config_str.as_ref())),
             ("GIT_CONFIG_GLOBAL", Some("/dev/null")),
         ],
@@ -375,8 +375,8 @@ fn claim_all_slots_empty_errors_no_current_user() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("JJF_ACTOR") || stderr.contains("no current user"),
-        "expected no_current_user hint mentioning JJF_ACTOR, got: {stderr}"
+        stderr.contains("ISS_ACTOR") || stderr.contains("no current user"),
+        "expected no_current_user hint mentioning ISS_ACTOR, got: {stderr}"
     );
 }
 
@@ -388,7 +388,7 @@ fn claim_actor_conflicts_with_unclaim() {
     let out = run_jjf_with_env(
         &repo,
         &["update", &id, "--unclaim", "--actor", "flag-bob"],
-        &[("JJF_ACTOR", None)],
+        &[("ISS_ACTOR", None)],
     );
     assert!(
         !out.status.success(),
@@ -417,7 +417,7 @@ fn claim_actor_conflicts_with_assignee() {
             "--assignee",
             "explicit",
         ],
-        &[("JJF_ACTOR", None)],
+        &[("ISS_ACTOR", None)],
     );
     assert!(
         !out.status.success(),
@@ -434,7 +434,7 @@ fn claim_actor_conflicts_with_unset_assignee() {
     let out = run_jjf_with_env(
         &repo,
         &["update", &id, "--actor", "flag-bob", "--unset-assignee"],
-        &[("JJF_ACTOR", None)],
+        &[("ISS_ACTOR", None)],
     );
     assert!(
         !out.status.success(),
@@ -454,11 +454,11 @@ fn comment_env_drives_author_when_flag_absent() {
         &repo,
         &["comment", &id, "-F", "-"],
         b"hello from env-alice",
-        &[("JJF_ACTOR", Some("env-alice"))],
+        &[("ISS_ACTOR", Some("env-alice"))],
     );
     assert!(
         out.status.success(),
-        "comment with JJF_ACTOR failed: stderr={}",
+        "comment with ISS_ACTOR failed: stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
     let author = last_comment_author(&repo, &id).expect("author present");
@@ -490,7 +490,7 @@ fn comment_author_flag_still_wins_over_env() {
             "-",
         ],
         b"hello from --author",
-        &[("JJF_ACTOR", Some("env-alice"))],
+        &[("ISS_ACTOR", Some("env-alice"))],
     );
     assert!(
         out.status.success(),
@@ -500,7 +500,7 @@ fn comment_author_flag_still_wins_over_env() {
     let author = last_comment_author(&repo, &id).expect("author present");
     assert_eq!(
         author, "Flag Author <flag@example.com>",
-        "--author must win over JJF_ACTOR env"
+        "--author must win over ISS_ACTOR env"
     );
 }
 
@@ -513,7 +513,7 @@ fn comment_falls_back_to_config_when_no_env_or_flag() {
         &repo,
         &["comment", &id, "-F", "-"],
         b"hello from config",
-        &[("JJF_ACTOR", None)],
+        &[("ISS_ACTOR", None)],
     );
     assert!(
         out.status.success(),
@@ -555,7 +555,7 @@ fn claim_uses_git_config_user_name() {
     assert!(out.status.success(), "git config user.email failed");
 
     // Initialize jjf storage.
-    let out = std::process::Command::new(JJF_BIN)
+    let out = std::process::Command::new(ISS_BIN)
         .arg("init")
         .current_dir(&root)
         .output()
@@ -570,14 +570,14 @@ fn claim_uses_git_config_user_name() {
     let out = run_jjf_with_env(
         &root,
         &["new", "--json", "-t", "claim me", "-F", "-"],
-        &[("JJF_ACTOR", Some("setup-actor"))],
+        &[("ISS_ACTOR", Some("setup-actor"))],
     );
     assert!(out.status.success(), "jjf new failed: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("parse new --json");
     let id = v["id"].as_str().expect("id field").to_owned();
 
-    // --claim with no JJF_ACTOR / --actor: must fall back to git config user.name.
+    // --claim with no ISS_ACTOR / --actor: must fall back to git config user.name.
     // Pre-J2 this would fail (jj config has no user.name → NoCurrentUser).
     // Post-J2 this must succeed (git config has "Git Person").
     // GIT_CONFIG_GLOBAL=/dev/null proves resolution comes from the repo-local
@@ -586,7 +586,7 @@ fn claim_uses_git_config_user_name() {
     let out = run_jjf_with_env(
         &root,
         &["update", &id, "--claim", "--json"],
-        &[("JJF_ACTOR", None), ("GIT_CONFIG_GLOBAL", Some("/dev/null"))],
+        &[("ISS_ACTOR", None), ("GIT_CONFIG_GLOBAL", Some("/dev/null"))],
     );
     assert!(
         out.status.success(),

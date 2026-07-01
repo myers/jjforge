@@ -1,18 +1,18 @@
-//! Integration tests for `jjf dep add|rm|tree` (v2.4 `agent-dep-types`).
+//! Integration tests for `iss dep add|rm|tree` (v2.4 `agent-dep-types`).
 //!
 //! Drives the compiled binary against per-test scratch repos and
 //! asserts:
 //!
-//! - `jjf dep add A B` with default `--kind blocks` writes a blocks
-//!   edge; `jjf show A` reports it under the new typed
+//! - `iss dep add A B` with default `--kind blocks` writes a blocks
+//!   edge; `iss show A` reports it under the new typed
 //!   `dependencies:` section.
 //! - All four `--kind` values round-trip (`blocks`, `parent-child`,
 //!   `related`, `discovered-from`).
-//! - `jjf dep rm` removes only the named kind; other-kind edges to
+//! - `iss dep rm` removes only the named kind; other-kind edges to
 //!   the same target stay.
-//! - `jjf dep tree` prints the parent-child tree under a given root.
-//! - `jjf new --dep <kind>:<id>` accepts the inline kind syntax.
-//! - `jjf ready` excludes children of in-flight parents via the
+//! - `iss dep tree` prints the parent-child tree under a given root.
+//! - `iss new --dep <kind>:<id>` accepts the inline kind syntax.
+//! - `iss ready` excludes children of in-flight parents via the
 //!   parent-child cascade.
 //!
 //! Same hermetic-scratch / no-`assert_cmd` discipline as the other
@@ -189,7 +189,7 @@ fn dep_tree_json_envelope_carries_nested_structure() {
 
 #[test]
 fn new_with_inline_dep_kind_syntax() {
-    // `jjf new --dep parent-child:<id>` produces a parent-child edge.
+    // `iss new --dep parent-child:<id>` produces a parent-child edge.
     let repo = make_initialized_repo("new_inline_kind");
     let parent = create_issue(&repo, "parent");
     let spec = format!("parent-child:{parent}");
@@ -221,7 +221,7 @@ fn new_with_inline_dep_kind_syntax() {
 
 #[test]
 fn new_with_unknown_dep_kind_is_preflight_failure() {
-    // `jjf new --dep bogus:<id>` exits 2 with `bad_dep_kind`.
+    // `iss new --dep bogus:<id>` exits 2 with `bad_dep_kind`.
     let repo = make_initialized_repo("new_bad_dep_kind");
     let parent = create_issue(&repo, "parent");
     let spec = format!("bogus:{parent}");
@@ -326,7 +326,7 @@ fn dep_add_self_target_rejected_for_all_kinds() {
 
 #[test]
 fn new_with_phantom_dep_target_exits_with_issue_not_found() {
-    // `jjf new -d <phantom>` — bare 7-hex form, default `blocks`
+    // `iss new -d <phantom>` — bare 7-hex form, default `blocks`
     // semantics — must reject at create time.
     let repo = make_initialized_repo("new_phantom_dep_bare");
     let out = run_jjf_with_stdin(
@@ -351,7 +351,7 @@ fn new_with_phantom_dep_target_exits_with_issue_not_found() {
     assert_eq!(v["error"]["kind"], "issue_not_found");
     assert_eq!(v["error"]["details"]["id"], "deadbee");
 
-    // `jjf ls` must show no issues.
+    // `iss ls` must show no issues.
     let ls = run_jjf(&repo, &["--json", "ls", "--status", "all"]);
     let ls_out = String::from_utf8_lossy(&ls.stdout);
     let v: serde_json::Value = serde_json::from_str(ls_out.trim()).expect("ls json");
@@ -364,7 +364,7 @@ fn new_with_phantom_dep_target_exits_with_issue_not_found() {
 
 #[test]
 fn new_with_inline_phantom_dep_kind_exits_with_issue_not_found() {
-    // `jjf new --dep blocks:<phantom>` — explicit-kind form. The
+    // `iss new --dep blocks:<phantom>` — explicit-kind form. The
     // dep kind parses fine; the target doesn't exist; reject.
     let repo = make_initialized_repo("new_phantom_dep_kind");
     let out = run_jjf_with_stdin(
@@ -401,7 +401,7 @@ fn new_with_inline_phantom_dep_kind_exits_with_issue_not_found() {
 
 #[test]
 fn dep_rm_against_phantom_target_succeeds_as_noop() {
-    // `jjf dep rm A <phantom>` is permissive — removing a
+    // `iss dep rm A <phantom>` is permissive — removing a
     // non-existent edge is a useful cleanup primitive. Don't
     // adopt the strict validation here.
     let repo = make_initialized_repo("dep_rm_phantom_noop");
@@ -418,7 +418,7 @@ fn dep_rm_against_phantom_target_succeeds_as_noop() {
 #[test]
 fn ready_excludes_child_of_blocked_parent_via_cascade() {
     // Setup: blocker (open) → parent (open, blocked by blocker) →
-    // child (open, child of parent). `jjf ready` should exclude
+    // child (open, child of parent). `iss ready` should exclude
     // both parent (blocked by blocker) and child (cascaded).
     let repo = make_initialized_repo("ready_cascade");
     let blocker = create_issue(&repo, "blocker");
@@ -455,7 +455,7 @@ fn ready_excludes_child_of_blocked_parent_via_cascade() {
 }
 
 // ---- dep-cycle-undetected (43c7615) ---------------------------------
-// `jjf dep add` that would close a `blocks`-edge cycle exits 2 with
+// `iss dep add` that would close a `blocks`-edge cycle exits 2 with
 // the `dependency_cycle` JSON envelope. Self-deps still surface as
 // `self_dependency` (more specific check, runs first).
 // ---------------------------------------------------------------------
@@ -506,7 +506,7 @@ fn dep_add_blocks_cycle_exits_2_with_dependency_cycle() {
 }
 
 // ---- show-deps-blocked-by (f70d54f, fj#2) ---------------------------
-// `jjf show <A>` printed `blocks: B` for a `Blocks` edge whose storage
+// `iss show <A>` printed `blocks: B` for a `Blocks` edge whose storage
 // semantics are "A is blocked until B closes" — reads inverted to a
 // human. Fix: text renderer uses an owner-perspective label
 // (`blocked by:`); JSON / trailers / `--kind` flag stay wire-spelling.

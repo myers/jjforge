@@ -456,7 +456,7 @@ fn v3_cache_hit_avoids_rebuild_n_issues() {
     }
     // Force a clean cache miss for the first measurement. Open a
     // fresh Storage so the in-process memo doesn't shortcut us.
-    let cache_path = repo.join(".jj").join("jjforge-cache.json");
+    let cache_path = repo.join(".git").join("iss-cache.json");
     let _ = std::fs::remove_file(&cache_path);
     let storage = Storage::open(&repo).unwrap();
 

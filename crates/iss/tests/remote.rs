@@ -1,5 +1,5 @@
-//! Integration tests for `jjf remote add <name> <url>`, `jjf remote
-//! ls`, and `jjf remote rm <name>` — drive the compiled binary
+//! Integration tests for `iss remote add <name> <url>`, `iss remote
+//! ls`, and `iss remote rm <name>` — drive the compiled binary
 //! against per-test scratch jj repos and assert exit code, stdout
 //! shape (plain + `--json`), the round-trip semantics (add → ls →
 //! rm → ls), and the preflight / runtime error matrix:
@@ -282,10 +282,10 @@ fn remote_rm_in_non_jj_directory_exits_two() {
 #[test]
 fn remote_verbs_do_not_require_bugs_bookmark() {
     // The whole point of using the `jj_repo`-only preflight (instead
-    // of the full `bugs_bookmark` probe): `jjf remote *` must work in
-    // a jj repo BEFORE `jjf init` has been run. Without this, you'd
+    // of the full `bugs_bookmark` probe): `iss remote *` must work in
+    // a jj repo BEFORE `iss init` has been run. Without this, you'd
     // have to init a issues bookmark before you could even configure a
-    // remote, which is backwards (`jjf push` is what first sends the
+    // remote, which is backwards (`iss push` is what first sends the
     // bookmark to a remote).
     let repo = make_jj_repo("remote_no_bugs_bookmark");
 
@@ -317,7 +317,7 @@ fn remote_verbs_do_not_require_bugs_bookmark() {
 #[test]
 fn remote_help_documents_subcommands() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .args(["remote", "--help"])
         .current_dir(cwd)
         .output()
@@ -332,7 +332,7 @@ fn remote_help_documents_subcommands() {
 #[test]
 fn remote_add_help_documents_positionals() {
     let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = Command::new(JJF_BIN)
+    let out = Command::new(ISS_BIN)
         .args(["remote", "add", "--help"])
         .current_dir(cwd)
         .output()

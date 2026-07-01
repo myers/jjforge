@@ -1,4 +1,4 @@
-//! Integration tests for `jjf new` — drive the compiled binary against
+//! Integration tests for `iss new` — drive the compiled binary against
 //! per-test scratch repos and assert exit code, stderr, stdout (plain +
 //! `--json`), and observable storage state via `Storage::read`.
 //!
@@ -15,7 +15,7 @@ use iss_storage::{DepEdge, DepKind, IssueId, Storage};
 mod common;
 use common::*;
 
-/// Parse the stdout of a successful `jjf new` invocation (plain-text
+/// Parse the stdout of a successful `iss new` invocation (plain-text
 /// mode: a single line containing the new bug's id) into a `IssueId`.
 fn parse_id_from_plain_stdout(stdout: &[u8]) -> IssueId {
     let line = String::from_utf8_lossy(stdout);
@@ -87,9 +87,9 @@ fn new_json_emits_expected_object_and_id_parses() {
 
 #[test]
 fn new_json_error_envelope_on_missing_bookmark() {
-    // Fresh jj repo, no `jjf init` yet. With `--json` we expect the
+    // Fresh jj repo, no `iss init` yet. With `--json` we expect the
     // documented `missing_issues_bookmark` envelope on stderr — the same
-    // contract a script wrapping `jjf new` to file bugs would parse.
+    // contract a script wrapping `iss new` to file bugs would parse.
     let repo = make_jj_repo("new_json_err_no_bookmark");
 
     let out = run_jjf_with_stdin(
@@ -144,15 +144,15 @@ fn new_without_jjf_init_first_exits_two_with_run_jjf_init_first_message() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("`issues` bookmark") && stderr.contains("jjf init"),
-        "stderr should tell the user to run `jjf init` first, got: {stderr}"
+        stderr.contains("`issues` bookmark") && stderr.contains("iss init"),
+        "stderr should tell the user to run `iss init` first, got: {stderr}"
     );
 }
 
 #[test]
 fn new_in_non_jj_directory_exits_two_with_not_a_jj_repo_message() {
     // Not a jj repo at all — the preflight should produce the same
-    // `not a jj repo` signal `jjf init` produces in this situation.
+    // `not a jj repo` signal `iss init` produces in this situation.
     let dir = scratch_non_git("new_non_jj");
 
     let out = run_jjf_with_stdin(&dir, &["new", "-t", "x", "-F", "-"], b"");
@@ -280,7 +280,7 @@ fn new_full_field_round_trip() {
 
 #[test]
 fn new_with_parent_flag_creates_parent_child_edge() {
-    // Forgejo #3: `jjf new --dep <id>` hardcoded a `blocks` edge,
+    // Forgejo #3: `iss new --dep <id>` hardcoded a `blocks` edge,
     // making child-of-epic creation a 3-step dance. `--parent <id>`
     // is the shorthand: one flag → one `parent-child` edge.
     let repo = make_initialized_repo("new_parent_flag");
@@ -375,8 +375,8 @@ fn new_with_bogus_parent_id_exits_two() {
 
 #[test]
 fn new_with_parent_slug_resolves_to_id() {
-    // Forgejo b417864: `jjf new --parent <slug>` should resolve the slug
-    // to a 7-hex id the same way `jjf ls`/`ready`/`search` do, instead
+    // Forgejo b417864: `iss new --parent <slug>` should resolve the slug
+    // to a 7-hex id the same way `iss ls`/`ready`/`search` do, instead
     // of rejecting with `bad_id`.
     let repo = make_initialized_repo("new_parent_slug");
 
@@ -501,7 +501,7 @@ fn new_with_file_flag_reads_path_not_stdin() {
 
 #[test]
 fn new_meta_seeds_metadata_atomically() {
-    // `jjf new --meta k=v` must seed metadata in the same create-time
+    // `iss new --meta k=v` must seed metadata in the same create-time
     // multi-op commit so the issue arrives with metadata already
     // populated — no second mutation needed.
     let repo = make_initialized_repo("new_meta_seeds");

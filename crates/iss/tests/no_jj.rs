@@ -66,7 +66,7 @@ fn full_lifecycle_without_jj_on_path() {
             .expect("spawn jjf")
     };
 
-    // `jjf init` plants the v3 sentinel ref on a plain git repo.
+    // `iss init` plants the v3 sentinel ref on a plain git repo.
     let init_out = run(&["init"]);
     assert!(
         init_out.status.success(),
@@ -75,7 +75,7 @@ fn full_lifecycle_without_jj_on_path() {
         String::from_utf8_lossy(&init_out.stderr),
     );
 
-    // `jjf new` creates an issue and commits it as a git ref.
+    // `iss new` creates an issue and commits it as a git ref.
     let new_out = run(&["--json", "new", "-t", "first issue", "-F", "-"]);
     assert!(
         new_out.status.success(),
@@ -92,7 +92,7 @@ fn full_lifecycle_without_jj_on_path() {
         .to_owned();
     assert_eq!(id.len(), 7, "id must be 7 hex chars: {id:?}");
 
-    // `jjf ls` reads the issue back via git refs (no jj).
+    // `iss ls` reads the issue back via git refs (no jj).
     let ls_out = run(&["ls", "--json"]);
     assert!(
         ls_out.status.success(),
@@ -106,7 +106,7 @@ fn full_lifecycle_without_jj_on_path() {
         "ls should show the created issue; got: {ls_stdout}"
     );
 
-    // `jjf show <id>` also resolves without jj.
+    // `iss show <id>` also resolves without jj.
     let show_out = run(&["show", &id]);
     assert!(
         show_out.status.success(),
