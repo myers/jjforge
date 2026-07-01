@@ -407,7 +407,7 @@ fn merge_issue_ref(
     remote_oid: &str,
 ) -> Result<()> {
     let merged = reduce_two_heads_issue(git, id, local_oid, remote_oid)?;
-    let summary = format!("jjf: issue {} - merge", id);
+    let summary = format!("iss: issue {} - merge", id);
     let ops = [Op::Merge {
         issue_id: id.clone(),
     }];
@@ -516,7 +516,7 @@ fn merge_memory_ref(
         None => git.mktree(&[]).map_err(translate_git)?,
     };
 
-    let summary = format!("jjf: memory {} - merge", key);
+    let summary = format!("iss: memory {} - merge", key);
     // Memories don't have an issue id; we encode the op as a generic
     // free-form `Jjf-Op: merge` line with `Jjf-Key:` carrying the key.
     // Keeping the trailer minimal mirrors how v2 memory ops shape their

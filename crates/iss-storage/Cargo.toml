@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Write-path library for jjforge's on-disk storage format (v1) — shells out to `jj` and lands one commit per mutation on the `bugs` bookmark."
+description = "Storage library for git-issues — git-plumbing-backed v3 issue records on refs/jjf/*."
 
 [dependencies]
 serde = { workspace = true }

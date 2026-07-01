@@ -202,13 +202,13 @@ mod tests {
     #[test]
     fn set_memory_trailer_shape() {
         let msg = build_set_memory_commit_message(
-            "jjf: memory dolt-phantoms - set",
+            "iss: memory dolt-phantoms - set",
             "dolt-phantoms",
             "Dolt phantom DBs hide in three places",
             "2026-06-22T12:34:56.123456789Z",
         );
         let expected = "\
-jjf: memory dolt-phantoms - set
+iss: memory dolt-phantoms - set
 
 Jjf-Op: set-memory
 Jjf-At: 2026-06-22T12:34:56.123456789Z
@@ -221,12 +221,12 @@ Jjf-Memory-Value: Dolt phantom DBs hide in three places
     #[test]
     fn unset_memory_trailer_shape() {
         let msg = build_unset_memory_commit_message(
-            "jjf: memory dolt-phantoms - unset",
+            "iss: memory dolt-phantoms - unset",
             "dolt-phantoms",
             "2026-06-22T12:34:56.123456789Z",
         );
         let expected = "\
-jjf: memory dolt-phantoms - unset
+iss: memory dolt-phantoms - unset
 
 Jjf-Op: unset-memory
 Jjf-At: 2026-06-22T12:34:56.123456789Z
@@ -238,7 +238,7 @@ Jjf-Memory-Key: dolt-phantoms
     #[test]
     fn set_memory_trailer_one_lines_value() {
         let msg = build_set_memory_commit_message(
-            "jjf: memory k - set",
+            "iss: memory k - set",
             "k",
             "line1\nline2\nline3",
             "2026-06-22T12:34:56.123456789Z",
@@ -250,7 +250,7 @@ Jjf-Memory-Key: dolt-phantoms
     fn set_memory_trailer_truncates_long_value() {
         let big = "a".repeat(300);
         let msg = build_set_memory_commit_message(
-            "jjf: memory k - set",
+            "iss: memory k - set",
             "k",
             &big,
             "2026-06-22T12:34:56.123456789Z",

@@ -1796,7 +1796,7 @@ impl Storage {
         // Op order in the create-time multi-op stanza follows the
         // record's field-declaration order (spec §3.3): slug,
         // body, type, labels, dependencies, assignee.
-        let summary = format!("jjf: issue {} - create", id);
+        let summary = format!("iss: issue {} - create", id);
         let mut ops: Vec<Op> = Vec::new();
         ops.push(Op::Create {
             issue_id: id.clone(),
@@ -1901,7 +1901,7 @@ impl Storage {
             });
         }
         let title = title.to_owned();
-        self.mutate(id, &format!("jjf: issue {} - set-title", id), |rec| {
+        self.mutate(id, &format!("iss: issue {} - set-title", id), |rec| {
             rec.title = title.clone();
             MutateOutcome::Write(vec![Op::SetTitle {
                 issue_id: rec.id.clone(),
@@ -1913,7 +1913,7 @@ impl Storage {
 
     /// Replace the status.
     pub fn set_status(&self, id: &IssueId, status: Status) -> Result<()> {
-        self.mutate(id, &format!("jjf: issue {} - set-status", id), |rec| {
+        self.mutate(id, &format!("iss: issue {} - set-status", id), |rec| {
             rec.status = status;
             MutateOutcome::Write(vec![Op::SetStatus {
                 issue_id: rec.id.clone(),
@@ -1931,7 +1931,7 @@ impl Storage {
             return Err(Error::InvalidBody { reason });
         }
         let body = body.to_owned();
-        self.mutate(id, &format!("jjf: issue {} - set-body", id), |rec| {
+        self.mutate(id, &format!("iss: issue {} - set-body", id), |rec| {
             rec.body = body.clone();
             let hash = sha256_hex(body.as_bytes());
             MutateOutcome::Write(vec![Op::SetBody {
@@ -1950,7 +1950,7 @@ impl Storage {
         if let Err(reason) = validate_priority(priority) {
             return Err(Error::InvalidPriority { reason });
         }
-        self.mutate(id, &format!("jjf: issue {} - set-priority", id), |rec| {
+        self.mutate(id, &format!("iss: issue {} - set-priority", id), |rec| {
             rec.priority = priority;
             MutateOutcome::Write(vec![Op::SetPriority {
                 issue_id: rec.id.clone(),
@@ -1975,7 +1975,7 @@ impl Storage {
             }
         }
         let assignee = assignee.map(str::to_owned);
-        self.mutate(id, &format!("jjf: issue {} - set-assignee", id), |rec| {
+        self.mutate(id, &format!("iss: issue {} - set-assignee", id), |rec| {
             rec.assignee = assignee.clone();
             MutateOutcome::Write(vec![Op::SetAssignee {
                 issue_id: rec.id.clone(),
@@ -2065,7 +2065,7 @@ impl Storage {
                 return Err(Error::InvalidPriority { reason });
             }
         }
-        let summary = format!("jjf: issue {} - update", id);
+        let summary = format!("iss: issue {} - update", id);
         let id_owned = id.clone();
         self.mutate(id, &summary, |rec| {
             // Slug uniqueness probe: a non-`None` slug write must not
@@ -2194,7 +2194,7 @@ impl Storage {
         // `set-assignee + set-status InProgress` against a record
         // that the winner had already claimed, returning Ok and
         // silently double-claiming.
-        self.mutate(id, &format!("jjf: issue {} - claim", id), |rec| {
+        self.mutate(id, &format!("iss: issue {} - claim", id), |rec| {
             match rec.status {
                 Status::Closed => {
                     return MutateOutcome::Conflict(Error::Invalid(format!(
@@ -2284,7 +2284,7 @@ impl Storage {
         // re-checks against the post-race record. Without this, a
         // racer closing the issue between our read and our retry
         // would let us silently re-open it (`a6b8fb7`).
-        self.mutate(id, &format!("jjf: issue {} - unclaim", id), |rec| {
+        self.mutate(id, &format!("iss: issue {} - unclaim", id), |rec| {
             if rec.status == Status::Closed {
                 return MutateOutcome::Conflict(Error::Invalid(format!(
                     "issue {id_owned} is closed; nothing to unclaim"
@@ -2366,7 +2366,7 @@ impl Storage {
         // record. Without this, a racer closing the issue between
         // our read and the retry would let us silently re-open-then-
         // block it (`a6b8fb7`).
-        self.mutate(id, &format!("jjf: issue {} - block", id), |rec| {
+        self.mutate(id, &format!("iss: issue {} - block", id), |rec| {
             if rec.status == Status::Closed {
                 return MutateOutcome::Conflict(Error::Invalid(format!(
                     "issue {id_owned} is closed; reopen before blocking"
@@ -2416,7 +2416,7 @@ impl Storage {
         let id_owned = id.clone();
         // Precondition + idempotent-skip live in the closure so a
         // CAS-loss retry re-checks the fresh record (`a6b8fb7`).
-        self.mutate(id, &format!("jjf: issue {} - unblock", id), |rec| {
+        self.mutate(id, &format!("iss: issue {} - unblock", id), |rec| {
             if rec.status == Status::Closed {
                 return MutateOutcome::Conflict(Error::Invalid(format!(
                     "issue {id_owned} is closed; nothing to unblock"
@@ -2459,7 +2459,7 @@ impl Storage {
             ));
         }
         let label = label.to_owned();
-        self.mutate(id, &format!("jjf: issue {} - label-add", id), |rec| {
+        self.mutate(id, &format!("iss: issue {} - label-add", id), |rec| {
             if !rec.labels.iter().any(|l| l == &label) {
                 rec.labels.push(label.clone());
                 rec.labels.sort();
@@ -2480,7 +2480,7 @@ impl Storage {
             ));
         }
         let label = label.to_owned();
-        self.mutate(id, &format!("jjf: issue {} - label-rm", id), |rec| {
+        self.mutate(id, &format!("iss: issue {} - label-rm", id), |rec| {
             rec.labels.retain(|l| l != &label);
             MutateOutcome::Write(vec![Op::LabelRm {
                 issue_id: rec.id.clone(),
@@ -2507,7 +2507,7 @@ impl Storage {
         }
         let key = key.to_owned();
         let value = value.to_owned();
-        self.mutate(id, &format!("jjf: issue {} - set-metadata", id), |rec| {
+        self.mutate(id, &format!("iss: issue {} - set-metadata", id), |rec| {
             // Idempotence: short-circuit if the key already has this value.
             // Mirrors the pattern used in `unblock` / `unclaim` (search
             // `MutateOutcome::Skip` in this file for siblings). No commit
@@ -2535,7 +2535,7 @@ impl Storage {
             )));
         }
         let key = key.to_owned();
-        self.mutate(id, &format!("jjf: issue {} - unset-metadata", id), |rec| {
+        self.mutate(id, &format!("iss: issue {} - unset-metadata", id), |rec| {
             // Idempotence: short-circuit if the key is already absent.
             if !rec.metadata.contains_key(&key) {
                 return MutateOutcome::Skip;
@@ -2607,7 +2607,7 @@ impl Storage {
         // writer deleted the target between attempts, we surface a
         // typed IssueNotFound instead of writing a dangling dep edge
         // (`a6b8fb7`).
-        self.mutate(id, &format!("jjf: issue {} - dep-add", id), |rec| {
+        self.mutate(id, &format!("iss: issue {} - dep-add", id), |rec| {
             match self.issue_exists_on_bookmark(&target) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -2764,7 +2764,7 @@ impl Storage {
         kind: DepKind,
     ) -> Result<()> {
         let target = target.clone();
-        self.mutate(id, &format!("jjf: issue {} - dep-rm", id), |rec| {
+        self.mutate(id, &format!("iss: issue {} - dep-rm", id), |rec| {
             rec.dependencies
                 .retain(|d| !(d.target == target && d.kind == kind));
             MutateOutcome::Write(vec![Op::DepRm {
@@ -2940,7 +2940,7 @@ impl Storage {
             created_at: record.updated_at.clone(),
             body,
         };
-        let summary = format!("jjf: issue {} - comment-add", id);
+        let summary = format!("iss: issue {} - comment-add", id);
         let mut all_comments = existing_comments;
         all_comments.push(comment);
         let ops = vec![Op::CommentAdd {
@@ -2998,7 +2998,7 @@ impl Storage {
                 updated_at: now,
             },
         };
-        let summary = format!("jjf: memory {} - set", key);
+        let summary = format!("iss: memory {} - set", key);
         let jjf_at = now_rfc3339_nanos()?;
         let msg = memory::build_set_memory_commit_message(&summary, key, value, &jjf_at);
         self.commit_memory_v3(key, Some(&record), &msg)
@@ -3024,7 +3024,7 @@ impl Storage {
                 "no memory with key {key:?}"
             )));
         }
-        let summary = format!("jjf: memory {} - unset", key);
+        let summary = format!("iss: memory {} - unset", key);
         let jjf_at = now_rfc3339_nanos()?;
         let msg = memory::build_unset_memory_commit_message(&summary, key, &jjf_at);
         self.commit_memory_v3(key, None, &msg)
@@ -4250,12 +4250,12 @@ mod tests {
             status: Status::Open,
         };
         let msg = build_commit_message(
-            "jjf: issue aa6600b - create",
+            "iss: issue aa6600b - create",
             &[op],
             "2026-06-22T12:34:56.123456789Z",
         );
         let expected = "\
-jjf: issue aa6600b - create
+iss: issue aa6600b - create
 
 Jjf-Op: create
 Jjf-Issue: aa6600b
@@ -4284,12 +4284,12 @@ Jjf-Status: open
             },
         ];
         let msg = build_commit_message(
-            "jjf: issue aa6600b - close + label",
+            "iss: issue aa6600b - close + label",
             &ops,
             "2026-06-22T12:34:56.123456789Z",
         );
         let expected = "\
-jjf: issue aa6600b - close + label
+iss: issue aa6600b - close + label
 
 Jjf-Op: set-status
 Jjf-Issue: aa6600b

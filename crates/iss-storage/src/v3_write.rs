@@ -484,7 +484,7 @@ pub(crate) fn write_format_version_sentinel(repo: &GitRepo) -> Result<()> {
         .mktree(&[(BLOB_MODE, "version", &blob_oid)])
         .map_err(translate)?;
     let commit_oid = repo
-        .commit_tree(&tree_oid, &[], "jjf: storage format v3 sentinel\n")
+        .commit_tree(&tree_oid, &[], "iss: storage format v3 sentinel\n")
         .map_err(translate)?;
     repo.update_ref(refs::FORMAT_VERSION_REF, &commit_oid, ZERO_OID)
         .map_err(translate)?;
