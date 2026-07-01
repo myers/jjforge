@@ -61,6 +61,28 @@ fn make_jj_repo(name: &str) -> PathBuf {
         "jj config set user.email failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // J2: also set git config so the binary reads identity from git
+    // (the author-resolution chain now calls `git config user.name`).
+    let out = Command::new("git")
+        .args(["config", "user.name", "Test User"])
+        .current_dir(&dir)
+        .output()
+        .expect("spawn git config user.name");
+    assert!(
+        out.status.success(),
+        "git config user.name failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(&dir)
+        .output()
+        .expect("spawn git config user.email");
+    assert!(
+        out.status.success(),
+        "git config user.email failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     dir
 }
 

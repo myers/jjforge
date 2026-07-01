@@ -3755,7 +3755,7 @@ fn run_comment(
 ///    `actor-override-chain` ticket: `--actor ""` is "skip me," not
 ///    "set empty assignee").
 /// 2. `JJF_ACTOR` env var. Same emptiness rule as the flag.
-/// 3. `jj config get user.name`.
+/// 3. `git config user.name` (J2: was `jj config get user.name`).
 ///
 /// Returns [`CliError::NoCurrentUser`] when the chain runs dry.
 /// Differs from [`resolve_author`] in that it doesn't synthesize
@@ -3773,7 +3773,7 @@ fn resolve_current_user(actor_override: Option<&str>) -> Result<String, CliError
     if let Some(name) = jjf_actor_env() {
         return Ok(name);
     }
-    let name = jj_config_get("user.name")?;
+    let name = git_config_get("user.name")?;
     match name {
         Some(n) => Ok(n),
         None => Err(CliError::NoCurrentUser),
@@ -3809,8 +3809,9 @@ fn jjf_actor_env() -> Option<String> {
 /// 2. `JJF_ACTOR` env var, synthesized as `$JJF_ACTOR <user.email>`
 ///    (or just `$JJF_ACTOR` if `user.email` is unset). v2.12
 ///    (`actor-override-chain`).
-/// 3. `jj config user.name` + `user.email` synthesized as
-///    `Name <email>` (or just `name` if `user.email` is unset).
+/// 3. `git config user.name` + `user.email` synthesized as
+///    `Name <email>` (or just `name` if `user.email` is unset). J2:
+///    was `jj config user.name`.
 ///
 /// Format matches jj's `author` commit-template field (`Name <email>`)
 /// so a comment author and the surrounding commit's `author` line stay
@@ -3836,42 +3837,41 @@ fn resolve_author(override_name: Option<String>) -> Result<String, CliError> {
         }
     }
     if let Some(actor) = jjf_actor_env() {
-        let email = jj_config_get("user.email")?;
+        let email = git_config_get("user.email")?;
         return Ok(match email {
             Some(email) => format!("{actor} <{email}>"),
             None => actor,
         });
     }
-    let name = jj_config_get("user.name")?;
+    let name = git_config_get("user.name")?;
     let Some(name) = name else {
         return Err(CliError::MissingAuthor);
     };
-    let email = jj_config_get("user.email")?;
+    let email = git_config_get("user.email")?;
     Ok(match email {
         Some(email) => format!("{name} <{email}>"),
         None => name,
     })
 }
 
-/// Shell out to `jj config get <key>` and return the trimmed value, or
-/// `None` if the key isn't configured. Any other failure (binary not
-/// on PATH, unexpected stderr) surfaces as a `Probe` error.
+/// Shell out to `git config <key>` and return the trimmed value, or
+/// `None` if the key isn't configured. Any spawn failure surfaces as
+/// a `Probe` error.
 ///
-/// `jj config get` exits non-zero when the key is absent — we treat
+/// `git config <key>` exits non-zero when the key is absent — we treat
 /// that specific case as "not configured" rather than a hard probe
-/// failure so the caller can decide what to do.
-fn jj_config_get(key: &str) -> Result<Option<String>, CliError> {
-    let out = std::process::Command::new("jj")
-        .args(["config", "get", key])
+/// failure so the caller can decide what to do. J2 (jj-divorce):
+/// replaces `jj_config_get` so actor-identity resolution has no jj
+/// dependency.
+fn git_config_get(key: &str) -> Result<Option<String>, CliError> {
+    let out = std::process::Command::new("git")
+        .args(["config", key])
         .output()
         .map_err(CliError::Probe)?;
     if !out.status.success() {
-        // jj prints `config error: ... is not defined` (or similar) and
-        // exits non-zero when the key is missing. Treat any non-success
-        // here as "not configured" — the verb falls back accordingly,
-        // and if the real failure was something else (e.g. malformed
-        // config file) the user will hit it on the next jj invocation
-        // with a clearer message than we could synthesize.
+        // `git config` exits non-zero when the key is absent. Treat any
+        // non-success here as "not configured" — the verb falls back
+        // accordingly.
         return Ok(None);
     }
     let val = String::from_utf8_lossy(&out.stdout).trim().to_owned();

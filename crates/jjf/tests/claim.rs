@@ -60,6 +60,29 @@ fn make_jj_repo_with_user(name: &str, user: &str) -> PathBuf {
         "jj config set user.email failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // J2: also set git config so the binary reads identity from git
+    // (the actor chain now calls `git config user.name` instead of
+    // `jj config get user.name`).
+    let out = Command::new("git")
+        .args(["config", "user.name", user])
+        .current_dir(&dir)
+        .output()
+        .expect("spawn git config user.name");
+    assert!(
+        out.status.success(),
+        "git config user.name failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(&dir)
+        .output()
+        .expect("spawn git config user.email");
+    assert!(
+        out.status.success(),
+        "git config user.email failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     dir
 }
 
@@ -210,9 +233,16 @@ fn update_claim_different_user_errors_already_claimed() {
     let out = run_jjf(&repo, &["update", &id, "--claim"]);
     assert!(out.status.success(), "alice's claim must succeed");
 
-    // Flip user.name to bob.
+    // Flip user.name to bob in both jj config and git config (J2: the
+    // binary now reads from git config, so both must be updated).
     let out = Command::new("jj")
         .args(["config", "set", "--repo", "user.name", "bob"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let out = Command::new("git")
+        .args(["config", "user.name", "bob"])
         .current_dir(&repo)
         .output()
         .unwrap();

@@ -5,7 +5,7 @@
 //! `jjf comment` for its author field):
 //!
 //! ```text
-//! --actor flag > JJF_ACTOR env > jj config user.name > error
+//! --actor flag > JJF_ACTOR env > git config user.name > error
 //! ```
 //!
 //! Plus the empty-string fall-through rule (`--actor ""` and
@@ -63,6 +63,30 @@ fn make_jj_repo_with_user(name: &str, user: Option<&str>) -> PathBuf {
         assert!(
             out.status.success(),
             "jj config set user.email failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // J2: also set git config so the binary reads identity from git
+        // (the actor chain now calls `git config user.name` instead of
+        // `jj config get user.name`). Setting both keeps jj-init working
+        // and makes git the authoritative source of truth post-J2.
+        let out = Command::new("git")
+            .args(["config", "user.name", user])
+            .current_dir(&dir)
+            .output()
+            .expect("spawn git config user.name");
+        assert!(
+            out.status.success(),
+            "git config user.name failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&dir)
+            .output()
+            .expect("spawn git config user.email");
+        assert!(
+            out.status.success(),
+            "git config user.email failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
@@ -302,13 +326,12 @@ fn claim_empty_flag_falls_through_to_env() {
 #[test]
 fn claim_all_slots_empty_errors_no_current_user() {
     // Set up a fixture where every chain slot is empty: no
-    // `--actor` (or empty), no `JJF_ACTOR`, and no jj user.name in
-    // ANY scope. The repo-local config is unset by construction
-    // (we pass `user = None` to the fixture), and we point
-    // `JJ_CONFIG` at the scratch dir's bookkeeping subpath so the
-    // test runner's global `~/.config/jj/config.toml` (which
-    // typically has a `user.name = Tester` fallback) doesn't
-    // satisfy the chain. v2.12 (`actor-override-chain`).
+    // `--actor` (or empty), no `JJF_ACTOR`, and no user.name in
+    // ANY config scope. The repo-local config is unset by construction
+    // (we pass `user = None` to the fixture). We block both global
+    // config sources: `JJ_CONFIG` → nonexistent path (for legacy jj
+    // paths), `GIT_CONFIG_GLOBAL` → /dev/null (for the new git-config
+    // resolution path added in J2). v2.12 (`actor-override-chain`).
     let repo = make_initialized_repo_with_user("actor_no_current_user", None);
 
     // Create the issue under a JJF_ACTOR fallback so the
@@ -337,12 +360,18 @@ fn claim_all_slots_empty_errors_no_current_user() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("parse");
     let id = v["id"].as_str().expect("id").to_owned();
 
-    // Now run --claim with JJF_ACTOR explicitly unset AND
-    // `JJ_CONFIG` pointed at a path with no `user.name`. We use
-    // the scratch repo's `.jj/` (which has no top-level config
-    // file) — jj falls back to "no config" cleanly. A
-    // nonexistent path also works (jj treats missing config
-    // sources as empty).
+    // Now run --claim with JJF_ACTOR explicitly unset AND both config
+    // escape hatches engaged:
+    //   - `JJ_CONFIG` → nonexistent path: blocks jj's global config
+    //     (`~/.config/jj/config.toml`, which carries `user.name = Tester`).
+    //   - `GIT_CONFIG_GLOBAL` → /dev/null: blocks git's global config
+    //     (`~/.gitconfig`, which may carry `user.name`). After J2 the
+    //     binary reads from `git config`, so this prevents the global
+    //     git identity from satisfying the chain.
+    // The repo-local git config is unset by construction (None was passed
+    // to make_initialized_repo_with_user, so no git config user.name was
+    // written to .git/config). Together these ensure every chain slot is
+    // genuinely empty and the binary must error.
     let empty_config = repo.join("nonexistent-config.toml");
     let empty_config_str = empty_config.to_string_lossy();
     let out = run_jjf_with_env(
@@ -351,6 +380,7 @@ fn claim_all_slots_empty_errors_no_current_user() {
         &[
             ("JJF_ACTOR", None),
             ("JJ_CONFIG", Some(empty_config_str.as_ref())),
+            ("GIT_CONFIG_GLOBAL", Some("/dev/null")),
         ],
     );
     assert!(
@@ -516,5 +546,76 @@ fn comment_falls_back_to_config_when_no_env_or_flag() {
     assert!(
         author.starts_with("config-user"),
         "expected author to start with config-user, got: {author}"
+    );
+}
+
+// --- J2: git config resolution ------------------------------------
+
+/// Attribution resolves from `git config user.name` when jj config has
+/// NO user.name but git config does. Tests Task J2 (jj-divorce): after
+/// rerouting resolution from `jj config get` to `git config`, the binary
+/// reads identity from git, not jj.
+#[test]
+fn claim_uses_git_config_user_name() {
+    // jj git init (required for jjf init), but do NOT set jj user config.
+    let root = make_jj_repo_with_user("claim_uses_git_config", None);
+
+    // Set user identity via git config (repo-local) only — jj config
+    // user.name is deliberately unset above. Pre-J2, the binary reads
+    // `jj config get user.name`, which returns nothing (no jj config).
+    // Post-J2, it reads `git config user.name`, which returns "Git Person".
+    let out = std::process::Command::new("git")
+        .args(["-C", root.to_str().unwrap(), "config", "user.name", "Git Person"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git config user.name failed");
+
+    let out = std::process::Command::new("git")
+        .args(["-C", root.to_str().unwrap(), "config", "user.email", "git@example.com"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git config user.email failed");
+
+    // Initialize jjf storage.
+    let out = std::process::Command::new(JJF_BIN)
+        .arg("init")
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "jjf init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Create issue under a setup actor so `new` doesn't hit the no-user error.
+    let out = run_jjf_with_env(
+        &root,
+        &["new", "--json", "-t", "claim me", "-F", "-"],
+        &[("JJF_ACTOR", Some("setup-actor"))],
+    );
+    assert!(out.status.success(), "jjf new failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("parse new --json");
+    let id = v["id"].as_str().expect("id field").to_owned();
+
+    // --claim with no JJF_ACTOR / --actor: must fall back to git config user.name.
+    // Pre-J2 this would fail (jj config has no user.name → NoCurrentUser).
+    // Post-J2 this must succeed (git config has "Git Person").
+    let out = run_jjf_with_env(
+        &root,
+        &["update", &id, "--claim", "--json"],
+        &[("JJF_ACTOR", None)],
+    );
+    assert!(
+        out.status.success(),
+        "update --claim via git config failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let assignee = show_assignee(&root, &id).expect("assignee should be set");
+    assert_eq!(
+        assignee, "Git Person",
+        "--claim must resolve from git config user.name, got: {assignee}"
     );
 }
